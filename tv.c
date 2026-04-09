@@ -902,7 +902,7 @@ static void handle_key(int k){
 /* ═══════════════════════════════════════════════════════════════════ */
 int main(int argc,char**argv){
     int load_mode=0; char load_file[256]=""; char**cmd=NULL;
-    char dd_spec[65536]="";
+    char dd_spec[65536]=""; /* JSON array of key names, e.g. ["j","j","W"] */
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--load")==0&&i+1<argc){load_mode=1;snprintf(load_file,sizeof load_file,"%s",argv[++i]);}
         else if(strcmp(argv[i],"--dd")==0&&i+1<argc){snprintf(dd_spec,sizeof dd_spec,"%s",argv[++i]);}
