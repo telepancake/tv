@@ -1,0 +1,19 @@
+> ─── Process ───
+  TGID:  1002
+  PPID:  1000
+  EXE:   /usr/bin/gcc
+  CWD:   /build/subdir
+    [0] gcc
+    [1] -c
+    [2] ../bar.c
+    [3] -o
+    [4] ../bar.o
+  Exit: exited code=1
+  Duration: 1.00s
+  ─── Children (0) ───
+  ─── Events (5) ───
+  3.000000 EXEC   
+  3.000000 OPEN   /build/subdir/../bar.c [O_RDONLY] fd=3
+  3.250000 OPEN   /build/bar.o [O_WRONLY|O_CREAT|O_TRUNC] fd=4
+  3.500000 STDERR error: 'x' undeclared↵
+  4.000000 EXIT   exited code=1

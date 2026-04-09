@@ -1,0 +1,16 @@
+> ─── Process ───
+  TGID:  1004
+  PPID:  1000
+  EXE:   /usr/bin/ld
+  CWD:   /build
+    [0] ld
+    [1] -o
+    [2] prog
+    [3] foo.o
+    [4] bar.o
+  Duration: 250.0ms
+  ─── Children (0) ───
+  ─── Events (3) ───
+  5.000000 EXEC   
+  5.000000 OPEN   /build/foo.o [O_RDONLY] fd=3
+  5.250000 OPEN   /build/bar.o [O_RDWR] fd=4

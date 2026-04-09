@@ -40,7 +40,11 @@ install:
         $(MAKE) -C $(KDIR) M=$(PWD) modules_install
         depmod -a
 
-tv: tv.c
-        cc -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -o tv tv.c sqlite3.c -static
+tv: tv.c sqlite3.c sqlite3.h
+	cc -O2 -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 \
+		-o tv tv.c sqlite3.c -static -lm
 
-.PHONY: all keygen sign load unload clean install
+test: tv
+	@bash tests/run_tests.sh
+
+.PHONY: all keygen sign load unload clean install test

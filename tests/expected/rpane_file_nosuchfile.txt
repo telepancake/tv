@@ -1,0 +1,5 @@
+> ─── File ───
+  Path: /build/nosuchfile.h
+  Opens: 1  Errors: 1  Procs: 1
+  ─── Accesses ───
+  4.250000  PID 1003 (gcc)  [O_RDONLY] err=-2

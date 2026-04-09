@@ -180,8 +180,10 @@ static void process_line(const char *ln){
              const char*f=(const char*)sqlite3_column_text(st,1);if(f)snprintf(flag0,sizeof flag0,"%s",f);}
          sqlite3_finalize(st);}
 
-        /* Resolve relative path using cwd_cache */
-        if(path[0]&&path[0]!='/'){
+        /* Resolve relative path using cwd_cache.
+         * Skip paths that are kernel pseudo-paths (pipe:[N], socket:[N], anon_inode:...)
+         * since they are not real filesystem paths and should not have CWD prepended. */
+        if(path[0]&&path[0]!='/'&&strncmp(path,"pipe:",5)!=0&&strncmp(path,"socket:",7)!=0&&strncmp(path,"anon_inode:",11)!=0){
             char cwd[4096]="";
             {sqlite3_stmt*st;
              sqlite3_prepare_v2(db,"SELECT COALESCE(cwd,'') FROM cwd_cache WHERE tgid=?",-1,&st,0);
@@ -288,7 +290,7 @@ static void process_line(const char *ln){
 /* ── Part 2: App state & SQL logic ─────────────────────────────────── */
 
 #define BNAME(c) "REPLACE("c",RTRIM("c",REPLACE("c",'/','')),'') "
-#define DUR(d) "CASE WHEN "d">=1 THEN printf('%.2fs',"d") WHEN "d">=.001 THEN printf('%.1fms',("d")*1e3) WHEN "d">0 THEN printf('%.0fµs',("d")*1e6) ELSE '' END"
+#define DUR(d) "CASE WHEN "d">=1 THEN printf('%%.2fs',"d") WHEN "d">=.001 THEN printf('%%.1fms',("d")*1e3) WHEN "d">0 THEN printf('%%.0fµs',("d")*1e6) ELSE '' END"
 
 /* ── Filter lpane to matching processes ────────────────────────────── */
 static void apply_lp_filter(void){
@@ -372,8 +374,10 @@ static void apply_lp_filter(void){
 static void rebuild_procs(void){
     int gr=qint("SELECT grouped FROM state",1);
     int sk=qint("SELECT sort_key FROM state",0);
-    const char*bo,*co;
-    switch(sk){case 1:bo="p2.first_ts";co="c.first_ts";break;case 2:bo="p2.last_ts";co="c.last_ts";break;default:bo="p2.tgid";co="c.tgid";}
+    const char*bo,*co,*fo; /* tree-root, tree-child, flat ORDER BY column */
+    switch(sk){case 1:bo="p2.first_ts";co="c.first_ts";fo="p.first_ts";break;
+               case 2:bo="p2.last_ts";co="c.last_ts";fo="p.last_ts";break;
+               default:bo="p2.tgid";co="c.tgid";fo="p.tgid";}
     if(gr){
         xexec("INSERT OR IGNORE INTO expanded(id,ex) SELECT CAST(tgid AS TEXT),1 FROM processes;");
         char sql[8192];snprintf(sql,sizeof sql,
@@ -416,7 +420,7 @@ static void rebuild_procs(void){
             "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%%d',x.signal)"
             "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
             " FROM processes p LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
-            " LEFT JOIN exit_events x ON x.eid=ev.id",bo);
+            " LEFT JOIN exit_events x ON x.eid=ev.id",fo);
     }
 }
 
@@ -486,7 +490,8 @@ static void rpane_proc(int tgid){
     xexecf("INSERT INTO rpane SELECT 4,'green',printf('CWD:   %%s',COALESCE(cwd,'?')),-1,'' FROM processes WHERE tgid=%d",tgid);
     /* Argv */
     xexecf("WITH RECURSIVE sp(i,rest,line) AS("
-        " SELECT 0,SUBSTR(argv,INSTR(argv,char(10))+1),"
+        " SELECT 0,"
+        "  CASE WHEN INSTR(argv,char(10))>0 THEN SUBSTR(argv,INSTR(argv,char(10))+1) ELSE '' END,"
         "  CASE WHEN INSTR(argv,char(10))>0 THEN SUBSTR(argv,1,INSTR(argv,char(10))-1) ELSE argv END"
         "  FROM processes WHERE tgid=%d AND argv IS NOT NULL"
         " UNION ALL SELECT i+1,"
@@ -783,6 +788,183 @@ static void save_db(void){
     if(bk){sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);}
     sqlite3_close(dst);}
 
+/* ── Ingest & direct-drive helpers ─────────────────────────────────── */
+
+/* Read a JSONL file and ingest all events into the current DB */
+static void ingest_jsonl(const char *path){
+    FILE*f=fopen(path,"r");
+    if(!f){fprintf(stderr,"tv: cannot open %s: %s\n",path,strerror(errno));exit(1);}
+    char *line=NULL;size_t cap=0;ssize_t n;
+    int count=0;
+    xexec("BEGIN");
+    while((n=getline(&line,&cap,f))>0){
+        while(n>0&&(line[n-1]=='\n'||line[n-1]=='\r'))line[--n]=0;
+        if(n>0){process_line(line);count++;}
+        if(count%500==0){xexec("COMMIT");xexec("BEGIN");}
+    }
+    xexec("COMMIT");
+    free(line);fclose(f);
+    xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
+    setup_fts();}
+
+/* Save in-memory DB to a file */
+static void save_db_to(const char *path){
+    sqlite3*dst;
+    if(sqlite3_open(path,&dst)!=SQLITE_OK){fprintf(stderr,"tv: cannot open %s for save\n",path);return;}
+    sqlite3_backup*bk=sqlite3_backup_init(dst,"main",db,"main");
+    if(bk){sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);}
+    sqlite3_close(dst);}
+
+/* Extract int from JSON spec via SQLite */
+static int dd_jint(const char *spec,const char *field,int def){
+    sqlite3_stmt*st;int v=def;
+    char sql[128];snprintf(sql,sizeof sql,"SELECT COALESCE(json_extract(?1,?2),%d)",def);
+    if(sqlite3_prepare_v2(db,sql,-1,&st,0)==SQLITE_OK){
+        sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
+        char fp[64];snprintf(fp,sizeof fp,"$.%s",field);
+        sqlite3_bind_text(st,2,fp,-1,SQLITE_TRANSIENT);
+        if(sqlite3_step(st)==SQLITE_ROW)v=sqlite3_column_int(st,0);
+        sqlite3_finalize(st);}
+    return v;}
+
+/* Extract string from JSON spec via SQLite */
+static void dd_jstr(const char *spec,const char *field,const char *def,char *buf,int bufsz){
+    sqlite3_stmt*st;
+    snprintf(buf,bufsz,"%s",def?def:"");
+    if(sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,?2),?3)",-1,&st,0)==SQLITE_OK){
+        sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
+        char fp[64];snprintf(fp,sizeof fp,"$.%s",field);
+        sqlite3_bind_text(st,2,fp,-1,SQLITE_TRANSIENT);
+        sqlite3_bind_text(st,3,def?def:"",-1,SQLITE_TRANSIENT);
+        if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(buf,bufsz,"%s",t);}
+        sqlite3_finalize(st);}
+}
+
+/* Print lpane rows as plain text (no ANSI) to stdout */
+static void dd_print_lpane(int rows){
+    int cursor=qint("SELECT cursor FROM state",0);
+    int total=qint("SELECT COUNT(*) FROM lpane",0);
+    int scroll=0;
+    if(cursor>=rows)scroll=cursor-rows+1;
+    if(scroll<0)scroll=0;
+    if(total>rows&&scroll>total-rows)scroll=total-rows;
+    sqlite3_stmt*st;
+    sqlite3_prepare_v2(db,
+        "SELECT rownum,text FROM lpane WHERE rownum>=? AND rownum<? ORDER BY rownum",
+        -1,&st,0);
+    sqlite3_bind_int(st,1,scroll);sqlite3_bind_int(st,2,scroll+rows);
+    while(sqlite3_step(st)==SQLITE_ROW){
+        int rn=sqlite3_column_int(st,0);
+        const char*text=(const char*)sqlite3_column_text(st,1);
+        printf("%c %s\n",rn==cursor?'>':' ',text?text:"");}
+    sqlite3_finalize(st);}
+
+/* Print rpane rows as plain text (no ANSI) to stdout */
+static void dd_print_rpane(int rows){
+    int dcursor=qint("SELECT dcursor FROM state",0);
+    int nrp=qint("SELECT COUNT(*) FROM rpane",0);
+    int dscroll=0;
+    if(dcursor>=rows)dscroll=dcursor-rows+1;
+    if(dscroll<0)dscroll=0;
+    if(nrp>rows&&dscroll>nrp-rows)dscroll=nrp-rows;
+    sqlite3_stmt*st;
+    sqlite3_prepare_v2(db,
+        "SELECT rownum,text FROM rpane WHERE rownum>=? AND rownum<? ORDER BY rownum",
+        -1,&st,0);
+    sqlite3_bind_int(st,1,dscroll);sqlite3_bind_int(st,2,dscroll+rows);
+    while(sqlite3_step(st)==SQLITE_ROW){
+        int rn=sqlite3_column_int(st,0);
+        const char*text=(const char*)sqlite3_column_text(st,1);
+        printf("%c %s\n",rn==dcursor?'>':' ',text?text:"");}
+    sqlite3_finalize(st);}
+
+/*
+ * Direct-drive mode: parse JSON spec, configure state, rebuild panes, print.
+ *
+ * Spec fields (all optional):
+ *   rows, cols        – terminal dimensions (default 24×80)
+ *   mode              – 0=procs 1=files 2=output (default 0)
+ *   grouped           – 1=tree 0=flat (default 1)
+ *   ts_mode           – 0=abs 1=rel 2=delta (default 0)
+ *   sort_key          – 0=id 1=first 2=last (default 0)
+ *   lp_filter         – 0=all 1=failed 2=running (default 0)
+ *   focus             – 0=left 1=right (default 0)
+ *   cursor            – lpane row (default 0)
+ *   dcursor           – rpane row (default 0)
+ *   expand            – array of IDs to expand (default [])
+ *   collapse          – array of IDs to collapse (default [])
+ *   select_id         – lpane ID to move cursor to (overrides cursor)
+ *   pane              – "left", "right", or "both" (default "left")
+ */
+static void dd_run(const char *spec){
+    int rows=dd_jint(spec,"rows",24);
+    int cols=dd_jint(spec,"cols",80);
+    int mode=dd_jint(spec,"mode",0);
+    int grouped=dd_jint(spec,"grouped",1);
+    int ts_mode=dd_jint(spec,"ts_mode",0);
+    int sort_key=dd_jint(spec,"sort_key",0);
+    int lp_filter=dd_jint(spec,"lp_filter",0);
+    int focus=dd_jint(spec,"focus",0);
+    int cursor=dd_jint(spec,"cursor",0);
+    int dcursor=dd_jint(spec,"dcursor",0);
+    char pane[16];dd_jstr(spec,"pane","left",pane,sizeof pane);
+    char select_id[4096];dd_jstr(spec,"select_id","",select_id,sizeof select_id);
+
+    xexecf("UPDATE state SET rows=%d,cols=%d,mode=%d,grouped=%d,ts_mode=%d,"
+           "sort_key=%d,lp_filter=%d,focus=%d,cursor=%d,dcursor=%d",
+           rows,cols,mode,grouped,ts_mode,sort_key,lp_filter,focus,cursor,dcursor);
+
+    /* Expand IDs listed in spec */
+    {sqlite3_stmt*st;
+     sqlite3_prepare_v2(db,
+         "SELECT value FROM json_each(COALESCE(json_extract(?1,'$.expand'),'[]'))",
+         -1,&st,0);
+     sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
+     while(sqlite3_step(st)==SQLITE_ROW){
+         const char*id=(const char*)sqlite3_column_text(st,0);
+         if(id){sqlite3_stmt*u;
+             sqlite3_prepare_v2(db,"INSERT OR REPLACE INTO expanded(id,ex) VALUES(?,1)",-1,&u,0);
+             sqlite3_bind_text(u,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(u);sqlite3_finalize(u);}}
+     sqlite3_finalize(st);}
+
+    /* Collapse IDs listed in spec */
+    {sqlite3_stmt*st;
+     sqlite3_prepare_v2(db,
+         "SELECT value FROM json_each(COALESCE(json_extract(?1,'$.collapse'),'[]'))",
+         -1,&st,0);
+     sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
+     while(sqlite3_step(st)==SQLITE_ROW){
+         const char*id=(const char*)sqlite3_column_text(st,0);
+         if(id){sqlite3_stmt*u;
+             sqlite3_prepare_v2(db,"INSERT OR REPLACE INTO expanded(id,ex) VALUES(?,0)",-1,&u,0);
+             sqlite3_bind_text(u,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(u);sqlite3_finalize(u);}}
+     sqlite3_finalize(st);}
+
+    rebuild_lpane();
+
+    /* Move cursor to select_id if provided */
+    if(select_id[0]){
+        sqlite3_stmt*st;
+        sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&st,0);
+        sqlite3_bind_text(st,1,select_id,-1,SQLITE_TRANSIENT);
+        if(sqlite3_step(st)==SQLITE_ROW)
+            xexecf("UPDATE state SET cursor=%d",sqlite3_column_int(st,0));
+        sqlite3_finalize(st);}
+
+    rebuild_rpane();
+
+    int print_rows=rows-1; /* reserve 1 row for status bar */
+    if(strcmp(pane,"right")==0){
+        dd_print_rpane(print_rows);
+    } else if(strcmp(pane,"both")==0){
+        printf("=== LEFT ===\n");
+        dd_print_lpane(print_rows);
+        printf("=== RIGHT ===\n");
+        dd_print_rpane(print_rows);
+    } else {
+        dd_print_lpane(print_rows);
+    }}
+
 /* ── Key dispatch ──────────────────────────────────────────────────── */
 static void handle_key(int k){
     int focus=qint("SELECT focus FROM state",0),nf=qint("SELECT COUNT(*) FROM lpane",0);
@@ -864,11 +1046,20 @@ static void handle_key(int k){
 /* ═══════════════════════════════════════════════════════════════════ */
 int main(int argc,char**argv){
     int load_mode=0; char load_file[256]=""; char**cmd=NULL;
+    int ingest_mode=0; char ingest_file[4096]="";
+    char save_file[4096]="";
+    int dd_mode=0; char dd_spec[65536]="";
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--load")==0&&i+1<argc){load_mode=1;snprintf(load_file,sizeof load_file,"%s",argv[++i]);}
+        else if(strcmp(argv[i],"--ingest")==0&&i+1<argc){ingest_mode=1;snprintf(ingest_file,sizeof ingest_file,"%s",argv[++i]);}
+        else if(strcmp(argv[i],"--save")==0&&i+1<argc){snprintf(save_file,sizeof save_file,"%s",argv[++i]);}
+        else if(strcmp(argv[i],"--dd")==0&&i+1<argc){dd_mode=1;snprintf(dd_spec,sizeof dd_spec,"%s",argv[++i]);}
         else if(strcmp(argv[i],"--")==0&&i+1<argc){cmd=argv+i+1;break;}}
-    if(!load_mode&&!cmd){
-        fprintf(stderr,"Usage: tv -- <command> [args...]\n       tv --load <file.db>\n");
+    if(!load_mode&&!ingest_mode&&!cmd){
+        fprintf(stderr,
+            "Usage: tv -- <command> [args...]\n"
+            "       tv --load <file.db> [--dd '<json>']\n"
+            "       tv --ingest <file.jsonl> [--save <file.db>] [--dd '<json>']\n");
         return 1;}
 
     if(sqlite3_open(":memory:",&db)!=SQLITE_OK)die("sqlite3_open");
@@ -884,18 +1075,40 @@ int main(int argc,char**argv){
         {char*e=0;sqlite3_exec(db,"ALTER TABLE state ADD COLUMN lp_filter INT DEFAULT 0",0,0,&e);if(e)sqlite3_free(e);}
         setup_app(); /* idempotent: IF NOT EXISTS throughout */
         if(!qint("SELECT has_fts FROM state",0)) setup_fts();
+    } else if(ingest_mode){
+        /* Headless ingest: read JSONL file, no kernel module required */
+        db_create();
+        setup_app();
+        ingest_jsonl(ingest_file);
     } else {
         /* Live tracing mode */
         db_create();
         setup_app();
         g_own_tgid=(int)getpid();
-        g_trace_fd=open("/proc/proctrace/new",O_RDONLY);
-        if(g_trace_fd<0)die("cannot open /proc/proctrace/new — is the module loaded?");
+        /* TV_TRACE_PATH overrides the default kernel proc interface path */
+        const char*tpath=getenv("TV_TRACE_PATH");
+        if(!tpath)tpath="/proc/proctrace/new";
+        g_trace_fd=open(tpath,O_RDONLY);
+        if(g_trace_fd<0){fprintf(stderr,"tv: cannot open %s — is the module loaded?\n",tpath);exit(1);}
         g_child_pid=fork();
         if(g_child_pid<0){close(g_trace_fd);die("fork");}
         if(g_child_pid==0){execvp(cmd[0],cmd);perror(cmd[0]);_exit(127);}
         xexec("UPDATE state SET lp_filter=2"); /* show running processes while tracing */
     }
+
+    /* --save: persist DB to file (useful after --ingest) */
+    if(save_file[0]) save_db_to(save_file);
+
+    /* --dd: headless render, print pane to stdout, exit without TUI */
+    if(dd_mode){
+        dd_run(dd_spec);
+        sqlite3_close(db);
+        return 0;}
+
+    /* Headless ingest+save without --dd: just exit after saving */
+    if(ingest_mode&&save_file[0]){
+        sqlite3_close(db);
+        return 0;}
 
     rebuild_lpane();rebuild_rpane();
     tty_init();

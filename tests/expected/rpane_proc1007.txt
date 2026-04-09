@@ -1,0 +1,13 @@
+> ─── Process ───
+  TGID:  1007
+  PPID:  1000
+  EXE:   /build/prog
+  CWD:   /build
+    [0] ./prog
+  Exit: signal 11 (core)
+  Duration: 1.00s
+  ─── Children (0) ───
+  ─── Events (3) ───
+  8.000000 EXEC   
+  8.500000 STDERR Segmentation fault (core dumped)↵
+  9.000000 EXIT   signal=11

@@ -1,0 +1,40 @@
+{"event":"CWD","ts":1.0,"pid":1000,"tgid":1000,"ppid":999,"nspid":1000,"nstgid":1000,"path":"/build"}
+{"event":"EXEC","ts":1.0,"pid":1000,"tgid":1000,"ppid":999,"nspid":1000,"nstgid":1000,"exe":"/usr/bin/make","argv":["make","all"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/usr/bin/make","AT_PLATFORM":"x86_64"}}
+{"event":"OPEN","ts":1.0,"pid":1000,"tgid":1000,"ppid":999,"nspid":1000,"nstgid":1000,"path":"/build/Makefile","flags":["O_RDONLY"],"fd":3}
+{"event":"CWD","ts":2.0,"pid":1001,"tgid":1001,"ppid":1000,"nspid":1001,"nstgid":1001,"path":"/build"}
+{"event":"EXEC","ts":2.0,"pid":1001,"tgid":1001,"ppid":1000,"nspid":1001,"nstgid":1001,"exe":"/usr/bin/gcc","argv":["gcc","-c","foo.c","-o","foo.o"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/usr/bin/gcc","AT_PLATFORM":"x86_64"}}
+{"event":"OPEN","ts":2.0,"pid":1001,"tgid":1001,"ppid":1000,"nspid":1001,"nstgid":1001,"path":"foo.c","flags":["O_RDONLY"],"fd":3}
+{"event":"OPEN","ts":2.25,"pid":1001,"tgid":1001,"ppid":1000,"nspid":1001,"nstgid":1001,"path":"/build/foo.o","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4}
+{"event":"STDOUT","ts":2.5,"pid":1001,"tgid":1001,"ppid":1000,"nspid":1001,"nstgid":1001,"len":16,"data":"Compiling foo.c\n"}
+{"event":"EXIT","ts":3.0,"pid":1001,"tgid":1001,"ppid":1000,"nspid":1001,"nstgid":1001,"status":"exited","code":0,"raw":0}
+{"event":"CWD","ts":3.0,"pid":1002,"tgid":1002,"ppid":1000,"nspid":1002,"nstgid":1002,"path":"/build/subdir"}
+{"event":"EXEC","ts":3.0,"pid":1002,"tgid":1002,"ppid":1000,"nspid":1002,"nstgid":1002,"exe":"/usr/bin/gcc","argv":["gcc","-c","../bar.c","-o","../bar.o"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/usr/bin/gcc","AT_PLATFORM":"x86_64"}}
+{"event":"OPEN","ts":3.0,"pid":1002,"tgid":1002,"ppid":1000,"nspid":1002,"nstgid":1002,"path":"../bar.c","flags":["O_RDONLY"],"fd":3}
+{"event":"OPEN","ts":3.25,"pid":1002,"tgid":1002,"ppid":1000,"nspid":1002,"nstgid":1002,"path":"/build/bar.o","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4}
+{"event":"STDERR","ts":3.5,"pid":1002,"tgid":1002,"ppid":1000,"nspid":1002,"nstgid":1002,"len":23,"data":"error: 'x' undeclared\n"}
+{"event":"EXIT","ts":4.0,"pid":1002,"tgid":1002,"ppid":1000,"nspid":1002,"nstgid":1002,"status":"exited","code":1,"raw":256}
+{"event":"CWD","ts":4.0,"pid":1003,"tgid":1003,"ppid":1000,"nspid":1003,"nstgid":1003,"path":"/build"}
+{"event":"EXEC","ts":4.0,"pid":1003,"tgid":1003,"ppid":1000,"nspid":1003,"nstgid":1003,"exe":"/usr/bin/gcc","argv":["gcc","-c","baz.c"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/usr/bin/gcc","AT_PLATFORM":"x86_64"}}
+{"event":"OPEN","ts":4.0,"pid":1003,"tgid":1003,"ppid":1000,"nspid":1003,"nstgid":1003,"path":"/build/baz.c","flags":["O_RDONLY"],"fd":3}
+{"event":"OPEN","ts":4.25,"pid":1003,"tgid":1003,"ppid":1000,"nspid":1003,"nstgid":1003,"path":"nosuchfile.h","flags":["O_RDONLY"],"err":-2}
+{"event":"EXIT","ts":5.0,"pid":1003,"tgid":1003,"ppid":1000,"nspid":1003,"nstgid":1003,"status":"exited","code":1,"raw":256}
+{"event":"CWD","ts":5.0,"pid":1004,"tgid":1004,"ppid":1000,"nspid":1004,"nstgid":1004,"path":"/build"}
+{"event":"EXEC","ts":5.0,"pid":1004,"tgid":1004,"ppid":1000,"nspid":1004,"nstgid":1004,"exe":"/usr/bin/ld","argv":["ld","-o","prog","foo.o","bar.o"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/usr/bin/ld","AT_PLATFORM":"x86_64"}}
+{"event":"OPEN","ts":5.0,"pid":1004,"tgid":1004,"ppid":1000,"nspid":1004,"nstgid":1004,"path":"/build/foo.o","flags":["O_RDONLY"],"fd":3}
+{"event":"OPEN","ts":5.25,"pid":1004,"tgid":1004,"ppid":1000,"nspid":1004,"nstgid":1004,"path":"/build/bar.o","flags":["O_RDWR"],"fd":4}
+{"event":"CWD","ts":6.0,"pid":1005,"tgid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"path":"/build"}
+{"event":"EXEC","ts":6.0,"pid":1005,"tgid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"exe":"/bin/cat","argv":["cat","input.txt"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/bin/cat","AT_PLATFORM":"x86_64"}}
+{"event":"OPEN","ts":6.0,"pid":1005,"tgid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"path":"pipe:[88231]","flags":["O_WRONLY"],"fd":1,"ino":88231,"dev":"0:12","inherited":true}
+{"event":"OPEN","ts":6.0,"pid":1005,"tgid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"path":"/build/input.txt","flags":["O_RDONLY"],"fd":3}
+{"event":"STDOUT","ts":6.5,"pid":1005,"tgid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"len":12,"data":"line1\nline2\n"}
+{"event":"EXIT","ts":7.0,"pid":1005,"tgid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"status":"exited","code":0,"raw":0}
+{"event":"CWD","ts":7.0,"pid":1006,"tgid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"path":"/build"}
+{"event":"EXEC","ts":7.0,"pid":1006,"tgid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"exe":"/usr/bin/sort","argv":["sort"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/usr/bin/sort","AT_PLATFORM":"x86_64"}}
+{"event":"OPEN","ts":7.0,"pid":1006,"tgid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"path":"pipe:[88231]","flags":["O_RDONLY"],"fd":0,"ino":88231,"dev":"0:12","inherited":true}
+{"event":"OPEN","ts":7.0,"pid":1006,"tgid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"path":"/build/output.txt","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":1,"ino":91002,"dev":"259:2","inherited":true}
+{"event":"EXIT","ts":8.0,"pid":1006,"tgid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"status":"exited","code":0,"raw":0}
+{"event":"CWD","ts":8.0,"pid":1007,"tgid":1007,"ppid":1000,"nspid":1007,"nstgid":1007,"path":"/build"}
+{"event":"EXEC","ts":8.0,"pid":1007,"tgid":1007,"ppid":1000,"nspid":1007,"nstgid":1007,"exe":"/build/prog","argv":["./prog"],"env":{"PATH":"/usr/bin:/bin"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0,"AT_EXECFN":"/build/prog","AT_PLATFORM":"x86_64"}}
+{"event":"STDERR","ts":8.5,"pid":1007,"tgid":1007,"ppid":1000,"nspid":1007,"nstgid":1007,"len":33,"data":"Segmentation fault (core dumped)\n"}
+{"event":"EXIT","ts":9.0,"pid":1007,"tgid":1007,"ppid":1000,"nspid":1007,"nstgid":1007,"status":"signaled","signal":11,"core_dumped":true,"raw":139}
+{"event":"EXIT","ts":9.5,"pid":1000,"tgid":1000,"ppid":999,"nspid":1000,"nstgid":1000,"status":"exited","code":1,"raw":256}
