@@ -35,6 +35,7 @@
 #include <linux/fs.h>
 #include <linux/fs_struct.h>
 #include <linux/file.h>
+#include <linux/fdtable.h>
 #include <linux/path.h>
 #include <linux/dcache.h>
 #include <linux/mm.h>
@@ -801,6 +802,95 @@ static struct kretprobe fork_kretprobe = {
     .handler=fork_ret, .entry_handler=fork_entry, .maxactive=64,
 };
 
+/* ===============================================================
+ * Emit fake OPEN events for inherited fds
+ * ===============================================================
+ *
+ * On exec, the new program inherits the fd table of its predecessor
+ * (minus O_CLOEXEC ones, which the kernel has already closed by the
+ * time our kretprobe fires).  Emit one "inherited":true OPEN event
+ * per surviving fd, so the trace records which files/pipes/sockets
+ * a freshly-exec'd process started with — even if it never calls
+ * open() itself (e.g. `sort` in `cat a | sort > b`).
+ *
+ * Both ends of a pipe share the same pipefs inode, so matching
+ * (dev,ino) across two inherited OPEN events unambiguously pairs
+ * the two ends of a shell pipe.
+ */
+
+static void emit_inherited_open_for_fd(struct task_struct *task,
+                                       struct timespec64 *ts,
+                                       unsigned int fd, struct file *file)
+{
+    struct trace_session *s;
+    pid_t tgid = task->tgid;
+    struct inode *ino;
+    unsigned long ino_nr = 0;
+    dev_t dev = 0;
+    char *path_buf = NULL, *path = NULL, *path_esc = NULL;
+    char *flags_j = NULL, *line = NULL;
+    int pos;
+
+    ino = file_inode(file);
+    if (ino) { ino_nr = ino->i_ino; dev = ino->i_sb->s_dev; }
+
+    path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+    if (!path_buf) return;
+    path = file_path(file, path_buf, PATH_MAX);
+    if (IS_ERR(path)) path = NULL;
+
+    path_esc = kmalloc(PATH_MAX*2, GFP_ATOMIC);
+    if (path_esc && path) json_escape(path_esc, PATH_MAX*2, path, strlen(path));
+
+    flags_j = kmalloc(256, GFP_ATOMIC);
+    if (flags_j) json_open_flags(file->f_flags, flags_j, 256);
+
+    line = kmalloc(PATH_MAX*2+512, GFP_ATOMIC);
+    if (!line) goto out;
+
+    pos = json_header(line, PATH_MAX*2+512, "OPEN", task, ts);
+    pos += snprintf(line+pos, PATH_MAX*2+512-pos,
+        ",\"path\":%s,\"flags\":%s,\"fd\":%u,\"ino\":%lu,\"dev\":\"%u:%u\","
+        "\"inherited\":true}\n",
+        (path && path_esc) ? path_esc : "null",
+        flags_j ? flags_j : "[]",
+        fd, ino_nr, MAJOR(dev), MINOR(dev));
+
+    if (pos > 0) {
+        rcu_read_lock();
+        list_for_each_entry_rcu(s, &sessions, list) {
+            if (!s->dead && session_is_tagged(s, tgid))
+                session_log_queue(s, line, (size_t)pos);
+        }
+        rcu_read_unlock();
+    }
+
+out:
+    kfree(line); kfree(flags_j); kfree(path_esc); kfree(path_buf);
+}
+
+struct inherited_open_ctx {
+    struct task_struct *task;
+    struct timespec64   ts;
+};
+
+static int inherited_open_iter(const void *p, struct file *file, unsigned fd)
+{
+    struct inherited_open_ctx *ctx = (struct inherited_open_ctx *)p;
+    emit_inherited_open_for_fd(ctx->task, &ctx->ts, fd, file);
+    return 0; /* 0 = keep iterating */
+}
+
+static void emit_inherited_open_events(struct task_struct *task)
+{
+    struct inherited_open_ctx ctx;
+    struct files_struct *files = task->files; /* safe: task == current */
+    if (!files) return;
+    ctx.task = task;
+    ktime_get_real_ts64(&ctx.ts);
+    iterate_fd(files, 0, inherited_open_iter, &ctx);
+}
+
 /* ---- 2. Exec ---- */
 
 static int exec_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -859,6 +949,9 @@ static int exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
         }
         rcu_read_unlock();
     }
+
+    /* Emit fake OPEN events for inherited fds (pipes, redirects, etc). */
+    emit_inherited_open_events(task);
 out:
     kfree(line); kfree(auxv_buf); kfree(env_j); kfree(argv_j);
     kfree(exe_esc); kfree(env_raw); kfree(argv_raw); kfree(exe_buf);

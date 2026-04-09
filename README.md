@@ -134,26 +134,74 @@ Emitted when a process (thread group leader) exits.
 
 ## Event: `OPEN`
 
-Emitted when a tagged process opens a file.
+Emitted when a tagged process opens a file. Also emitted synthetically
+for each file descriptor a process inherits across `execve()` (see
+*Inherited fds* below).
 
-| Field   | Type           | Condition  | Description |
-|---------|----------------|------------|-------------|
-| `path`  | string ∣ null  | always     | Path as passed to the syscall (may be relative to current CWD) |
-| `flags` | string[]       | always     | Open flags, e.g. `["O_RDONLY"]` or `["O_WRONLY","O_CREAT","O_TRUNC"]` |
-| `fd`    | int            | on success | Returned file descriptor number |
-| `ino`   | int            | on success | Inode number of the opened file |
-| `dev`   | string         | on success | Device in `"major:minor"` format (identifies the filesystem) |
-| `err`   | int            | on failure | Negative errno (e.g. `-2` for ENOENT) |
+| Field       | Type           | Condition     | Description |
+|-------------|----------------|---------------|-------------|
+| `path`      | string ∣ null  | always        | Path as passed to the syscall, or the resolved path of an inherited fd (e.g. `"pipe:[12345]"` for pipes, `"socket:[67890]"` for sockets). May be relative to current CWD for real `open()` calls. |
+| `flags`     | string[]       | always        | Open flags, e.g. `["O_RDONLY"]` or `["O_WRONLY","O_CREAT","O_TRUNC"]` |
+| `fd`        | int            | on success    | Returned (or inherited) file descriptor number |
+| `ino`       | int            | on success    | Inode number of the opened file |
+| `dev`       | string         | on success    | Device in `"major:minor"` format (identifies the filesystem) |
+| `err`       | int            | on failure    | Negative errno (e.g. `-2` for ENOENT) |
+| `inherited` | bool           | inherited fds | `true` for synthetic OPEN events emitted at exec time for inherited fds. Absent (or `false`) for real `open()` calls. |
 
 ### Identifying files
 
 Two paths refer to the same file if and only if their `(dev, ino)` pairs match. This handles hardlinks, bind mounts, and different relative paths to the same file.
 
+### Inherited fds (`"inherited": true`)
+
+Immediately after every `EXEC` event, one synthetic `OPEN` event is
+emitted for **each open file descriptor the new program inherited**
+from its predecessor (i.e. every fd not marked `O_CLOEXEC`). These
+events carry `"inherited": true` and describe the fd's current state
+in the post-exec process: resolved path, flags, and `(dev, ino)`.
+
+This lets consumers reconstruct what files a program "already had
+open" when it started — even if the program itself never calls
+`open()`. For example, in `cat file1.txt | sort > file2.txt`, the
+`sort` process never opens anything, yet the trace contains inherited
+OPEN events showing `fd 0` bound to the pipe from `cat` and `fd 1`
+bound to `file2.txt`.
+
+#### Pairing pipe / socket endpoints
+
+Both ends of a kernel pipe share the **same pipefs inode**. So when
+you see two inherited OPEN events with matching `(dev, ino)` in two
+different tgids — one with a write-capable `flags` set and one with a
+read-capable one — they are the two ends of the same pipe. This is
+how pipelines like `cat a | sort > b` can be reconstructed end-to-end
+from the trace:
+
+1. `cat` has an inherited OPEN for `fd 1` → `pipe:[N]` with `O_WRONLY`.
+2. `sort` has an inherited OPEN for `fd 0` → `pipe:[N]` with `O_RDONLY`.
+3. The matching `ino=N` (and matching `dev` for pipefs) links them.
+
+The same `(dev, ino)` matching rule identifies the endpoints of a
+`socketpair()` when both ends live in the same socket inode (kernel
+socket objects share a sockfs inode per endpoint — when the kernel
+assigns them distinct inodes, they will not match; in that case the
+pairing must be inferred by other means).
+
 ### Examples
+
+Real open:
 
 ```json
 {"event":"OPEN","ts":1711814400.200,"pid":1234,"tgid":1234,"ppid":1200,"nspid":1234,"nstgid":1234,"path":"/etc/passwd","flags":["O_RDONLY"],"fd":3,"ino":524297,"dev":"259:2"}
 {"event":"OPEN","ts":1711814400.400,"pid":1234,"tgid":1234,"ppid":1200,"nspid":1234,"nstgid":1234,"path":"nosuchfile","flags":["O_RDONLY"],"err":-2}
+```
+
+Inherited fds in `cat a | sort > b` — note the shared `ino` on the
+pipe between the two processes:
+
+```json
+{"event":"OPEN","ts":1711814400.101,"pid":2001,"tgid":2001,"ppid":2000,"nspid":2001,"nstgid":2001,"path":"pipe:[88231]","flags":["O_WRONLY"],"fd":1,"ino":88231,"dev":"0:12","inherited":true}
+{"event":"OPEN","ts":1711814400.102,"pid":2002,"tgid":2002,"ppid":2000,"nspid":2002,"nstgid":2002,"path":"pipe:[88231]","flags":["O_RDONLY"],"fd":0,"ino":88231,"dev":"0:12","inherited":true}
+{"event":"OPEN","ts":1711814400.102,"pid":2002,"tgid":2002,"ppid":2000,"nspid":2002,"nstgid":2002,"path":"/tmp/b","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":1,"ino":91002,"dev":"259:2","inherited":true}
 ```
 
 ---
@@ -224,7 +272,8 @@ Within a single process (`tgid`), events are emitted in causal order:
 
 1. `CWD` (initial working directory)
 2. `EXEC` (the program starts)
-3. `OPEN`, `CWD`, `STDOUT`, `STDERR` (during execution, in real-time order)
-4. `EXIT` (process ends)
+3. `OPEN` with `"inherited":true` — one per fd the new program inherited from its predecessor (pipes, redirects, stdio, etc.)
+4. `OPEN`, `CWD`, `STDOUT`, `STDERR` (during execution, in real-time order)
+5. `EXIT` (process ends)
 
 Across different processes, events are ordered by `ts` but may interleave. The ring buffer preserves per-session insertion order.
