@@ -1,9 +1,12 @@
 #!/bin/bash
 # Test runner for tv.
 #
-# Uses TV_TRACE_PATH to feed a pre-recorded JSONL trace through the existing
-# streaming code path, then TV_SAVE_PATH to persist the resulting DB.
-# All assertions query that DB with sqlite3 — no new driver code.
+# Phase 1 (ingest): TV_TRACE_PATH feeds the trace through the existing streaming
+#   code path; --dd '["W"]' presses the 'W' (save) key via handle_key(), and
+#   TV_SAVE_PATH makes save_db() write to the given path without a tty prompt.
+#
+# Phase 2 (navigation): --load + --dd inject keystroke sequences through
+#   handle_key() to verify the UI state machine (cursor, mode, filter, etc.).
 #
 # Usage: bash tests/run_tests.sh
 
@@ -12,10 +15,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 TV="$REPO_DIR/tv"
-DB="/tmp/tv_test_$$.db"
+BASE_DB="/tmp/tv_base_$$.db"
+NAV_DB="/tmp/tv_nav_$$.db"
 PASS=0; FAIL=0
 
-cleanup() { rm -f "$DB"; }
+cleanup() { rm -f "$BASE_DB" "$NAV_DB"; }
 trap cleanup EXIT
 
 # Build if stale
@@ -24,16 +28,18 @@ if [ ! -x "$TV" ] || [ "$REPO_DIR/tv.c" -nt "$TV" ]; then
     make -C "$REPO_DIR" tv
 fi
 
-# ── Ingest the sample trace through the existing streaming code path ────────
-# TV_TRACE_PATH replaces /proc/proctrace/new with our JSONL fixture.
-# TV_SAVE_PATH triggers auto-save after trace EOF and exits without the TUI.
-TV_TRACE_PATH="$SCRIPT_DIR/trace.jsonl" TV_SAVE_PATH="$DB" \
-    "$TV" -- /bin/true 2>/dev/null
-echo "Trace ingested → $DB"
+# ── Phase 1: ingest trace via existing streaming code path ──────────────────
+# TV_TRACE_PATH overrides /proc/proctrace/new with the JSONL fixture.
+# --dd '["W"]' presses the save key (W) through handle_key() after trace EOF.
+# TV_SAVE_PATH is used by save_db() instead of a tty prompt.
+TV_TRACE_PATH="$SCRIPT_DIR/trace.jsonl" TV_SAVE_PATH="$BASE_DB" \
+    "$TV" --dd '["W"]' -- /bin/true 2>/dev/null
+echo "Trace ingested → $BASE_DB"
 
 # ── Assertion helpers ────────────────────────────────────────────────────────
 
-q() { sqlite3 "$DB" "$1"; }
+q()  { sqlite3 "$BASE_DB" "$1"; }
+qn() { sqlite3 "$NAV_DB"  "$1"; }
 
 assert_eq() {
     local expected="$1" actual="$2" label="$3"
@@ -46,7 +52,7 @@ assert_eq() {
     fi
 }
 
-# ── Tests ────────────────────────────────────────────────────────────────────
+# ── Phase 1 tests: data model correctness ────────────────────────────────────
 
 # T1: All 8 processes ingested (PIDs 1000–1007)
 assert_eq 8 "$(q "SELECT COUNT(*) FROM processes")" \
@@ -164,6 +170,52 @@ assert_eq 1 "$(q "WITH RECURSIVE sp(i,rest,line) AS(
     FROM sp WHERE LENGTH(rest)>0
 ) SELECT COUNT(*) FROM sp")" \
     "single-arg argv no duplicate"
+
+# ── Phase 2: UI interaction tests (--load + --dd drives handle_key) ──────────
+#
+# Each test loads base.db into memory, injects keystrokes through handle_key(),
+# saves the resulting state, and asserts on the DB.
+
+run_dd() {
+    # run_dd <keys_json> <label_prefix>
+    local keys="$1"
+    TV_SAVE_PATH="$NAV_DB" "$TV" --load "$BASE_DB" --dd "$keys" 2>/dev/null
+}
+
+# T25: cursor moves down by 2 (j j → cursor=2)
+run_dd '["j","j","W"]' "nav"
+assert_eq 2 "$(qn "SELECT cursor FROM state")" \
+    "cursor after jj"
+
+# T26: cursor jumps to end (END key → cursor = lpane count - 1 = 7)
+run_dd '["END","W"]' "nav"
+assert_eq 7 "$(qn "SELECT cursor FROM state")" \
+    "cursor at end after END"
+
+# T27: switch to files mode (2 key → mode=1); lpane has file entries
+run_dd '["2","W"]' "nav"
+assert_eq 1 "$(qn "SELECT mode FROM state")" \
+    "mode=1 after key 2"
+assert_eq 1 "$(qn "SELECT COUNT(*)>0 FROM lpane")" \
+    "lpane populated in files mode"
+
+# T28: switch to output mode (3 key → mode=2); lpane has io entries
+run_dd '["3","W"]' "nav"
+assert_eq 2 "$(qn "SELECT mode FROM state")" \
+    "mode=2 after key 3"
+
+# T29: cycle view filter once (v key → lp_filter=1, only failed procs shown)
+run_dd '["v","W"]' "nav"
+assert_eq 1 "$(qn "SELECT lp_filter FROM state")" \
+    "lp_filter=1 after v"
+NFAIL="$(qn "SELECT COUNT(*) FROM lpane")"
+assert_eq 1 "$([ "$NFAIL" -lt 8 ] && echo 1 || echo 0)" \
+    "fewer rows when lp_filter=1"
+
+# T30: cycle sort order (s key → sort_key=1); lpane still populated
+run_dd '["s","W"]' "nav"
+assert_eq 1 "$(qn "SELECT sort_key FROM state")" \
+    "sort_key=1 after s"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 

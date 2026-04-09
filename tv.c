@@ -67,7 +67,9 @@ static void setup_app(void){
         " rows INT DEFAULT 24,cols INT DEFAULT 80,"
         " base_ts REAL DEFAULT 0,has_fts INT DEFAULT 0,mode INT DEFAULT 0,"
         " lp_filter INT DEFAULT 0);"
-        "INSERT OR IGNORE INTO state(base_ts) VALUES((SELECT COALESCE(MIN(ts),0) FROM events));"
+        "INSERT INTO state(base_ts)"
+        " SELECT v FROM(SELECT COALESCE(MIN(ts),0) AS v FROM events)"
+        " WHERE NOT EXISTS(SELECT 1 FROM state);"
         "CREATE TABLE IF NOT EXISTS lpane(rownum INTEGER PRIMARY KEY,id TEXT NOT NULL,"
         " parent_id TEXT,style TEXT DEFAULT 'normal',text TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS rpane(rownum INTEGER PRIMARY KEY,style TEXT DEFAULT 'normal',"
@@ -355,11 +357,10 @@ static void apply_lp_filter(void){
 
     /* Re-number rows after deletion */
     xexec(
-        "CREATE TEMP TABLE _lp AS"
-        " SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,id,parent_id,style,text FROM lpane;"
-        "DELETE FROM lpane;"
-        "INSERT INTO lpane(rownum,id,parent_id,style,text) SELECT*FROM _lp;"
-        "DROP TABLE _lp;");
+        "WITH rn AS("
+        " SELECT rowid,ROW_NUMBER()OVER(ORDER BY rownum)-1 AS new_rn FROM lpane"
+        ")"
+        "UPDATE lpane SET rownum=(SELECT new_rn FROM rn WHERE rn.rowid=lpane.rowid)");
 
     /* Restore cursor to pinned item if it survived */
     if(pinned[0]){
@@ -603,8 +604,11 @@ static void rebuild_rpane(void){
     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}
     sqlite3_finalize(st);if(!id[0])return;
     switch(mode){case 0:rpane_proc(atoi(id));break;case 1:rpane_file(id);break;case 2:rpane_output(id);break;}
-    xexec("CREATE TEMP TABLE _rp AS SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,style,text,link_mode,link_id FROM rpane;"
-        "DELETE FROM rpane;INSERT INTO rpane SELECT*FROM _rp;DROP TABLE _rp;");
+    xexec(
+        "WITH rn AS("
+        " SELECT rowid,ROW_NUMBER()OVER(ORDER BY rownum)-1 AS new_rn FROM rpane"
+        ")"
+        "UPDATE rpane SET rownum=(SELECT new_rn FROM rn WHERE rn.rowid=rpane.rowid)");
     /* Highlight search matches in detail pane */
     {char sq[256]="";
      {sqlite3_stmt*st2;sqlite3_prepare_v2(db,"SELECT search FROM state",-1,&st2,0);
@@ -782,20 +786,40 @@ static void run_sql(void){char sql[1024]="";if(!line_edit("SQL> ",sql,sizeof sql
 /* ── Save DB ───────────────────────────────────────────────────────── */
 static void save_db(void){
     char fname[256]="trace.db";
-    if(!line_edit("Save to: ",fname,sizeof fname)||!fname[0])return;
+    /* TV_SAVE_PATH: headless save without a tty prompt */
+    const char*sp=getenv("TV_SAVE_PATH");
+    if(sp&&sp[0]){snprintf(fname,sizeof fname,"%s",sp);}
+    else if(!line_edit("Save to: ",fname,sizeof fname)||!fname[0])return;
     sqlite3*dst;
     if(sqlite3_open(fname,&dst)!=SQLITE_OK)return;
     sqlite3_backup*bk=sqlite3_backup_init(dst,"main",db,"main");
     if(bk){sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);}
     sqlite3_close(dst);}
 
-/* ── Save DB (headless helper, used by TV_SAVE_PATH) ────────────────── */
-static void save_db_to(const char *path){
-    sqlite3*dst;
-    if(sqlite3_open(path,&dst)!=SQLITE_OK){fprintf(stderr,"tv: cannot open %s for save\n",path);return;}
-    sqlite3_backup*bk=sqlite3_backup_init(dst,"main",db,"main");
-    if(bk){sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);}
-    sqlite3_close(dst);}
+/* ── Direct-drive: map keystroke name → key code, pump through handle_key() */
+static void handle_key(int k); /* forward declaration */
+static int parse_key_name(const char *s){
+    if(!s||!s[0])return K_NONE;
+    if(!strcmp(s,"UP"))return K_UP;if(!strcmp(s,"DOWN"))return K_DOWN;
+    if(!strcmp(s,"LEFT"))return K_LEFT;if(!strcmp(s,"RIGHT"))return K_RIGHT;
+    if(!strcmp(s,"PGUP"))return K_PGUP;if(!strcmp(s,"PGDN"))return K_PGDN;
+    if(!strcmp(s,"HOME"))return K_HOME;if(!strcmp(s,"END"))return K_END;
+    if(!strcmp(s,"TAB"))return K_TAB;
+    if(!strcmp(s,"ENTER")||!strcmp(s,"RETURN"))return K_ENTER;
+    if(!strcmp(s,"ESC"))return K_ESC;
+    if(s[0]&&!s[1])return(unsigned char)s[0];
+    return K_NONE;}
+
+/* Feed a JSON array of keystroke name strings through handle_key() */
+static void dd_run(const char *spec){
+    sqlite3_stmt*st;
+    if(sqlite3_prepare_v2(db,"SELECT value FROM json_each(?1)",-1,&st,0)==SQLITE_OK){
+        sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
+        while(sqlite3_step(st)==SQLITE_ROW){
+            const char*ks=(const char*)sqlite3_column_text(st,0);
+            int k=parse_key_name(ks);
+            if(k!=K_NONE)handle_key(k);}
+        sqlite3_finalize(st);}}
 
 /* ── Key dispatch ──────────────────────────────────────────────────── */
 static void handle_key(int k){
@@ -878,16 +902,23 @@ static void handle_key(int k){
 /* ═══════════════════════════════════════════════════════════════════ */
 int main(int argc,char**argv){
     int load_mode=0; char load_file[256]=""; char**cmd=NULL;
+    char dd_spec[65536]="";
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--load")==0&&i+1<argc){load_mode=1;snprintf(load_file,sizeof load_file,"%s",argv[++i]);}
+        else if(strcmp(argv[i],"--dd")==0&&i+1<argc){snprintf(dd_spec,sizeof dd_spec,"%s",argv[++i]);}
         else if(strcmp(argv[i],"--")==0&&i+1<argc){cmd=argv+i+1;break;}}
     if(!load_mode&&!cmd){
         fprintf(stderr,
             "Usage: tv -- <command> [args...]\n"
-            "       tv --load <file.db>\n"
+            "       tv [--dd '<keys>'] -- <command> [args...]\n"
+            "       tv --load <file.db> [--dd '<keys>']\n"
             "Env:   TV_TRACE_PATH  override default /proc/proctrace/new path\n"
-            "       TV_SAVE_PATH   auto-save DB on trace EOF and exit (for testing)\n");
+            "       TV_SAVE_PATH   used by W key (save) without a tty prompt\n"
+            "Keys:  --dd takes a JSON array of key names, e.g. '[\"j\",\"j\",\"W\"]'\n"
+            "       Special names: UP DOWN LEFT RIGHT PGUP PGDN HOME END TAB ENTER ESC\n");
         return 1;}
+
+    if(dd_spec[0])g_headless=1;
 
     if(sqlite3_open(":memory:",&db)!=SQLITE_OK)die("sqlite3_open");
 
@@ -902,6 +933,9 @@ int main(int argc,char**argv){
         {char*e=0;sqlite3_exec(db,"ALTER TABLE state ADD COLUMN lp_filter INT DEFAULT 0",0,0,&e);if(e)sqlite3_free(e);}
         setup_app(); /* idempotent: IF NOT EXISTS throughout */
         if(!qint("SELECT has_fts FROM state",0)) setup_fts();
+        rebuild_lpane();rebuild_rpane();
+        /* --dd: drive UI interactions through handle_key() then exit */
+        if(dd_spec[0]){dd_run(dd_spec);sqlite3_close(db);return 0;}
     } else {
         /* Live tracing mode */
         db_create();
@@ -916,8 +950,6 @@ int main(int argc,char**argv){
         if(g_child_pid<0){close(g_trace_fd);die("fork");}
         if(g_child_pid==0){execvp(cmd[0],cmd);perror(cmd[0]);_exit(127);}
         xexec("UPDATE state SET lp_filter=2"); /* show running processes while tracing */
-        /* TV_SAVE_PATH: headless mode — skip TUI, auto-save after trace EOF */
-        if(getenv("TV_SAVE_PATH"))g_headless=1;
     }
 
     rebuild_lpane();rebuild_rpane();
@@ -952,10 +984,9 @@ int main(int argc,char**argv){
                     xexec("UPDATE state SET lp_filter=0");
                     close(g_trace_fd);g_trace_fd=-1;
                     rebuild_lpane();rebuild_rpane();
-                    /* TV_SAVE_PATH: auto-save and exit without starting the TUI */
+                    /* --dd: drive UI interactions through handle_key() then exit */
                     if(g_headless){
-                        const char*sp=getenv("TV_SAVE_PATH");
-                        if(sp&&sp[0])save_db_to(sp);
+                        dd_run(dd_spec);
                         goto done;}
                 } else {
                     g_rbuf_len+=n;
