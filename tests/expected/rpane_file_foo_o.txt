@@ -1,6 +1,0 @@
-> ─── File ───
-  Path: /build/foo.o
-  Opens: 2  Errors: 0  Procs: 2
-  ─── Accesses ───
-  2.250000  PID 1001 (gcc)  [O_WRONLY|O_CREAT|O_TRUNC] fd=4
-  5.000000  PID 1004 (ld)  [O_RDONLY] fd=3

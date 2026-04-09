@@ -36,6 +36,7 @@ static int g_trace_fd = -1;
 static pid_t g_child_pid = 0;
 static char g_rbuf[1<<20];
 static int g_rbuf_len = 0;
+static int g_headless = 0; /* set when TV_SAVE_PATH is used; skips TUI */
 
 /* ── Part 1: Schema & streaming ingest ────────────────────────────── */
 
@@ -788,182 +789,13 @@ static void save_db(void){
     if(bk){sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);}
     sqlite3_close(dst);}
 
-/* ── Ingest & direct-drive helpers ─────────────────────────────────── */
-
-/* Read a JSONL file and ingest all events into the current DB */
-static void ingest_jsonl(const char *path){
-    FILE*f=fopen(path,"r");
-    if(!f){fprintf(stderr,"tv: cannot open %s: %s\n",path,strerror(errno));exit(1);}
-    char *line=NULL;size_t cap=0;ssize_t n;
-    int count=0;
-    xexec("BEGIN");
-    while((n=getline(&line,&cap,f))>0){
-        while(n>0&&(line[n-1]=='\n'||line[n-1]=='\r'))line[--n]=0;
-        if(n>0){process_line(line);count++;}
-        if(count%500==0){xexec("COMMIT");xexec("BEGIN");}
-    }
-    xexec("COMMIT");
-    free(line);fclose(f);
-    xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
-    setup_fts();}
-
-/* Save in-memory DB to a file */
+/* ── Save DB (headless helper, used by TV_SAVE_PATH) ────────────────── */
 static void save_db_to(const char *path){
     sqlite3*dst;
     if(sqlite3_open(path,&dst)!=SQLITE_OK){fprintf(stderr,"tv: cannot open %s for save\n",path);return;}
     sqlite3_backup*bk=sqlite3_backup_init(dst,"main",db,"main");
     if(bk){sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);}
     sqlite3_close(dst);}
-
-/* Extract int from JSON spec via SQLite */
-static int dd_jint(const char *spec,const char *field,int def){
-    sqlite3_stmt*st;int v=def;
-    char sql[128];snprintf(sql,sizeof sql,"SELECT COALESCE(json_extract(?1,?2),%d)",def);
-    if(sqlite3_prepare_v2(db,sql,-1,&st,0)==SQLITE_OK){
-        sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
-        char fp[64];snprintf(fp,sizeof fp,"$.%s",field);
-        sqlite3_bind_text(st,2,fp,-1,SQLITE_TRANSIENT);
-        if(sqlite3_step(st)==SQLITE_ROW)v=sqlite3_column_int(st,0);
-        sqlite3_finalize(st);}
-    return v;}
-
-/* Extract string from JSON spec via SQLite */
-static void dd_jstr(const char *spec,const char *field,const char *def,char *buf,int bufsz){
-    sqlite3_stmt*st;
-    snprintf(buf,bufsz,"%s",def?def:"");
-    if(sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,?2),?3)",-1,&st,0)==SQLITE_OK){
-        sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
-        char fp[64];snprintf(fp,sizeof fp,"$.%s",field);
-        sqlite3_bind_text(st,2,fp,-1,SQLITE_TRANSIENT);
-        sqlite3_bind_text(st,3,def?def:"",-1,SQLITE_TRANSIENT);
-        if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(buf,bufsz,"%s",t);}
-        sqlite3_finalize(st);}
-}
-
-/* Print lpane rows as plain text (no ANSI) to stdout */
-static void dd_print_lpane(int rows){
-    int cursor=qint("SELECT cursor FROM state",0);
-    int total=qint("SELECT COUNT(*) FROM lpane",0);
-    int scroll=0;
-    if(cursor>=rows)scroll=cursor-rows+1;
-    if(scroll<0)scroll=0;
-    if(total>rows&&scroll>total-rows)scroll=total-rows;
-    sqlite3_stmt*st;
-    sqlite3_prepare_v2(db,
-        "SELECT rownum,text FROM lpane WHERE rownum>=? AND rownum<? ORDER BY rownum",
-        -1,&st,0);
-    sqlite3_bind_int(st,1,scroll);sqlite3_bind_int(st,2,scroll+rows);
-    while(sqlite3_step(st)==SQLITE_ROW){
-        int rn=sqlite3_column_int(st,0);
-        const char*text=(const char*)sqlite3_column_text(st,1);
-        printf("%c %s\n",rn==cursor?'>':' ',text?text:"");}
-    sqlite3_finalize(st);}
-
-/* Print rpane rows as plain text (no ANSI) to stdout */
-static void dd_print_rpane(int rows){
-    int dcursor=qint("SELECT dcursor FROM state",0);
-    int nrp=qint("SELECT COUNT(*) FROM rpane",0);
-    int dscroll=0;
-    if(dcursor>=rows)dscroll=dcursor-rows+1;
-    if(dscroll<0)dscroll=0;
-    if(nrp>rows&&dscroll>nrp-rows)dscroll=nrp-rows;
-    sqlite3_stmt*st;
-    sqlite3_prepare_v2(db,
-        "SELECT rownum,text FROM rpane WHERE rownum>=? AND rownum<? ORDER BY rownum",
-        -1,&st,0);
-    sqlite3_bind_int(st,1,dscroll);sqlite3_bind_int(st,2,dscroll+rows);
-    while(sqlite3_step(st)==SQLITE_ROW){
-        int rn=sqlite3_column_int(st,0);
-        const char*text=(const char*)sqlite3_column_text(st,1);
-        printf("%c %s\n",rn==dcursor?'>':' ',text?text:"");}
-    sqlite3_finalize(st);}
-
-/*
- * Direct-drive mode: parse JSON spec, configure state, rebuild panes, print.
- *
- * Spec fields (all optional):
- *   rows, cols        – terminal dimensions (default 24×80)
- *   mode              – 0=procs 1=files 2=output (default 0)
- *   grouped           – 1=tree 0=flat (default 1)
- *   ts_mode           – 0=abs 1=rel 2=delta (default 0)
- *   sort_key          – 0=id 1=first 2=last (default 0)
- *   lp_filter         – 0=all 1=failed 2=running (default 0)
- *   focus             – 0=left 1=right (default 0)
- *   cursor            – lpane row (default 0)
- *   dcursor           – rpane row (default 0)
- *   expand            – array of IDs to expand (default [])
- *   collapse          – array of IDs to collapse (default [])
- *   select_id         – lpane ID to move cursor to (overrides cursor)
- *   pane              – "left", "right", or "both" (default "left")
- */
-static void dd_run(const char *spec){
-    int rows=dd_jint(spec,"rows",24);
-    int cols=dd_jint(spec,"cols",80);
-    int mode=dd_jint(spec,"mode",0);
-    int grouped=dd_jint(spec,"grouped",1);
-    int ts_mode=dd_jint(spec,"ts_mode",0);
-    int sort_key=dd_jint(spec,"sort_key",0);
-    int lp_filter=dd_jint(spec,"lp_filter",0);
-    int focus=dd_jint(spec,"focus",0);
-    int cursor=dd_jint(spec,"cursor",0);
-    int dcursor=dd_jint(spec,"dcursor",0);
-    char pane[16];dd_jstr(spec,"pane","left",pane,sizeof pane);
-    char select_id[4096];dd_jstr(spec,"select_id","",select_id,sizeof select_id);
-
-    xexecf("UPDATE state SET rows=%d,cols=%d,mode=%d,grouped=%d,ts_mode=%d,"
-           "sort_key=%d,lp_filter=%d,focus=%d,cursor=%d,dcursor=%d",
-           rows,cols,mode,grouped,ts_mode,sort_key,lp_filter,focus,cursor,dcursor);
-
-    /* Expand IDs listed in spec */
-    {sqlite3_stmt*st;
-     sqlite3_prepare_v2(db,
-         "SELECT value FROM json_each(COALESCE(json_extract(?1,'$.expand'),'[]'))",
-         -1,&st,0);
-     sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
-     while(sqlite3_step(st)==SQLITE_ROW){
-         const char*id=(const char*)sqlite3_column_text(st,0);
-         if(id){sqlite3_stmt*u;
-             sqlite3_prepare_v2(db,"INSERT OR REPLACE INTO expanded(id,ex) VALUES(?,1)",-1,&u,0);
-             sqlite3_bind_text(u,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(u);sqlite3_finalize(u);}}
-     sqlite3_finalize(st);}
-
-    /* Collapse IDs listed in spec */
-    {sqlite3_stmt*st;
-     sqlite3_prepare_v2(db,
-         "SELECT value FROM json_each(COALESCE(json_extract(?1,'$.collapse'),'[]'))",
-         -1,&st,0);
-     sqlite3_bind_text(st,1,spec,-1,SQLITE_TRANSIENT);
-     while(sqlite3_step(st)==SQLITE_ROW){
-         const char*id=(const char*)sqlite3_column_text(st,0);
-         if(id){sqlite3_stmt*u;
-             sqlite3_prepare_v2(db,"INSERT OR REPLACE INTO expanded(id,ex) VALUES(?,0)",-1,&u,0);
-             sqlite3_bind_text(u,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(u);sqlite3_finalize(u);}}
-     sqlite3_finalize(st);}
-
-    rebuild_lpane();
-
-    /* Move cursor to select_id if provided */
-    if(select_id[0]){
-        sqlite3_stmt*st;
-        sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&st,0);
-        sqlite3_bind_text(st,1,select_id,-1,SQLITE_TRANSIENT);
-        if(sqlite3_step(st)==SQLITE_ROW)
-            xexecf("UPDATE state SET cursor=%d",sqlite3_column_int(st,0));
-        sqlite3_finalize(st);}
-
-    rebuild_rpane();
-
-    int print_rows=rows-1; /* reserve 1 row for status bar */
-    if(strcmp(pane,"right")==0){
-        dd_print_rpane(print_rows);
-    } else if(strcmp(pane,"both")==0){
-        printf("=== LEFT ===\n");
-        dd_print_lpane(print_rows);
-        printf("=== RIGHT ===\n");
-        dd_print_rpane(print_rows);
-    } else {
-        dd_print_lpane(print_rows);
-    }}
 
 /* ── Key dispatch ──────────────────────────────────────────────────── */
 static void handle_key(int k){
@@ -1046,21 +878,15 @@ static void handle_key(int k){
 /* ═══════════════════════════════════════════════════════════════════ */
 int main(int argc,char**argv){
     int load_mode=0; char load_file[256]=""; char**cmd=NULL;
-    int ingest_mode=0; char ingest_file[4096]="";
-    char save_file[4096]="";
-    int dd_mode=0; char dd_spec[65536]="";
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--load")==0&&i+1<argc){load_mode=1;snprintf(load_file,sizeof load_file,"%s",argv[++i]);}
-        else if(strcmp(argv[i],"--ingest")==0&&i+1<argc){ingest_mode=1;snprintf(ingest_file,sizeof ingest_file,"%s",argv[++i]);}
-        else if(strcmp(argv[i],"--save")==0&&i+1<argc){snprintf(save_file,sizeof save_file,"%s",argv[++i]);}
-        else if(strcmp(argv[i],"--dd")==0&&i+1<argc){dd_mode=1;snprintf(dd_spec,sizeof dd_spec,"%s",argv[++i]);}
         else if(strcmp(argv[i],"--")==0&&i+1<argc){cmd=argv+i+1;break;}}
-    if(!load_mode&&!ingest_mode&&!cmd){
+    if(!load_mode&&!cmd){
         fprintf(stderr,
             "Usage: tv -- <command> [args...]\n"
-            "       tv --load <file.db> [--dd '<json>']\n"
-            "       tv --ingest <file.jsonl> [--save <file.db>] [--dd '<json>']\n"
-            "Env:   TV_TRACE_PATH  override default /proc/proctrace/new path\n");
+            "       tv --load <file.db>\n"
+            "Env:   TV_TRACE_PATH  override default /proc/proctrace/new path\n"
+            "       TV_SAVE_PATH   auto-save DB on trace EOF and exit (for testing)\n");
         return 1;}
 
     if(sqlite3_open(":memory:",&db)!=SQLITE_OK)die("sqlite3_open");
@@ -1076,11 +902,6 @@ int main(int argc,char**argv){
         {char*e=0;sqlite3_exec(db,"ALTER TABLE state ADD COLUMN lp_filter INT DEFAULT 0",0,0,&e);if(e)sqlite3_free(e);}
         setup_app(); /* idempotent: IF NOT EXISTS throughout */
         if(!qint("SELECT has_fts FROM state",0)) setup_fts();
-    } else if(ingest_mode){
-        /* Headless ingest: read JSONL file, no kernel module required */
-        db_create();
-        setup_app();
-        ingest_jsonl(ingest_file);
     } else {
         /* Live tracing mode */
         db_create();
@@ -1095,36 +916,28 @@ int main(int argc,char**argv){
         if(g_child_pid<0){close(g_trace_fd);die("fork");}
         if(g_child_pid==0){execvp(cmd[0],cmd);perror(cmd[0]);_exit(127);}
         xexec("UPDATE state SET lp_filter=2"); /* show running processes while tracing */
+        /* TV_SAVE_PATH: headless mode — skip TUI, auto-save after trace EOF */
+        if(getenv("TV_SAVE_PATH"))g_headless=1;
     }
 
-    /* --save: persist DB to file (useful after --ingest) */
-    if(save_file[0]) save_db_to(save_file);
-
-    /* --dd: headless render, print pane to stdout, exit without TUI */
-    if(dd_mode){
-        dd_run(dd_spec);
-        sqlite3_close(db);
-        return 0;}
-
-    /* Headless ingest+save without --dd: just exit after saving */
-    if(ingest_mode&&save_file[0]){
-        sqlite3_close(db);
-        return 0;}
-
     rebuild_lpane();rebuild_rpane();
-    tty_init();
-    struct sigaction sa2={0};sa2.sa_handler=on_winch;sigaction(SIGWINCH,&sa2,0);
+    if(!g_headless){
+        tty_init();
+        struct sigaction sa2={0};sa2.sa_handler=on_winch;sigaction(SIGWINCH,&sa2,0);
+    }
 
     for(;;){
-        if(g_resized){g_resized=0;tty_size();rebuild_lpane();rebuild_rpane();}
+        if(g_resized&&!g_headless){g_resized=0;tty_size();rebuild_lpane();rebuild_rpane();}
 
         if(g_trace_fd>=0){
             /* Streaming: multiplex tty and trace fd */
-            fd_set rfds;FD_ZERO(&rfds);FD_SET(tty_fd,&rfds);FD_SET(g_trace_fd,&rfds);
-            int mfd=tty_fd>g_trace_fd?tty_fd:g_trace_fd;
+            fd_set rfds;FD_ZERO(&rfds);
+            if(tty_fd>=0)FD_SET(tty_fd,&rfds);
+            FD_SET(g_trace_fd,&rfds);
+            int mfd=g_trace_fd;if(tty_fd>mfd)mfd=tty_fd;
             struct timeval to={0,50000}; /* 50 ms */
             int sel=select(mfd+1,&rfds,NULL,NULL,&to);
-            if(sel<0&&errno==EINTR){render();continue;}
+            if(sel<0&&errno==EINTR){if(!g_headless)render();continue;}
 
             if(sel>0&&FD_ISSET(g_trace_fd,&rfds)){
                 int n=read(g_trace_fd,g_rbuf+g_rbuf_len,
@@ -1139,6 +952,11 @@ int main(int argc,char**argv){
                     xexec("UPDATE state SET lp_filter=0");
                     close(g_trace_fd);g_trace_fd=-1;
                     rebuild_lpane();rebuild_rpane();
+                    /* TV_SAVE_PATH: auto-save and exit without starting the TUI */
+                    if(g_headless){
+                        const char*sp=getenv("TV_SAVE_PATH");
+                        if(sp&&sp[0])save_db_to(sp);
+                        goto done;}
                 } else {
                     g_rbuf_len+=n;
                     int did=0;xexec("BEGIN");
@@ -1163,9 +981,9 @@ int main(int argc,char**argv){
             if(g_child_pid>0){
                 int ws;if(waitpid(g_child_pid,&ws,WNOHANG)==g_child_pid)g_child_pid=0;}
 
-            render();
+            if(!g_headless)render();
 
-            if(sel>0&&FD_ISSET(tty_fd,&rfds)){
+            if(sel>0&&tty_fd>=0&&FD_ISSET(tty_fd,&rfds)){
                 int k=readkey();
                 if(k==K_NONE){}
                 else if(k=='q'||k=='Q')break;
@@ -1180,7 +998,8 @@ int main(int argc,char**argv){
         }
     }
 
-    tty_restore();
+done:
+    if(!g_headless)tty_restore();
     if(g_trace_fd>=0){close(g_trace_fd);g_trace_fd=-1;}
     if(g_child_pid>0){kill(g_child_pid,SIGTERM);waitpid(g_child_pid,NULL,0);}
     sqlite3_close(db);

@@ -1,8 +1,0 @@
-> ── PID 1001 gcc (1 lines) ──
-    STDOUT Compiling foo.c↵
-  ── PID 1002 gcc (1 lines) ──
-    STDERR error: 'x' undeclared↵
-  ── PID 1005 cat (1 lines) ──
-    STDOUT line1↵line2↵
-  ── PID 1007 prog (1 lines) ──
-    STDERR Segmentation fault (core dumped)↵
