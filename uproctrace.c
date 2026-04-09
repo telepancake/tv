@@ -388,7 +388,9 @@ static void pidset_add(struct pid_set *s, pid_t pid)
         if (s->pids[i] == pid) return;
     if (s->count >= s->cap) {
         int nc = s->cap ? s->cap * 2 : 64;
-        s->pids = realloc(s->pids, nc * sizeof(pid_t));
+        pid_t *np = realloc(s->pids, (size_t)nc * sizeof(pid_t));
+        if (!np) return; /* OOM: silently drop */
+        s->pids = np;
         s->cap = nc;
     }
     s->pids[s->count++] = pid;
@@ -707,19 +709,17 @@ static void emit_exit_event(pid_t pid, int status)
 
     if (WIFEXITED(status)) {
         int code = WEXITSTATUS(status);
-        long raw = (long)code << 8;
         pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"exited\",\"code\":%d,\"raw\":%ld}\n", code, raw);
+            ",\"status\":\"exited\",\"code\":%d,\"raw\":%d}\n", code, status);
     } else if (WIFSIGNALED(status)) {
         int sig = WTERMSIG(status);
         int core = 0;
 #ifdef WCOREDUMP
         core = WCOREDUMP(status) ? 1 : 0;
 #endif
-        long raw = sig | (core ? 0x80 : 0);
         pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"signaled\",\"signal\":%d,\"core_dumped\":%s,\"raw\":%ld}\n",
-            sig, core ? "true" : "false", raw);
+            ",\"status\":\"signaled\",\"signal\":%d,\"core_dumped\":%s,\"raw\":%d}\n",
+            sig, core ? "true" : "false", status);
     } else {
         pos += snprintf(line + pos, sizeof(line) - pos,
             ",\"status\":\"unknown\",\"raw\":%d}\n", status);
@@ -756,18 +756,20 @@ static int fd1_is_creator_stdout(pid_t pid)
 
 /* Get syscall registers */
 #if defined(__x86_64__)
-static void get_syscall_info(pid_t pid, long *nr,
+static int get_syscall_info(pid_t pid, long *nr,
     unsigned long *a0, unsigned long *a1, unsigned long *a2,
     long *ret)
 {
     struct user_regs_struct regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+        return -1;
     *nr  = regs.orig_rax;
     *a0  = regs.rdi;
     *a1  = regs.rsi;
     *a2  = regs.rdx;
     *ret = regs.rax;
+    return 0;
 }
 #elif defined(__aarch64__)
 struct aarch64_user_regs {
@@ -776,28 +778,31 @@ struct aarch64_user_regs {
     uint64_t pc;
     uint64_t pstate;
 };
-static void get_syscall_info(pid_t pid, long *nr,
+static int get_syscall_info(pid_t pid, long *nr,
     unsigned long *a0, unsigned long *a1, unsigned long *a2,
     long *ret)
 {
     struct aarch64_user_regs regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+        return -1;
     /* On arm64, the syscall number is in x8, return value in x0 */
     *nr  = regs.regs[8];
     *a0  = regs.regs[0];
     *a1  = regs.regs[1];
     *a2  = regs.regs[2];
     *ret = regs.regs[0];
+    return 0;
 }
 #else
 /* Fallback — will compile but may not work on other arches */
-static void get_syscall_info(pid_t pid, long *nr,
+static int get_syscall_info(pid_t pid, long *nr,
     unsigned long *a0, unsigned long *a1, unsigned long *a2,
     long *ret)
 {
     *nr = *a0 = *a1 = *a2 = 0;
     *ret = 0;
+    return -1;
 }
 #endif
 
@@ -805,7 +810,8 @@ static void handle_syscall_entry(pid_t pid, struct proc_state *ps)
 {
     long nr, ret;
     unsigned long a0, a1, a2;
-    get_syscall_info(pid, &nr, &a0, &a1, &a2, &ret);
+    if (get_syscall_info(pid, &nr, &a0, &a1, &a2, &ret) < 0)
+        return;
 
     ps->saved_syscall = nr;
     ps->arg0 = a0;
@@ -817,7 +823,8 @@ static void handle_syscall_exit(pid_t pid, struct proc_state *ps)
 {
     long nr, ret_unused;
     unsigned long a0_unused, a1_unused, a2_unused;
-    get_syscall_info(pid, &nr, &a0_unused, &a1_unused, &a2_unused, &ret_unused);
+    if (get_syscall_info(pid, &nr, &a0_unused, &a1_unused, &a2_unused, &ret_unused) < 0)
+        return;
 
     long syscall_nr = ps->saved_syscall;
     long ret_val = ret_unused; /* rax on x86_64, x0 on aarch64 */
