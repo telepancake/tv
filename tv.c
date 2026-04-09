@@ -1059,7 +1059,8 @@ int main(int argc,char**argv){
         fprintf(stderr,
             "Usage: tv -- <command> [args...]\n"
             "       tv --load <file.db> [--dd '<json>']\n"
-            "       tv --ingest <file.jsonl> [--save <file.db>] [--dd '<json>']\n");
+            "       tv --ingest <file.jsonl> [--save <file.db>] [--dd '<json>']\n"
+            "Env:   TV_TRACE_PATH  override default /proc/proctrace/new path\n");
         return 1;}
 
     if(sqlite3_open(":memory:",&db)!=SQLITE_OK)die("sqlite3_open");
