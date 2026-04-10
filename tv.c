@@ -1597,20 +1597,32 @@ static void dump_state(void){
     printf("=== END STATE ===\n");}
 
 /* ═══════════════════════════════════════════════════════════════════ */
+extern int uproctrace_main(int argc, char **argv);
+
 int main(int argc,char**argv){
-    int load_mode=0;char load_file[256]="";char trace_file[256]="";
+    /* --uproctrace: delegate entirely to uproctrace_main() */
+    if(argc>=2&&strcmp(argv[1],"--uproctrace")==0){
+        /* Shift argv so uproctrace_main sees: tv [opts] -- cmd ... */
+        return uproctrace_main(argc-1,argv+1);}
+
+    int load_mode=0;int force_ptrace=0;
+    char load_file[256]="";char trace_file[256]="";
     char save_file[256]="";char**cmd=NULL;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--load")==0&&i+1<argc){load_mode=1;snprintf(load_file,sizeof load_file,"%s",argv[++i]);}
         else if(strcmp(argv[i],"--trace")==0&&i+1<argc)snprintf(trace_file,sizeof trace_file,"%s",argv[++i]);
         else if(strcmp(argv[i],"--save")==0&&i+1<argc)snprintf(save_file,sizeof save_file,"%s",argv[++i]);
+        else if(strcmp(argv[i],"--ptrace")==0)force_ptrace=1;
         else if(strcmp(argv[i],"--")==0&&i+1<argc){cmd=argv+i+1;break;}}
     if(!load_mode&&!trace_file[0]&&!cmd){
-        fprintf(stderr,"Usage: tv -- <command> [args...]\n"
+        fprintf(stderr,"Usage: tv [--ptrace] -- <command> [args...]\n"
             "       tv --load <file.db>\n"
             "       tv --trace <file.jsonl> [--save <file.db>]\n"
             "       tv --load <file.db> --trace <input.jsonl>\n"
-            "  Input events in trace streams: {\"input\":\"key\",\"key\":\"j\"}\n"
+            "       tv --uproctrace [-o FILE] -- <command> [args...]\n"
+            "\n  --ptrace   Force ptrace backend (default: use proctrace kernel module if available)\n"
+            "  --uproctrace  Run as trace-only tool (write JSONL to stdout, no TUI)\n"
+            "\n  Input events in trace streams: {\"input\":\"key\",\"key\":\"j\"}\n"
             "  {\"input\":\"resize\",\"rows\":50,\"cols\":120}\n"
             "  {\"input\":\"select\",\"id\":\"1003\"}\n"
             "  {\"input\":\"search\",\"q\":\"term\"}\n"
@@ -1640,11 +1652,45 @@ int main(int argc,char**argv){
         db_create();
         setup_app();
         g_own_tgid=(int)getpid();
-        g_trace_fd=open("/proc/proctrace/new",O_RDONLY);
-        if(g_trace_fd<0)die("cannot open /proc/proctrace/new — is the module loaded?");
-        g_child_pid=fork();
-        if(g_child_pid<0){close(g_trace_fd);die("fork");}
-        if(g_child_pid==0){execvp(cmd[0],cmd);perror(cmd[0]);_exit(127);}
+        if(!force_ptrace){
+            g_trace_fd=open("/proc/proctrace/new",O_RDONLY);
+        }
+        if(g_trace_fd>=0){
+            /* proctrace kernel module available — use it directly */
+            g_child_pid=fork();
+            if(g_child_pid<0){close(g_trace_fd);die("fork");}
+            if(g_child_pid==0){execvp(cmd[0],cmd);perror(cmd[0]);_exit(127);}
+        } else {
+            /* Fall back to ptrace via built-in uproctrace.
+             * popen ourselves with --uproctrace to trace the command,
+             * reading JSONL from its stdout. */
+            char self_exe[4096];
+            ssize_t slen=readlink("/proc/self/exe",self_exe,sizeof(self_exe)-1);
+            if(slen<=0)die("cannot resolve /proc/self/exe");
+            self_exe[slen]='\0';
+
+            /* Build command: <self_exe> --uproctrace -- cmd args... */
+            size_t cmdlen=strlen(self_exe)+strlen(" --uproctrace --")+1;
+            for(char**p=cmd;*p;p++)cmdlen+=strlen(*p)+3; /* space + quotes */
+            char *popen_cmd=malloc(cmdlen+64);
+            if(!popen_cmd)die("malloc");
+            char *w=popen_cmd;
+            w+=sprintf(w,"%s --uproctrace --",self_exe);
+            for(char**p=cmd;*p;p++){
+                /* simple shell quoting with single quotes */
+                *w++=' '; *w++='\'';
+                for(const char*c=*p;*c;c++){
+                    if(*c=='\''){*w++='\'';*w++='\\';*w++='\'';*w++='\'';}
+                    else *w++=*c;}
+                *w++='\'';}
+            *w='\0';
+
+            FILE *pp=popen(popen_cmd,"r");
+            free(popen_cmd);
+            if(!pp)die("popen uproctrace failed");
+            g_trace_fd=fileno(pp);
+            /* Note: g_child_pid stays 0; pclose() handles child reaping. */
+        }
         xexec("UPDATE state SET lp_filter=2");
     }
 

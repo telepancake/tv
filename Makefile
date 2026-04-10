@@ -40,12 +40,9 @@ install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
-tv: tv.c
-	cc -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -o tv tv.c sqlite3.c -static -lm
+tv: tv.c uproctrace.c
+	cc -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -o tv tv.c uproctrace.c sqlite3.c -static -lm
 
 .PHONY: all keygen sign load unload clean install test
 test: tv
 	bash tests/run_tests.sh
-
-uproctrace: uproctrace.c
-	cc -O2 -Wall -o uproctrace uproctrace.c
