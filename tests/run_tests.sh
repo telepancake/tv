@@ -325,8 +325,8 @@ run_test "file_view: path resolution — relative" \
     'assert_contains t "$OUT" "/home/user/project/sub/deep.c"'
 
 run_test "file_view: path resolution — ../ components" \
-    'assert_contains t "$OUT" "/home/user/project/../include/foo.h"' \
-    'assert_contains t "$OUT" "/home/user/project/sub/../common.h"'
+    'assert_contains t "$OUT" "/home/user/include/foo.h"' \
+    'assert_contains t "$OUT" "/home/user/project/common.h"'
 
 run_test "file_view: pipe path" \
     'assert_contains t "$OUT" "pipe:[12345]"'
