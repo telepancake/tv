@@ -36,6 +36,8 @@ static int g_trace_fd = -1;
 static pid_t g_child_pid = 0;
 static char g_rbuf[1<<20];
 static int g_rbuf_len = 0;
+static int g_headless = 0;
+enum{K_NONE=-1,K_UP=256,K_DOWN,K_LEFT,K_RIGHT,K_PGUP,K_PGDN,K_HOME,K_END,K_TAB=9,K_ENTER=13,K_ESC=27,K_BS=127};
 
 /* ── Part 1: Schema & streaming ingest ────────────────────────────── */
 
@@ -47,7 +49,8 @@ static void db_create(void){xexec(
     "CREATE TABLE io_events(eid INTEGER PRIMARY KEY,stream TEXT NOT NULL,len INT,data TEXT);"
     "CREATE TABLE exit_events(eid INTEGER PRIMARY KEY,status TEXT,code INT,"
     " signal INT,core_dumped INT,raw INT);"
-    "CREATE TABLE cwd_cache(tgid INTEGER PRIMARY KEY,cwd TEXT);");}
+    "CREATE TABLE cwd_cache(tgid INTEGER PRIMARY KEY,cwd TEXT);"
+    "CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL);");}
 
 static void setup_app(void){
     xexec(
@@ -88,7 +91,7 @@ static void setup_fts(void){
     }else sqlite3_free(e);}
 
 /* Process one JSONL line from the trace */
-static void process_line(const char *ln){
+static void process_trace_event(const char *ln){
     if(!ln||ln[0]!='{') return;
 
     /* Extract event type and tgid */
@@ -286,6 +289,17 @@ static void process_line(const char *ln){
         return;}}
 
 /* ── File ingest ───────────────────────────────────────────────────── */
+
+/* Insert one JSON line into the inbox table (kind = 'trace' or 'input') */
+static void ingest_line(const char *ln){
+    if(!ln||!ln[0]||ln[0]!='{') return;
+    const char*kind=strstr(ln,"\"input\"")?"input":"trace";
+    sqlite3_stmt*st;
+    sqlite3_prepare_v2(db,"INSERT INTO inbox(kind,data) VALUES(?,?)",-1,&st,0);
+    sqlite3_bind_text(st,1,kind,-1,SQLITE_STATIC);
+    sqlite3_bind_text(st,2,ln,-1,SQLITE_TRANSIENT);
+    sqlite3_step(st);sqlite3_finalize(st);}
+
 static void ingest_file(const char *path){
     FILE*f=fopen(path,"r");
     if(!f){fprintf(stderr,"tv: cannot open %s\n",path);exit(1);}
@@ -294,9 +308,154 @@ static void ingest_file(const char *path){
     while(fgets(line,sizeof line,f)){
         char*nl=strchr(line,'\n');if(nl)*nl=0;
         if(nl>line&&*(nl-1)=='\r')*(nl-1)=0;
-        process_line(line);}
+        ingest_line(line);}
     xexec("COMMIT");
     fclose(f);}
+
+/* Process all trace rows from inbox (one-by-one inside a transaction) */
+static void flush_trace_inbox(void){
+    static char buf[1<<20];
+    xexec("BEGIN");
+    for(;;){
+        long long id=-1;buf[0]=0;
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT id,data FROM inbox WHERE kind='trace' ORDER BY id LIMIT 1",-1,&st,0);
+         if(sqlite3_step(st)==SQLITE_ROW){
+             id=sqlite3_column_int64(st,0);
+             const char*d=(const char*)sqlite3_column_text(st,1);
+             if(d)snprintf(buf,sizeof buf-1,"%s",d);}
+         sqlite3_finalize(st);}
+        if(id<0)break;
+        xexecf("DELETE FROM inbox WHERE id=%lld",id);
+        process_trace_event(buf);}
+    xexec("COMMIT");}
+
+/* Forward declarations for process_input_event */
+static void handle_key(int k);
+static void do_search(const char *q);
+static void rebuild_lpane(void);
+static void rebuild_rpane(void);
+static void dump_lpane(void);
+static void dump_rpane(void);
+static void dump_state(void);
+static int parse_key_name(const char *n);
+
+/* Dispatch one 'input' event (key / print / resize / select / search / evfilt) */
+static void process_input_event(const char *data){
+    char inp[32]="";
+    {sqlite3_stmt*st;
+     sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.input'),'')",-1,&st,0);
+     sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+     if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(inp,sizeof inp,"%s",v);}
+     sqlite3_finalize(st);}
+    if(!inp[0]) return;
+
+    if(strcmp(inp,"key")==0){
+        char kname[32]="";
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.key'),'')",-1,&st,0);
+         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(kname,sizeof kname,"%s",v);}
+         sqlite3_finalize(st);}
+        int k=parse_key_name(kname);
+        if(k!=K_NONE)handle_key(k);
+
+    }else if(strcmp(inp,"print")==0){
+        char what[32]="";
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.what'),'')",-1,&st,0);
+         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(what,sizeof what,"%s",v);}
+         sqlite3_finalize(st);}
+        if(strcmp(what,"lpane")==0)dump_lpane();
+        else if(strcmp(what,"rpane")==0)dump_rpane();
+        else if(strcmp(what,"state")==0)dump_state();
+        g_headless=1;
+
+    }else if(strcmp(inp,"resize")==0){
+        int rows=0,cols=0;
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT CAST(json_extract(?1,'$.rows')AS INT),CAST(json_extract(?1,'$.cols')AS INT)",-1,&st,0);
+         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+         if(sqlite3_step(st)==SQLITE_ROW){rows=sqlite3_column_int(st,0);cols=sqlite3_column_int(st,1);}
+         sqlite3_finalize(st);}
+        if(rows>0&&cols>0){
+            xexecf("UPDATE state SET rows=%d,cols=%d",rows,cols);
+            rebuild_lpane();rebuild_rpane();}
+
+    }else if(strcmp(inp,"select")==0){
+        char id[256]="";
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.id'),'')",-1,&st,0);
+         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(id,sizeof id,"%s",v);}
+         sqlite3_finalize(st);}
+        if(id[0]){
+            int found=-1;
+            {sqlite3_stmt*st;
+             sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&st,0);
+             sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);
+             if(sqlite3_step(st)==SQLITE_ROW)found=sqlite3_column_int(st,0);
+             sqlite3_finalize(st);}
+            if(found>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",found);rebuild_rpane();}}
+
+    }else if(strcmp(inp,"search")==0){
+        char q[256]="";
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.q'),'')",-1,&st,0);
+         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(q,sizeof q,"%s",v);}
+         sqlite3_finalize(st);}
+        if(q[0]){
+            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET search=?",-1,&st,0);
+            sqlite3_bind_text(st,1,q,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+            do_search(q);rebuild_lpane();rebuild_rpane();}
+
+    }else if(strcmp(inp,"evfilt")==0){
+        char q[64]="";
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT UPPER(COALESCE(json_extract(?1,'$.q'),''))",-1,&st,0);
+         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(q,sizeof q,"%s",v);}
+         sqlite3_finalize(st);}
+        if(q[0]){
+            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET evfilt=?",-1,&st,0);
+            sqlite3_bind_text(st,1,q,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+            rebuild_rpane();}}}
+
+/* Process all input rows from inbox one-by-one (no surrounding transaction:
+   process_input_event may trigger DDL via rebuild_lpane/rebuild_rpane) */
+static void flush_input_inbox(void){
+    static char buf[1<<20];
+    for(;;){
+        long long id=-1;buf[0]=0;
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT id,data FROM inbox WHERE kind='input' ORDER BY id LIMIT 1",-1,&st,0);
+         if(sqlite3_step(st)==SQLITE_ROW){
+             id=sqlite3_column_int64(st,0);
+             const char*d=(const char*)sqlite3_column_text(st,1);
+             if(d)snprintf(buf,sizeof buf-1,"%s",d);}
+         sqlite3_finalize(st);}
+        if(id<0)break;
+        xexecf("DELETE FROM inbox WHERE id=%lld",id);
+        process_input_event(buf);}}
+
+/* Convert a live key code to a JSON input event string */
+static const char* key_code_to_json(int k){
+    static char j[64];
+    const char*n=NULL;
+    switch(k){
+    case K_UP:    n="up";   break; case K_DOWN:  n="down";  break;
+    case K_LEFT:  n="left"; break; case K_RIGHT: n="right"; break;
+    case K_PGUP:  n="pgup"; break; case K_PGDN:  n="pgdn";  break;
+    case K_HOME:  n="home"; break; case K_END:   n="end";   break;
+    case K_TAB:   n="tab";  break; case K_ENTER: n="enter"; break;
+    case K_ESC:   n="esc";  break; case K_BS:    n="bs";    break;
+    default:
+        if(k>=32&&k<127){snprintf(j,sizeof j,"{\"input\":\"key\",\"key\":\"%c\"}",(char)k);return j;}
+        return NULL;}
+    snprintf(j,sizeof j,"{\"input\":\"key\",\"key\":\"%s\"}",n);
+    return j;}
 
 /* ── Part 2: App state & SQL logic ─────────────────────────────────── */
 
@@ -690,7 +849,6 @@ static void tty_init(void){tty_fd=open("/dev/tty",O_RDWR);if(tty_fd<0)die("canno
     r.c_lflag&=~(unsigned)(ECHO|ICANON|IEXTEN|ISIG);r.c_cc[VMIN]=0;r.c_cc[VTIME]=1;
     tcsetattr(tty_fd,TCSAFLUSH,&r);tty_raw=1;(void)write(tty_fd,"\x1b[?1049h\x1b[?25l",14);tty_size();}
 static void on_winch(int s){(void)s;g_resized=1;}
-enum{K_NONE=-1,K_UP=256,K_DOWN,K_LEFT,K_RIGHT,K_PGUP,K_PGDN,K_HOME,K_END,K_TAB=9,K_ENTER=13,K_ESC=27,K_BS=127};
 static int readkey(void){char c;if(read(tty_fd,&c,1)<=0)return K_NONE;
     if(c=='\x1b'){char s[3];if(read(tty_fd,&s[0],1)!=1)return K_ESC;if(read(tty_fd,&s[1],1)!=1)return K_ESC;
         if(s[0]=='['){if(s[1]>='0'&&s[1]<='9'){if(read(tty_fd,&s[2],1)!=1)return K_ESC;
@@ -880,7 +1038,7 @@ static void handle_key(int k){
     case'W':save_db();break;
     case'x':run_sql();break;case'?':show_help();break;}}
 
-/* ── Drive mode ────────────────────────────────────────────────────── */
+/* ── Headless output helpers (also used interactively) ─────────────── */
 
 static int parse_key_name(const char *n){
     if(strcmp(n,"up")==0)return K_UP;if(strcmp(n,"down")==0)return K_DOWN;
@@ -891,16 +1049,6 @@ static int parse_key_name(const char *n){
     if(strcmp(n,"esc")==0)return K_ESC;
     if(strlen(n)==1)return(unsigned char)n[0];
     return K_NONE;}
-
-static void drive_select(const char *id){
-    sqlite3_stmt*st;int found=-1;
-    sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&st,0);
-    sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);
-    if(sqlite3_step(st)==SQLITE_ROW)found=sqlite3_column_int(st,0);
-    sqlite3_finalize(st);
-    if(found>=0){
-        xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",found);
-        rebuild_rpane();}}
 
 static void dump_lpane(void){
     printf("=== LPANE ===\n");
@@ -941,59 +1089,26 @@ static void dump_state(void){
     sqlite3_finalize(st);
     printf("=== END STATE ===\n");}
 
-static void run_drive(const char *path){
-    FILE*f=fopen(path,"r");
-    if(!f){fprintf(stderr,"tv: cannot open drive script %s\n",path);exit(1);}
-    char line[4096];
-    while(fgets(line,sizeof line,f)){
-        char*nl=strchr(line,'\n');if(nl)*nl=0;
-        char*hash=strchr(line,'#');if(hash)*hash=0;
-        int len=strlen(line);while(len>0&&isspace((unsigned char)line[len-1]))line[--len]=0;
-        if(!line[0])continue;
-        if(strncmp(line,"resize ",7)==0){
-            int r,c;if(sscanf(line+7,"%d %d",&r,&c)==2)
-                xexecf("UPDATE state SET rows=%d,cols=%d",r,c);
-        }else if(strncmp(line,"key ",4)==0){
-            int k=parse_key_name(line+4);if(k!=K_NONE)handle_key(k);
-        }else if(strncmp(line,"select ",7)==0){
-            drive_select(line+7);
-        }else if(strcmp(line,"print lpane")==0){
-            dump_lpane();
-        }else if(strcmp(line,"print rpane")==0){
-            dump_rpane();
-        }else if(strcmp(line,"print state")==0){
-            dump_state();
-        }else if(strncmp(line,"search ",7)==0){
-            char*q=line+7;
-            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET search=?",-1,&st,0);
-            sqlite3_bind_text(st,1,q,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-            do_search(q);rebuild_lpane();rebuild_rpane();
-        }else if(strncmp(line,"evfilt ",7)==0){
-            char*q=line+7;for(char*p=q;*p;p++)*p=toupper((unsigned char)*p);
-            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET evfilt=?",-1,&st,0);
-            sqlite3_bind_text(st,1,q,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-            rebuild_rpane();
-        }else{
-            fprintf(stderr,"tv: unknown drive command: %s\n",line);
-        }
-    }
-    fclose(f);}
-
 /* ═══════════════════════════════════════════════════════════════════ */
 int main(int argc,char**argv){
     int load_mode=0;char load_file[256]="";char trace_file[256]="";
-    char save_file[256]="";char drive_file[256]="";char**cmd=NULL;
+    char save_file[256]="";char**cmd=NULL;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"--load")==0&&i+1<argc){load_mode=1;snprintf(load_file,sizeof load_file,"%s",argv[++i]);}
         else if(strcmp(argv[i],"--trace")==0&&i+1<argc)snprintf(trace_file,sizeof trace_file,"%s",argv[++i]);
         else if(strcmp(argv[i],"--save")==0&&i+1<argc)snprintf(save_file,sizeof save_file,"%s",argv[++i]);
-        else if(strcmp(argv[i],"--drive")==0&&i+1<argc)snprintf(drive_file,sizeof drive_file,"%s",argv[++i]);
         else if(strcmp(argv[i],"--")==0&&i+1<argc){cmd=argv+i+1;break;}}
     if(!load_mode&&!trace_file[0]&&!cmd){
         fprintf(stderr,"Usage: tv -- <command> [args...]\n"
             "       tv --load <file.db>\n"
-            "       tv --trace <file.jsonl> [--save <file.db>] [--drive <script>]\n"
-            "       tv --load <file.db> --drive <script>\n");
+            "       tv --trace <file.jsonl> [--save <file.db>]\n"
+            "       tv --load <file.db> --trace <input.jsonl>\n"
+            "  Input events in trace streams: {\"input\":\"key\",\"key\":\"j\"}\n"
+            "  {\"input\":\"resize\",\"rows\":50,\"cols\":120}\n"
+            "  {\"input\":\"select\",\"id\":\"1003\"}\n"
+            "  {\"input\":\"search\",\"q\":\"term\"}\n"
+            "  {\"input\":\"evfilt\",\"q\":\"OPEN\"}\n"
+            "  {\"input\":\"print\",\"what\":\"lpane|rpane|state\"}\n");
         return 1;}
 
     if(sqlite3_open(":memory:",&db)!=SQLITE_OK)die("sqlite3_open");
@@ -1005,11 +1120,14 @@ int main(int argc,char**argv){
         if(!bk)die("backup init failed");
         sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);sqlite3_close(src);
         {char*e=0;sqlite3_exec(db,"ALTER TABLE state ADD COLUMN lp_filter INT DEFAULT 0",0,0,&e);if(e)sqlite3_free(e);}
+        {char*e=0;sqlite3_exec(db,"CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL)",0,0,&e);if(e)sqlite3_free(e);}
         setup_app();
         if(!qint("SELECT has_fts FROM state",0))setup_fts();
+        if(trace_file[0]) ingest_file(trace_file); /* optional input-event file */
     } else if(trace_file[0]){
         db_create();
         ingest_file(trace_file);
+        flush_trace_inbox();
         setup_app();
         setup_fts();
     } else {
@@ -1027,7 +1145,8 @@ int main(int argc,char**argv){
     rebuild_lpane();rebuild_rpane();
 
     if(save_file[0])save_to_file(save_file);
-    if(drive_file[0]){run_drive(drive_file);sqlite3_close(db);return 0;}
+    flush_input_inbox();
+    if(g_headless){sqlite3_close(db);return 0;}
     if(save_file[0]&&!cmd){sqlite3_close(db);return 0;}
 
     tty_init();
@@ -1049,8 +1168,9 @@ int main(int argc,char**argv){
                 if(n<=0){
                     if(g_rbuf_len>0){
                         g_rbuf[g_rbuf_len]=0;
-                        xexec("BEGIN");process_line(g_rbuf);xexec("COMMIT");
-                        g_rbuf_len=0;}
+                        xexec("BEGIN");ingest_line(g_rbuf);xexec("COMMIT");
+                        g_rbuf_len=0;
+                        flush_trace_inbox();}
                     setup_fts();
                     xexec("UPDATE state SET lp_filter=0");
                     close(g_trace_fd);g_trace_fd=-1;
@@ -1061,14 +1181,15 @@ int main(int argc,char**argv){
                     while(1){
                         char*nl=(char*)memchr(g_rbuf,'\n',g_rbuf_len);if(!nl)break;
                         if(nl>g_rbuf&&*(nl-1)=='\r')*(nl-1)=0;
-                        *nl=0;process_line(g_rbuf);did++;
+                        *nl=0;ingest_line(g_rbuf);did++;
                         int used=(int)(nl-g_rbuf)+1;
                         memmove(g_rbuf,nl+1,g_rbuf_len-used);
                         g_rbuf_len-=used;}
                     if(g_rbuf_len>=(int)(sizeof(g_rbuf)-1)){
-                        g_rbuf[g_rbuf_len]=0;process_line(g_rbuf);did++;g_rbuf_len=0;}
+                        g_rbuf[g_rbuf_len]=0;ingest_line(g_rbuf);did++;g_rbuf_len=0;}
                     xexec("COMMIT");
                     if(did){
+                        flush_trace_inbox();
                         xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
                         rebuild_lpane();rebuild_rpane();}}}
 
@@ -1081,13 +1202,16 @@ int main(int argc,char**argv){
                 int k=readkey();
                 if(k==K_NONE){}
                 else if(k=='q'||k=='Q')break;
-                else{handle_key(k);render();}}
+                else{const char*j=key_code_to_json(k);
+                     if(j){ingest_line(j);flush_input_inbox();}
+                     render();}}
         } else {
             render();
             int k=readkey();
             if(k==K_NONE)continue;
             if(k=='q'||k=='Q')break;
-            handle_key(k);
+            const char*j=key_code_to_json(k);
+            if(j){ingest_line(j);flush_input_inbox();}
         }
     }
 
