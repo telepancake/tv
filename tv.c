@@ -128,7 +128,7 @@ static void setup_app(void){
         " search TEXT DEFAULT '',evfilt TEXT DEFAULT '',"
         " rows INT DEFAULT 24,cols INT DEFAULT 80,"
         " base_ts REAL DEFAULT 0,has_fts INT DEFAULT 0,mode INT DEFAULT 0,"
-        " lp_filter INT DEFAULT 0);"
+        " lp_filter INT DEFAULT 0,dep_filter INT DEFAULT 0,dep_root TEXT DEFAULT '');"
         "INSERT OR IGNORE INTO state(base_ts) VALUES((SELECT COALESCE(MIN(ts),0) FROM events));"
         "CREATE TABLE IF NOT EXISTS lpane(rownum INTEGER PRIMARY KEY,id TEXT NOT NULL,"
         " parent_id TEXT,style TEXT DEFAULT 'normal',text TEXT NOT NULL,visible INT DEFAULT 1);"
@@ -812,10 +812,252 @@ static void rebuild_outputs(void){
     }
 }
 
+/* ── Dependency views ──────────────────────────────────────────────── */
+
+/*
+ * Dependency model: if a process opened file A for writing and file B for
+ * reading, then A depends on B.  The directed edge is B → A (B is needed
+ * to produce A).  The dependency view computes the transitive closure of
+ * this graph starting from the currently-selected file.
+ *
+ * Modes:
+ *   3 – deps (files):   files the selected file depends on
+ *   4 – rdeps (files):  files that depend on the selected file
+ *   5 – deps (cmds):    commands that produce deps, reverse-execution order
+ *   6 – rdeps (cmds):   commands that consume rdeps, reverse-execution order
+ *
+ * dep_filter: 0 = show all dep files, 1 = only files written at least once
+ */
+
+/* Build the dep_edges temp table: src (read) → dst (written) per process */
+static void build_dep_edges(void){
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS dep_edges("
+        " src TEXT NOT NULL, dst TEXT NOT NULL, tgid INT NOT NULL);"
+        "DELETE FROM dep_edges;"
+        "INSERT INTO dep_edges(src,dst,tgid)"
+        " SELECT DISTINCT r.path, w.path, er.tgid"
+        " FROM open_events r"
+        " JOIN events er ON er.id=r.eid"
+        " JOIN open_events w"
+        " JOIN events ew ON ew.id=w.eid"
+        " WHERE er.tgid=ew.tgid"
+        "  AND r.path IS NOT NULL AND w.path IS NOT NULL"
+        "  AND r.path!=w.path"
+        "  AND (r.flags LIKE 'O_RDONLY%' OR r.flags LIKE 'O_RDWR%')"
+        "  AND (w.flags LIKE 'O_WRONLY%' OR w.flags LIKE 'O_RDWR%' OR w.flags LIKE 'O_WRONLY,%' OR w.flags LIKE 'O_RDWR,%');"
+        "CREATE INDEX IF NOT EXISTS ix_de_dst ON dep_edges(dst);"
+        "CREATE INDEX IF NOT EXISTS ix_de_src ON dep_edges(src);");
+}
+
+static void rebuild_deps(void){
+    build_dep_edges();
+    int df=qint("SELECT dep_filter FROM state",0);
+
+    /* Get the dep root from state */
+    char root[4096]="";
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT dep_root FROM state",-1,&st,0);
+     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(root,sizeof root,"%s",t);}
+     sqlite3_finalize(st);}
+    if(!root[0]){xexec("DROP TABLE IF EXISTS dep_edges;");return;}
+
+    /* Transitive closure: files the root depends on */
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
+        "DELETE FROM dep_closure;");
+    /* Root file at depth 0 */
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)",-1,&st,0);
+     sqlite3_bind_text(st,1,root,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}
+    /* BFS expansion */
+    for(int d=0;d<100;d++){
+        int added=qintf(0,
+            "SELECT COUNT(*) FROM dep_edges e"
+            " JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
+            " WHERE e.src NOT IN(SELECT path FROM dep_closure)",d);
+        if(!added)break;
+        xexecf(
+            "INSERT OR IGNORE INTO dep_closure(path,depth)"
+            " SELECT DISTINCT e.src,%d"
+            " FROM dep_edges e JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
+            " WHERE e.src NOT IN(SELECT path FROM dep_closure)",d+1,d);
+    }
+
+    /* Apply dep_filter: 0=all, 1=only files that have been written */
+    const char*filt=df?"AND EXISTS(SELECT 1 FROM open_events o2 JOIN events e2 ON e2.id=o2.eid"
+        " WHERE o2.path=dc.path AND (o2.flags LIKE 'O_WRONLY%%' OR o2.flags LIKE 'O_RDWR%%'"
+        " OR o2.flags LIKE 'O_WRONLY,%%' OR o2.flags LIKE 'O_RDWR,%%'))":"";
+
+    xexecf(
+        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+        " SELECT ROW_NUMBER()OVER(ORDER BY dc.depth,dc.path)-1,dc.path,NULL,"
+        "  CASE WHEN dc.depth=0 THEN 'cyan_bold'"
+        "       WHEN dc.path IN(SELECT id FROM search_hits) THEN 'search'"
+        "       ELSE 'normal' END,"
+        "  printf('%%*s%%s',dc.depth*2,''," BNAME("dc.path") ")"
+        " FROM dep_closure dc WHERE 1=1 %s ORDER BY dc.depth,dc.path",filt);
+
+    xexec("DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
+}
+
+static void rebuild_rdeps(void){
+    build_dep_edges();
+    int df=qint("SELECT dep_filter FROM state",0);
+
+    char root[4096]="";
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT dep_root FROM state",-1,&st,0);
+     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(root,sizeof root,"%s",t);}
+     sqlite3_finalize(st);}
+    if(!root[0]){xexec("DROP TABLE IF EXISTS dep_edges;");return;}
+
+    /* Transitive closure: files that depend on root (follow edges in reverse) */
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
+        "DELETE FROM dep_closure;");
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)",-1,&st,0);
+     sqlite3_bind_text(st,1,root,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}
+    for(int d=0;d<100;d++){
+        int added=qintf(0,
+            "SELECT COUNT(*) FROM dep_edges e"
+            " JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
+            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)",d);
+        if(!added)break;
+        xexecf(
+            "INSERT OR IGNORE INTO dep_closure(path,depth)"
+            " SELECT DISTINCT e.dst,%d"
+            " FROM dep_edges e JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
+            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)",d+1,d);
+    }
+
+    const char*filt=df?"AND EXISTS(SELECT 1 FROM open_events o2 JOIN events e2 ON e2.id=o2.eid"
+        " WHERE o2.path=dc.path AND (o2.flags LIKE 'O_WRONLY%%' OR o2.flags LIKE 'O_RDWR%%'"
+        " OR o2.flags LIKE 'O_WRONLY,%%' OR o2.flags LIKE 'O_RDWR,%%'))":"";
+
+    xexecf(
+        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+        " SELECT ROW_NUMBER()OVER(ORDER BY dc.depth,dc.path)-1,dc.path,NULL,"
+        "  CASE WHEN dc.depth=0 THEN 'cyan_bold'"
+        "       WHEN dc.path IN(SELECT id FROM search_hits) THEN 'search'"
+        "       ELSE 'normal' END,"
+        "  printf('%%*s%%s',dc.depth*2,''," BNAME("dc.path") ")"
+        " FROM dep_closure dc WHERE 1=1 %s ORDER BY dc.depth,dc.path",filt);
+
+    xexec("DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
+}
+
+static void rebuild_dep_cmds(void){
+    build_dep_edges();
+
+    char root[4096]="";
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT dep_root FROM state",-1,&st,0);
+     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(root,sizeof root,"%s",t);}
+     sqlite3_finalize(st);}
+    if(!root[0]){xexec("DROP TABLE IF EXISTS dep_edges;");return;}
+
+    /* Transitive closure of deps (same as rebuild_deps) */
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
+        "DELETE FROM dep_closure;");
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)",-1,&st,0);
+     sqlite3_bind_text(st,1,root,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}
+    for(int d=0;d<100;d++){
+        int added=qintf(0,
+            "SELECT COUNT(*) FROM dep_edges e"
+            " JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
+            " WHERE e.src NOT IN(SELECT path FROM dep_closure)",d);
+        if(!added)break;
+        xexecf(
+            "INSERT OR IGNORE INTO dep_closure(path,depth)"
+            " SELECT DISTINCT e.src,%d"
+            " FROM dep_edges e JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
+            " WHERE e.src NOT IN(SELECT path FROM dep_closure)",d+1,d);
+    }
+
+    xexecf(
+        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+        " SELECT ROW_NUMBER()OVER(ORDER BY p.last_ts DESC)-1,"
+        "  CAST(p.tgid AS TEXT),NULL,"
+        "  CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
+        "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
+        "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
+        "  printf('[%d] %s%s %s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
+        "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
+        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%d',x.signal)"
+        "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
+        " FROM processes p"
+        " LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
+        " LEFT JOIN exit_events x ON x.eid=ev.id"
+        " WHERE p.tgid IN("
+        "  SELECT DISTINCT e.tgid FROM dep_edges e"
+        "  JOIN dep_closure dc ON (e.dst=dc.path OR e.src=dc.path)"
+        " )"
+        " ORDER BY p.last_ts DESC");
+
+    xexec("DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
+}
+
+static void rebuild_rdep_cmds(void){
+    build_dep_edges();
+
+    char root[4096]="";
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT dep_root FROM state",-1,&st,0);
+     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(root,sizeof root,"%s",t);}
+     sqlite3_finalize(st);}
+    if(!root[0]){xexec("DROP TABLE IF EXISTS dep_edges;");return;}
+
+    /* Transitive closure of rdeps (same as rebuild_rdeps) */
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
+        "DELETE FROM dep_closure;");
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,
+        "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)",-1,&st,0);
+     sqlite3_bind_text(st,1,root,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}
+    for(int d=0;d<100;d++){
+        int added=qintf(0,
+            "SELECT COUNT(*) FROM dep_edges e"
+            " JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
+            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)",d);
+        if(!added)break;
+        xexecf(
+            "INSERT OR IGNORE INTO dep_closure(path,depth)"
+            " SELECT DISTINCT e.dst,%d"
+            " FROM dep_edges e JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
+            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)",d+1,d);
+    }
+
+    xexec(
+        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+        " SELECT ROW_NUMBER()OVER(ORDER BY p.last_ts DESC)-1,"
+        "  CAST(p.tgid AS TEXT),NULL,"
+        "  CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
+        "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
+        "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
+        "  printf('[%d] %s%s %s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
+        "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
+        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%d',x.signal)"
+        "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
+        " FROM processes p"
+        " LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
+        " LEFT JOIN exit_events x ON x.eid=ev.id"
+        " WHERE p.tgid IN("
+        "  SELECT DISTINCT e.tgid FROM dep_edges e"
+        "  JOIN dep_closure dc ON (e.dst=dc.path OR e.src=dc.path)"
+        " )"
+        " ORDER BY p.last_ts DESC");
+
+    xexec("DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
+}
+
 static void rebuild_lpane(void){
     xexec("DELETE FROM lpane;");
     int mode=qint("SELECT mode FROM state",0);
-    switch(mode){case 0:rebuild_procs();break;case 1:rebuild_files();break;case 2:rebuild_outputs();break;}
+    switch(mode){
+        case 0:rebuild_procs();break;case 1:rebuild_files();break;case 2:rebuild_outputs();break;
+        case 3:rebuild_deps();break;case 4:rebuild_rdeps();break;
+        case 5:rebuild_dep_cmds();break;case 6:rebuild_rdep_cmds();break;
+    }
     if(mode==0) apply_lp_filter();
     xexec("UPDATE state SET cursor=MIN(cursor,MAX((SELECT COUNT(*)-1 FROM lpane),0));");
 }
@@ -945,7 +1187,8 @@ static void rebuild_rpane(void){
     sqlite3_bind_int(st,1,cursor);char id[4096]="";
     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}
     sqlite3_finalize(st);if(!id[0])return;
-    switch(mode){case 0:rpane_proc(atoi(id));break;case 1:rpane_file(id);break;case 2:rpane_output(id);break;}
+    switch(mode){case 0:rpane_proc(atoi(id));break;case 1:rpane_file(id);break;case 2:rpane_output(id);break;
+        case 3:case 4:rpane_file(id);break;case 5:case 6:rpane_proc(atoi(id));break;}
 
     /* Apply section collapse via visible column — pure SQL, no C loops */
     /* Each heading's section name maps to an expanded entry 'rp_<section>' */
@@ -983,14 +1226,14 @@ static void do_search(const char *q){
     xexec("DELETE FROM search_hits;");if(!q||!q[0])return;
     int mode=qint("SELECT mode FROM state",0);char lk[512];snprintf(lk,sizeof lk,"%%%s%%",q);
     sqlite3_stmt*st;
-    if(mode==0){
+    if(mode==0||mode==5||mode==6){
         if(qint("SELECT has_fts FROM state",0)){char fq[512];snprintf(fq,sizeof fq,"\"%s\"*",q);
             sqlite3_prepare_v2(db,"INSERT OR IGNORE INTO search_hits(id) SELECT DISTINCT CAST(pid AS TEXT) FROM fts WHERE fts MATCH ?",-1,&st,0);
             sqlite3_bind_text(st,1,fq,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);}
         sqlite3_prepare_v2(db,"INSERT OR IGNORE INTO search_hits(id) SELECT CAST(tgid AS TEXT) FROM processes"
             " WHERE CAST(tgid AS TEXT) LIKE ?1 OR exe LIKE ?1 OR argv LIKE ?1",-1,&st,0);
         sqlite3_bind_text(st,1,lk,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-    } else if(mode==1){
+    } else if(mode==1||mode==3||mode==4){
         sqlite3_prepare_v2(db,"INSERT OR IGNORE INTO search_hits(id) SELECT DISTINCT path FROM open_events WHERE path LIKE ?",-1,&st,0);
         sqlite3_bind_text(st,1,lk,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
     } else {
@@ -1105,7 +1348,7 @@ static void render(void){
         while(row<uh-1){sf("\x1b[%d;%dH\x1b[0m\x1b[K",row+2,tw+1);row++;}sqlite3_finalize(st);}
     /* Status */
     {int mode=qint("SELECT mode FROM state",0),nf=qint("SELECT COUNT(*) FROM lpane",0);
-    const char*mn[]={"PROCS","FILES","OUTPUT"};const char*tsl[]={"abs","rel","Δ"};
+    const char*mn[]={"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};const char*tsl[]={"abs","rel","Δ"};
     int tsm=qint("SELECT ts_mode FROM state",0),gr=qint("SELECT grouped FROM state",1);
     int lpf=qint("SELECT lp_filter FROM state",0);
     char s[512];int p=0;p+=snprintf(s+p,sizeof s-p," %s%s | %d/%d",mn[mode],gr?" tree":"",cursor+1,nf);
@@ -1119,7 +1362,9 @@ static void render(void){
      sqlite3_finalize(st);}
     if(lpf==1)p+=snprintf(s+p,sizeof s-p," | V:failed");
     else if(lpf==2)p+=snprintf(s+p,sizeof s-p," | V:running");
-    p+=snprintf(s+p,sizeof s-p," | 1:proc 2:file 3:out G:group v:filter W:save ?:help");(void)p;
+    {int df=qint("SELECT dep_filter FROM state",0);
+     if(mode>=3&&mode<=6)p+=snprintf(s+p,sizeof s-p," | D:%s",df?"written":"all");}
+    p+=snprintf(s+p,sizeof s-p," | 1:proc 2:file 3:out 4:dep 5:rdep 6:dcmd 7:rcmd ?:help");(void)p;
     sf("\x1b[%d;1H\x1b[7;1m",rows);sputw(s,cols);sp("\x1b[0m");}sflush();}
 
 /* ── Help & SQL ────────────────────────────────────────────────────── */
@@ -1127,6 +1372,7 @@ static const char*HELP[]={"","  Process Trace Viewer","  ═══════�
     "  ↑↓ jk  Navigate    PgUp/PgDn  Page    g  First    Tab  Switch pane",
     "  ← h  Collapse/back    → l  Expand/detail    Enter  Follow link","",
     "  1 Process  2 File  3 Output    G  Toggle tree/flat    s  Sort    t  Timestamps",
+    "  4 Deps  5 Reverse-deps  6 Dep-cmds  7 Reverse-dep-cmds    d  Toggle dep filter",
     "  /  Search    n/N  Next/prev    f/F  Filter events/clear    e/E  Expand/collapse all",
     "  v  Cycle proc filter (none→failed→running)    V  Clear proc filter",
     "  W  Save DB to file    x  SQL query    q  Quit    ?  Help","","  Press any key.",0};
@@ -1264,6 +1510,11 @@ static void handle_key(int k){
     case'1':xexec("UPDATE state SET mode=0,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0");dirty_both();break;
     case'2':xexec("UPDATE state SET mode=1,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0");dirty_both();break;
     case'3':xexec("UPDATE state SET mode=2,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0");dirty_both();break;
+    case'4':xexec("UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=3,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");dirty_both();break;
+    case'5':xexec("UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=4,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");dirty_both();break;
+    case'6':xexec("UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=5,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");dirty_both();break;
+    case'7':xexec("UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=6,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");dirty_both();break;
+    case'd':xexec("UPDATE state SET dep_filter=1-dep_filter,cursor=0,scroll=0");dirty_both();break;
     case's':xexec("UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0");dirty_both();break;
     case't':xexec("UPDATE state SET ts_mode=(ts_mode+1)%3");dirty_rp();break;
 
@@ -1314,16 +1565,16 @@ static void dump_state(void){
     printf("=== STATE ===\n");
     sqlite3_stmt*st;
     sqlite3_prepare_v2(db,"SELECT cursor,scroll,focus,dcursor,dscroll,ts_mode,sort_key,grouped,mode,lp_filter,"
-        "COALESCE(search,''),COALESCE(evfilt,''),rows,cols FROM state",-1,&st,0);
+        "COALESCE(search,''),COALESCE(evfilt,''),rows,cols,dep_filter FROM state",-1,&st,0);
     if(sqlite3_step(st)==SQLITE_ROW)
         printf("cursor=%d scroll=%d focus=%d dcursor=%d dscroll=%d ts_mode=%d sort_key=%d"
-            " grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d\n",
+            " grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d dep_filter=%d\n",
             sqlite3_column_int(st,0),sqlite3_column_int(st,1),sqlite3_column_int(st,2),
             sqlite3_column_int(st,3),sqlite3_column_int(st,4),sqlite3_column_int(st,5),
             sqlite3_column_int(st,6),sqlite3_column_int(st,7),sqlite3_column_int(st,8),
             sqlite3_column_int(st,9),
             (const char*)sqlite3_column_text(st,10),(const char*)sqlite3_column_text(st,11),
-            sqlite3_column_int(st,12),sqlite3_column_int(st,13));
+            sqlite3_column_int(st,12),sqlite3_column_int(st,13),sqlite3_column_int(st,14));
     sqlite3_finalize(st);
     printf("=== END STATE ===\n");}
 
