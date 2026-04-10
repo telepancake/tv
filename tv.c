@@ -615,7 +615,7 @@ static void rebuild_files(void){
         " FROM open_events o JOIN events e ON e.id=o.eid"
         " WHERE o.path IS NOT NULL GROUP BY o.path ORDER BY o.path",-1,&st,0);
     while(sqlite3_step(st)==SQLITE_ROW){
-        if(fn>=fcap){fcap*=2;FEntry*t=realloc(files,fcap*sizeof(FEntry));if(!t)break;files=t;}
+        if(fn>=fcap){fcap*=2;FEntry*t=realloc(files,fcap*sizeof(FEntry));if(!t){sqlite3_finalize(st);free(files);return;}files=t;}
         const char*p=(const char*)sqlite3_column_text(st,0);
         snprintf(files[fn].path,sizeof files[fn].path,"%s",p?p:"");
         canon_path(files[fn].canon,sizeof files[fn].canon,files[fn].path);
@@ -642,7 +642,7 @@ static void rebuild_files(void){
         int cur=0;
         /* Handle non-path entries (no /) */
         if(!strchr(p,'/')){
-            if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)break;nodes=t;}
+            if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)goto done;nodes=t;}
             int ni=tn++;
             snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",files[fi].path);
             snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",p);
@@ -678,7 +678,7 @@ static void rebuild_files(void){
             cur=ni;
         }
         /* Add file leaf under cur */
-        if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)break;nodes=t;}
+        if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)goto done;nodes=t;}
         int ni=tn++;
         snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",files[fi].path);
         snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",comp[nc-1]);
@@ -726,9 +726,9 @@ static void rebuild_files(void){
 
     /* Helper: push sorted children (dirs first, then alphabetical) */
     #define PUSH_CHILDREN(parent_idx,d) do{ \
-        int _chs[4096];int _nc=0; \
+        int _chs[1024];int _nc=0; \
         {int _ch=nodes[parent_idx].first_child; \
-         while(_ch>=0&&_nc<4096){if(nodes[_ch].parent!=-2)_chs[_nc++]=_ch;_ch=nodes[_ch].next_sib;}} \
+         while(_ch>=0&&_nc<1024){if(nodes[_ch].parent!=-2)_chs[_nc++]=_ch;_ch=nodes[_ch].next_sib;}} \
         for(int _a=0;_a<_nc-1;_a++)for(int _b=_a+1;_b<_nc;_b++){ \
             int _da=nodes[_chs[_a]].is_dir,_db=nodes[_chs[_b]].is_dir; \
             if(_db>_da||(_da==_db&&strcmp(nodes[_chs[_a]].name,nodes[_chs[_b]].name)>0)) \
@@ -1416,7 +1416,7 @@ int main(int argc,char**argv){
             int mfd=tty_fd>g_trace_fd?tty_fd:g_trace_fd;
             struct timeval to={0,50000};
             int sel=select(mfd+1,&rfds,NULL,NULL,&to);
-            if(sel<0&&errno==EINTR){g_need_render=1;if(g_need_render){render();g_need_render=0;}continue;}
+            if(sel<0&&errno==EINTR){render();continue;}
 
             if(sel>0&&FD_ISSET(g_trace_fd,&rfds)){
                 int n=read(g_trace_fd,g_rbuf+g_rbuf_len,
@@ -1458,7 +1458,7 @@ int main(int argc,char**argv){
                 int k=readkey();
                 if(k==K_NONE){}
                 else if(k=='q'||k=='Q')break;
-                else{handle_key(k);g_need_render=1;if(g_need_render){render();g_need_render=0;}}}
+                else{handle_key(k);render();g_need_render=0;}}
         } else {
             if(g_need_render){render();g_need_render=0;}
             int k=readkey();
