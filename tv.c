@@ -110,9 +110,7 @@ static void db_create(void){xexec(
     "CREATE TABLE exit_events(eid INTEGER PRIMARY KEY,status TEXT,code INT,"
     " signal INT,core_dumped INT,raw INT);"
     "CREATE TABLE cwd_cache(tgid INTEGER PRIMARY KEY,cwd TEXT);"
-    "CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL);"
-    "CREATE TABLE outbox(id INTEGER PRIMARY KEY CHECK(id=1),rl INT DEFAULT 0,rr INT DEFAULT 0);"
-    "INSERT INTO outbox VALUES(1,0,0);");}
+    "CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL);");}
 
 static void setup_app(void){
     xexec(
@@ -133,7 +131,7 @@ static void setup_app(void){
         " lp_filter INT DEFAULT 0);"
         "INSERT OR IGNORE INTO state(base_ts) VALUES((SELECT COALESCE(MIN(ts),0) FROM events));"
         "CREATE TABLE IF NOT EXISTS lpane(rownum INTEGER PRIMARY KEY,id TEXT NOT NULL,"
-        " parent_id TEXT,style TEXT DEFAULT 'normal',text TEXT NOT NULL);"
+        " parent_id TEXT,style TEXT DEFAULT 'normal',text TEXT NOT NULL,visible INT DEFAULT 1);"
         "CREATE TABLE IF NOT EXISTS rpane(rownum INTEGER PRIMARY KEY,style TEXT DEFAULT 'normal',"
         " text TEXT NOT NULL,link_mode INT DEFAULT -1,link_id TEXT DEFAULT '',"
         " section TEXT DEFAULT '',visible INT DEFAULT 1);"
@@ -500,19 +498,9 @@ static void apply_lp_filter(void){
     int filt=qint("SELECT lp_filter FROM state",0);
     if(!filt) return;
 
-    /* Remember current cursor item so it stays visible */
-    char pinned[64]="";
-    {sqlite3_stmt*st;
-     sqlite3_prepare_v2(db,
-         "SELECT COALESCE(id,'') FROM lpane WHERE rownum=(SELECT cursor FROM state)",
-         -1,&st,0);
-     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(pinned,sizeof pinned,"%s",t);}
-     sqlite3_finalize(st);}
-
     if(filt==1){
         /* Failed: signaled, or non-zero exit with ≥1 write-mode open; plus ancestors */
-        sqlite3_stmt*st;
-        sqlite3_prepare_v2(db,
+        xexec(
             "WITH RECURSIVE"
             " failed(tgid) AS("
             "  SELECT p.tgid FROM processes p"
@@ -529,15 +517,11 @@ static void apply_lp_filter(void){
             "  UNION SELECT p2.ppid FROM processes p2 JOIN visible v ON p2.tgid=v.tgid"
             "   WHERE p2.ppid IS NOT NULL AND p2.ppid IN(SELECT tgid FROM processes)"
             " )"
-            " DELETE FROM lpane"
-            "  WHERE CAST(id AS INT) NOT IN(SELECT tgid FROM visible) AND id!=?",
-            -1,&st,0);
-        sqlite3_bind_text(st,1,pinned,-1,SQLITE_TRANSIENT);
-        sqlite3_step(st);sqlite3_finalize(st);
+            " UPDATE lpane SET visible=0"
+            "  WHERE CAST(id AS INT) NOT IN(SELECT tgid FROM visible)");
     } else if(filt==2){
         /* Running: no EXIT event yet; plus ancestors */
-        sqlite3_stmt*st;
-        sqlite3_prepare_v2(db,
+        xexec(
             "WITH RECURSIVE"
             " running(tgid) AS("
             "  SELECT tgid FROM processes"
@@ -549,28 +533,18 @@ static void apply_lp_filter(void){
             "  UNION SELECT p2.ppid FROM processes p2 JOIN visible v ON p2.tgid=v.tgid"
             "   WHERE p2.ppid IS NOT NULL AND p2.ppid IN(SELECT tgid FROM processes)"
             " )"
-            " DELETE FROM lpane"
-            "  WHERE CAST(id AS INT) NOT IN(SELECT tgid FROM visible) AND id!=?",
-            -1,&st,0);
-        sqlite3_bind_text(st,1,pinned,-1,SQLITE_TRANSIENT);
-        sqlite3_step(st);sqlite3_finalize(st);}
+            " UPDATE lpane SET visible=0"
+            "  WHERE CAST(id AS INT) NOT IN(SELECT tgid FROM visible)");
+    }
 
-    /* Re-number rows after deletion */
+    /* Renumber visible rows, drop hidden */
     xexec(
         "CREATE TEMP TABLE _lp AS"
-        " SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,id,parent_id,style,text FROM lpane;"
+        " SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,id,parent_id,style,text,1 AS visible FROM lpane WHERE visible=1;"
         "DELETE FROM lpane;"
-        "INSERT INTO lpane(rownum,id,parent_id,style,text) SELECT*FROM _lp;"
+        "INSERT INTO lpane(rownum,id,parent_id,style,text,visible) SELECT*FROM _lp;"
         "DROP TABLE _lp;");
-
-    /* Restore cursor to pinned item if it survived */
-    if(pinned[0]){
-        sqlite3_stmt*st;
-        sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&st,0);
-        sqlite3_bind_text(st,1,pinned,-1,SQLITE_TRANSIENT);
-        if(sqlite3_step(st)==SQLITE_ROW)
-            xexecf("UPDATE state SET cursor=%d",sqlite3_column_int(st,0));
-        sqlite3_finalize(st);}}
+}
 
 /* ── Rebuild lpane ─────────────────────────────────────────────────── */
 
@@ -1384,8 +1358,6 @@ int main(int argc,char**argv){
         sqlite3_backup*bk=sqlite3_backup_init(db,"main",src,"main");
         if(!bk)die("backup init failed");
         sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);sqlite3_close(src);
-        {char*e=0;sqlite3_exec(db,"ALTER TABLE state ADD COLUMN lp_filter INT DEFAULT 0",0,0,&e);if(e)sqlite3_free(e);}
-        {char*e=0;sqlite3_exec(db,"CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL)",0,0,&e);if(e)sqlite3_free(e);}
         setup_app();
         if(!qint("SELECT has_fts FROM state",0))setup_fts();
         if(trace_file[0]) ingest_file(trace_file); /* optional input-event file */
@@ -1419,62 +1391,54 @@ int main(int argc,char**argv){
 
     for(;;){
         if(g_resized){g_resized=0;tty_size();rebuild_lpane();rebuild_rpane();g_need_render=1;}
+        if(g_need_render){render();g_need_render=0;}
 
-        if(g_trace_fd>=0){
-            fd_set rfds;FD_ZERO(&rfds);FD_SET(tty_fd,&rfds);FD_SET(g_trace_fd,&rfds);
-            int mfd=tty_fd>g_trace_fd?tty_fd:g_trace_fd;
-            struct timeval to={0,50000};
-            int sel=select(mfd+1,&rfds,NULL,NULL,&to);
-            if(sel<0&&errno==EINTR){render();continue;}
+        /* Block until input arrives (tty, trace fd, or signal) */
+        fd_set rfds;FD_ZERO(&rfds);FD_SET(tty_fd,&rfds);
+        int mfd=tty_fd;
+        if(g_trace_fd>=0){FD_SET(g_trace_fd,&rfds);if(g_trace_fd>mfd)mfd=g_trace_fd;}
+        int sel=select(mfd+1,&rfds,NULL,NULL,NULL);
+        if(sel<0&&errno==EINTR)continue;
 
-            if(sel>0&&FD_ISSET(g_trace_fd,&rfds)){
-                int n=read(g_trace_fd,g_rbuf+g_rbuf_len,
-                           (int)(sizeof(g_rbuf)-g_rbuf_len-1));
-                if(n<=0){
-                    if(g_rbuf_len>0){
-                        g_rbuf[g_rbuf_len]=0;
-                        xexec("BEGIN");ingest_line(g_rbuf);xexec("COMMIT");
-                        g_rbuf_len=0;
-                        process_inbox(1);}
-                    setup_fts();
-                    xexec("UPDATE state SET lp_filter=0");
-                    close(g_trace_fd);g_trace_fd=-1;
-                    rebuild_lpane();rebuild_rpane();g_need_render=1;
-                } else {
-                    g_rbuf_len+=n;
-                    int did=0;xexec("BEGIN");
-                    while(1){
-                        char*nl=(char*)memchr(g_rbuf,'\n',g_rbuf_len);if(!nl)break;
-                        if(nl>g_rbuf&&*(nl-1)=='\r')*(nl-1)=0;
-                        *nl=0;ingest_line(g_rbuf);did++;
-                        int used=(int)(nl-g_rbuf)+1;
-                        memmove(g_rbuf,nl+1,g_rbuf_len-used);
-                        g_rbuf_len-=used;}
-                    if(g_rbuf_len>=(int)(sizeof(g_rbuf)-1)){
-                        g_rbuf[g_rbuf_len]=0;ingest_line(g_rbuf);did++;g_rbuf_len=0;}
-                    xexec("COMMIT");
-                    if(did){
-                        process_inbox(1);
-                        xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
-                        rebuild_lpane();rebuild_rpane();g_need_render=1;}}}
+        if(g_trace_fd>=0&&sel>0&&FD_ISSET(g_trace_fd,&rfds)){
+            int n=read(g_trace_fd,g_rbuf+g_rbuf_len,
+                       (int)(sizeof(g_rbuf)-g_rbuf_len-1));
+            if(n<=0){
+                if(g_rbuf_len>0){
+                    g_rbuf[g_rbuf_len]=0;
+                    xexec("BEGIN");ingest_line(g_rbuf);xexec("COMMIT");
+                    g_rbuf_len=0;
+                    process_inbox(1);}
+                setup_fts();
+                xexec("UPDATE state SET lp_filter=0");
+                close(g_trace_fd);g_trace_fd=-1;
+                rebuild_lpane();rebuild_rpane();g_need_render=1;
+            } else {
+                g_rbuf_len+=n;
+                int did=0;xexec("BEGIN");
+                while(1){
+                    char*nl=(char*)memchr(g_rbuf,'\n',g_rbuf_len);if(!nl)break;
+                    if(nl>g_rbuf&&*(nl-1)=='\r')*(nl-1)=0;
+                    *nl=0;ingest_line(g_rbuf);did++;
+                    int used=(int)(nl-g_rbuf)+1;
+                    memmove(g_rbuf,nl+1,g_rbuf_len-used);
+                    g_rbuf_len-=used;}
+                if(g_rbuf_len>=(int)(sizeof(g_rbuf)-1)){
+                    g_rbuf[g_rbuf_len]=0;ingest_line(g_rbuf);did++;g_rbuf_len=0;}
+                xexec("COMMIT");
+                if(did){
+                    process_inbox(1);
+                    xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
+                    rebuild_lpane();rebuild_rpane();g_need_render=1;}}}
 
-            if(g_child_pid>0){
-                int ws;if(waitpid(g_child_pid,&ws,WNOHANG)==g_child_pid)g_child_pid=0;}
+        if(g_child_pid>0){
+            int ws;if(waitpid(g_child_pid,&ws,WNOHANG)==g_child_pid)g_child_pid=0;}
 
-            if(g_need_render){render();g_need_render=0;}
-
-            if(sel>0&&FD_ISSET(tty_fd,&rfds)){
-                int k=readkey();
-                if(k==K_NONE){}
-                else if(k=='q'||k=='Q')break;
-                else{handle_key(k);render();g_need_render=0;}}
-        } else {
-            if(g_need_render){render();g_need_render=0;}
+        if(sel>0&&FD_ISSET(tty_fd,&rfds)){
             int k=readkey();
-            if(k==K_NONE)continue;
-            if(k=='q'||k=='Q')break;
-            handle_key(k);g_need_render=1;
-        }
+            if(k==K_NONE){}
+            else if(k=='q'||k=='Q')break;
+            else{handle_key(k);g_need_render=1;}}
     }
 
     tty_restore();
