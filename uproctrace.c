@@ -431,6 +431,8 @@ static int pidset_contains(struct pid_set *s, pid_t pid)
 
 struct proc_state {
     pid_t pid;
+    pid_t tgid;           /* thread group leader — cached at first sight */
+    int   is_thread;      /* 1 if pid != tgid (a non-leader thread) */
     int   in_syscall;     /* 1 if we're at syscall entry, 0 at exit */
     long  saved_syscall;  /* syscall number at entry */
     /* saved args for specific syscalls */
@@ -441,6 +443,7 @@ struct proc_state {
     unsigned long emu_wait_wstatus_addr; /* wstatus pointer for emulated wait */
     long  emu_wait_pid;    /* pid arg for emulated wait */
     long  emu_wait_options;/* options arg for emulated wait */
+    int   emu_race_interrupt; /* 1 if we injected SIGCHLD to break real wait4 */
     struct proc_state *next;
 };
 
@@ -452,6 +455,9 @@ static struct proc_state *get_state(pid_t pid)
         if (s->pid == pid) return s;
     struct proc_state *s = calloc(1, sizeof(*s));
     s->pid = pid;
+    /* Cache tgid at creation so it's available even after /proc disappears */
+    s->tgid = get_tgid(pid);
+    s->is_thread = (s->tgid != pid);
     s->next = g_states;
     g_states = s;
     return s;
@@ -988,11 +994,18 @@ static void try_deliver_to_tracer(pid_t tracer_pid)
         /* Race-condition path: the sub-tracer entered wait4 before
          * any sub-tracee existed, so the syscall was NOT neutralised.
          * If it is still blocked in the kernel we must interrupt it,
-         * so that it returns a syscall-exit-stop we can hijack. */
+         * so that it returns a syscall-exit-stop we can hijack.
+         *
+         * PTRACE_INTERRUPT only works for PTRACE_SEIZE-attached processes,
+         * not for PTRACE_TRACEME.  Instead, inject a SIGCHLD via tgkill()
+         * which will break the kernel's wait4 with -EINTR (or restart it).
+         * We then get a signal-delivery-stop for SIGCHLD which we handle
+         * specially (see main loop). */
 #ifdef SYS_wait4
         if (tps->in_syscall && !tps->emu_neutralized &&
             tps->saved_syscall == SYS_wait4) {
-            ptrace(PTRACE_INTERRUPT, tracer_pid, NULL, NULL);
+            tps->emu_race_interrupt = 1;
+            syscall(SYS_tgkill, tracer_pid, tracer_pid, SIGCHLD);
         }
 #endif
         return;
@@ -1370,7 +1383,11 @@ static int handle_syscall_exit(pid_t pid, struct proc_state *ps)
 #endif
        ) {
         if (ret_val == 0) {
-            /* Successful exec: emit CWD then EXEC then inherited OPENs */
+            /* Successful exec: emit CWD then EXEC then inherited OPENs.
+             * After exec, the thread becomes the new thread-group leader,
+             * so update our cached tgid and clear is_thread. */
+            ps->tgid = pid;
+            ps->is_thread = 0;
             emit_cwd_event(pid);
             emit_exec_event(pid);
             emit_inherited_open_events(pid);
@@ -1535,9 +1552,13 @@ int main(int argc, char **argv)
         }
 
         if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
-            /* Process exited */
+            /* Process/thread exited */
             if (pidset_contains(&g_tracked, wpid)) {
-                emit_exit_event(wpid, wstatus);
+                /* Only emit EXIT for thread-group leaders (pid == tgid),
+                 * matching the kernel module's behaviour. */
+                struct proc_state *eps = get_state(wpid);
+                if (!eps->is_thread)
+                    emit_exit_event(wpid, wstatus);
                 pidset_remove(&g_tracked, wpid);
                 free_state(wpid);
             }
@@ -1676,6 +1697,15 @@ int main(int argc, char **argv)
         /* Signal delivery — if this is a sub-tracee, let the sub-tracer
          * decide whether to deliver the signal. */
         {
+            /* Check for our injected SIGCHLD used to break a real wait4
+             * (race-condition path).  Suppress it — don't deliver. */
+            struct proc_state *sigps = get_state(wpid);
+            if (sig == SIGCHLD && sigps->emu_race_interrupt) {
+                sigps->emu_race_interrupt = 0;
+                ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+                continue;
+            }
+
             struct emu_tracee *et = find_emu_tracee(wpid);
             if (et) {
                 et->pending_sig = sig;
