@@ -40,8 +40,13 @@ install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
-tv: tv.c uproctrace.c
-	cc -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -o tv tv.c uproctrace.c sqlite3.c -static -lm
+CFLAGS := -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0
+
+tv_sql.h: tv.sql gen_sql_h.py
+	python3 gen_sql_h.py tv.sql tv_sql.h
+
+tv: main.c engine.c engine.h tv_sql.h uproctrace.c
+	cc $(CFLAGS) -o tv main.c engine.c uproctrace.c sqlite3.c -static -lm
 
 .PHONY: all keygen sign load unload clean install test
 test: tv
