@@ -344,7 +344,24 @@ run_test "file_view: O_RDWR file" \
     'assert_contains t "$OUT" "data.bin"'
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: file detail — dependency chain
+# Test: file view — absolute paths in tree hierarchy
+# ═══════════════════════════════════════════════════════════════════════
+# Verify include/ and project/ have correct parent (not orphaned root-level)
+run_test "file_view: collapsed dirs nested under common ancestor" \
+    'assert_line_match t "$OUT" "/home/user/include|/home/user|"' \
+    'assert_line_match t "$OUT" "/home/user/project|/home/user|"'
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: file view — ungrouped shows full paths
+# ═══════════════════════════════════════════════════════════════════════
+OUT_FLAT=$(drive '{"input":"resize","rows":50,"cols":120}
+{"input":"key","key":"2"}
+{"input":"key","key":"G"}
+{"input":"print","what":"lpane"}')
+run_test "file_flat: full absolute paths shown" \
+    'assert_contains t "$OUT_FLAT" "/home/user/project/foo.c"' \
+    'assert_contains t "$OUT_FLAT" "/home/user/project/sub/deep.c"' \
+    'assert_contains t "$OUT_FLAT" "/home/user/include/foo.h"'
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"key","key":"2"}
