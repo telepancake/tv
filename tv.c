@@ -565,18 +565,234 @@ static void rebuild_procs(void){
     }
 }
 
+/* Canonicalize path: resolve . and .. components */
+static void canon_path(char *out, int outsz, const char *in){
+    char *parts[256];int np=0;
+    char tmp[4096];snprintf(tmp,sizeof tmp,"%s",in);
+    int abs=(tmp[0]=='/');
+    char*s=tmp;if(abs)s++;
+    while(*s&&np<256){
+        char*sl=strchr(s,'/');if(sl)*sl=0;
+        if(strcmp(s,"..")==0){if(np>0)np--;}
+        else if(strcmp(s,".")!=0&&*s)parts[np++]=s;
+        if(sl)s=sl+1;else break;}
+    int p=0;if(abs&&p<outsz-1)out[p++]='/';
+    for(int i=0;i<np;i++){
+        if(i>0&&p<outsz-1)out[p++]='/';
+        int l=strlen(parts[i]);if(p+l>=outsz)l=outsz-p-1;
+        memcpy(out+p,parts[i],l);p+=l;}
+    out[p]=0;}
+
 static void rebuild_files(void){
+    int gr=qint("SELECT grouped FROM state",1);
     int sk=qint("SELECT sort_key FROM state",0);
-    const char*ob;switch(sk){case 1:ob="MIN(e.ts)";break;case 2:ob="MAX(e.ts)";break;default:ob="o.path";}
-    xexecf(
-        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-        " SELECT ROW_NUMBER()OVER(ORDER BY %s)-1,o.path,NULL,"
-        "  CASE WHEN o.path IN(SELECT id FROM search_hits) THEN 'search'"
-        "       WHEN SUM(CASE WHEN o.err IS NOT NULL THEN 1 ELSE 0 END)>0 THEN 'error'"
-        "       ELSE 'normal' END,"
-        "  printf('%%s  [%%d opens, %%d procs%%s]',o.path,COUNT(*),COUNT(DISTINCT e.tgid),"
-        "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %%d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
-        " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path",ob);
+
+    if(!gr){
+        /* Flat mode: simple list with colored stats */
+        const char*ob;switch(sk){case 1:ob="MIN(e.ts)";break;case 2:ob="MAX(e.ts)";break;default:ob="o.path";}
+        xexecf(
+            "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+            " SELECT ROW_NUMBER()OVER(ORDER BY %s)-1,o.path,NULL,"
+            "  CASE WHEN o.path IN(SELECT id FROM search_hits) THEN 'search'"
+            "       WHEN SUM(CASE WHEN o.err IS NOT NULL THEN 1 ELSE 0 END)>0 THEN 'error'"
+            "       ELSE 'normal' END,"
+            "  printf('%%s  \x1b[36m[%%d opens, %%d procs%%s]\x1b[0m',"
+            "   " BNAME("o.path") ","
+            "   COUNT(*),COUNT(DISTINCT e.tgid),"
+            "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %%d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
+            " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path",ob);
+        return;
+    }
+
+    /* Tree mode: build directory hierarchy in C */
+    /* Phase 1: Collect all file paths with stats, canonicalize paths */
+    typedef struct { char path[4096]; char canon[4096]; int opens,procs,errs; } FEntry;
+    int fcap=256,fn=0;
+    FEntry *files=malloc(fcap*sizeof(FEntry));
+    if(!files)return;
+    {sqlite3_stmt*st;sqlite3_prepare_v2(db,
+        "SELECT o.path,COUNT(*),COUNT(DISTINCT e.tgid),SUM(o.err IS NOT NULL)"
+        " FROM open_events o JOIN events e ON e.id=o.eid"
+        " WHERE o.path IS NOT NULL GROUP BY o.path ORDER BY o.path",-1,&st,0);
+    while(sqlite3_step(st)==SQLITE_ROW){
+        if(fn>=fcap){fcap*=2;FEntry*t=realloc(files,fcap*sizeof(FEntry));if(!t)break;files=t;}
+        const char*p=(const char*)sqlite3_column_text(st,0);
+        snprintf(files[fn].path,sizeof files[fn].path,"%s",p?p:"");
+        canon_path(files[fn].canon,sizeof files[fn].canon,files[fn].path);
+        files[fn].opens=sqlite3_column_int(st,1);
+        files[fn].procs=sqlite3_column_int(st,2);
+        files[fn].errs=sqlite3_column_int(st,3);fn++;}
+    sqlite3_finalize(st);}
+    if(!fn){free(files);return;}
+
+    /* Phase 2: Build tree nodes (dirs + files) using canonicalized paths */
+    typedef struct { char path[4096]; char name[1024]; int parent; int is_dir;
+        int opens,procs,errs; int first_child,next_sib; } TNode;
+    int tcap=fn*4+64,tn=0;
+    TNode *nodes=malloc(tcap*sizeof(TNode));
+    if(!nodes){free(files);return;}
+
+    /* Root node (virtual) */
+    nodes[0].path[0]=0;nodes[0].name[0]=0;nodes[0].parent=-1;nodes[0].is_dir=1;
+    nodes[0].opens=nodes[0].procs=nodes[0].errs=0;
+    nodes[0].first_child=-1;nodes[0].next_sib=-1;tn=1;
+
+    for(int fi=0;fi<fn;fi++){
+        const char*p=files[fi].canon;
+        int cur=0;
+        /* Handle non-path entries (no /) */
+        if(!strchr(p,'/')){
+            if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)break;nodes=t;}
+            int ni=tn++;
+            snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",files[fi].path);
+            snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",p);
+            nodes[ni].parent=0;nodes[ni].is_dir=0;
+            nodes[ni].opens=files[fi].opens;nodes[ni].procs=files[fi].procs;nodes[ni].errs=files[fi].errs;
+            nodes[ni].first_child=-1;nodes[ni].next_sib=nodes[0].first_child;nodes[0].first_child=ni;
+            continue;
+        }
+        /* Split canonicalized path into components */
+        char tmp[4096];snprintf(tmp,sizeof tmp,"%s",p);
+        char*comp[256];int nc=0;
+        {char*s=tmp;while(*s=='/')s++;
+         while(*s&&nc<256){comp[nc]=s;char*sl=strchr(s,'/');
+             if(sl){*sl=0;s=sl+1;while(*s=='/')s++;}else s+=strlen(s);nc++;}}
+        if(!nc)continue;
+        /* Walk/create directory nodes for all but last component */
+        char built[4096]="";
+        for(int ci=0;ci<nc-1;ci++){
+            int blen=strlen(built);
+            snprintf(built+blen,sizeof(built)-blen,"/%s",comp[ci]);
+            /* Search for existing child of cur with this path */
+            int found=-1,ch=nodes[cur].first_child;
+            while(ch>=0){if(nodes[ch].is_dir&&strcmp(nodes[ch].path,built)==0){found=ch;break;}ch=nodes[ch].next_sib;}
+            if(found>=0){cur=found;continue;}
+            /* Create new dir node */
+            if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)goto done;nodes=t;}
+            int ni=tn++;
+            snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",built);
+            snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",comp[ci]);
+            nodes[ni].parent=cur;nodes[ni].is_dir=1;
+            nodes[ni].opens=0;nodes[ni].procs=0;nodes[ni].errs=0;
+            nodes[ni].first_child=-1;nodes[ni].next_sib=nodes[cur].first_child;nodes[cur].first_child=ni;
+            cur=ni;
+        }
+        /* Add file leaf under cur */
+        if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)break;nodes=t;}
+        int ni=tn++;
+        snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",files[fi].path);
+        snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",comp[nc-1]);
+        nodes[ni].parent=cur;nodes[ni].is_dir=0;
+        nodes[ni].opens=files[fi].opens;nodes[ni].procs=files[fi].procs;nodes[ni].errs=files[fi].errs;
+        nodes[ni].first_child=-1;nodes[ni].next_sib=nodes[cur].first_child;nodes[cur].first_child=ni;
+    }
+
+    /* Phase 3: Collapse single-child directory chains */
+    for(int i=1;i<tn;i++){
+        if(!nodes[i].is_dir||nodes[i].parent==-2)continue;
+        int ch=nodes[i].first_child;
+        if(ch<0||nodes[ch].next_sib>=0||!nodes[ch].is_dir)continue;
+        /* Merge child into this node */
+        char merged[1024];snprintf(merged,sizeof merged,"%s/%s",nodes[i].name,nodes[ch].name);
+        snprintf(nodes[i].name,sizeof nodes[i].name,"%s",merged);
+        snprintf(nodes[i].path,sizeof nodes[i].path,"%s",nodes[ch].path);
+        nodes[i].first_child=nodes[ch].first_child;
+        int gc=nodes[ch].first_child;while(gc>=0){nodes[gc].parent=i;gc=nodes[gc].next_sib;}
+        nodes[ch].parent=-2;
+        i--;
+    }
+
+    /* Phase 4: Aggregate stats for directories (bottom-up) */
+    for(int i=1;i<tn;i++){
+        if(nodes[i].parent==-2||nodes[i].is_dir)continue;
+        int p=nodes[i].parent;
+        while(p>=0){nodes[p].opens+=nodes[i].opens;nodes[p].procs+=nodes[i].procs;
+            nodes[p].errs+=nodes[i].errs;p=nodes[p].parent;}
+    }
+
+    /* Phase 5: Flatten tree into lpane via DFS */
+    for(int i=1;i<tn;i++){
+        if(nodes[i].parent==-2||!nodes[i].is_dir)continue;
+        sqlite3_stmt*st;sqlite3_prepare_v2(db,
+            "INSERT OR IGNORE INTO expanded(id,ex) VALUES(?,1)",-1,&st,0);
+        sqlite3_bind_text(st,1,nodes[i].path,-1,SQLITE_TRANSIENT);
+        sqlite3_step(st);sqlite3_finalize(st);
+    }
+
+    int rownum=0;
+    int *stk=malloc(tn*2*sizeof(int));
+    if(!stk)goto done;
+    int sp2=0;
+
+    /* Helper: push sorted children (dirs first, then alphabetical) */
+    #define PUSH_CHILDREN(parent_idx,d) do{ \
+        int _chs[4096];int _nc=0; \
+        {int _ch=nodes[parent_idx].first_child; \
+         while(_ch>=0&&_nc<4096){if(nodes[_ch].parent!=-2)_chs[_nc++]=_ch;_ch=nodes[_ch].next_sib;}} \
+        for(int _a=0;_a<_nc-1;_a++)for(int _b=_a+1;_b<_nc;_b++){ \
+            int _da=nodes[_chs[_a]].is_dir,_db=nodes[_chs[_b]].is_dir; \
+            if(_db>_da||(_da==_db&&strcmp(nodes[_chs[_a]].name,nodes[_chs[_b]].name)>0)) \
+                {int _t=_chs[_a];_chs[_a]=_chs[_b];_chs[_b]=_t;}} \
+        for(int _j=_nc-1;_j>=0;_j--){stk[sp2++]=_chs[_j];stk[sp2++]=(d);} \
+    }while(0)
+
+    PUSH_CHILDREN(0,0);
+
+    while(sp2>0){
+        int depth=stk[--sp2];int ni=stk[--sp2];
+        if(nodes[ni].parent==-2)continue;
+
+        int has_ch=(nodes[ni].first_child>=0&&nodes[ni].is_dir);
+        int is_ex=1;
+        if(has_ch){
+            sqlite3_stmt*st;sqlite3_prepare_v2(db,
+                "SELECT COALESCE((SELECT ex FROM expanded WHERE id=?),1)",-1,&st,0);
+            sqlite3_bind_text(st,1,nodes[ni].path,-1,SQLITE_TRANSIENT);
+            if(sqlite3_step(st)==SQLITE_ROW)is_ex=sqlite3_column_int(st,0);
+            sqlite3_finalize(st);
+        }
+
+        /* Build display text with embedded ANSI colors */
+        char text[4096];
+        const char*ind=has_ch?(is_ex?"\xe2\x96\xbc ":"\xe2\x96\xb6 "):"  ";
+        char errbuf[64]="";
+        if(nodes[ni].errs>0)snprintf(errbuf,sizeof errbuf,", %d errs",nodes[ni].errs);
+
+        if(nodes[ni].is_dir){
+            snprintf(text,sizeof text,"%*s%s\x1b[1m%s/\x1b[0m  \x1b[36m[%d opens, %d procs%s]\x1b[0m",
+                depth*2,"",ind,nodes[ni].name,
+                nodes[ni].opens,nodes[ni].procs,errbuf);
+        } else {
+            snprintf(text,sizeof text,"%*s  \x1b[32m%s\x1b[0m  \x1b[36m[%d opens, %d procs%s]\x1b[0m",
+                depth*2,"",nodes[ni].name,
+                nodes[ni].opens,nodes[ni].procs,errbuf);
+        }
+
+        int search_hit=0;
+        {sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT 1 FROM search_hits WHERE id=?",-1,&st,0);
+         sqlite3_bind_text(st,1,nodes[ni].path,-1,SQLITE_TRANSIENT);
+         if(sqlite3_step(st)==SQLITE_ROW)search_hit=1;sqlite3_finalize(st);}
+        const char*sty=search_hit?"search":(nodes[ni].errs>0?"error":"normal");
+
+        {sqlite3_stmt*st;sqlite3_prepare_v2(db,
+            "INSERT INTO lpane(rownum,id,parent_id,style,text) VALUES(?,?,?,?,?)",-1,&st,0);
+         sqlite3_bind_int(st,1,rownum);
+         sqlite3_bind_text(st,2,nodes[ni].path,-1,SQLITE_TRANSIENT);
+         const char*par=(nodes[ni].parent>0)?nodes[nodes[ni].parent].path:NULL;
+         if(par)sqlite3_bind_text(st,3,par,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(st,3);
+         sqlite3_bind_text(st,4,sty,-1,SQLITE_STATIC);
+         sqlite3_bind_text(st,5,text,-1,SQLITE_TRANSIENT);
+         sqlite3_step(st);sqlite3_finalize(st);}
+        rownum++;
+
+        if(has_ch&&is_ex) PUSH_CHILDREN(ni,depth+1);
+    }
+    #undef PUSH_CHILDREN
+    free(stk);
+
+done:
+    free(nodes);
+    free(files);
 }
 
 static void rebuild_outputs(void){
