@@ -100,6 +100,7 @@ static void register_sql_functions(sqlite3*dbi){
 static int g_own_tgid = 0;
 static int g_trace_fd = -1;
 static pid_t g_child_pid = 0;
+static FILE *g_trace_pipe = NULL; /* popen'd uproctrace subprocess */
 static char g_rbuf[1<<20];
 static int g_rbuf_len = 0;
 static int g_headless = 0;
@@ -1671,8 +1672,8 @@ int main(int argc,char**argv){
 
             /* Build command: <self_exe> --uproctrace -- cmd args... */
             size_t cmdlen=strlen(self_exe)+strlen(" --uproctrace --")+1;
-            for(char**p=cmd;*p;p++)cmdlen+=strlen(*p)+3; /* space + quotes */
-            char *popen_cmd=malloc(cmdlen+64);
+            for(char**p=cmd;*p;p++)cmdlen+=strlen(*p)*4+3; /* worst-case: every char is a quote */
+            char *popen_cmd=malloc(cmdlen);
             if(!popen_cmd)die("malloc");
             char *w=popen_cmd;
             w+=sprintf(w,"%s --uproctrace --",self_exe);
@@ -1688,8 +1689,8 @@ int main(int argc,char**argv){
             FILE *pp=popen(popen_cmd,"r");
             free(popen_cmd);
             if(!pp)die("popen uproctrace failed");
+            g_trace_pipe=pp;
             g_trace_fd=fileno(pp);
-            /* Note: g_child_pid stays 0; pclose() handles child reaping. */
         }
         xexec("UPDATE state SET lp_filter=2");
     }
@@ -1726,7 +1727,8 @@ int main(int argc,char**argv){
                     process_inbox(1);}
                 setup_fts();
                 xexec("UPDATE state SET lp_filter=0");
-                close(g_trace_fd);g_trace_fd=-1;
+                if(g_trace_pipe){pclose(g_trace_pipe);g_trace_pipe=NULL;g_trace_fd=-1;}
+                else{close(g_trace_fd);g_trace_fd=-1;}
                 rebuild_lpane();rebuild_rpane();g_need_render=1;
             } else {
                 g_rbuf_len+=n;
@@ -1757,7 +1759,8 @@ int main(int argc,char**argv){
     }
 
     tty_restore();
-    if(g_trace_fd>=0){close(g_trace_fd);g_trace_fd=-1;}
+    if(g_trace_pipe){pclose(g_trace_pipe);g_trace_pipe=NULL;g_trace_fd=-1;}
+    else if(g_trace_fd>=0){close(g_trace_fd);g_trace_fd=-1;}
     if(g_child_pid>0){kill(g_child_pid,SIGTERM);waitpid(g_child_pid,NULL,0);}
     sqlite3_close(db);
     return 0;}
