@@ -46,3 +46,6 @@ tv: tv.c
 .PHONY: all keygen sign load unload clean install test
 test: tv
 	bash tests/run_tests.sh
+
+uproctrace: uproctrace.c
+	cc -O2 -Wall -o uproctrace uproctrace.c
