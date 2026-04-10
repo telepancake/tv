@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS state(
     rows INT DEFAULT 24, cols INT DEFAULT 80,
     base_ts REAL DEFAULT 0, has_fts INT DEFAULT 0, mode INT DEFAULT 0,
     lp_filter INT DEFAULT 0, dep_filter INT DEFAULT 0,
-    dep_root TEXT DEFAULT '');
+    dep_root TEXT DEFAULT '', status TEXT DEFAULT '');
 INSERT OR IGNORE INTO state(base_ts)
     VALUES((SELECT COALESCE(MIN(ts),0) FROM events));
 CREATE TABLE IF NOT EXISTS lpane(

@@ -1,153 +1,283 @@
 /*
- * engine.h — Generic TUI engine API for a two-pane SQLite-driven viewer.
+ * engine.h — Generic two-pane TUI engine.
  *
- * The engine manages:
- *   • An in-memory SQLite database with well-known tables
- *     (lpane, rpane, state, outbox, inbox)
- *   • A terminal-based two-pane TUI (left list + right detail)
- *   • The main event loop (keyboard + optional streaming fd)
- *   • DB helper utilities (xexec, qint, etc.)
+ * ═══════════════════════════════════════════════════════════════════
+ *  OVERVIEW
+ * ═══════════════════════════════════════════════════════════════════
  *
- * All application-specific logic is provided via callbacks.
- * The engine has no knowledge of processes, traces, or files —
- * it only renders what the app puts into lpane/rpane.
+ * This engine renders a two-pane terminal UI: a scrollable left list
+ * and a scrollable right detail pane, plus a bottom status bar.  It
+ * knows nothing about what is being displayed — processes, files,
+ * htop rows, Norton Commander panels, Lotus 123 cells, whatever.
+ *
+ * The application is responsible for:
+ *   • Managing the SQLite database (opening, schema, populating data)
+ *   • The event loop (poll/select/kqueue, reading fds, timers)
+ *   • Populating the display tables (lpane, rpane) before each render
+ *   • Handling keypresses (engine reads keys; app decides what they mean)
+ *
+ * The engine provides:
+ *   • Terminal management (raw mode, alternate screen, cleanup)
+ *   • Key reading from the terminal fd
+ *   • Rendering the two-pane layout from display tables in a DB
+ *   • A line editor for interactive prompts
+ *   • Help screen display
+ *   • Screen-buffer utilities
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  DISPLAY TABLES  (the contract between app and engine)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * The engine reads from these tables in the sqlite3* you give it.
+ * The app must CREATE them and keep them populated.  The engine never
+ * writes to them except where noted below.
+ *
+ *   lpane — left pane content
+ *   ─────────────────────────────────────────────────────────────────
+ *   rownum  INTEGER PRIMARY KEY   — 0-based sequential row index
+ *   id      TEXT NOT NULL         — app-defined row identifier
+ *   style   TEXT DEFAULT 'normal' — rendering style (see STYLES)
+ *   text    TEXT NOT NULL         — display text (may contain ANSI)
+ *
+ *   rpane — right pane content
+ *   ─────────────────────────────────────────────────────────────────
+ *   rownum  INTEGER PRIMARY KEY   — 0-based sequential row index
+ *   style   TEXT DEFAULT 'normal' — rendering style (see STYLES)
+ *   text    TEXT NOT NULL         — display text (may contain ANSI)
+ *
+ *   state — UI navigation state
+ *   ─────────────────────────────────────────────────────────────────
+ *   cursor   INT  — lpane cursor position (0-based rownum)
+ *   scroll   INT  — lpane scroll offset
+ *   focus    INT  — 0 = left pane focused, 1 = right pane focused
+ *   dcursor  INT  — rpane cursor position
+ *   dscroll  INT  — rpane scroll offset
+ *   rows     INT  — terminal height (engine writes on resize)
+ *   cols     INT  — terminal width  (engine writes on resize)
+ *   status   TEXT — text for the status bar (app-provided)
+ *
+ *   The engine WRITES to state: rows, cols (on tui_resize).
+ *   The engine READS: cursor, scroll, focus, dcursor, dscroll, rows,
+ *                     cols, status.
+ *   The app is responsible for all other writes to state (updating
+ *   cursor, scroll, focus, etc. in response to keys).
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  STYLES
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ *   The style column maps to ANSI colors:
+ *     "normal"    — default terminal color
+ *     "error"     — red
+ *     "green"     — green
+ *     "yellow"    — yellow
+ *     "cyan"      — cyan
+ *     "cyan_bold" — bold cyan
+ *     "heading"   — bold yellow
+ *     "search"    — bold magenta
+ *     "dim"       — dim
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  TYPICAL USAGE
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ *   sqlite3 *db = ...;          // app opens & populates DB
+ *   tui_t *tui = tui_open(db);  // engine opens terminal
+ *
+ *   // app event loop:
+ *   for (;;) {
+ *       rebuild_lpane(db);       // app populates lpane
+ *       rebuild_rpane(db);       // app populates rpane
+ *       tui_render(tui);         // engine draws from tables
+ *
+ *       // app does select/poll on tui_fd(tui) + its own fds
+ *       int k = tui_read_key(tui);
+ *       if (k == 'q') break;
+ *       handle_key(db, k);       // app updates state/tables
+ *   }
+ *
+ *   tui_close(tui);
  */
 #ifndef ENGINE_H
 #define ENGINE_H
 
 #include "sqlite3.h"
-#include <stdio.h>
-#include <sys/types.h>
 
 /* ── Key constants ─────────────────────────────────────────────────── */
 enum {
-    K_NONE  = -1,
-    K_UP    = 256, K_DOWN, K_LEFT, K_RIGHT,
-    K_PGUP, K_PGDN, K_HOME, K_END,
-    K_TAB   = 9,
-    K_ENTER = 13,
-    K_ESC   = 27,
-    K_BS    = 127
+    TUI_K_NONE  = -1,
+    TUI_K_UP    = 256, TUI_K_DOWN, TUI_K_LEFT, TUI_K_RIGHT,
+    TUI_K_PGUP, TUI_K_PGDN, TUI_K_HOME, TUI_K_END,
+    TUI_K_TAB   = 9,
+    TUI_K_ENTER = 13,
+    TUI_K_ESC   = 27,
+    TUI_K_BS    = 127
 };
 
-/* ── Opaque engine handle ──────────────────────────────────────────── */
-typedef struct tv_engine tv_engine;
+/* ── Opaque TUI handle ─────────────────────────────────────────────── */
+typedef struct tui tui_t;
 
-/* ── SQL custom function registration ──────────────────────────────── */
-typedef struct {
-    const char *name;
-    int         nargs;
-    void      (*xFunc)(sqlite3_context*, int, sqlite3_value**);
-} tv_sql_func;
+/* ═══════════════════════════════════════════════════════════════════
+ *  LIFECYCLE
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── Application callbacks ─────────────────────────────────────────── */
-typedef struct {
-    void *app_data;
+/*
+ * tui_open — initialise terminal for TUI rendering.
+ *
+ * Opens /dev/tty, enters raw mode / alternate screen, registers
+ * atexit cleanup, and writes initial rows/cols into state table.
+ *
+ * db:  The app's SQLite database.  Must already contain the state
+ *      table with rows and cols columns.  Engine will UPDATE them.
+ *
+ * Returns an opaque handle, or NULL on failure.
+ */
+tui_t *tui_open(sqlite3 *db);
 
-    /* Called for every keypress.  Return non-zero to quit. */
-    int  (*on_key)(tv_engine *eng, void *app_data, int key);
+/*
+ * tui_close — restore terminal and free resources.
+ *
+ * Restores the original terminal state (cooked mode, main screen,
+ * visible cursor).  Safe to call with NULL.
+ */
+void tui_close(tui_t *tui);
 
-    /* Called when outbox.rl is set — repopulate lpane table. */
-    void (*rebuild_lpane)(tv_engine *eng, void *app_data);
+/* ═══════════════════════════════════════════════════════════════════
+ *  TERMINAL QUERIES
+ * ═══════════════════════════════════════════════════════════════════ */
 
-    /* Called when outbox.rr is set — repopulate rpane table. */
-    void (*rebuild_rpane)(tv_engine *eng, void *app_data);
+/*
+ * tui_fd — return the file descriptor for the terminal.
+ *
+ * The app should include this fd in its poll/select set to know when
+ * keyboard input is available.  Returns -1 if tui is NULL.
+ */
+int tui_fd(tui_t *tui);
 
-    /* Called for each JSONL trace line from the streaming fd. */
-    void (*on_trace_line)(tv_engine *eng, void *app_data, const char *line);
+/* ═══════════════════════════════════════════════════════════════════
+ *  INPUT
+ * ═══════════════════════════════════════════════════════════════════ */
 
-    /* Called for each input event from the inbox. */
-    void (*on_input)(tv_engine *eng, void *app_data, const char *data);
+/*
+ * tui_read_key — read one keypress from the terminal.
+ *
+ * Non-blocking if no data is available (returns TUI_K_NONE).
+ * Decodes ANSI escape sequences into TUI_K_* constants.
+ * Single printable bytes are returned as-is (e.g. 'q', '/').
+ */
+int tui_read_key(tui_t *tui);
 
-    /* Called when the trace stream ends (e.g. to build FTS). */
-    void (*on_stream_end)(tv_engine *eng, void *app_data);
-} tv_callbacks;
+/* ═══════════════════════════════════════════════════════════════════
+ *  RENDERING
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── Lifecycle ─────────────────────────────────────────────────────── */
+/*
+ * tui_render — draw the two-pane layout to the terminal.
+ *
+ * Reads from lpane, rpane, and state tables in the DB.
+ *
+ * Layout:
+ *   rows 1..rows-1  — content area
+ *   row  rows       — status bar (from state.status)
+ *
+ * Left pane occupies cols/2 columns; right pane gets the rest.
+ * If the right pane would be < 20 columns, it is hidden and the
+ * left pane uses the full width.
+ *
+ * Cursor highlight: the row at state.cursor gets inverse video.
+ * If state.focus=0, the cursor is bold+inverse; if focus=1, just
+ * inverse.  Similarly for rpane with state.dcursor.
+ *
+ * The engine adjusts scroll/dscroll to keep cursors visible, and
+ * writes the adjusted values back to state.
+ */
+void tui_render(tui_t *tui);
 
-/* Create an engine with an in-memory SQLite DB.
- * Registers the given SQL custom functions.
- * Does NOT execute any schema — call tv_xexec() afterwards. */
-tv_engine *tv_engine_new(const tv_callbacks *cb,
-                         const tv_sql_func  *funcs, int nfuncs);
+/* ═══════════════════════════════════════════════════════════════════
+ *  RESIZE
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* Destroy engine, close DB, free resources. */
-void tv_engine_destroy(tv_engine *eng);
+/*
+ * tui_check_resize — query actual terminal size and update state.
+ *
+ * Call this after SIGWINCH or at the top of each loop iteration.
+ * Returns 1 if the size changed, 0 otherwise.
+ * Updates state.rows and state.cols if changed.
+ */
+int tui_check_resize(tui_t *tui);
 
-/* ── Database access ───────────────────────────────────────────────── */
-sqlite3    *tv_db(tv_engine *eng);
+/* ═══════════════════════════════════════════════════════════════════
+ *  LINE EDITOR
+ * ═══════════════════════════════════════════════════════════════════ */
 
-void        tv_xexec (tv_engine *eng, const char *sql);
-void        tv_xexecf(tv_engine *eng, const char *fmt, ...);
-int         tv_qint  (tv_engine *eng, const char *sql, int def);
-int         tv_qintf (tv_engine *eng, int def, const char *fmt, ...);
-double      tv_qdbl  (tv_engine *eng, const char *sql, double def);
+/*
+ * tui_line_edit — interactive single-line text editor.
+ *
+ * Draws a prompt on the bottom row, lets the user type, and returns
+ * when Enter or Esc is pressed.
+ *
+ * prompt: displayed before the text (e.g. "/", "SQL> ")
+ * buf:    in/out buffer; pre-populated text is shown initially
+ * bsz:   size of buf in bytes
+ *
+ * Returns 1 on Enter (accept), 0 on Esc (cancel).
+ * buf is updated in-place with the edited text.
+ */
+int tui_line_edit(tui_t *tui, const char *prompt, char *buf, int bsz);
 
-/* ── Pane dirty flags ──────────────────────────────────────────────── */
-void tv_dirty_lp  (tv_engine *eng);   /* mark left pane for rebuild  */
-void tv_dirty_rp  (tv_engine *eng);   /* mark right pane for rebuild */
-void tv_dirty_both(tv_engine *eng);   /* mark both panes             */
-void tv_sync_panes(tv_engine *eng);   /* check outbox, call rebuild  */
+/* ═══════════════════════════════════════════════════════════════════
+ *  HELP SCREEN
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── Database loading ──────────────────────────────────────────────── */
+/*
+ * tui_show_help — display a full-screen help overlay.
+ *
+ * lines: NULL-terminated array of strings, one per line.
+ * Clears the screen, shows the lines in cyan, then blocks until
+ * any key is pressed.
+ */
+void tui_show_help(tui_t *tui, const char **lines);
 
-/* Load a saved DB file into the in-memory DB (sqlite3_backup). */
-void tv_load_db(tv_engine *eng, const char *path);
+/* ═══════════════════════════════════════════════════════════════════
+ *  SQL PROMPT
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* Save the in-memory DB to a file. */
-void tv_save_to_file(tv_engine *eng, const char *path);
+/*
+ * tui_sql_prompt — interactive SQL query and result display.
+ *
+ * Prompts the user for a SQL statement, executes it against the DB,
+ * and shows the results in a table.  Blocks until any key is pressed
+ * after showing results.
+ */
+void tui_sql_prompt(tui_t *tui);
 
-/* ── Ingest ────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════
+ *  HEADLESS OUTPUT
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* Insert a JSONL line into the inbox table. */
-void tv_ingest_line(tv_engine *eng, const char *line);
+/*
+ * tui_dump_table — print contents of a display table to stdout.
+ *
+ * table: one of "lpane", "rpane", "state".
+ *
+ * Prints a section header ("=== LPANE ==="), one row per line with
+ * pipe-delimited fields, then a footer ("=== END LPANE ===").
+ * For "state", prints key=value pairs on one line.
+ *
+ * This does not require the terminal to be open; it works headless.
+ */
+void tui_dump_table(sqlite3 *db, const char *table);
 
-/* Ingest an entire file line-by-line into inbox. */
-void tv_ingest_file(tv_engine *eng, const char *path);
+/* ═══════════════════════════════════════════════════════════════════
+ *  SIGWINCH SUPPORT
+ * ═══════════════════════════════════════════════════════════════════ */
 
-/* Drain inbox: process trace events (calls on_trace_line),
- * then (if !trace_only) process input events (calls on_input). */
-void tv_process_inbox(tv_engine *eng, int trace_only);
-
-/* ── TUI utilities (for use by callbacks) ──────────────────────────── */
-
-/* Interactive line editor.  Returns 1 on Enter, 0 on Esc. */
-int  tv_line_edit(tv_engine *eng, const char *prompt, char *buf, int bsz);
-
-/* Display a help screen (NULL-terminated array of lines). */
-void tv_show_help(tv_engine *eng, const char **lines);
-
-/* Interactive SQL query tool. */
-void tv_run_sql(tv_engine *eng);
-
-/* Save DB via interactive filename prompt. */
-void tv_save_db(tv_engine *eng);
-
-/* ── Headless output ───────────────────────────────────────────────── */
-void tv_dump_lpane(tv_engine *eng);
-void tv_dump_rpane(tv_engine *eng);
-void tv_dump_state(tv_engine *eng);
-
-/* ── Main loop ─────────────────────────────────────────────────────── */
-
-/* Run the TUI main loop.
- * trace_fd:    fd to read streaming JSONL from (-1 if none)
- * trace_pipe:  popen'd FILE* owning trace_fd (NULL if not popen'd)
- * child_pid:   child process to reap (0 if none)
- * headless:    if true, skip TUI entirely (just process inbox)
- * Returns 0. */
-int tv_engine_run(tv_engine *eng,
-                  int trace_fd, FILE *trace_pipe, pid_t child_pid,
-                  int headless);
-
-/* ── State accessors ───────────────────────────────────────────────── */
-void tv_set_headless (tv_engine *eng, int h);
-int  tv_is_headless  (tv_engine *eng);
-void tv_set_own_tgid (tv_engine *eng, int tgid);
-int  tv_own_tgid     (tv_engine *eng);
-
-/* ── Render (exposed so callbacks can force a re-render) ───────────── */
-void tv_render(tv_engine *eng);
-void tv_need_render(tv_engine *eng);
+/*
+ * tui_sigwinch_handler — signal handler for SIGWINCH.
+ *
+ * Install this with sigaction(SIGWINCH, ...) if you want automatic
+ * resize detection via tui_check_resize().
+ */
+void tui_sigwinch_handler(int sig);
 
 #endif /* ENGINE_H */
