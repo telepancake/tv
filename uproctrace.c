@@ -288,6 +288,18 @@ static ssize_t read_proc_mem(pid_t pid, unsigned long addr, void *buf, size_t le
     return n;
 }
 
+/* Write to a process's memory at a given address. */
+static ssize_t write_proc_mem(pid_t pid, unsigned long addr, const void *buf, size_t len)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "/proc/%d/mem", (int)pid);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t n = pwrite(fd, buf, len, (off_t)addr);
+    close(fd);
+    return n;
+}
+
 /* Read /proc/PID/auxv and extract interesting entries */
 static int format_auxv_json(pid_t pid, char *buf, int buflen)
 {
@@ -422,7 +434,13 @@ struct proc_state {
     int   in_syscall;     /* 1 if we're at syscall entry, 0 at exit */
     long  saved_syscall;  /* syscall number at entry */
     /* saved args for specific syscalls */
-    unsigned long arg0, arg1, arg2;
+    unsigned long arg0, arg1, arg2, arg3;
+    /* ptrace emulation */
+    int   emu_neutralized; /* 1 if syscall was replaced with -1 for emulation */
+    int   emu_waiting;     /* 1 if blocked in emulated wait4 */
+    unsigned long emu_wait_wstatus_addr; /* wstatus pointer for emulated wait */
+    long  emu_wait_pid;    /* pid arg for emulated wait */
+    long  emu_wait_options;/* options arg for emulated wait */
     struct proc_state *next;
 };
 
@@ -758,7 +776,7 @@ static int fd1_is_creator_stdout(pid_t pid)
 #if defined(__x86_64__)
 static int get_syscall_info(pid_t pid, long *nr,
     unsigned long *a0, unsigned long *a1, unsigned long *a2,
-    long *ret)
+    unsigned long *a3, long *ret)
 {
     struct user_regs_struct regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
@@ -768,9 +786,31 @@ static int get_syscall_info(pid_t pid, long *nr,
     *a0  = regs.rdi;
     *a1  = regs.rsi;
     *a2  = regs.rdx;
+    *a3  = regs.r10;
     *ret = regs.rax;
     return 0;
 }
+
+static int set_syscall_nr(pid_t pid, long nr)
+{
+    struct user_regs_struct regs;
+    struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+        return -1;
+    regs.orig_rax = nr;
+    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+}
+
+static int set_syscall_ret(pid_t pid, long ret)
+{
+    struct user_regs_struct regs;
+    struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+        return -1;
+    regs.rax = ret;
+    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+}
+
 #elif defined(__aarch64__)
 struct aarch64_user_regs {
     uint64_t regs[31];
@@ -780,7 +820,7 @@ struct aarch64_user_regs {
 };
 static int get_syscall_info(pid_t pid, long *nr,
     unsigned long *a0, unsigned long *a1, unsigned long *a2,
-    long *ret)
+    unsigned long *a3, long *ret)
 {
     struct aarch64_user_regs regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
@@ -791,40 +831,534 @@ static int get_syscall_info(pid_t pid, long *nr,
     *a0  = regs.regs[0];
     *a1  = regs.regs[1];
     *a2  = regs.regs[2];
+    *a3  = regs.regs[3];
     *ret = regs.regs[0];
     return 0;
 }
+
+static int set_syscall_nr(pid_t pid, long nr)
+{
+    struct aarch64_user_regs regs;
+    struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+        return -1;
+    regs.regs[8] = nr;
+    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+}
+
+static int set_syscall_ret(pid_t pid, long ret)
+{
+    struct aarch64_user_regs regs;
+    struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+        return -1;
+    regs.regs[0] = ret;
+    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+}
+
 #else
 /* Fallback — will compile but may not work on other arches */
 static int get_syscall_info(pid_t pid, long *nr,
     unsigned long *a0, unsigned long *a1, unsigned long *a2,
-    long *ret)
+    unsigned long *a3, long *ret)
 {
-    *nr = *a0 = *a1 = *a2 = 0;
+    *nr = *a0 = *a1 = *a2 = *a3 = 0;
     *ret = 0;
     return -1;
 }
+static int set_syscall_nr(pid_t pid, long nr)
+{
+    (void)pid; (void)nr; return -1;
+}
+static int set_syscall_ret(pid_t pid, long ret)
+{
+    (void)pid; (void)ret; return -1;
+}
 #endif
+
+/* ================================================================
+ * Ptrace emulation — data structures
+ * ================================================================
+ *
+ * When a tracee calls ptrace() (e.g. fakeroot-ng, nested uproctrace),
+ * we intercept the syscall, neutralise it (replace with -1 → ENOSYS),
+ * and emulate the operation ourselves.  This allows multiple layers
+ * of ptrace-based tools to run under a single real tracer.
+ */
+
+struct emu_tracee {
+    pid_t pid;            /* the sub-tracee */
+    pid_t tracer_pid;     /* the sub-tracer that thinks it owns this tracee */
+    long  options;        /* PTRACE_O_xxx set by the sub-tracer */
+    int   syscall_stop;   /* 1 = sub-tracer wants syscall-stops (PTRACE_SYSCALL) */
+    int   stopped;        /* 1 = sub-tracee held, awaiting sub-tracer resume */
+    int   stop_reported;  /* 1 = stop was delivered to sub-tracer via wait */
+    int   wstatus;        /* synthetic wait-status for sub-tracer */
+    long  event_msg;      /* GETEVENTMSG value (new child pid, etc.) */
+    int   pending_sig;    /* signal to deliver when sub-tracer resumes */
+    struct emu_tracee *next;
+};
+
+static struct emu_tracee *g_emu_tracees = NULL;
+
+static struct emu_tracee *find_emu_tracee(pid_t pid)
+{
+    for (struct emu_tracee *t = g_emu_tracees; t; t = t->next)
+        if (t->pid == pid) return t;
+    return NULL;
+}
+
+static struct emu_tracee *find_emu_tracee_for(pid_t tracer, pid_t tracee)
+{
+    for (struct emu_tracee *t = g_emu_tracees; t; t = t->next)
+        if (t->tracer_pid == tracer && t->pid == tracee) return t;
+    return NULL;
+}
+
+static int is_emu_tracer(pid_t pid)
+{
+    for (struct emu_tracee *t = g_emu_tracees; t; t = t->next)
+        if (t->tracer_pid == pid) return 1;
+    return 0;
+}
+
+static struct emu_tracee *add_emu_tracee(pid_t tracee_pid, pid_t tracer_pid)
+{
+    struct emu_tracee *t = find_emu_tracee(tracee_pid);
+    if (t) { t->tracer_pid = tracer_pid; return t; }
+    t = calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->pid = tracee_pid;
+    t->tracer_pid = tracer_pid;
+    t->next = g_emu_tracees;
+    g_emu_tracees = t;
+    return t;
+}
+
+static void remove_emu_tracee(pid_t pid)
+{
+    struct emu_tracee **pp = &g_emu_tracees;
+    while (*pp) {
+        if ((*pp)->pid == pid) {
+            struct emu_tracee *tmp = *pp;
+            *pp = tmp->next;
+            free(tmp);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+/* Remove all sub-tracees belonging to a given sub-tracer. */
+static void remove_emu_tracees_for(pid_t tracer_pid)
+{
+    struct emu_tracee **pp = &g_emu_tracees;
+    while (*pp) {
+        if ((*pp)->tracer_pid == tracer_pid) {
+            struct emu_tracee *tmp = *pp;
+            *pp = tmp->next;
+            free(tmp);
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+}
+
+/* Find any un-reported stopped sub-tracee for a given sub-tracer. */
+static struct emu_tracee *find_stopped_for(pid_t tracer, long wait_pid)
+{
+    for (struct emu_tracee *t = g_emu_tracees; t; t = t->next) {
+        if (t->tracer_pid != tracer) continue;
+        if (!t->stopped || t->stop_reported) continue;
+        if (wait_pid == -1 || wait_pid == t->pid ||
+            (wait_pid == 0 /* any in same pgid – approximate */))
+            return t;
+    }
+    return NULL;
+}
+
+/* ================================================================
+ * Ptrace emulation — deliver stop to a waiting sub-tracer
+ * ================================================================ */
+
+static void try_deliver_to_tracer(pid_t tracer_pid)
+{
+    struct proc_state *tps = get_state(tracer_pid);
+    if (!tps->emu_waiting) {
+        /* Race-condition path: the sub-tracer entered wait4 before
+         * any sub-tracee existed, so the syscall was NOT neutralised.
+         * If it is still blocked in the kernel we must interrupt it,
+         * so that it returns a syscall-exit-stop we can hijack. */
+#ifdef SYS_wait4
+        if (tps->in_syscall && !tps->emu_neutralized &&
+            tps->saved_syscall == SYS_wait4) {
+            ptrace(PTRACE_INTERRUPT, tracer_pid, NULL, NULL);
+        }
+#endif
+        return;
+    }
+
+    struct emu_tracee *et = find_stopped_for(tracer_pid, tps->emu_wait_pid);
+    if (!et) return;
+
+    /* Write wstatus to the sub-tracer's address space */
+    if (tps->emu_wait_wstatus_addr) {
+        int wst = et->wstatus;
+        write_proc_mem(tracer_pid, tps->emu_wait_wstatus_addr, &wst, sizeof(wst));
+    }
+
+    /* Set the return value to the stopped sub-tracee's pid */
+    set_syscall_ret(tracer_pid, et->pid);
+
+    et->stop_reported = 1;
+    tps->emu_waiting = 0;
+
+    /* Resume the sub-tracer */
+    ptrace(PTRACE_SYSCALL, tracer_pid, NULL, 0);
+}
+
+/* ================================================================
+ * Ptrace emulation — handle emulated ptrace() syscall
+ * ================================================================
+ *
+ * Called at syscall-exit after we neutralised a SYS_ptrace.
+ * Returns the value to place in the return register.
+ */
+
+static long emu_handle_ptrace(pid_t caller, unsigned long request,
+                              unsigned long pid_arg, unsigned long addr,
+                              unsigned long data)
+{
+    pid_t target = (pid_t)pid_arg;
+
+    switch (request) {
+
+    /* ---- PTRACE_TRACEME ---- */
+    case PTRACE_TRACEME: {
+        pid_t ppid = get_ppid(caller);
+        if (ppid <= 0) return -ESRCH;
+        add_emu_tracee(caller, ppid);
+        return 0;
+    }
+
+    /* ---- PTRACE_SETOPTIONS ---- */
+    case PTRACE_SETOPTIONS: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et) return -ESRCH;
+        et->options = (long)data;
+        return 0;
+    }
+
+    /* ---- PTRACE_SYSCALL / PTRACE_CONT ---- */
+    case PTRACE_SYSCALL:
+    case PTRACE_CONT: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et) return -ESRCH;
+        et->syscall_stop = (request == PTRACE_SYSCALL) ? 1 : 0;
+        int sig = (int)data;  /* signal to deliver */
+        et->stopped = 0;
+        et->stop_reported = 0;
+        /* Actually resume the sub-tracee (we always use PTRACE_SYSCALL
+         * for our own tracing; the syscall_stop flag controls whether
+         * we also report stops to the sub-tracer). */
+        ptrace(PTRACE_SYSCALL, target, NULL, (void *)(long)sig);
+        return 0;
+    }
+
+    /* ---- PTRACE_DETACH ---- */
+    case PTRACE_DETACH: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et) return -ESRCH;
+        int sig = (int)data;
+        et->stopped = 0;
+        et->stop_reported = 0;
+        remove_emu_tracee(target);
+        /* Resume normally */
+        ptrace(PTRACE_SYSCALL, target, NULL, (void *)(long)sig);
+        return 0;
+    }
+
+    /* ---- PTRACE_GETEVENTMSG ---- */
+    case PTRACE_GETEVENTMSG: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et) return -ESRCH;
+        unsigned long msg = (unsigned long)et->event_msg;
+        if (data)
+            write_proc_mem(caller, data, &msg, sizeof(msg));
+        return 0;
+    }
+
+    /* ---- PTRACE_GETREGS ---- */
+    case PTRACE_GETREGS: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et || !et->stopped) return -ESRCH;
+#if defined(__x86_64__)
+        struct user_regs_struct regs;
+        struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+        if (ptrace(PTRACE_GETREGSET, target, NT_PRSTATUS, &iov) < 0)
+            return -EIO;
+        if (data)
+            write_proc_mem(caller, data, &regs, sizeof(regs));
+#else
+        /* On non-x86_64, GETREGS may not be available; fall back. */
+        return -EIO;
+#endif
+        return 0;
+    }
+
+    /* ---- PTRACE_SETREGS ---- */
+    case PTRACE_SETREGS: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et || !et->stopped) return -ESRCH;
+#if defined(__x86_64__)
+        struct user_regs_struct regs;
+        if (!data) return -EIO;
+        if (read_proc_mem(caller, data, &regs, sizeof(regs)) < (ssize_t)sizeof(regs))
+            return -EIO;
+        struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+        if (ptrace(PTRACE_SETREGSET, target, NT_PRSTATUS, &iov) < 0)
+            return -EIO;
+#else
+        return -EIO;
+#endif
+        return 0;
+    }
+
+    /* ---- PTRACE_GETREGSET ---- */
+    case PTRACE_GETREGSET: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et || !et->stopped) return -ESRCH;
+        if (!data) return -EIO;
+        /* Read the iovec from the caller's address space */
+        struct iovec caller_iov;
+        if (read_proc_mem(caller, data, &caller_iov, sizeof(caller_iov))
+                < (ssize_t)sizeof(caller_iov))
+            return -EIO;
+        /* Allocate a local buffer, do the real ptrace, write back */
+        size_t bufsz = caller_iov.iov_len;
+        if (bufsz > 4096) bufsz = 4096;
+        void *buf = malloc(bufsz);
+        if (!buf) return -ENOMEM;
+        struct iovec local_iov = { .iov_base = buf, .iov_len = bufsz };
+        if (ptrace(PTRACE_GETREGSET, target, addr, &local_iov) < 0) {
+            free(buf);
+            return -EIO;
+        }
+        write_proc_mem(caller, (unsigned long)caller_iov.iov_base, buf, local_iov.iov_len);
+        /* Update iov_len in caller's iov to reflect actual size */
+        caller_iov.iov_len = local_iov.iov_len;
+        write_proc_mem(caller, data, &caller_iov, sizeof(caller_iov));
+        free(buf);
+        return 0;
+    }
+
+    /* ---- PTRACE_SETREGSET ---- */
+    case PTRACE_SETREGSET: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et || !et->stopped) return -ESRCH;
+        if (!data) return -EIO;
+        struct iovec caller_iov;
+        if (read_proc_mem(caller, data, &caller_iov, sizeof(caller_iov))
+                < (ssize_t)sizeof(caller_iov))
+            return -EIO;
+        size_t bufsz = caller_iov.iov_len;
+        if (bufsz > 4096) bufsz = 4096;
+        void *buf = malloc(bufsz);
+        if (!buf) return -ENOMEM;
+        if (read_proc_mem(caller, (unsigned long)caller_iov.iov_base, buf, bufsz)
+                < (ssize_t)bufsz) {
+            free(buf);
+            return -EIO;
+        }
+        struct iovec local_iov = { .iov_base = buf, .iov_len = bufsz };
+        int rc = ptrace(PTRACE_SETREGSET, target, addr, &local_iov) < 0 ? -EIO : 0;
+        free(buf);
+        return rc;
+    }
+
+    /* ---- PTRACE_PEEKDATA / PTRACE_PEEKTEXT ---- */
+    case PTRACE_PEEKDATA:
+    case PTRACE_PEEKTEXT: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et) return -ESRCH;
+        errno = 0;
+        long val = ptrace(PTRACE_PEEKDATA, target, (void *)addr, NULL);
+        if (errno) return -errno;
+        return val;
+    }
+
+    /* ---- PTRACE_POKEDATA / PTRACE_POKETEXT ---- */
+    case PTRACE_POKEDATA:
+    case PTRACE_POKETEXT: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et) return -ESRCH;
+        if (ptrace(PTRACE_POKEDATA, target, (void *)addr, (void *)data) < 0)
+            return -errno;
+        return 0;
+    }
+
+    /* ---- PTRACE_ATTACH ---- */
+    case PTRACE_ATTACH: {
+        /* Only allow attaching to processes we're already tracing */
+        if (!pidset_contains(&g_tracked, target)) return -EPERM;
+        add_emu_tracee(target, caller);
+        /* The target will receive a SIGSTOP; we'll queue it. */
+        kill(target, SIGSTOP);
+        return 0;
+    }
+
+    /* ---- PTRACE_KILL ---- */
+#ifdef PTRACE_KILL
+    case PTRACE_KILL: {
+        struct emu_tracee *et = find_emu_tracee_for(caller, target);
+        if (!et) return -ESRCH;
+        kill(target, SIGKILL);
+        remove_emu_tracee(target);
+        return 0;
+    }
+#endif
+
+    default:
+        /* Unsupported request — return EINVAL so the caller can cope */
+        return -EINVAL;
+    }
+}
+
+/* ================================================================
+ * Ptrace emulation — handle emulated wait4() syscall
+ * ================================================================
+ *
+ * Called at syscall-exit for a sub-tracer whose wait4 was neutralised.
+ * Returns 1 if the caller should be held (not resumed) until a
+ * sub-tracee stop becomes available, 0 otherwise.
+ */
+
+static int emu_handle_wait4(pid_t caller, struct proc_state *ps)
+{
+    long wpid_arg = (long)(int)ps->arg0; /* sign-extend pid_t */
+    unsigned long wstatus_addr = ps->arg1;
+    int options = (int)ps->arg2;
+
+    /* Check for an already-stopped sub-tracee */
+    struct emu_tracee *et = find_stopped_for(caller, wpid_arg);
+    if (et) {
+        if (wstatus_addr) {
+            int wst = et->wstatus;
+            write_proc_mem(caller, wstatus_addr, &wst, sizeof(wst));
+        }
+        set_syscall_ret(caller, et->pid);
+        et->stop_reported = 1;
+        return 0; /* resume caller */
+    }
+
+    if (options & WNOHANG) {
+        set_syscall_ret(caller, 0);
+        return 0;
+    }
+
+    /* No pending stop and blocking — hold the sub-tracer */
+    ps->emu_waiting = 1;
+    ps->emu_wait_wstatus_addr = wstatus_addr;
+    ps->emu_wait_pid = wpid_arg;
+    ps->emu_wait_options = options;
+    return 1; /* hold caller */
+}
+
+/* ================================================================
+ * Ptrace emulation — queue a stop for a sub-tracee
+ * ================================================================
+ *
+ * Call this when a sub-tracee hits a stop that should be visible
+ * to its sub-tracer (syscall stop, signal stop, ptrace event).
+ */
+
+static void emu_queue_stop(struct emu_tracee *et, int wstatus)
+{
+    et->stopped = 1;
+    et->stop_reported = 0;
+    et->wstatus = wstatus;
+    try_deliver_to_tracer(et->tracer_pid);
+}
 
 static void handle_syscall_entry(pid_t pid, struct proc_state *ps)
 {
     long nr, ret;
-    unsigned long a0, a1, a2;
-    if (get_syscall_info(pid, &nr, &a0, &a1, &a2, &ret) < 0)
+    unsigned long a0, a1, a2, a3;
+    if (get_syscall_info(pid, &nr, &a0, &a1, &a2, &a3, &ret) < 0)
         return;
 
     ps->saved_syscall = nr;
     ps->arg0 = a0;
     ps->arg1 = a1;
     ps->arg2 = a2;
+    ps->arg3 = a3;
+    ps->emu_neutralized = 0;
+
+    /* ---- Intercept ptrace() syscall ---- */
+    if (nr == SYS_ptrace) {
+        set_syscall_nr(pid, -1);   /* neutralise → kernel returns -ENOSYS */
+        ps->emu_neutralized = 1;
+        return;
+    }
+
+    /* ---- Intercept wait4() from sub-tracers ---- */
+#ifdef SYS_wait4
+    if (nr == SYS_wait4 && is_emu_tracer(pid)) {
+        set_syscall_nr(pid, -1);
+        ps->emu_neutralized = 1;
+        return;
+    }
+#endif
+#ifdef SYS_waitid
+    if (nr == SYS_waitid && is_emu_tracer(pid)) {
+        set_syscall_nr(pid, -1);
+        ps->emu_neutralized = 1;
+        return;
+    }
+#endif
 }
 
-static void handle_syscall_exit(pid_t pid, struct proc_state *ps)
+/*
+ * handle_syscall_exit — returns 1 if the pid should be held (not resumed).
+ */
+static int handle_syscall_exit(pid_t pid, struct proc_state *ps)
 {
     long nr, ret_unused;
-    unsigned long a0_unused, a1_unused, a2_unused;
-    if (get_syscall_info(pid, &nr, &a0_unused, &a1_unused, &a2_unused, &ret_unused) < 0)
-        return;
+    unsigned long a0_unused, a1_unused, a2_unused, a3_unused;
+    if (get_syscall_info(pid, &nr, &a0_unused, &a1_unused, &a2_unused, &a3_unused, &ret_unused) < 0)
+        return 0;
+
+    /* ---- Handle emulated (neutralised) syscalls ---- */
+    if (ps->emu_neutralized) {
+        if (ps->saved_syscall == SYS_ptrace) {
+            long result = emu_handle_ptrace(pid, ps->arg0, ps->arg1,
+                                            ps->arg2, ps->arg3);
+            set_syscall_ret(pid, result);
+            return 0;
+        }
+#ifdef SYS_wait4
+        if (ps->saved_syscall == SYS_wait4) {
+            return emu_handle_wait4(pid, ps);
+        }
+#endif
+#ifdef SYS_waitid
+        if (ps->saved_syscall == SYS_waitid) {
+            /* waitid has different arg layout but approximate with wait4 logic */
+            return emu_handle_wait4(pid, ps);
+        }
+#endif
+        return 0;
+    }
+
+    /* Race-condition path: wait4 was NOT neutralised (the process was not
+     * yet a sub-tracer at syscall-entry) but became one before we got the
+     * syscall-exit (e.g. child called TRACEME in the meantime, and we
+     * interrupted this wait4 via PTRACE_INTERRUPT).  Handle it as emulated. */
+#ifdef SYS_wait4
+    if (ps->saved_syscall == SYS_wait4 && is_emu_tracer(pid)) {
+        return emu_handle_wait4(pid, ps);
+    }
+#endif
 
     long syscall_nr = ps->saved_syscall;
     long ret_val = ret_unused; /* rax on x86_64, x0 on aarch64 */
@@ -841,7 +1375,7 @@ static void handle_syscall_exit(pid_t pid, struct proc_state *ps)
             emit_exec_event(pid);
             emit_inherited_open_events(pid);
         }
-        return;
+        return 0;
     }
 
     /* ---- openat / open ---- */
@@ -851,7 +1385,7 @@ static void handle_syscall_exit(pid_t pid, struct proc_state *ps)
         char *path = read_tracee_string(pid, ps->arg1, PATH_MAX);
         emit_open_event(pid, path, (int)ps->arg2, ret_val);
         free(path);
-        return;
+        return 0;
     }
 #endif
 #ifdef SYS_open
@@ -860,7 +1394,7 @@ static void handle_syscall_exit(pid_t pid, struct proc_state *ps)
         char *path = read_tracee_string(pid, ps->arg0, PATH_MAX);
         emit_open_event(pid, path, (int)ps->arg1, ret_val);
         free(path);
-        return;
+        return 0;
     }
 #endif
 
@@ -868,27 +1402,27 @@ static void handle_syscall_exit(pid_t pid, struct proc_state *ps)
     if (syscall_nr == SYS_chdir || syscall_nr == SYS_fchdir) {
         if (ret_val == 0)
             emit_cwd_event(pid);
-        return;
+        return 0;
     }
 
     /* ---- write ---- */
     if (syscall_nr == SYS_write) {
         unsigned int fd = (unsigned int)ps->arg0;
-        if (ret_val <= 0) return;
+        if (ret_val <= 0) return 0;
         if (fd == 2) {
             emit_write_event(pid, "STDERR", ps->arg1, (size_t)ret_val);
         } else if (fd == 1 && fd1_is_creator_stdout(pid)) {
             emit_write_event(pid, "STDOUT", ps->arg1, (size_t)ret_val);
         }
-        return;
+        return 0;
     }
 
     /* ---- writev (for STDERR/STDOUT that goes through writev) ---- */
     if (syscall_nr == SYS_writev) {
         unsigned int fd = (unsigned int)ps->arg0;
-        if (ret_val <= 0) return;
-        if (fd != 1 && fd != 2) return;
-        if (fd == 1 && !fd1_is_creator_stdout(pid)) return;
+        if (ret_val <= 0) return 0;
+        if (fd != 1 && fd != 2) return 0;
+        if (fd == 1 && !fd1_is_creator_stdout(pid)) return 0;
         const char *stream = (fd == 2) ? "STDERR" : "STDOUT";
         /*
          * For writev we would need to read the iovec array from the tracee.
@@ -897,8 +1431,10 @@ static void handle_syscall_exit(pid_t pid, struct proc_state *ps)
          * capture the length. Skip actual data capture for writev.
          */
         (void)stream;
-        return;
+        return 0;
     }
+
+    return 0;
 }
 
 /* ================================================================
@@ -1005,6 +1541,16 @@ int main(int argc, char **argv)
                 pidset_remove(&g_tracked, wpid);
                 free_state(wpid);
             }
+            /* If this was a sub-tracee, queue the exit for its sub-tracer */
+            struct emu_tracee *et = find_emu_tracee(wpid);
+            if (et) {
+                /* Synthesise an exit wstatus for the sub-tracer.
+                 * The kernel's real wstatus is fine as-is. */
+                emu_queue_stop(et, wstatus);
+                /* Don't remove yet — sub-tracer needs to wait for it. */
+            }
+            /* If this was a sub-tracer, release all its sub-tracees */
+            remove_emu_tracees_for(wpid);
             continue;
         }
 
@@ -1021,16 +1567,48 @@ int main(int argc, char **argv)
             ptrace(PTRACE_GETEVENTMSG, wpid, NULL, &new_pid);
             if (new_pid > 0) {
                 pidset_add(&g_tracked, (pid_t)new_pid);
-                /* The new child is auto-traced; it will be delivered
-                 * its own stop. We need to set it up for SYSCALL tracing. */
             }
+
+            /* If the forking process is a sub-tracee, check if the
+             * sub-tracer wants this event and auto-attach the child. */
+            struct emu_tracee *et = find_emu_tracee(wpid);
+            if (et) {
+                int want = 0;
+                if (event == PTRACE_EVENT_FORK && (et->options & PTRACE_O_TRACEFORK)) want = 1;
+                if (event == PTRACE_EVENT_VFORK && (et->options & PTRACE_O_TRACEVFORK)) want = 1;
+                if (event == PTRACE_EVENT_CLONE && (et->options & PTRACE_O_TRACECLONE)) want = 1;
+
+                if (want && new_pid > 0) {
+                    /* Auto-attach new child as a sub-tracee */
+                    struct emu_tracee *net = add_emu_tracee((pid_t)new_pid, et->tracer_pid);
+                    if (net) {
+                        net->options = et->options;
+                        net->syscall_stop = et->syscall_stop;
+                    }
+                }
+
+                if (want) {
+                    et->event_msg = (long)new_pid;
+                    int emu_wstatus = (SIGTRAP << 8) | (event << 16) | 0x7f;
+                    emu_queue_stop(et, emu_wstatus);
+                    /* Hold the sub-tracee */
+                    continue;
+                }
+            }
+
             ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
 
         if (event == PTRACE_EVENT_EXEC) {
-            /* The exec happened. We don't need to do anything special here
-             * because we handle it in the execve syscall exit. */
+            /* If this is a sub-tracee, notify its sub-tracer */
+            struct emu_tracee *et = find_emu_tracee(wpid);
+            if (et && (et->options & PTRACE_O_TRACEEXEC)) {
+                et->event_msg = (long)wpid;
+                int emu_wstatus = (SIGTRAP << 8) | (PTRACE_EVENT_EXEC << 16) | 0x7f;
+                emu_queue_stop(et, emu_wstatus);
+                continue;  /* hold sub-tracee */
+            }
             ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
@@ -1038,6 +1616,7 @@ int main(int argc, char **argv)
         /* Syscall stop (bit 7 set in signal from PTRACE_O_TRACESYSGOOD) */
         if (sig == (SIGTRAP | 0x80)) {
             struct proc_state *ps = get_state(wpid);
+            int hold = 0;
             if (!ps->in_syscall) {
                 /* Syscall entry */
                 ps->in_syscall = 1;
@@ -1045,22 +1624,65 @@ int main(int argc, char **argv)
             } else {
                 /* Syscall exit */
                 ps->in_syscall = 0;
-                handle_syscall_exit(wpid, ps);
+                hold = handle_syscall_exit(wpid, ps);
             }
-            ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+
+            /* After our tracing, check if this is a sub-tracee whose
+             * sub-tracer wants syscall-stop reports. */
+            if (!hold) {
+                struct emu_tracee *et = find_emu_tracee(wpid);
+                if (et && et->syscall_stop) {
+                    /* Synthesise a syscall-stop for the sub-tracer */
+                    int ss = (et->options & PTRACE_O_TRACESYSGOOD)
+                             ? (SIGTRAP | 0x80) : SIGTRAP;
+                    int emu_wstatus = (ss << 8) | 0x7f;
+                    emu_queue_stop(et, emu_wstatus);
+                    hold = 1;
+                }
+            }
+
+            if (!hold)
+                ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
 
         /* PTRACE_EVENT_STOP for newly traced processes */
         if (sig == SIGSTOP && event == 0 && pidset_contains(&g_tracked, wpid)) {
+            /* If this process is a sub-tracee, queue the SIGSTOP for the
+             * sub-tracer (the child's initial stop after TRACEME). */
+            struct emu_tracee *et = find_emu_tracee(wpid);
+            if (et) {
+                int emu_wstatus = (SIGSTOP << 8) | 0x7f;
+                emu_queue_stop(et, emu_wstatus);
+                continue;  /* hold sub-tracee */
+            }
             ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
 
-        /* Group stop */
+        /* Group stop / PTRACE_INTERRUPT stop */
         if (event == PTRACE_EVENT_STOP) {
-            ptrace(PTRACE_LISTEN, wpid, NULL, 0);
+            /* PTRACE_INTERRUPT generates SIGTRAP; real group-stops use
+             * SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU.  For interrupt stops we
+             * must resume with PTRACE_SYSCALL (not PTRACE_LISTEN). */
+            if (sig == SIGTRAP) {
+                ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+            } else {
+                ptrace(PTRACE_LISTEN, wpid, NULL, 0);
+            }
             continue;
+        }
+
+        /* Signal delivery — if this is a sub-tracee, let the sub-tracer
+         * decide whether to deliver the signal. */
+        {
+            struct emu_tracee *et = find_emu_tracee(wpid);
+            if (et) {
+                et->pending_sig = sig;
+                int emu_wstatus = (sig << 8) | 0x7f;
+                emu_queue_stop(et, emu_wstatus);
+                continue;  /* hold sub-tracee until sub-tracer resumes */
+            }
         }
 
         /* Deliver the signal to the tracee */
@@ -1076,6 +1698,11 @@ int main(int argc, char **argv)
         struct proc_state *s = g_states;
         g_states = s->next;
         free(s);
+    }
+    while (g_emu_tracees) {
+        struct emu_tracee *t = g_emu_tracees;
+        g_emu_tracees = t->next;
+        free(t);
     }
 
     return 0;
