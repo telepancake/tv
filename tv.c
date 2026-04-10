@@ -623,7 +623,7 @@ static void rebuild_files(void){
             "       WHEN SUM(CASE WHEN o.err IS NOT NULL THEN 1 ELSE 0 END)>0 THEN 'error'"
             "       ELSE 'normal' END,"
             "  printf('%%s  \x1b[36m[%%d opens, %%d procs%%s]\x1b[0m',"
-            "   " BNAME("o.path") ","
+            "   o.path,"
             "   COUNT(*),COUNT(DISTINCT e.tgid),"
             "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %%d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
             " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path",ob);
@@ -675,7 +675,11 @@ static void rebuild_files(void){
             "SELECT COUNT(*) FROM dir_nodes p"
             " WHERE p.dead=0 AND p.parent_path IS NOT NULL"
             " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0)=1"
-            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0",0);
+            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0"
+            " AND NOT EXISTS(SELECT 1 FROM dir_nodes ch"
+            "  WHERE ch.parent_path=p.path AND ch.dead=0"
+            "  AND (SELECT COUNT(*) FROM dir_nodes gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
+            "  AND (SELECT COUNT(*) FROM file_stats f2 WHERE dir_part(f2.canon)=ch.path)=0)",0);
         if(!merged)break;
         /* For each mergeable parent: absorb child's name, path, children, stats */
         xexec(
@@ -686,7 +690,11 @@ static void rebuild_files(void){
             " errs=(SELECT c.errs FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0)"
             " WHERE dead=0 AND parent_path IS NOT NULL"
             " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0)=1"
-            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=dir_nodes.path)=0;");
+            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=dir_nodes.path)=0"
+            " AND NOT EXISTS(SELECT 1 FROM dir_nodes ch"
+            "  WHERE ch.parent_path=dir_nodes.path AND ch.dead=0"
+            "  AND (SELECT COUNT(*) FROM dir_nodes gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
+            "  AND (SELECT COUNT(*) FROM file_stats f2 WHERE dir_part(f2.canon)=ch.path)=0);");
         /* Mark child as dead, reparent grandchildren, update path */
         xexec(
             /* First get old path, find child path */
@@ -696,16 +704,16 @@ static void rebuild_files(void){
             " (SELECT c.path FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0 LIMIT 1)"
             " FROM dir_nodes p WHERE p.dead=0 AND p.parent_path IS NOT NULL"
             " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0)=1"
-            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0;");
+            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0"
+            " AND NOT EXISTS(SELECT 1 FROM dir_nodes ch"
+            "  WHERE ch.parent_path=p.path AND ch.dead=0"
+            "  AND (SELECT COUNT(*) FROM dir_nodes gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
+            "  AND (SELECT COUNT(*) FROM file_stats f2 WHERE dir_part(f2.canon)=ch.path)=0);");
         /* Mark children dead */
         xexec(
             "UPDATE dir_nodes SET dead=1 WHERE path IN(SELECT child_path FROM _merge) AND dead=0;");
-        /* Reparent grandchildren */
-        xexec(
-            "UPDATE dir_nodes SET parent_path="
-            " (SELECT m.old_path FROM _merge m WHERE m.child_path=dir_nodes.parent_path)"
-            " WHERE parent_path IN(SELECT child_path FROM _merge);");
-        /* Update parent path to child's path */
+        /* Update parent path to child's path (grandchildren already point to
+           child_path which becomes the merged node's new path — no reparent needed) */
         xexec(
             "UPDATE dir_nodes SET path="
             " (SELECT m.child_path FROM _merge m WHERE m.pid=dir_nodes.id)"
