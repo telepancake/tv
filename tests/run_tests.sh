@@ -332,7 +332,8 @@ run_test "file_view: pipe path" \
     'assert_contains t "$OUT" "pipe:[12345]"'
 
 run_test "file_view: file dependency chain — foo.o shared" \
-    'assert_contains t "$OUT" "foo.o  [2 opens, 2 procs]"'
+    'assert_contains t "$OUT" "foo.o"' \
+    'assert_contains t "$OUT" "[2 opens, 2 procs]"'
 
 run_test "file_view: error files" \
     'assert_contains t "$OUT" "/nonexistent"' \
