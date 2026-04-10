@@ -5,13 +5,10 @@
  * but runs entirely in userspace via PTRACE.  Meant to be accessible
  * in environments where loading a kernel module is impractical.
  *
- * Usage:  uproctrace [options] -- command [args...]
- *
- *   -o FILE   Write trace to FILE instead of stdout.
+ * Built into the tv binary.  Invoked as:
+ *   tv --uproctrace [-o FILE] -- command [args...]
  *
  * Events emitted: CWD, EXEC, OPEN (real + inherited), EXIT, STDOUT, STDERR.
- *
- * Build:  cc -O2 -o uproctrace uproctrace.c
  */
 
 #define _GNU_SOURCE
@@ -1464,7 +1461,7 @@ static void usage(const char *prog)
     exit(1);
 }
 
-int main(int argc, char **argv)
+int uproctrace_main(int argc, char **argv)
 {
     const char *outfile = NULL;
     int cmd_start = -1;
