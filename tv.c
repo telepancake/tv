@@ -30,6 +30,61 @@ static double qdbl(const char *sql,double def){
     sqlite3_stmt*s;double r=def;if(sqlite3_prepare_v2(db,sql,-1,&s,0)==SQLITE_OK){
         if(sqlite3_step(s)==SQLITE_ROW)r=sqlite3_column_double(s,0);sqlite3_finalize(s);}return r;}
 
+/* ── SQL custom functions ──────────────────────────────────────────── */
+
+/* REGEXP(pattern, string) — enables  string REGEXP pattern  in SQL */
+static void sql_regexp(sqlite3_context*ctx,int n,sqlite3_value**v){
+    (void)n;
+    const char*pat=(const char*)sqlite3_value_text(v[0]);
+    const char*str=(const char*)sqlite3_value_text(v[1]);
+    if(!pat||!str){sqlite3_result_int(ctx,0);return;}
+    /* Simple substring match for now — fast, no regex library needed */
+    sqlite3_result_int(ctx,strstr(str,pat)!=NULL);}
+
+/* CANON_PATH(path) — resolve . and .. components */
+static void sql_canon_path(sqlite3_context*ctx,int n,sqlite3_value**v){
+    (void)n;
+    const char*in=(const char*)sqlite3_value_text(v[0]);
+    if(!in){sqlite3_result_null(ctx);return;}
+    char*parts[256];int np=0;
+    char tmp[4096];snprintf(tmp,sizeof tmp,"%s",in);
+    int ab=(tmp[0]=='/');char*s=tmp;if(ab)s++;
+    while(*s&&np<256){
+        char*sl=strchr(s,'/');if(sl)*sl=0;
+        if(strcmp(s,"..")==0){if(np>0)np--;}
+        else if(strcmp(s,".")!=0&&*s)parts[np++]=s;
+        if(sl)s=sl+1;else break;}
+    char out[4096];int p=0;if(ab&&p<(int)sizeof(out)-1)out[p++]='/';
+    for(int i=0;i<np;i++){
+        if(i>0&&p<(int)sizeof(out)-1)out[p++]='/';
+        int l=strlen(parts[i]);if(p+l>=(int)sizeof(out))l=(int)sizeof(out)-p-1;
+        memcpy(out+p,parts[i],l);p+=l;}
+    out[p]=0;
+    sqlite3_result_text(ctx,out,-1,SQLITE_TRANSIENT);}
+
+/* DIR_PART(path) — everything up to last '/' */
+static void sql_dir_part(sqlite3_context*ctx,int n,sqlite3_value**v){
+    (void)n;
+    const char*in=(const char*)sqlite3_value_text(v[0]);
+    if(!in){sqlite3_result_null(ctx);return;}
+    const char*last=strrchr(in,'/');
+    if(!last||last==in){sqlite3_result_text(ctx,last?"/":"",1,SQLITE_TRANSIENT);return;}
+    sqlite3_result_text(ctx,in,(int)(last-in),SQLITE_TRANSIENT);}
+
+/* DEPTH(path) — number of '/' separators (for indentation) */
+static void sql_depth(sqlite3_context*ctx,int n,sqlite3_value**v){
+    (void)n;
+    const char*in=(const char*)sqlite3_value_text(v[0]);
+    if(!in){sqlite3_result_int(ctx,0);return;}
+    int d=0;for(const char*p=in;*p;p++)if(*p=='/')d++;
+    sqlite3_result_int(ctx,d);}
+
+static void register_sql_functions(sqlite3*dbi){
+    sqlite3_create_function(dbi,"regexp",2,SQLITE_UTF8,0,sql_regexp,0,0);
+    sqlite3_create_function(dbi,"canon_path",1,SQLITE_UTF8,0,sql_canon_path,0,0);
+    sqlite3_create_function(dbi,"dir_part",1,SQLITE_UTF8,0,sql_dir_part,0,0);
+    sqlite3_create_function(dbi,"depth",1,SQLITE_UTF8,0,sql_depth,0,0);}
+
 /* ── Globals for streaming ─────────────────────────────────────────── */
 static int g_own_tgid = 0;
 static int g_trace_fd = -1;
@@ -76,7 +131,8 @@ static void setup_app(void){
         "CREATE TABLE IF NOT EXISTS lpane(rownum INTEGER PRIMARY KEY,id TEXT NOT NULL,"
         " parent_id TEXT,style TEXT DEFAULT 'normal',text TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS rpane(rownum INTEGER PRIMARY KEY,style TEXT DEFAULT 'normal',"
-        " text TEXT NOT NULL,link_mode INT DEFAULT -1,link_id TEXT DEFAULT '');"
+        " text TEXT NOT NULL,link_mode INT DEFAULT -1,link_id TEXT DEFAULT '',"
+        " section TEXT DEFAULT '',visible INT DEFAULT 1);"
         "CREATE TABLE IF NOT EXISTS search_hits(id TEXT PRIMARY KEY);"
         "CREATE TABLE IF NOT EXISTS cwd_cache(tgid INTEGER PRIMARY KEY,cwd TEXT);"
         "CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY CHECK(id=1),rl INT DEFAULT 0,rr INT DEFAULT 0);"
@@ -565,24 +621,6 @@ static void rebuild_procs(void){
     }
 }
 
-/* Canonicalize path: resolve . and .. components */
-static void canon_path(char *out, int outsz, const char *in){
-    char *parts[256];int np=0;
-    char tmp[4096];snprintf(tmp,sizeof tmp,"%s",in);
-    int abs=(tmp[0]=='/');
-    char*s=tmp;if(abs)s++;
-    while(*s&&np<256){
-        char*sl=strchr(s,'/');if(sl)*sl=0;
-        if(strcmp(s,"..")==0){if(np>0)np--;}
-        else if(strcmp(s,".")!=0&&*s)parts[np++]=s;
-        if(sl)s=sl+1;else break;}
-    int p=0;if(abs&&p<outsz-1)out[p++]='/';
-    for(int i=0;i<np;i++){
-        if(i>0&&p<outsz-1)out[p++]='/';
-        int l=strlen(parts[i]);if(p+l>=outsz)l=outsz-p-1;
-        memcpy(out+p,parts[i],l);p+=l;}
-    out[p]=0;}
-
 static void rebuild_files(void){
     int gr=qint("SELECT grouped FROM state",1);
     int sk=qint("SELECT sort_key FROM state",0);
@@ -604,195 +642,167 @@ static void rebuild_files(void){
         return;
     }
 
-    /* Tree mode: build directory hierarchy in C */
-    /* Phase 1: Collect all file paths with stats, canonicalize paths */
-    typedef struct { char path[4096]; char canon[4096]; int opens,procs,errs; } FEntry;
-    int fcap=256,fn=0;
-    FEntry *files=malloc(fcap*sizeof(FEntry));
-    if(!files)return;
-    {sqlite3_stmt*st;sqlite3_prepare_v2(db,
-        "SELECT o.path,COUNT(*),COUNT(DISTINCT e.tgid),SUM(o.err IS NOT NULL)"
-        " FROM open_events o JOIN events e ON e.id=o.eid"
-        " WHERE o.path IS NOT NULL GROUP BY o.path ORDER BY o.path",-1,&st,0);
-    while(sqlite3_step(st)==SQLITE_ROW){
-        if(fn>=fcap){fcap*=2;FEntry*t=realloc(files,fcap*sizeof(FEntry));if(!t){sqlite3_finalize(st);free(files);return;}files=t;}
-        const char*p=(const char*)sqlite3_column_text(st,0);
-        snprintf(files[fn].path,sizeof files[fn].path,"%s",p?p:"");
-        canon_path(files[fn].canon,sizeof files[fn].canon,files[fn].path);
-        files[fn].opens=sqlite3_column_int(st,1);
-        files[fn].procs=sqlite3_column_int(st,2);
-        files[fn].errs=sqlite3_column_int(st,3);fn++;}
-    sqlite3_finalize(st);}
-    if(!fn){free(files);return;}
+    /* ── Tree mode: pure SQL with recursive CTE ─────────────────────── */
+    /* Step 1: Build file_stats temp with canonicalized paths */
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS file_stats("
+        " path TEXT NOT NULL, canon TEXT NOT NULL,"
+        " opens INT, procs INT, errs INT);"
+        "DELETE FROM file_stats;"
+        "INSERT INTO file_stats(path,canon,opens,procs,errs)"
+        " SELECT o.path,canon_path(o.path),COUNT(*),COUNT(DISTINCT e.tgid),SUM(o.err IS NOT NULL)"
+        " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path;");
 
-    /* Phase 2: Build tree nodes (dirs + files) using canonicalized paths */
-    typedef struct { char path[4096]; char name[1024]; int parent; int is_dir;
-        int opens,procs,errs; int first_child,next_sib; } TNode;
-    int tcap=fn*4+64,tn=0;
-    TNode *nodes=malloc(tcap*sizeof(TNode));
-    if(!nodes){free(files);return;}
+    /* Step 2: Build dir_nodes with integer ID so path updates don't hit UNIQUE */
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS dir_nodes("
+        " id INTEGER PRIMARY KEY, path TEXT NOT NULL, parent_path TEXT, name TEXT,"
+        " opens INT DEFAULT 0, procs INT DEFAULT 0, errs INT DEFAULT 0, dead INT DEFAULT 0);"
+        "DELETE FROM dir_nodes;"
+        /* Extract all directory prefixes from canonical paths */
+        "WITH RECURSIVE dirs(d) AS("
+        "  SELECT DISTINCT dir_part(canon) FROM file_stats WHERE INSTR(canon,'/')>0"
+        "  UNION"
+        "  SELECT dir_part(d) FROM dirs WHERE LENGTH(d)>1 AND INSTR(d,'/')>0"
+        ")"
+        "INSERT INTO dir_nodes(path,parent_path,name)"
+        " SELECT d,"
+        "  CASE WHEN d='/' THEN NULL"
+        "   WHEN INSTR(SUBSTR(d,2),'/')=0 THEN '/'"
+        "   ELSE dir_part(d) END,"
+        "  " BNAME("d")
+        " FROM dirs WHERE d IS NOT NULL AND LENGTH(d)>0;"
+        "CREATE INDEX IF NOT EXISTS ix_dn_path ON dir_nodes(path);"
+        "CREATE INDEX IF NOT EXISTS ix_dn_par ON dir_nodes(parent_path);"
+        /* Aggregate stats from files into directories */
+        "UPDATE dir_nodes SET"
+        " opens=(SELECT COALESCE(SUM(f.opens),0) FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%'),"
+        " procs=(SELECT COALESCE(SUM(f.procs),0) FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%'),"
+        " errs =(SELECT COALESCE(SUM(f.errs),0)  FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%');");
 
-    /* Root node (virtual) */
-    nodes[0].path[0]=0;nodes[0].name[0]=0;nodes[0].parent=-1;nodes[0].is_dir=1;
-    nodes[0].opens=nodes[0].procs=nodes[0].errs=0;
-    nodes[0].first_child=-1;nodes[0].next_sib=-1;tn=1;
-
-    for(int fi=0;fi<fn;fi++){
-        const char*p=files[fi].canon;
-        int cur=0;
-        /* Handle non-path entries (no /) */
-        if(!strchr(p,'/')){
-            if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)goto done;nodes=t;}
-            int ni=tn++;
-            snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",files[fi].path);
-            snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",p);
-            nodes[ni].parent=0;nodes[ni].is_dir=0;
-            nodes[ni].opens=files[fi].opens;nodes[ni].procs=files[fi].procs;nodes[ni].errs=files[fi].errs;
-            nodes[ni].first_child=-1;nodes[ni].next_sib=nodes[0].first_child;nodes[0].first_child=ni;
-            continue;
-        }
-        /* Split canonicalized path into components */
-        char tmp[4096];snprintf(tmp,sizeof tmp,"%s",p);
-        char*comp[256];int nc=0;
-        {char*s=tmp;while(*s=='/')s++;
-         while(*s&&nc<256){comp[nc]=s;char*sl=strchr(s,'/');
-             if(sl){*sl=0;s=sl+1;while(*s=='/')s++;}else s+=strlen(s);nc++;}}
-        if(!nc)continue;
-        /* Walk/create directory nodes for all but last component */
-        char built[4096]="";
-        for(int ci=0;ci<nc-1;ci++){
-            int blen=strlen(built);
-            snprintf(built+blen,sizeof(built)-blen,"/%s",comp[ci]);
-            /* Search for existing child of cur with this path */
-            int found=-1,ch=nodes[cur].first_child;
-            while(ch>=0){if(nodes[ch].is_dir&&strcmp(nodes[ch].path,built)==0){found=ch;break;}ch=nodes[ch].next_sib;}
-            if(found>=0){cur=found;continue;}
-            /* Create new dir node */
-            if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)goto done;nodes=t;}
-            int ni=tn++;
-            snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",built);
-            snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",comp[ci]);
-            nodes[ni].parent=cur;nodes[ni].is_dir=1;
-            nodes[ni].opens=0;nodes[ni].procs=0;nodes[ni].errs=0;
-            nodes[ni].first_child=-1;nodes[ni].next_sib=nodes[cur].first_child;nodes[cur].first_child=ni;
-            cur=ni;
-        }
-        /* Add file leaf under cur */
-        if(tn>=tcap){tcap*=2;TNode*t=realloc(nodes,tcap*sizeof(TNode));if(!t)goto done;nodes=t;}
-        int ni=tn++;
-        snprintf(nodes[ni].path,sizeof nodes[ni].path,"%s",files[fi].path);
-        snprintf(nodes[ni].name,sizeof nodes[ni].name,"%s",comp[nc-1]);
-        nodes[ni].parent=cur;nodes[ni].is_dir=0;
-        nodes[ni].opens=files[fi].opens;nodes[ni].procs=files[fi].procs;nodes[ni].errs=files[fi].errs;
-        nodes[ni].first_child=-1;nodes[ni].next_sib=nodes[cur].first_child;nodes[cur].first_child=ni;
+    /* Step 3: Collapse single-child directory chains */
+    /* A parent with exactly one child (dir), and no direct files, merges with child */
+    for(int pass=0;pass<20;pass++){
+        int merged=qint(
+            "SELECT COUNT(*) FROM dir_nodes p"
+            " WHERE p.dead=0 AND p.parent_path IS NOT NULL"
+            " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0)=1"
+            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0",0);
+        if(!merged)break;
+        /* For each mergeable parent: absorb child's name, path, children, stats */
+        xexec(
+            "UPDATE dir_nodes SET"
+            " name=name||'/'||(SELECT c.name FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0),"
+            " opens=(SELECT c.opens FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0),"
+            " procs=(SELECT c.procs FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0),"
+            " errs=(SELECT c.errs FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0)"
+            " WHERE dead=0 AND parent_path IS NOT NULL"
+            " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0)=1"
+            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=dir_nodes.path)=0;");
+        /* Mark child as dead, reparent grandchildren, update path */
+        xexec(
+            /* First get old path, find child path */
+            "CREATE TEMP TABLE IF NOT EXISTS _merge(pid INT, old_path TEXT, child_path TEXT);"
+            "DELETE FROM _merge;"
+            "INSERT INTO _merge SELECT p.id, p.path,"
+            " (SELECT c.path FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0 LIMIT 1)"
+            " FROM dir_nodes p WHERE p.dead=0 AND p.parent_path IS NOT NULL"
+            " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0)=1"
+            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0;");
+        /* Mark children dead */
+        xexec(
+            "UPDATE dir_nodes SET dead=1 WHERE path IN(SELECT child_path FROM _merge) AND dead=0;");
+        /* Reparent grandchildren */
+        xexec(
+            "UPDATE dir_nodes SET parent_path="
+            " (SELECT m.old_path FROM _merge m WHERE m.child_path=dir_nodes.parent_path)"
+            " WHERE parent_path IN(SELECT child_path FROM _merge);");
+        /* Update parent path to child's path */
+        xexec(
+            "UPDATE dir_nodes SET path="
+            " (SELECT m.child_path FROM _merge m WHERE m.pid=dir_nodes.id)"
+            " WHERE id IN(SELECT pid FROM _merge);");
+        xexec("DROP TABLE IF EXISTS _merge;");
     }
 
-    /* Phase 3: Collapse single-child directory chains */
-    for(int i=1;i<tn;i++){
-        if(!nodes[i].is_dir||nodes[i].parent==-2)continue;
-        int ch=nodes[i].first_child;
-        if(ch<0||nodes[ch].next_sib>=0||!nodes[ch].is_dir)continue;
-        /* Merge child into this node */
-        char merged[1024];snprintf(merged,sizeof merged,"%s/%s",nodes[i].name,nodes[ch].name);
-        snprintf(nodes[i].name,sizeof nodes[i].name,"%s",merged);
-        snprintf(nodes[i].path,sizeof nodes[i].path,"%s",nodes[ch].path);
-        nodes[i].first_child=nodes[ch].first_child;
-        int gc=nodes[ch].first_child;while(gc>=0){nodes[gc].parent=i;gc=nodes[gc].next_sib;}
-        nodes[ch].parent=-2;
-        i--;
+    /* Step 4: Ensure expanded entries for directories */
+    xexec("INSERT OR IGNORE INTO expanded(id,ex) SELECT path,1 FROM dir_nodes WHERE dead=0;");
+
+    /* Step 5: Flatten tree iteratively — insert roots, then expand children level-by-level */
+    /* Use temp table for DFS flattening; sort_key is a text path for correct DFS ordering */
+    xexec(
+        "CREATE TEMP TABLE IF NOT EXISTS ftree("
+        " id INTEGER PRIMARY KEY, sort_key TEXT, path TEXT, parent_path TEXT, name TEXT,"
+        " opens INT, procs INT, errs INT, is_dir INT, depth INT);"
+        "DELETE FROM ftree;");
+
+    /* Insert root-level directories (dirs first, sorted by name) */
+    xexec(
+        "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+        " SELECT printf('0/%s',name),"
+        "  path,parent_path,name,opens,procs,errs,1,0"
+        " FROM dir_nodes"
+        " WHERE dead=0 AND (parent_path IS NULL OR parent_path NOT IN(SELECT path FROM dir_nodes WHERE dead=0));");
+    /* Insert root-level files */
+    xexec(
+        "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+        " SELECT printf('1/%s'," BNAME("canon") "),"
+        "  path,NULL," BNAME("canon") ",opens,procs,errs,0,0"
+        " FROM file_stats"
+        " WHERE INSTR(canon,'/')=0"
+        "  OR dir_part(canon) NOT IN(SELECT path FROM dir_nodes WHERE dead=0);");
+
+    /* Iteratively expand children of expanded directories */
+    for(int depth=0;depth<50;depth++){
+        /* Check if there are expanded dirs at this depth with children */
+        int has_more=qint(
+            sqlite3_mprintf(
+                "SELECT COUNT(*) FROM ftree t"
+                " WHERE t.depth=%d AND t.is_dir=1"
+                " AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1"
+                " AND (EXISTS(SELECT 1 FROM dir_nodes d WHERE d.parent_path=t.path AND d.dead=0)"
+                "  OR EXISTS(SELECT 1 FROM file_stats f WHERE dir_part(f.canon)=t.path))",
+                depth),0);
+        if(!has_more) break;
+
+        /* Insert child dirs */
+        xexecf(
+            "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+            " SELECT t.sort_key||'/0/'||d.name,"
+            "  d.path,d.parent_path,d.name,d.opens,d.procs,d.errs,1,%d"
+            " FROM ftree t JOIN dir_nodes d ON d.parent_path=t.path"
+            " WHERE t.depth=%d AND t.is_dir=1 AND d.dead=0"
+            "  AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1",
+            depth+1, depth);
+        /* Insert child files */
+        xexecf(
+            "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+            " SELECT t.sort_key||'/1/'||" BNAME("f.canon") ","
+            "  f.path,dir_part(f.canon)," BNAME("f.canon") ",f.opens,f.procs,f.errs,0,%d"
+            " FROM ftree t JOIN file_stats f ON dir_part(f.canon)=t.path"
+            " WHERE t.depth=%d AND t.is_dir=1"
+            "  AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1",
+            depth+1, depth);
     }
 
-    /* Phase 4: Aggregate stats for directories (bottom-up) */
-    for(int i=1;i<tn;i++){
-        if(nodes[i].parent==-2||nodes[i].is_dir)continue;
-        int p=nodes[i].parent;
-        while(p>=0){nodes[p].opens+=nodes[i].opens;nodes[p].procs+=nodes[i].procs;
-            nodes[p].errs+=nodes[i].errs;p=nodes[p].parent;}
-    }
+    /* Step 6: Insert flattened tree into lpane */
+    xexec(
+        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+        " SELECT ROW_NUMBER()OVER(ORDER BY sort_key)-1,"
+        "  path,parent_path,"
+        "  CASE WHEN path IN(SELECT id FROM search_hits) THEN 'search'"
+        "       WHEN errs>0 THEN 'error' ELSE 'normal' END,"
+        "  printf('%*s%s%s%s  \x1b[36m[%d opens, %d procs%s]\x1b[0m',"
+        "   depth*2,'',"
+        "   CASE WHEN is_dir AND COALESCE((SELECT ex FROM expanded WHERE id=path),1)=1"
+        "    THEN '▼ ' WHEN is_dir THEN '▶ ' ELSE '  ' END,"
+        "   CASE WHEN is_dir THEN '\x1b[1m' ELSE '\x1b[32m' END,"
+        "   name||CASE WHEN is_dir THEN '/\x1b[0m' ELSE '\x1b[0m' END,"
+        "   opens,procs,"
+        "   CASE WHEN errs>0 THEN printf(', %d errs',errs) ELSE '' END)"
+        " FROM ftree;");
 
-    /* Phase 5: Flatten tree into lpane via DFS */
-    for(int i=1;i<tn;i++){
-        if(nodes[i].parent==-2||!nodes[i].is_dir)continue;
-        sqlite3_stmt*st;sqlite3_prepare_v2(db,
-            "INSERT OR IGNORE INTO expanded(id,ex) VALUES(?,1)",-1,&st,0);
-        sqlite3_bind_text(st,1,nodes[i].path,-1,SQLITE_TRANSIENT);
-        sqlite3_step(st);sqlite3_finalize(st);
-    }
-
-    int rownum=0;
-    int *stk=malloc(tn*2*sizeof(int));
-    if(!stk)goto done;
-    int sp2=0;
-
-    /* Helper: push sorted children (dirs first, then alphabetical) */
-    #define PUSH_CHILDREN(parent_idx,d) do{ \
-        int _chs[1024];int _nc=0; \
-        {int _ch=nodes[parent_idx].first_child; \
-         while(_ch>=0&&_nc<1024){if(nodes[_ch].parent!=-2)_chs[_nc++]=_ch;_ch=nodes[_ch].next_sib;}} \
-        for(int _a=0;_a<_nc-1;_a++)for(int _b=_a+1;_b<_nc;_b++){ \
-            int _da=nodes[_chs[_a]].is_dir,_db=nodes[_chs[_b]].is_dir; \
-            if(_db>_da||(_da==_db&&strcmp(nodes[_chs[_a]].name,nodes[_chs[_b]].name)>0)) \
-                {int _t=_chs[_a];_chs[_a]=_chs[_b];_chs[_b]=_t;}} \
-        for(int _j=_nc-1;_j>=0;_j--){stk[sp2++]=_chs[_j];stk[sp2++]=(d);} \
-    }while(0)
-
-    PUSH_CHILDREN(0,0);
-
-    while(sp2>0){
-        int depth=stk[--sp2];int ni=stk[--sp2];
-        if(nodes[ni].parent==-2)continue;
-
-        int has_ch=(nodes[ni].first_child>=0&&nodes[ni].is_dir);
-        int is_ex=1;
-        if(has_ch){
-            sqlite3_stmt*st;sqlite3_prepare_v2(db,
-                "SELECT COALESCE((SELECT ex FROM expanded WHERE id=?),1)",-1,&st,0);
-            sqlite3_bind_text(st,1,nodes[ni].path,-1,SQLITE_TRANSIENT);
-            if(sqlite3_step(st)==SQLITE_ROW)is_ex=sqlite3_column_int(st,0);
-            sqlite3_finalize(st);
-        }
-
-        /* Build display text with embedded ANSI colors */
-        char text[4096];
-        const char*ind=has_ch?(is_ex?"\xe2\x96\xbc ":"\xe2\x96\xb6 "):"  ";
-        char errbuf[64]="";
-        if(nodes[ni].errs>0)snprintf(errbuf,sizeof errbuf,", %d errs",nodes[ni].errs);
-
-        if(nodes[ni].is_dir){
-            snprintf(text,sizeof text,"%*s%s\x1b[1m%s/\x1b[0m  \x1b[36m[%d opens, %d procs%s]\x1b[0m",
-                depth*2,"",ind,nodes[ni].name,
-                nodes[ni].opens,nodes[ni].procs,errbuf);
-        } else {
-            snprintf(text,sizeof text,"%*s  \x1b[32m%s\x1b[0m  \x1b[36m[%d opens, %d procs%s]\x1b[0m",
-                depth*2,"",nodes[ni].name,
-                nodes[ni].opens,nodes[ni].procs,errbuf);
-        }
-
-        int search_hit=0;
-        {sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT 1 FROM search_hits WHERE id=?",-1,&st,0);
-         sqlite3_bind_text(st,1,nodes[ni].path,-1,SQLITE_TRANSIENT);
-         if(sqlite3_step(st)==SQLITE_ROW)search_hit=1;sqlite3_finalize(st);}
-        const char*sty=search_hit?"search":(nodes[ni].errs>0?"error":"normal");
-
-        {sqlite3_stmt*st;sqlite3_prepare_v2(db,
-            "INSERT INTO lpane(rownum,id,parent_id,style,text) VALUES(?,?,?,?,?)",-1,&st,0);
-         sqlite3_bind_int(st,1,rownum);
-         sqlite3_bind_text(st,2,nodes[ni].path,-1,SQLITE_TRANSIENT);
-         const char*par=(nodes[ni].parent>0)?nodes[nodes[ni].parent].path:NULL;
-         if(par)sqlite3_bind_text(st,3,par,-1,SQLITE_TRANSIENT);else sqlite3_bind_null(st,3);
-         sqlite3_bind_text(st,4,sty,-1,SQLITE_STATIC);
-         sqlite3_bind_text(st,5,text,-1,SQLITE_TRANSIENT);
-         sqlite3_step(st);sqlite3_finalize(st);}
-        rownum++;
-
-        if(has_ch&&is_ex) PUSH_CHILDREN(ni,depth+1);
-    }
-    #undef PUSH_CHILDREN
-    free(stk);
-
-done:
-    free(nodes);
-    free(files);
+    xexec("DROP TABLE IF EXISTS ftree;DROP TABLE IF EXISTS file_stats;DROP TABLE IF EXISTS dir_nodes;");
 }
 
 static void rebuild_outputs(void){
@@ -840,11 +850,11 @@ static void rpane_proc(int tgid){
     char ef[64]="";{sqlite3_stmt*s;sqlite3_prepare_v2(db,"SELECT evfilt FROM state",-1,&s,0);
         if(sqlite3_step(s)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(s,0);if(t&&t[0])snprintf(ef,sizeof ef,"%s",t);}sqlite3_finalize(s);}
 
-    xexecf("INSERT INTO rpane VALUES(0,'heading','─── Process ───',-1,'')");
-    xexecf("INSERT INTO rpane SELECT 1,'cyan',printf('TGID:  %%d',tgid),-1,'' FROM processes WHERE tgid=%d",tgid);
-    xexecf("INSERT INTO rpane SELECT 2,'cyan',printf('PPID:  %%d',ppid),0,CAST(ppid AS TEXT) FROM processes WHERE tgid=%d AND ppid IS NOT NULL",tgid);
-    xexecf("INSERT INTO rpane SELECT 3,'green',printf('EXE:   %%s',COALESCE(exe,'?')),-1,'' FROM processes WHERE tgid=%d",tgid);
-    xexecf("INSERT INTO rpane SELECT 4,'green',printf('CWD:   %%s',COALESCE(cwd,'?')),-1,'' FROM processes WHERE tgid=%d",tgid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(0,'heading','─── Process ───',-1,'','process')");
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 1,'cyan',printf('TGID:  %%d',tgid),-1,'','process' FROM processes WHERE tgid=%d",tgid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 2,'cyan',printf('PPID:  %%d',ppid),0,CAST(ppid AS TEXT),'process' FROM processes WHERE tgid=%d AND ppid IS NOT NULL",tgid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 3,'green',printf('EXE:   %%s',COALESCE(exe,'?')),-1,'','process' FROM processes WHERE tgid=%d",tgid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 4,'green',printf('CWD:   %%s',COALESCE(cwd,'?')),-1,'','process' FROM processes WHERE tgid=%d",tgid);
     /* Argv */
     xexecf("WITH RECURSIVE sp(i,rest,line) AS("
         " SELECT 0,SUBSTR(argv,INSTR(argv,char(10))+1),"
@@ -854,29 +864,29 @@ static void rpane_proc(int tgid){
         "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,INSTR(rest,char(10))+1) ELSE '' END,"
         "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,1,INSTR(rest,char(10))-1) ELSE rest END"
         "  FROM sp WHERE LENGTH(rest)>0"
-        ")INSERT INTO rpane SELECT 10+i,'normal',printf('  [%%d] %%s',i,line),-1,'' FROM sp",tgid);
+        ")INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 10+i,'normal',printf('  [%%d] %%s',i,line),-1,'','process' FROM sp",tgid);
     /* Exit */
     xexecf(
-        "INSERT INTO rpane SELECT 200,"
+        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 200,"
         " CASE WHEN x.signal IS NOT NULL THEN 'error' WHEN x.code!=0 THEN 'error' ELSE 'green' END,"
         " CASE WHEN x.signal IS NOT NULL THEN printf('Exit: signal %%d%%s',x.signal,"
         "   CASE WHEN x.core_dumped THEN ' (core)' ELSE '' END)"
         "  ELSE printf('Exit: %%s code=%%d',COALESCE(x.status,'?'),COALESCE(x.code,-1)) END,"
-        " -1,'' FROM events ev JOIN exit_events x ON x.eid=ev.id WHERE ev.tgid=%d AND ev.event='EXIT'",tgid);
-    xexecf("INSERT INTO rpane SELECT 201,'cyan','Duration: '||" DUR("last_ts-first_ts") ",-1,'' FROM processes WHERE tgid=%d",tgid);
+        " -1,'','process' FROM events ev JOIN exit_events x ON x.eid=ev.id WHERE ev.tgid=%d AND ev.event='EXIT'",tgid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 201,'cyan','Duration: '||" DUR("last_ts-first_ts") ",-1,'','process' FROM processes WHERE tgid=%d",tgid);
     /* Children */
-    xexecf("INSERT INTO rpane VALUES(300,'heading',printf('─── Children (%%d) ───',"
-        "(SELECT COUNT(*) FROM processes WHERE ppid=%d)),-1,'')",tgid);
-    xexecf("INSERT INTO rpane SELECT 300+ROW_NUMBER()OVER(ORDER BY first_ts),'normal',"
-        " printf('  [%%d] %%s',tgid,COALESCE(" BNAME("exe") ",'?')),0,CAST(tgid AS TEXT)"
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(300,'heading',printf('─── Children (%%d) ───',"
+        "(SELECT COUNT(*) FROM processes WHERE ppid=%d)),-1,'','children')",tgid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 300+ROW_NUMBER()OVER(ORDER BY first_ts),'normal',"
+        " printf('  [%%d] %%s',tgid,COALESCE(" BNAME("exe") ",'?')),0,CAST(tgid AS TEXT),'children'"
         " FROM processes WHERE ppid=%d ORDER BY first_ts LIMIT 50",tgid);
     /* Events */
     char fc[128]="";if(ef[0])snprintf(fc,sizeof fc," AND e.event='%s'",ef);
-    xexecf("INSERT INTO rpane VALUES(500,'heading',printf('─── Events (%%d)%%s ───',"
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(500,'heading',printf('─── Events (%%d)%%s ───',"
         "(SELECT COUNT(*) FROM events WHERE tgid=%d),"
-        "CASE WHEN '%s'!='' THEN printf(' [%%s]','%s') ELSE '' END),-1,'')",tgid,ef,ef);
+        "CASE WHEN '%s'!='' THEN printf(' [%%s]','%s') ELSE '' END),-1,'','events')",tgid,ef,ef);
     xexecf(
-        "INSERT INTO rpane SELECT 501+ROW_NUMBER()OVER(ORDER BY e.ts),"
+        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 501+ROW_NUMBER()OVER(ORDER BY e.ts),"
         " CASE WHEN e.event='EXEC' THEN 'cyan_bold'"
         "      WHEN e.event='EXIT' AND(COALESCE(x.code,0)!=0 OR x.signal IS NOT NULL) THEN 'error'"
         "      WHEN e.event='EXIT' THEN 'green'"
@@ -896,7 +906,8 @@ static void rpane_proc(int tgid){
         "    ELSE printf('%%s code=%%d',COALESCE(x.status,'?'),COALESCE(x.code,-1)) END"
         "   ELSE '' END),"
         " CASE WHEN e.event='OPEN' THEN 1 WHEN e.event IN('STDERR','STDOUT') THEN 2 ELSE -1 END,"
-        " CASE WHEN e.event='OPEN' THEN COALESCE(o.path,'') WHEN e.event IN('STDERR','STDOUT') THEN CAST(e.id AS TEXT) ELSE '' END"
+        " CASE WHEN e.event='OPEN' THEN COALESCE(o.path,'') WHEN e.event IN('STDERR','STDOUT') THEN CAST(e.id AS TEXT) ELSE '' END,"
+        " 'events'"
         " FROM events e LEFT JOIN open_events o ON o.eid=e.id LEFT JOIN io_events i ON i.eid=e.id"
         " LEFT JOIN exit_events x ON x.eid=e.id WHERE e.tgid=%d%s ORDER BY e.ts LIMIT 5000",
         tsm,bts,tgid,fc);
@@ -904,18 +915,18 @@ static void rpane_proc(int tgid){
 
 static void rpane_file(const char *path){
     int tsm=qint("SELECT ts_mode FROM state",0);double bts=qdbl("SELECT base_ts FROM state",0);
-    xexecf("INSERT INTO rpane VALUES(0,'heading','─── File ───',-1,'')");
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(0,'heading','─── File ───',-1,'','file')");
     sqlite3_stmt*st;
-    sqlite3_prepare_v2(db,"INSERT INTO rpane VALUES(1,'green',printf('Path: %s',?),-1,'')",-1,&st,0);
+    sqlite3_prepare_v2(db,"INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(1,'green',printf('Path: %s',?),-1,'','file')",-1,&st,0);
     sqlite3_bind_text(st,1,path,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
     sqlite3_prepare_v2(db,
-        "INSERT INTO rpane SELECT 2,'cyan',printf('Opens: %d  Errors: %d  Procs: %d',"
-        " COUNT(*),SUM(o.err IS NOT NULL),COUNT(DISTINCT e.tgid)),-1,''"
+        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 2,'cyan',printf('Opens: %d  Errors: %d  Procs: %d',"
+        " COUNT(*),SUM(o.err IS NOT NULL),COUNT(DISTINCT e.tgid)),-1,'','file'"
         " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path=?",-1,&st,0);
     sqlite3_bind_text(st,1,path,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-    xexecf("INSERT INTO rpane VALUES(10,'heading','─── Accesses ───',-1,'')");
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(10,'heading','─── Accesses ───',-1,'','accesses')");
     sqlite3_prepare_v2(db,
-        "INSERT INTO rpane SELECT 11+ROW_NUMBER()OVER(ORDER BY e.ts),"
+        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 11+ROW_NUMBER()OVER(ORDER BY e.ts),"
         " CASE WHEN o.err IS NOT NULL THEN 'error' ELSE 'green' END,"
         " printf('%s  PID %d (%s)  [%s]%s%s',"
         "  CASE ?2 WHEN 0 THEN printf('%.6f',e.ts) WHEN 1 THEN printf('+%.6f',e.ts-?3)"
@@ -923,7 +934,7 @@ static void rpane_file(const char *path){
         "  e.tgid,COALESCE(" BNAME("p.exe") ",'?'),COALESCE(o.flags,'?'),"
         "  CASE WHEN o.fd IS NOT NULL THEN printf(' fd=%d',o.fd) ELSE '' END,"
         "  CASE WHEN o.err IS NOT NULL THEN printf(' err=%d',o.err) ELSE '' END),"
-        " 0,CAST(e.tgid AS TEXT)"
+        " 0,CAST(e.tgid AS TEXT),'accesses'"
         " FROM open_events o JOIN events e ON e.id=o.eid JOIN processes p ON p.tgid=e.tgid"
         " WHERE o.path=?1 ORDER BY e.ts LIMIT 5000",-1,&st,0);
     sqlite3_bind_text(st,1,path,-1,SQLITE_TRANSIENT);sqlite3_bind_int(st,2,tsm);sqlite3_bind_double(st,3,bts);
@@ -933,12 +944,12 @@ static void rpane_file(const char *path){
 static void rpane_output(const char *id){
     if(!strncmp(id,"io_",3)){rpane_proc(atoi(id+3));return;}
     int eid=atoi(id);
-    xexecf("INSERT INTO rpane VALUES(0,'heading','─── Output ───',-1,'')");
-    xexecf("INSERT INTO rpane SELECT 1,'cyan',printf('Stream: %%s  PID: %%d',i.stream,e.tgid),"
-        "0,CAST(e.tgid AS TEXT) FROM io_events i JOIN events e ON e.id=i.eid WHERE e.id=%d",eid);
-    xexecf("INSERT INTO rpane SELECT 2,'green',printf('Process: %%s',COALESCE(p.exe,'?')),"
-        "0,CAST(p.tgid AS TEXT) FROM events e JOIN processes p ON p.tgid=e.tgid WHERE e.id=%d",eid);
-    xexecf("INSERT INTO rpane VALUES(5,'heading','─── Content ───',-1,'')");
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(0,'heading','─── Output ───',-1,'','output')");
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 1,'cyan',printf('Stream: %%s  PID: %%d',i.stream,e.tgid),"
+        "0,CAST(e.tgid AS TEXT),'output' FROM io_events i JOIN events e ON e.id=i.eid WHERE e.id=%d",eid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 2,'green',printf('Process: %%s',COALESCE(p.exe,'?')),"
+        "0,CAST(p.tgid AS TEXT),'output' FROM events e JOIN processes p ON p.tgid=e.tgid WHERE e.id=%d",eid);
+    xexecf("INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(5,'heading','─── Content ───',-1,'','content')");
     xexecf("WITH RECURSIVE sp(i,rest,line) AS("
         " SELECT 0,SUBSTR(data,INSTR(data,char(10))+1),"
         "  CASE WHEN INSTR(data,char(10))>0 THEN SUBSTR(data,1,INSTR(data,char(10))-1) ELSE data END"
@@ -947,7 +958,7 @@ static void rpane_output(const char *id){
         "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,INSTR(rest,char(10))+1) ELSE '' END,"
         "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,1,INSTR(rest,char(10))-1) ELSE rest END"
         "  FROM sp WHERE LENGTH(rest)>0"
-        ")INSERT INTO rpane SELECT 10+i,'normal',line,-1,'' FROM sp",eid);
+        ")INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 10+i,'normal',line,-1,'','content' FROM sp",eid);
 }
 
 static void rebuild_rpane(void){
@@ -958,30 +969,28 @@ static void rebuild_rpane(void){
     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}
     sqlite3_finalize(st);if(!id[0])return;
     switch(mode){case 0:rpane_proc(atoi(id));break;case 1:rpane_file(id);break;case 2:rpane_output(id);break;}
-    /* Apply section collapse: remove rows between collapsed heading and next heading */
-    {sqlite3_stmt*h;sqlite3_prepare_v2(db,
-        "SELECT rownum,text FROM rpane WHERE style='heading' ORDER BY rownum",-1,&h,0);
-     /* Collect heading rownums */
-     int hrn[64];char htxt[64][128];int nh=0;
-     while(sqlite3_step(h)==SQLITE_ROW&&nh<64){hrn[nh]=sqlite3_column_int(h,0);
-         const char*t=(const char*)sqlite3_column_text(h,1);
-         htxt[nh][0]=0;if(t)snprintf(htxt[nh],128,"%.127s",t);nh++;}
-     sqlite3_finalize(h);
-     for(int i=0;i<nh;i++){
-         char rid[128]="";int rj=0,rk=0;
-         for(;htxt[i][rk]&&rj<127;rk++){
-             unsigned char c=(unsigned char)htxt[i][rk];
-             if(c==' ')rid[rj++]='_';
-             else if(c>=0x80){rid[rj++]='_';while(htxt[i][rk+1]&&((unsigned char)htxt[i][rk+1]&0xC0)==0x80)rk++;}
-             else rid[rj++]=htxt[i][rk];}rid[rj]=0;
-         int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",rid),1);
-         if(!is_ex){int lo=hrn[i]+1,hi=(i+1<nh)?hrn[i+1]:999999;
-             xexecf("DELETE FROM rpane WHERE rownum>=%d AND rownum<%d AND style!='heading'",lo,hi);
-             /* Update heading text to show collapsed indicator */
-             xexecf("UPDATE rpane SET text=REPLACE(text,'───','▶──') WHERE rownum=%d",hrn[i]);}
-         else{xexecf("UPDATE rpane SET text=REPLACE(text,'▶──','───') WHERE rownum=%d",hrn[i]);}}}
-    xexec("CREATE TEMP TABLE _rp AS SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,style,text,link_mode,link_id FROM rpane;"
-        "DELETE FROM rpane;INSERT INTO rpane SELECT*FROM _rp;DROP TABLE _rp;");
+
+    /* Apply section collapse via visible column — pure SQL, no C loops */
+    /* Each heading's section name maps to an expanded entry 'rp_<section>' */
+    xexec(
+        "UPDATE rpane SET visible=0"
+        " WHERE style!='heading'"
+        "  AND section IN("
+        "   SELECT section FROM rpane WHERE style='heading'"
+        "    AND COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)=0);"
+        /* Mark headings with collapse indicator */
+        "UPDATE rpane SET text=REPLACE(text,'───','▶──')"
+        " WHERE style='heading'"
+        "  AND COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)=0;"
+        "UPDATE rpane SET text=REPLACE(text,'▶──','───')"
+        " WHERE style='heading'"
+        "  AND COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)=1;");
+
+    /* Renumber visible rows only */
+    xexec("CREATE TEMP TABLE _rp AS SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,"
+        "style,text,link_mode,link_id,section,visible FROM rpane WHERE visible=1;"
+        "DELETE FROM rpane;INSERT INTO rpane(rownum,style,text,link_mode,link_id,section,visible) SELECT*FROM _rp;DROP TABLE _rp;");
+
     /* Highlight search matches in detail pane */
     {char sq[256]="";
      {sqlite3_stmt*st2;sqlite3_prepare_v2(db,"SELECT search FROM state",-1,&st2,0);
@@ -1173,17 +1182,13 @@ static void save_to_file(const char *path){
     if(bk){sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);}
     sqlite3_close(dst);}
 
-/* ── Helper: get rpane heading ID for section collapse ──────────────── */
-static void sf_rpane_id(int rownum,char*buf,int bsz){
+/* ── Helper: get rpane section name for collapse ──────────────────── */
+static void rpane_section_at(int rownum,char*buf,int bsz){
     sqlite3_stmt*st;sqlite3_prepare_v2(db,
-        "SELECT COALESCE(SUBSTR(text,1,40),'') FROM rpane WHERE rownum=?",-1,&st,0);
+        "SELECT COALESCE(section,'') FROM rpane WHERE rownum=?",-1,&st,0);
     sqlite3_bind_int(st,1,rownum);buf[0]=0;
     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);
-        if(t){int i=0,o=0;for(;t[i]&&o<bsz-1;i++){
-            unsigned char c=(unsigned char)t[i];
-            if(c==' ')buf[o++]='_';
-            else if(c>=0x80){buf[o++]='_';while(t[i+1]&&((unsigned char)t[i+1]&0xC0)==0x80)i++;}
-            else buf[o++]=t[i];}buf[o]=0;}}
+        if(t)snprintf(buf,bsz,"%s",t);}
     sqlite3_finalize(st);}
 
 /* ── Key dispatch (game engine) ─────────────────────────────────────── */
@@ -1218,10 +1223,10 @@ static void handle_key(int k){
             {sqlite3_stmt*st2;sqlite3_prepare_v2(db,"SELECT COALESCE(style,'') FROM rpane WHERE rownum=?",-1,&st2,0);
              sqlite3_bind_int(st2,1,dc);if(sqlite3_step(st2)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st2,0);if(t)snprintf(rsty,sizeof rsty,"%s",t);}sqlite3_finalize(st2);}
             if(strcmp(rsty,"heading")==0){
-                char rid[128]="";sf_rpane_id(dc,rid,sizeof rid);
-                int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",rid),1);
-                xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)",rid,is_ex?0:1);
-                dirty_rp();break;}
+                char sec[128]="";rpane_section_at(dc,sec,sizeof sec);
+                if(sec[0]){int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",sec),1);
+                xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)",sec,is_ex?0:1);
+                dirty_rp();}break;}
             follow_link();break;}
         {char id[256]="";sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
          if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}sqlite3_finalize(st);
@@ -1240,11 +1245,11 @@ static void handle_key(int k){
             {sqlite3_stmt*st2;sqlite3_prepare_v2(db,"SELECT COALESCE(style,'') FROM rpane WHERE rownum=?",-1,&st2,0);
              sqlite3_bind_int(st2,1,dc);if(sqlite3_step(st2)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st2,0);if(t)snprintf(rsty,sizeof rsty,"%s",t);}sqlite3_finalize(st2);}
             if(strcmp(rsty,"heading")==0){
-                /* Toggle rpane section collapse */
-                char rid[128]="";sf_rpane_id(dc,rid,sizeof rid);
-                int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",rid),1);
-                xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)",rid,is_ex?0:1);
-                dirty_rp();break;}
+                /* Toggle rpane section collapse via section column */
+                char sec[128]="";rpane_section_at(dc,sec,sizeof sec);
+                if(sec[0]){int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",sec),1);
+                xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)",sec,is_ex?0:1);
+                dirty_rp();}break;}
             break;}
         {char id[256]="";sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
          if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}sqlite3_finalize(st);
@@ -1368,6 +1373,7 @@ int main(int argc,char**argv){
         return 1;}
 
     if(sqlite3_open(":memory:",&db)!=SQLITE_OK)die("sqlite3_open");
+    register_sql_functions(db);
 
     if(load_mode){
         sqlite3*src;
