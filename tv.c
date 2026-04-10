@@ -26,6 +26,10 @@ static void xexecf(const char *fmt,...){
 static int qint(const char *sql,int def){
     sqlite3_stmt*s;int r=def;if(sqlite3_prepare_v2(db,sql,-1,&s,0)==SQLITE_OK){
         if(sqlite3_step(s)==SQLITE_ROW)r=sqlite3_column_int(s,0);sqlite3_finalize(s);}return r;}
+/* qintf: like qint but takes printf-style args and frees the formatted string */
+static int qintf(int def,const char *fmt,...){
+    va_list a;va_start(a,fmt);char*sql=sqlite3_vmprintf(fmt,a);va_end(a);
+    if(!sql)return def;int r=qint(sql,def);sqlite3_free(sql);return r;}
 static double qdbl(const char *sql,double def){
     sqlite3_stmt*s;double r=def;if(sqlite3_prepare_v2(db,sql,-1,&s,0)==SQLITE_OK){
         if(sqlite3_step(s)==SQLITE_ROW)r=sqlite3_column_double(s,0);sqlite3_finalize(s);}return r;}
@@ -68,7 +72,7 @@ static void sql_dir_part(sqlite3_context*ctx,int n,sqlite3_value**v){
     const char*in=(const char*)sqlite3_value_text(v[0]);
     if(!in){sqlite3_result_null(ctx);return;}
     const char*last=strrchr(in,'/');
-    if(!last||last==in){sqlite3_result_text(ctx,last?"/":"",1,SQLITE_TRANSIENT);return;}
+    if(!last||last==in){sqlite3_result_text(ctx,last?"/":"",last?1:0,SQLITE_TRANSIENT);return;}
     sqlite3_result_text(ctx,in,(int)(last-in),SQLITE_TRANSIENT);}
 
 /* DEPTH(path) — number of '/' separators (for indentation) */
@@ -755,14 +759,13 @@ static void rebuild_files(void){
     /* Iteratively expand children of expanded directories */
     for(int depth=0;depth<50;depth++){
         /* Check if there are expanded dirs at this depth with children */
-        int has_more=qint(
-            sqlite3_mprintf(
+        int has_more=qintf(0,
                 "SELECT COUNT(*) FROM ftree t"
                 " WHERE t.depth=%d AND t.is_dir=1"
                 " AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1"
                 " AND (EXISTS(SELECT 1 FROM dir_nodes d WHERE d.parent_path=t.path AND d.dead=0)"
                 "  OR EXISTS(SELECT 1 FROM file_stats f WHERE dir_part(f.canon)=t.path))",
-                depth),0);
+                depth);
         if(!has_more) break;
 
         /* Insert child dirs */
@@ -1224,17 +1227,17 @@ static void handle_key(int k){
              sqlite3_bind_int(st2,1,dc);if(sqlite3_step(st2)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st2,0);if(t)snprintf(rsty,sizeof rsty,"%s",t);}sqlite3_finalize(st2);}
             if(strcmp(rsty,"heading")==0){
                 char sec[128]="";rpane_section_at(dc,sec,sizeof sec);
-                if(sec[0]){int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",sec),1);
+                if(sec[0]){int is_ex=qintf(1,"SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",sec);
                 xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)",sec,is_ex?0:1);
                 dirty_rp();}break;}
             follow_link();break;}
         {char id[256]="";sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
          if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}sqlite3_finalize(st);
          if((mode==0||mode==1||mode==2)&&id[0]){
-             int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);
+             int is_ex=qintf(1,"SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id);
              int has_ch=0;
-             if(mode==0)has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",atoi(id)),0);
-             else if(mode==1)has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'",id),0);
+             if(mode==0)has_ch=qintf(0,"SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",atoi(id));
+             else if(mode==1)has_ch=qintf(0,"SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'",id);
              else if(!strncmp(id,"io_",3))has_ch=1;
              if(has_ch&&!is_ex){xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)",id);dirty_both();break;}}}break;
     case K_LEFT:case'h':
@@ -1247,35 +1250,35 @@ static void handle_key(int k){
             if(strcmp(rsty,"heading")==0){
                 /* Toggle rpane section collapse via section column */
                 char sec[128]="";rpane_section_at(dc,sec,sizeof sec);
-                if(sec[0]){int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",sec),1);
+                if(sec[0]){int is_ex=qintf(1,"SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)",sec);
                 xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)",sec,is_ex?0:1);
                 dirty_rp();}break;}
             break;}
         {char id[256]="";sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
          if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}sqlite3_finalize(st);
          if(mode==0&&id[0]){int tgid=atoi(id);
-             int has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",tgid),0);
-             int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);
+             int has_ch=qintf(0,"SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",tgid);
+             int is_ex=qintf(1,"SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id);
              if(has_ch&&is_ex){xexecf("UPDATE expanded SET ex=0 WHERE id='%s'",id);dirty_both();break;}
-             int ppid=qint(sqlite3_mprintf("SELECT ppid FROM processes WHERE tgid=%d",tgid),-1);
-             if(ppid>=0){int r=qint(sqlite3_mprintf("SELECT rownum FROM lpane WHERE id='%d'",ppid),-1);
+             int ppid=qintf(-1,"SELECT ppid FROM processes WHERE tgid=%d",tgid);
+             if(ppid>=0){int r=qintf(-1,"SELECT rownum FROM lpane WHERE id='%d'",ppid);
                  if(r>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",r);dirty_rp();}}}
          else if(mode==1&&id[0]){
              /* Files mode: collapse directory or jump to parent */
-             int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);
-             int has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'",id),0);
+             int is_ex=qintf(1,"SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id);
+             int has_ch=qintf(0,"SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'",id);
              if(has_ch&&is_ex){xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)",id);dirty_both();break;}
              {sqlite3_stmt*s2;sqlite3_prepare_v2(db,"SELECT parent_id FROM lpane WHERE id=? LIMIT 1",-1,&s2,0);
               sqlite3_bind_text(s2,1,id,-1,SQLITE_TRANSIENT);
               if(sqlite3_step(s2)==SQLITE_ROW){const char*pi=(const char*)sqlite3_column_text(s2,0);
-                  if(pi&&pi[0]){int r=qint(sqlite3_mprintf("SELECT rownum FROM lpane WHERE id='%s'",pi),-1);
+                  if(pi&&pi[0]){int r=qintf(-1,"SELECT rownum FROM lpane WHERE id='%s'",pi);
                       if(r>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",r);dirty_rp();}}}
               sqlite3_finalize(s2);}}
          else if(mode==2&&id[0]){
              if(!strncmp(id,"io_",3)){xexecf("UPDATE expanded SET ex=0 WHERE id='%s'",id);dirty_both();}
              else{sqlite3_stmt*s2;sqlite3_prepare_v2(db,"SELECT parent_id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&s2,0);
                  if(sqlite3_step(s2)==SQLITE_ROW){const char*pi=(const char*)sqlite3_column_text(s2,0);
-                     if(pi){int r=qint(sqlite3_mprintf("SELECT rownum FROM lpane WHERE id='%s'",pi),-1);
+                     if(pi){int r=qintf(-1,"SELECT rownum FROM lpane WHERE id='%s'",pi);
                          if(r>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",r);dirty_rp();}}}
                  sqlite3_finalize(s2);}}}break;
     case'e':case'E':if(mode==0){char id[64]="";sqlite3_stmt*st;
