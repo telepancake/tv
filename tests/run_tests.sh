@@ -1,7 +1,7 @@
 #!/bin/bash
 # tests/run_tests.sh — test suite for tv
 # Tests run by piping combined trace+input JSON streams into tv --trace /dev/stdin.
-# Input events embedded in the stream: {"input":"nav","d":1}
+# Input events embedded in the stream: {"input":"key","key":"j"}
 # {"input":"resize","rows":50,"cols":120}  {"input":"select","id":"1003"}
 # {"input":"search","q":"term"}  {"input":"evfilt","q":"OPEN"}
 # {"input":"print","what":"lpane|rpane|state"}
@@ -242,7 +242,7 @@ run_test "proc_detail: stderr event" \
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1000"}
-{"input":"left","id":"1000"}
+{"input":"key","key":"left"}
 {"input":"print","what":"lpane"}')
 run_test "proc_tree: collapse hides children" \
     'assert_contains t "$OUT" "▶ [1000]"' \
@@ -252,8 +252,8 @@ run_test "proc_tree: collapse hides children" \
 
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1000"}
-{"input":"left","id":"1000"}
-{"input":"right","id":"1000"}
+{"input":"key","key":"left"}
+{"input":"key","key":"right"}
 {"input":"print","what":"lpane"}')
 run_test "proc_tree: expand shows children" \
     'assert_contains t "$OUT" "▼ [1000]"' \
@@ -264,7 +264,7 @@ run_test "proc_tree: expand shows children" \
 # Test: flat mode
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"group"}
+{"input":"key","key":"G"}
 {"input":"print","what":"lpane"}')
 run_test "proc_flat: all processes, no indentation" \
     'assert_contains t "$OUT" "[1000] make"' \
@@ -277,7 +277,7 @@ run_test "proc_flat: all processes, no indentation" \
 # Test: process filter — failed (interesting failures + ancestors)
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"lpfilter","v":1}
+{"input":"key","key":"v"}
 {"input":"print","what":"lpane"}')
 run_test "proc_filter: failed shows interesting failures" \
     'assert_contains t "$OUT" "|1000|"' \
@@ -294,8 +294,8 @@ run_test "proc_filter: failed shows interesting failures" \
 # Test: process filter — running (no EXIT + ancestors)
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"lpfilter","v":1}
-{"input":"lpfilter","v":2}
+{"input":"key","key":"v"}
+{"input":"key","key":"v"}
 {"input":"print","what":"lpane"}')
 run_test "proc_filter: running shows non-exited" \
     'assert_contains t "$OUT" "|1000|"' \
@@ -308,7 +308,7 @@ run_test "proc_filter: running shows non-exited" \
 # Test: file view
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":1}
+{"input":"key","key":"2"}
 {"input":"print","what":"lpane"}')
 run_test "file_view: all opened files present" \
     'assert_contains t "$OUT" "foo.c"' \
@@ -346,7 +346,7 @@ run_test "file_view: O_RDWR file" \
 # Test: file detail — dependency chain
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":1}
+{"input":"key","key":"2"}
 {"input":"select","id":"/home/user/project/foo.o"}
 {"input":"print","what":"rpane"}')
 run_test "file_detail: foo.o dependency chain" \
@@ -363,7 +363,7 @@ run_test "file_detail: foo.o dependency chain" \
 # Test: file detail — error file
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":1}
+{"input":"key","key":"2"}
 {"input":"select","id":"/nonexistent"}
 {"input":"print","what":"rpane"}')
 run_test "file_detail: error file" \
@@ -376,7 +376,7 @@ run_test "file_detail: error file" \
 # Test: output view
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":2}
+{"input":"key","key":"3"}
 {"input":"print","what":"lpane"}')
 run_test "output_view: grouped by process" \
     'assert_contains t "$OUT" "PID 1002 gcc"' \
@@ -400,7 +400,7 @@ run_test "output_view: stderr styled as error" \
 # Test: output detail — stdout content
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":2}
+{"input":"key","key":"3"}
 {"input":"select","id":"28"}
 {"input":"print","what":"rpane"}')
 run_test "output_detail: stdout content" \
@@ -414,7 +414,7 @@ run_test "output_detail: stdout content" \
 # Test: output detail — stderr content
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":2}
+{"input":"key","key":"3"}
 {"input":"select","id":"16"}
 {"input":"print","what":"rpane"}')
 run_test "output_detail: stderr content" \
@@ -426,8 +426,8 @@ run_test "output_detail: stderr content" \
 # Test: output view — flat mode (ungrouped)
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":2}
-{"input":"group"}
+{"input":"key","key":"3"}
+{"input":"key","key":"G"}
 {"input":"print","what":"lpane"}')
 run_test "output_flat: all lines present" \
     'assert_contains t "$OUT" "STDERR"' \
@@ -438,9 +438,9 @@ run_test "output_flat: all lines present" \
 # Test: output group expand/collapse
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":2}
+{"input":"key","key":"3"}
 {"input":"select","id":"io_1002"}
-{"input":"left","id":"io_1002"}
+{"input":"key","key":"left"}
 {"input":"print","what":"lpane"}')
 run_test "output_group: collapse hides children" \
     'assert_contains t "$OUT" "PID 1002"' \
@@ -451,12 +451,12 @@ run_test "output_group: collapse hides children" \
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"print","what":"state"}
-{"input":"nav","d":1}
+{"input":"key","key":"j"}
 {"input":"print","what":"state"}
-{"input":"nav","d":1}
-{"input":"nav","d":1}
+{"input":"key","key":"j"}
+{"input":"key","key":"j"}
 {"input":"print","what":"state"}
-{"input":"nav","d":-1}
+{"input":"key","key":"k"}
 {"input":"print","what":"state"}')
 run_test "navigation: cursor moves" \
     'assert_line_match t "$OUT" "^cursor=0 "' \
@@ -469,9 +469,9 @@ run_test "navigation: cursor moves" \
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"print","what":"state"}
-{"input":"focus","v":-1}
+{"input":"key","key":"tab"}
 {"input":"print","what":"state"}
-{"input":"focus","v":-1}
+{"input":"key","key":"tab"}
 {"input":"print","what":"state"}')
 run_test "navigation: tab switches pane" \
     'assert_line_match t "$OUT" "^cursor=0.*focus=0"' \
@@ -483,7 +483,7 @@ run_test "navigation: tab switches pane" \
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1000"}
-{"input":"focus","v":1}
+{"input":"key","key":"enter"}
 {"input":"print","what":"state"}')
 run_test "navigation: enter opens detail pane" \
     'assert_line_match t "$OUT" "focus=1"'
@@ -492,7 +492,7 @@ run_test "navigation: enter opens detail pane" \
 # Test: sort modes
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"sort"}
+{"input":"key","key":"s"}
 {"input":"print","what":"state"}
 {"input":"print","what":"lpane"}')
 run_test "sort: changes sort_key" \
@@ -504,7 +504,7 @@ run_test "sort: changes sort_key" \
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1001"}
-{"input":"tsmode"}
+{"input":"key","key":"t"}
 {"input":"print","what":"rpane"}
 {"input":"print","what":"state"}')
 run_test "timestamps: relative mode" \
@@ -513,8 +513,8 @@ run_test "timestamps: relative mode" \
 
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1001"}
-{"input":"tsmode"}
-{"input":"tsmode"}
+{"input":"key","key":"t"}
+{"input":"key","key":"t"}
 {"input":"print","what":"rpane"}
 {"input":"print","what":"state"}')
 run_test "timestamps: delta mode" \
@@ -533,7 +533,7 @@ run_test "search: matches process" \
     'assert_line_match t "$OUT" "search=broken"'
 
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":1}
+{"input":"key","key":"2"}
 {"input":"search","q":"foo"}
 {"input":"print","what":"lpane"}')
 run_test "search: matches file" \
@@ -566,11 +566,11 @@ run_test "save_load: round-trip preserves data" \
 # Test: mode switching
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":0}
+{"input":"key","key":"1"}
 {"input":"print","what":"state"}
-{"input":"mode","m":1}
+{"input":"key","key":"2"}
 {"input":"print","what":"state"}
-{"input":"mode","m":2}
+{"input":"key","key":"3"}
 {"input":"print","what":"state"}')
 run_test "mode_switch: 1=proc 2=file 3=output" \
     'assert_line_match t "$OUT" "mode=0.*rows=50"' \
@@ -582,7 +582,7 @@ run_test "mode_switch: 1=proc 2=file 3=output" \
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1000"}
-{"input":"collapse","id":"1000"}
+{"input":"key","key":"E"}
 {"input":"print","what":"lpane"}')
 run_test "expand_all: E collapses subtree" \
     'assert_contains t "$OUT" "▶ [1000]"' \
@@ -590,8 +590,8 @@ run_test "expand_all: E collapses subtree" \
 
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1000"}
-{"input":"collapse","id":"1000"}
-{"input":"expand","id":"1000"}
+{"input":"key","key":"E"}
+{"input":"key","key":"e"}
 {"input":"print","what":"lpane"}')
 run_test "expand_all: e expands subtree" \
     'assert_contains t "$OUT" "▼ [1000]"' \
@@ -602,7 +602,7 @@ run_test "expand_all: e expands subtree" \
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"select","id":"1003"}
-{"input":"left","id":"1003"}
+{"input":"key","key":"left"}
 {"input":"print","what":"state"}')
 run_test "navigation: left from leaf jumps to parent" \
     'assert_line_match t "$OUT" "cursor=0"'
@@ -611,14 +611,14 @@ run_test "navigation: left from leaf jumps to parent" \
 # Test: follow link from rpane
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"mode","m":1}
+{"input":"key","key":"2"}
 {"input":"select","id":"/home/user/project/foo.o"}
-{"input":"focus","v":1}
-{"input":"nav","d":1}
-{"input":"nav","d":1}
-{"input":"nav","d":1}
-{"input":"nav","d":1}
-{"input":"follow"}
+{"input":"key","key":"tab"}
+{"input":"key","key":"j"}
+{"input":"key","key":"j"}
+{"input":"key","key":"j"}
+{"input":"key","key":"j"}
+{"input":"key","key":"enter"}
 {"input":"print","what":"state"}
 {"input":"print","what":"lpane"}')
 run_test "follow_link: file→process navigation" \
@@ -639,8 +639,8 @@ run_test "resize: updates rows/cols" \
 # Test: process filter clear
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"lpfilter","v":1}
-{"input":"lpfilter","v":0}
+{"input":"key","key":"v"}
+{"input":"key","key":"V"}
 {"input":"print","what":"lpane"}
 {"input":"print","what":"state"}')
 run_test "proc_filter: V clears filter" \
@@ -652,14 +652,14 @@ run_test "proc_filter: V clears filter" \
 # Test: home/end navigation
 # ═══════════════════════════════════════════════════════════════════════
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"goto","v":1}
+{"input":"key","key":"end"}
 {"input":"print","what":"state"}')
 run_test "navigation: end goes to last" \
     'assert_line_match t "$OUT" "cursor=8"'
 
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
-{"input":"goto","v":1}
-{"input":"goto","v":0}
+{"input":"key","key":"end"}
+{"input":"key","key":"home"}
 {"input":"print","what":"state"}')
 run_test "navigation: home goes to first" \
     'assert_line_match t "$OUT" "cursor=0"'
@@ -670,7 +670,7 @@ run_test "navigation: home goes to first" \
 # Verify that the stream is truly unified: no separate driver file needed
 printf '%s\n' \
     '{"input":"resize","rows":50,"cols":120}' \
-    '{"input":"mode","m":1}' \
+    '{"input":"key","key":"2"}' \
     '{"input":"print","what":"lpane"}' \
     > "$TMPDIR/input_only.jsonl"
 OUT=$(cat "$TRACE" "$TMPDIR/input_only.jsonl" | "$TV" --trace /dev/stdin 2>&1)
