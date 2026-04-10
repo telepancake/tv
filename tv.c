@@ -1098,7 +1098,6 @@ int main(int argc,char**argv){
         process_inbox(1);  /* drain trace events only */
         setup_app();
         setup_fts();
-        setup_fts();
     } else {
         db_create();
         setup_app();
