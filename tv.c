@@ -50,7 +50,10 @@ static void db_create(void){xexec(
     "CREATE TABLE exit_events(eid INTEGER PRIMARY KEY,status TEXT,code INT,"
     " signal INT,core_dumped INT,raw INT);"
     "CREATE TABLE cwd_cache(tgid INTEGER PRIMARY KEY,cwd TEXT);"
-    "CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL);");}
+    "CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL);"
+    "CREATE TABLE outbox(rlp INT DEFAULT 0,rrp INT DEFAULT 0);"
+    "INSERT INTO outbox VALUES(0,0);"
+    );}
 
 static void setup_app(void){
     xexec(
@@ -68,15 +71,16 @@ static void setup_app(void){
         " search TEXT DEFAULT '',evfilt TEXT DEFAULT '',"
         " rows INT DEFAULT 24,cols INT DEFAULT 80,"
         " base_ts REAL DEFAULT 0,has_fts INT DEFAULT 0,mode INT DEFAULT 0,"
-        " lp_filter INT DEFAULT 0);"
+        " lp_filter INT DEFAULT 0,selected_id TEXT DEFAULT '');"
         "INSERT OR IGNORE INTO state(base_ts) VALUES((SELECT COALESCE(MIN(ts),0) FROM events));"
         "CREATE TABLE IF NOT EXISTS lpane(rownum INTEGER PRIMARY KEY,id TEXT NOT NULL,"
         " parent_id TEXT,style TEXT DEFAULT 'normal',text TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS rpane(rownum INTEGER PRIMARY KEY,style TEXT DEFAULT 'normal',"
         " text TEXT NOT NULL,link_mode INT DEFAULT -1,link_id TEXT DEFAULT '');"
         "CREATE TABLE IF NOT EXISTS search_hits(id TEXT PRIMARY KEY);"
-        "CREATE TABLE IF NOT EXISTS cwd_cache(tgid INTEGER PRIMARY KEY,cwd TEXT);");}
-
+        "CREATE TABLE IF NOT EXISTS cwd_cache(tgid INTEGER PRIMARY KEY,cwd TEXT);");
+    {char*e=0;sqlite3_exec(db,"CREATE TABLE IF NOT EXISTS outbox(rlp INT DEFAULT 0,rrp INT DEFAULT 0)",0,0,&e);if(e)sqlite3_free(e);}
+    {char*e=0;sqlite3_exec(db,"INSERT INTO outbox SELECT 0,0 WHERE NOT EXISTS(SELECT 1 FROM outbox)",0,0,&e);if(e)sqlite3_free(e);}}
 static void setup_fts(void){
     char*e=0;if(sqlite3_exec(db,
         "CREATE VIRTUAL TABLE fts USING fts5(id UNINDEXED,source,content,tokenize='unicode61')",0,0,&e)==SQLITE_OK){
@@ -312,150 +316,13 @@ static void ingest_file(const char *path){
     xexec("COMMIT");
     fclose(f);}
 
-/* Process all trace rows from inbox (one-by-one inside a transaction) */
-static void flush_trace_inbox(void){
-    static char buf[1<<20];
-    xexec("BEGIN");
-    for(;;){
-        long long id=-1;buf[0]=0;
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT id,data FROM inbox WHERE kind='trace' ORDER BY id LIMIT 1",-1,&st,0);
-         if(sqlite3_step(st)==SQLITE_ROW){
-             id=sqlite3_column_int64(st,0);
-             const char*d=(const char*)sqlite3_column_text(st,1);
-             if(d)snprintf(buf,sizeof buf-1,"%s",d);}
-         sqlite3_finalize(st);}
-        if(id<0)break;
-        xexecf("DELETE FROM inbox WHERE id=%lld",id);
-        process_trace_event(buf);}
-    xexec("COMMIT");}
-
-/* Forward declarations for process_input_event */
-static void handle_key(int k);
+/* Forward declarations */
 static void do_search(const char *q);
 static void rebuild_lpane(void);
 static void rebuild_rpane(void);
 static void dump_lpane(void);
 static void dump_rpane(void);
 static void dump_state(void);
-static int parse_key_name(const char *n);
-
-/* Dispatch one 'input' event (key / print / resize / select / search / evfilt) */
-static void process_input_event(const char *data){
-    char inp[32]="";
-    {sqlite3_stmt*st;
-     sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.input'),'')",-1,&st,0);
-     sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
-     if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(inp,sizeof inp,"%s",v);}
-     sqlite3_finalize(st);}
-    if(!inp[0]) return;
-
-    if(strcmp(inp,"key")==0){
-        char kname[32]="";
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.key'),'')",-1,&st,0);
-         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
-         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(kname,sizeof kname,"%s",v);}
-         sqlite3_finalize(st);}
-        int k=parse_key_name(kname);
-        if(k!=K_NONE)handle_key(k);
-
-    }else if(strcmp(inp,"print")==0){
-        char what[32]="";
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.what'),'')",-1,&st,0);
-         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
-         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(what,sizeof what,"%s",v);}
-         sqlite3_finalize(st);}
-        if(strcmp(what,"lpane")==0)dump_lpane();
-        else if(strcmp(what,"rpane")==0)dump_rpane();
-        else if(strcmp(what,"state")==0)dump_state();
-        g_headless=1;
-
-    }else if(strcmp(inp,"resize")==0){
-        int rows=0,cols=0;
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT CAST(json_extract(?1,'$.rows')AS INT),CAST(json_extract(?1,'$.cols')AS INT)",-1,&st,0);
-         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
-         if(sqlite3_step(st)==SQLITE_ROW){rows=sqlite3_column_int(st,0);cols=sqlite3_column_int(st,1);}
-         sqlite3_finalize(st);}
-        if(rows>0&&cols>0){
-            xexecf("UPDATE state SET rows=%d,cols=%d",rows,cols);
-            rebuild_lpane();rebuild_rpane();}
-
-    }else if(strcmp(inp,"select")==0){
-        char id[256]="";
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.id'),'')",-1,&st,0);
-         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
-         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(id,sizeof id,"%s",v);}
-         sqlite3_finalize(st);}
-        if(id[0]){
-            int found=-1;
-            {sqlite3_stmt*st;
-             sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&st,0);
-             sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);
-             if(sqlite3_step(st)==SQLITE_ROW)found=sqlite3_column_int(st,0);
-             sqlite3_finalize(st);}
-            if(found>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",found);rebuild_rpane();}}
-
-    }else if(strcmp(inp,"search")==0){
-        char q[256]="";
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT COALESCE(json_extract(?1,'$.q'),'')",-1,&st,0);
-         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
-         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(q,sizeof q,"%s",v);}
-         sqlite3_finalize(st);}
-        if(q[0]){
-            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET search=?",-1,&st,0);
-            sqlite3_bind_text(st,1,q,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-            do_search(q);rebuild_lpane();rebuild_rpane();}
-
-    }else if(strcmp(inp,"evfilt")==0){
-        char q[64]="";
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT UPPER(COALESCE(json_extract(?1,'$.q'),''))",-1,&st,0);
-         sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
-         if(sqlite3_step(st)==SQLITE_ROW){const char*v=(const char*)sqlite3_column_text(st,0);if(v)snprintf(q,sizeof q,"%s",v);}
-         sqlite3_finalize(st);}
-        if(q[0]){
-            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET evfilt=?",-1,&st,0);
-            sqlite3_bind_text(st,1,q,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-            rebuild_rpane();}}}
-
-/* Process all input rows from inbox one-by-one (no surrounding transaction:
-   process_input_event may trigger DDL via rebuild_lpane/rebuild_rpane) */
-static void flush_input_inbox(void){
-    static char buf[1<<20];
-    for(;;){
-        long long id=-1;buf[0]=0;
-        {sqlite3_stmt*st;
-         sqlite3_prepare_v2(db,"SELECT id,data FROM inbox WHERE kind='input' ORDER BY id LIMIT 1",-1,&st,0);
-         if(sqlite3_step(st)==SQLITE_ROW){
-             id=sqlite3_column_int64(st,0);
-             const char*d=(const char*)sqlite3_column_text(st,1);
-             if(d)snprintf(buf,sizeof buf-1,"%s",d);}
-         sqlite3_finalize(st);}
-        if(id<0)break;
-        xexecf("DELETE FROM inbox WHERE id=%lld",id);
-        process_input_event(buf);}}
-
-/* Convert a live key code to a JSON input event string */
-static const char* key_code_to_json(int k){
-    static char j[64];
-    const char*n=NULL;
-    switch(k){
-    case K_UP:    n="up";   break; case K_DOWN:  n="down";  break;
-    case K_LEFT:  n="left"; break; case K_RIGHT: n="right"; break;
-    case K_PGUP:  n="pgup"; break; case K_PGDN:  n="pgdn";  break;
-    case K_HOME:  n="home"; break; case K_END:   n="end";   break;
-    case K_TAB:   n="tab";  break; case K_ENTER: n="enter"; break;
-    case K_ESC:   n="esc";  break; case K_BS:    n="bs";    break;
-    default:
-        if(k>=32&&k<127){snprintf(j,sizeof j,"{\"input\":\"key\",\"key\":\"%c\"}",(char)k);return j;}
-        return NULL;}
-    snprintf(j,sizeof j,"{\"input\":\"key\",\"key\":\"%s\"}",n);
-    return j;}
 
 /* ── Part 2: App state & SQL logic ─────────────────────────────────── */
 
@@ -763,11 +630,16 @@ static void rpane_output(const char *id){
 
 static void rebuild_rpane(void){
     xexec("DELETE FROM rpane;");
-    int mode=qint("SELECT mode FROM state",0),cursor=qint("SELECT cursor FROM state",0);
-    sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=?",-1,&st,0);
-    sqlite3_bind_int(st,1,cursor);char id[4096]="";
-    if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}
-    sqlite3_finalize(st);if(!id[0])return;
+    int mode=qint("SELECT mode FROM state",0);
+    char id[4096]="";
+    {sqlite3_stmt*st;
+     sqlite3_prepare_v2(db,
+         "SELECT COALESCE(NULLIF((SELECT selected_id FROM state),''),(SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)))",
+         -1,&st,0);
+     if(sqlite3_step(st)==SQLITE_ROW&&sqlite3_column_text(st,0))
+         snprintf(id,sizeof id,"%s",(const char*)sqlite3_column_text(st,0));
+     sqlite3_finalize(st);}
+    if(!id[0])return;
     switch(mode){case 0:rpane_proc(atoi(id));break;case 1:rpane_file(id);break;case 2:rpane_output(id);break;}
     xexec("CREATE TEMP TABLE _rp AS SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,style,text,link_mode,link_id FROM rpane;"
         "DELETE FROM rpane;INSERT INTO rpane SELECT*FROM _rp;DROP TABLE _rp;");
@@ -811,7 +683,15 @@ static void jump_hit(int dir){
     sqlite3_finalize(st);
     if(f<0){sql=dir>0?"SELECT MIN(rownum) FROM lpane WHERE id IN(SELECT id FROM search_hits)"
                       :"SELECT MAX(rownum) FROM lpane WHERE id IN(SELECT id FROM search_hits)";f=qint(sql,-1);}
-    if(f>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",f);rebuild_rpane();}
+    if(f>=0){
+        char id2[4096]="";
+        {sqlite3_stmt*s2;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=?",-1,&s2,0);
+         sqlite3_bind_int(s2,1,f);
+         if(sqlite3_step(s2)==SQLITE_ROW&&sqlite3_column_text(s2,0))snprintf(id2,sizeof id2,"%s",(const char*)sqlite3_column_text(s2,0));
+         sqlite3_finalize(s2);}
+        sqlite3_stmt*s3;sqlite3_prepare_v2(db,"UPDATE state SET cursor=?,dscroll=0,dcursor=0,selected_id=?",-1,&s3,0);
+        sqlite3_bind_int(s3,1,f);sqlite3_bind_text(s3,2,id2,-1,SQLITE_TRANSIENT);sqlite3_step(s3);sqlite3_finalize(s3);
+        xexec("UPDATE outbox SET rrp=1");}
 }
 static void follow_link(void){
     int dc=qint("SELECT dcursor FROM state",0);sqlite3_stmt*st;
@@ -826,11 +706,256 @@ static void follow_link(void){
                 " UNION ALL SELECT ppid FROM processes JOIN a ON tgid=a.p WHERE ppid IS NOT NULL"
                 ")UPDATE expanded SET ex=1 WHERE id IN(SELECT CAST(p AS TEXT) FROM a)",tg);}
             rebuild_lpane();
-            sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&st,0);
-            sqlite3_bind_text(st,1,tid,-1,SQLITE_TRANSIENT);
-            if(sqlite3_step(st)==SQLITE_ROW)xexecf("UPDATE state SET cursor=%d",sqlite3_column_int(st,0));
-            sqlite3_finalize(st);rebuild_rpane();return;}}
+            int rn=0;
+            {sqlite3_stmt*s2;sqlite3_prepare_v2(db,"SELECT rownum FROM lpane WHERE id=?",-1,&s2,0);
+             sqlite3_bind_text(s2,1,tid,-1,SQLITE_TRANSIENT);
+             if(sqlite3_step(s2)==SQLITE_ROW)rn=sqlite3_column_int(s2,0);
+             sqlite3_finalize(s2);}
+            {sqlite3_stmt*s2;sqlite3_prepare_v2(db,"UPDATE state SET cursor=?,selected_id=?",-1,&s2,0);
+             sqlite3_bind_int(s2,1,rn);sqlite3_bind_text(s2,2,tid,-1,SQLITE_TRANSIENT);
+             sqlite3_step(s2);sqlite3_finalize(s2);}
+            xexec("UPDATE outbox SET rlp=0,rrp=1");
+            return;}}
     sqlite3_finalize(st);
+}
+
+/* ── sql_handle_input: process one semantic input event ────────────── */
+static void sql_handle_input(const char *data){
+    char inp[32]="",id[4096]="",q[256]="",what[32]="";
+    int m=0,d=0,v=0,rows=0,cols=0;
+    {sqlite3_stmt*st;
+     sqlite3_prepare_v2(db,
+         "SELECT COALESCE(json_extract(?1,'$.input'),''),"
+         "       COALESCE(json_extract(?1,'$.id'),''),"
+         "       COALESCE(json_extract(?1,'$.q'),''),"
+         "       COALESCE(json_extract(?1,'$.what'),''),"
+         "       CAST(COALESCE(json_extract(?1,'$.m'),0) AS INT),"
+         "       CAST(COALESCE(json_extract(?1,'$.d'),0) AS INT),"
+         "       CAST(COALESCE(json_extract(?1,'$.v'),0) AS INT),"
+         "       CAST(COALESCE(json_extract(?1,'$.rows'),0) AS INT),"
+         "       CAST(COALESCE(json_extract(?1,'$.cols'),0) AS INT)",
+         -1,&st,0);
+     sqlite3_bind_text(st,1,data,-1,SQLITE_TRANSIENT);
+     if(sqlite3_step(st)==SQLITE_ROW){
+         const char*s;
+         s=(const char*)sqlite3_column_text(st,0);if(s)snprintf(inp,sizeof inp,"%s",s);
+         s=(const char*)sqlite3_column_text(st,1);if(s)snprintf(id,sizeof id,"%s",s);
+         s=(const char*)sqlite3_column_text(st,2);if(s)snprintf(q,sizeof q,"%s",s);
+         s=(const char*)sqlite3_column_text(st,3);if(s)snprintf(what,sizeof what,"%s",s);
+         m=sqlite3_column_int(st,4);d=sqlite3_column_int(st,5);v=sqlite3_column_int(st,6);
+         rows=sqlite3_column_int(st,7);cols=sqlite3_column_int(st,8);}
+     sqlite3_finalize(st);}
+    if(!inp[0]) return;
+    int focus=qint("SELECT focus FROM state",0);
+    int mode=qint("SELECT mode FROM state",0);
+
+    if(strcmp(inp,"nav")==0){
+        if(!focus){
+            sqlite3_stmt*st;
+            sqlite3_prepare_v2(db,"UPDATE state SET cursor=MAX(0,MIN(cursor+?1,(SELECT COUNT(*)-1 FROM lpane))),dscroll=0,dcursor=0",-1,&st,0);
+            sqlite3_bind_int(st,1,d);sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE state SET selected_id=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),'')");
+            xexec("UPDATE outbox SET rrp=1");
+        } else {
+            sqlite3_stmt*st;
+            sqlite3_prepare_v2(db,"UPDATE state SET dcursor=MAX(0,MIN(dcursor+?1,(SELECT COUNT(*)-1 FROM rpane)))",-1,&st,0);
+            sqlite3_bind_int(st,1,d);sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE outbox SET rrp=1");}
+
+    } else if(strcmp(inp,"pgnav")==0){
+        int pg=qint("SELECT rows FROM state",24)-3;
+        int ad=d*pg;
+        if(!focus){
+            sqlite3_stmt*st;
+            sqlite3_prepare_v2(db,"UPDATE state SET cursor=MAX(0,MIN(cursor+?1,(SELECT COUNT(*)-1 FROM lpane))),dscroll=0,dcursor=0",-1,&st,0);
+            sqlite3_bind_int(st,1,ad);sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE state SET selected_id=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),'')");
+            xexec("UPDATE outbox SET rrp=1");
+        } else {
+            sqlite3_stmt*st;
+            sqlite3_prepare_v2(db,"UPDATE state SET dcursor=MAX(0,MIN(dcursor+?1,(SELECT COUNT(*)-1 FROM rpane)))",-1,&st,0);
+            sqlite3_bind_int(st,1,ad);sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE outbox SET rrp=1");}
+
+    } else if(strcmp(inp,"goto")==0){
+        if(!focus){
+            if(v==0)xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0");
+            else xexec("UPDATE state SET cursor=MAX((SELECT COUNT(*)-1 FROM lpane),0),dscroll=0,dcursor=0");
+            xexec("UPDATE state SET selected_id=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),'')");
+        } else {
+            if(v==0)xexec("UPDATE state SET dcursor=0");
+            else xexec("UPDATE state SET dcursor=MAX((SELECT COUNT(*)-1 FROM rpane),0)");}
+        xexec("UPDATE outbox SET rrp=1");
+
+    } else if(strcmp(inp,"select")==0){
+        if(id[0]){
+            sqlite3_stmt*st;
+            sqlite3_prepare_v2(db,"UPDATE state SET selected_id=?,cursor=COALESCE((SELECT rownum FROM lpane WHERE id=?),cursor),dscroll=0,dcursor=0",-1,&st,0);
+            sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_bind_text(st,2,id,-1,SQLITE_TRANSIENT);
+            sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE outbox SET rrp=1");}
+
+    } else if(strcmp(inp,"focus")==0){
+        int nf=(v==-1)?(focus?0:1):v;
+        sqlite3_stmt*st;
+        sqlite3_prepare_v2(db,"UPDATE state SET focus=?,dcursor=0,dscroll=0",-1,&st,0);
+        sqlite3_bind_int(st,1,nf);sqlite3_step(st);sqlite3_finalize(st);
+
+    } else if(strcmp(inp,"mode")==0){
+        sqlite3_stmt*st;
+        sqlite3_prepare_v2(db,"UPDATE state SET mode=?,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0,selected_id=''",-1,&st,0);
+        sqlite3_bind_int(st,1,m);sqlite3_step(st);sqlite3_finalize(st);
+        xexec("UPDATE outbox SET rlp=1,rrp=1");
+
+    } else if(strcmp(inp,"group")==0){
+        xexec("UPDATE state SET grouped=1-grouped,cursor=0,scroll=0,dscroll=0,dcursor=0,selected_id=''");
+        xexec("UPDATE outbox SET rlp=1,rrp=1");
+
+    } else if(strcmp(inp,"sort")==0){
+        xexec("UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0,selected_id=''");
+        xexec("UPDATE outbox SET rlp=1,rrp=1");
+
+    } else if(strcmp(inp,"tsmode")==0){
+        xexec("UPDATE state SET ts_mode=(ts_mode+1)%3");
+        xexec("UPDATE outbox SET rrp=1");
+
+    } else if(strcmp(inp,"expand")==0){
+        if(id[0]&&mode==0){
+            sqlite3_stmt*st;
+            sqlite3_prepare_v2(db,
+                "WITH RECURSIVE d(t) AS(SELECT CAST(?1 AS INT) UNION ALL SELECT c.tgid FROM processes c JOIN d ON c.ppid=d.t)"
+                " UPDATE expanded SET ex=1 WHERE id IN(SELECT CAST(t AS TEXT) FROM d)",
+                -1,&st,0);
+            sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE outbox SET rlp=1,rrp=1");}
+
+    } else if(strcmp(inp,"collapse")==0){
+        if(id[0]&&mode==0){
+            sqlite3_stmt*st;
+            sqlite3_prepare_v2(db,
+                "WITH RECURSIVE d(t) AS(SELECT CAST(?1 AS INT) UNION ALL SELECT c.tgid FROM processes c JOIN d ON c.ppid=d.t)"
+                " UPDATE expanded SET ex=0 WHERE id IN(SELECT CAST(t AS TEXT) FROM d)",
+                -1,&st,0);
+            sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE outbox SET rlp=1,rrp=1");}
+
+    } else if(strcmp(inp,"left")==0){
+        if(mode==0&&id[0]){
+            int tgid=atoi(id);
+            int has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",tgid),0);
+            int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);
+            if(has_ch&&is_ex){
+                sqlite3_stmt*st;
+                sqlite3_prepare_v2(db,"UPDATE expanded SET ex=0 WHERE id=?",-1,&st,0);
+                sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+                xexec("UPDATE outbox SET rlp=1,rrp=1");
+            } else {
+                int ppid=qint(sqlite3_mprintf("SELECT ppid FROM processes WHERE tgid=%d",tgid),-1);
+                if(ppid>=0){
+                    sqlite3_stmt*st;
+                    sqlite3_prepare_v2(db,"UPDATE state SET cursor=COALESCE((SELECT rownum FROM lpane WHERE CAST(id AS INT)=?),cursor),selected_id=CAST(? AS TEXT),dscroll=0,dcursor=0",-1,&st,0);
+                    sqlite3_bind_int(st,1,ppid);sqlite3_bind_int(st,2,ppid);
+                    sqlite3_step(st);sqlite3_finalize(st);
+                    xexec("UPDATE outbox SET rrp=1");}}
+        } else if(mode==2&&id[0]){
+            if(strncmp(id,"io_",3)==0){
+                sqlite3_stmt*st;
+                sqlite3_prepare_v2(db,"UPDATE expanded SET ex=0 WHERE id=?",-1,&st,0);
+                sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+                xexec("UPDATE outbox SET rlp=1,rrp=1");
+            } else {
+                xexec("UPDATE state SET cursor=COALESCE((SELECT rownum FROM lpane WHERE id=(SELECT parent_id FROM lpane WHERE rownum=(SELECT cursor FROM state))),cursor)");
+                xexec("UPDATE outbox SET rrp=1");}}
+
+    } else if(strcmp(inp,"right")==0){
+        if((mode==0||mode==2)&&id[0]){
+            int has_ch=0,is_ex=1;
+            if(mode==0){
+                int tgid=atoi(id);
+                has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",tgid),0);
+                is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);
+            } else {
+                if(strncmp(id,"io_",3)==0)has_ch=1;
+                is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);}
+            if(has_ch&&!is_ex){
+                sqlite3_stmt*st;
+                sqlite3_prepare_v2(db,"UPDATE expanded SET ex=1 WHERE id=?",-1,&st,0);
+                sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+                xexec("UPDATE outbox SET rlp=1,rrp=1");
+                return;}}
+        xexec("UPDATE state SET focus=1,dcursor=0,dscroll=0");
+
+    } else if(strcmp(inp,"follow")==0){
+        follow_link();
+
+    } else if(strcmp(inp,"lpfilter")==0){
+        sqlite3_stmt*st;
+        sqlite3_prepare_v2(db,"UPDATE state SET lp_filter=?,cursor=0,scroll=0,selected_id=''",-1,&st,0);
+        sqlite3_bind_int(st,1,v);sqlite3_step(st);sqlite3_finalize(st);
+        xexec("UPDATE outbox SET rlp=1,rrp=1");
+
+    } else if(strcmp(inp,"search")==0){
+        if(q[0]){
+            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET search=?",-1,&st,0);
+            sqlite3_bind_text(st,1,q,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+            do_search(q);xexec("UPDATE outbox SET rlp=1,rrp=1");}
+
+    } else if(strcmp(inp,"nexthit")==0){
+        jump_hit(d>=0?1:-1);
+
+    } else if(strcmp(inp,"evfilt")==0){
+        char uq[256]="";
+        for(int i=0;q[i]&&i<(int)sizeof(uq)-1;i++)uq[i]=(char)toupper((unsigned char)q[i]);
+        sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET evfilt=?",-1,&st,0);
+        sqlite3_bind_text(st,1,uq,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
+        xexec("UPDATE outbox SET rrp=1");
+
+    } else if(strcmp(inp,"resize")==0){
+        if(rows>0&&cols>0){
+            sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET rows=?,cols=?",-1,&st,0);
+            sqlite3_bind_int(st,1,rows);sqlite3_bind_int(st,2,cols);sqlite3_step(st);sqlite3_finalize(st);
+            xexec("UPDATE outbox SET rlp=1,rrp=1");}
+
+    } else if(strcmp(inp,"print")==0){
+        if(strcmp(what,"lpane")==0)dump_lpane();
+        else if(strcmp(what,"rpane")==0)dump_rpane();
+        else if(strcmp(what,"state")==0)dump_state();
+        g_headless=1;}}
+
+/* ── process_inbox: drain inbox and act on outbox ──────────────────── */
+static void process_inbox(void){
+    static char buf[1<<20];
+    int had_trace=0;
+    xexec("BEGIN");
+    for(;;){
+        long long id=-1;buf[0]=0;
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT id,data FROM inbox WHERE kind='trace' ORDER BY id LIMIT 1",-1,&st,0);
+         if(sqlite3_step(st)==SQLITE_ROW){
+             id=sqlite3_column_int64(st,0);
+             const char*dd=(const char*)sqlite3_column_text(st,1);
+             if(dd)snprintf(buf,sizeof buf-1,"%s",dd);}
+         sqlite3_finalize(st);}
+        if(id<0)break;
+        xexecf("DELETE FROM inbox WHERE id=%lld",id);
+        process_trace_event(buf);
+        had_trace=1;}
+    xexec("COMMIT");
+    if(had_trace)xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
+    for(;;){
+        long long id=-1;buf[0]=0;
+        {sqlite3_stmt*st;
+         sqlite3_prepare_v2(db,"SELECT id,data FROM inbox WHERE kind='input' ORDER BY id LIMIT 1",-1,&st,0);
+         if(sqlite3_step(st)==SQLITE_ROW){
+             id=sqlite3_column_int64(st,0);
+             const char*dd=(const char*)sqlite3_column_text(st,1);
+             if(dd)snprintf(buf,sizeof buf-1,"%s",dd);}
+         sqlite3_finalize(st);}
+        if(id<0)break;
+        xexecf("DELETE FROM inbox WHERE id=%lld",id);
+        sql_handle_input(buf);}
+    if(qint("SELECT rlp FROM outbox",0)){xexec("UPDATE outbox SET rlp=0");rebuild_lpane();}
+    if(qint("SELECT rrp FROM outbox",0)){xexec("UPDATE outbox SET rrp=0");rebuild_rpane();}
 }
 
 /* ── Part 3: Terminal ──────────────────────────────────────────────── */
@@ -962,93 +1087,58 @@ static void save_to_file(const char *path){
 
 /* ── Key dispatch ──────────────────────────────────────────────────── */
 static void handle_key(int k){
-    int focus=qint("SELECT focus FROM state",0),nf=qint("SELECT COUNT(*) FROM lpane",0);
-    int nrp=qint("SELECT COUNT(*) FROM rpane",0),rows=qint("SELECT rows FROM state",24),pg=rows-3;
+    int focus=qint("SELECT focus FROM state",0);
     int mode=qint("SELECT mode FROM state",0);
+    char cur_id[4096]="";
+    {sqlite3_stmt*st;
+     sqlite3_prepare_v2(db,"SELECT COALESCE(id,'') FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
+     if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(cur_id,sizeof cur_id,"%s",t);}
+     sqlite3_finalize(st);}
+    char ev[4096]="";
     switch(k){
-    case K_UP:case'k':if(!focus){xexec("UPDATE state SET cursor=MAX(cursor-1,0),dscroll=0,dcursor=0");rebuild_rpane();}
-        else xexec("UPDATE state SET dcursor=MAX(dcursor-1,0)");break;
-    case K_DOWN:case'j':if(!focus){xexecf("UPDATE state SET cursor=MIN(cursor+1,%d),dscroll=0,dcursor=0",nf-1);rebuild_rpane();}
-        else xexecf("UPDATE state SET dcursor=MIN(dcursor+1,%d)",nrp-1);break;
-    case K_PGUP:if(!focus){xexecf("UPDATE state SET cursor=MAX(cursor-%d,0),dscroll=0,dcursor=0",pg);rebuild_rpane();}
-        else xexecf("UPDATE state SET dcursor=MAX(dcursor-%d,0)",pg);break;
-    case K_PGDN:if(!focus){xexecf("UPDATE state SET cursor=MIN(cursor+%d,%d),dscroll=0,dcursor=0",pg,nf-1);rebuild_rpane();}
-        else xexecf("UPDATE state SET dcursor=MIN(dcursor+%d,%d)",pg,nrp-1);break;
-    case K_HOME:case'g':if(!focus){xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0");rebuild_rpane();}
-        else xexec("UPDATE state SET dcursor=0");break;
-    case K_END:if(!focus){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",nf>0?nf-1:0);rebuild_rpane();}
-        else xexecf("UPDATE state SET dcursor=%d",nrp>0?nrp-1:0);break;
-    case'G':xexec("UPDATE state SET grouped=1-grouped,cursor=0,scroll=0,dscroll=0,dcursor=0");rebuild_lpane();rebuild_rpane();break;
-    case K_RIGHT:case'l':
-        if(focus){follow_link();break;}
-        {char id[256]="";sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
-         if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}sqlite3_finalize(st);
-         /* Try expand (process tree or output groups) */
-         if((mode==0||mode==2)&&id[0]){
-             int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);
-             int has_ch=0;
-             if(mode==0)has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",atoi(id)),0);
-             else if(!strncmp(id,"io_",3))has_ch=1;
-             if(has_ch&&!is_ex){xexecf("UPDATE expanded SET ex=1 WHERE id='%s'",id);rebuild_lpane();rebuild_rpane();break;}}
-         xexec("UPDATE state SET focus=1,dcursor=0,dscroll=0");}break;
-    case K_ENTER:case'\n':if(focus)follow_link();else xexec("UPDATE state SET focus=1,dcursor=0,dscroll=0");break;
+    case K_UP:case'k':  snprintf(ev,sizeof ev,"{\"input\":\"nav\",\"d\":-1}");break;
+    case K_DOWN:case'j':snprintf(ev,sizeof ev,"{\"input\":\"nav\",\"d\":1}");break;
+    case K_PGUP:        snprintf(ev,sizeof ev,"{\"input\":\"pgnav\",\"d\":-1}");break;
+    case K_PGDN:        snprintf(ev,sizeof ev,"{\"input\":\"pgnav\",\"d\":1}");break;
+    case K_HOME:case'g':snprintf(ev,sizeof ev,"{\"input\":\"goto\",\"v\":0}");break;
+    case K_END:         snprintf(ev,sizeof ev,"{\"input\":\"goto\",\"v\":1}");break;
+    case K_TAB:         snprintf(ev,sizeof ev,"{\"input\":\"focus\",\"v\":-1}");break;
+    case K_ENTER:case'\n':
+        if(!focus)snprintf(ev,sizeof ev,"{\"input\":\"focus\",\"v\":1}");
+        else       snprintf(ev,sizeof ev,"{\"input\":\"follow\"}");break;
     case K_LEFT:case'h':
-        if(focus){xexec("UPDATE state SET focus=0");break;}
-        {char id[256]="";sqlite3_stmt*st;sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
-         if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}sqlite3_finalize(st);
-         if(mode==0&&id[0]){int tgid=atoi(id);
-             int has_ch=qint(sqlite3_mprintf("SELECT COUNT(*)>0 FROM processes WHERE ppid=%d",tgid),0);
-             int is_ex=qint(sqlite3_mprintf("SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)",id),1);
-             if(has_ch&&is_ex){xexecf("UPDATE expanded SET ex=0 WHERE id='%s'",id);rebuild_lpane();rebuild_rpane();break;}
-             int ppid=qint(sqlite3_mprintf("SELECT ppid FROM processes WHERE tgid=%d",tgid),-1);
-             if(ppid>=0){int r=qint(sqlite3_mprintf("SELECT rownum FROM lpane WHERE id='%d'",ppid),-1);
-                 if(r>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",r);rebuild_rpane();}}}
-         else if(mode==2&&id[0]){
-             if(!strncmp(id,"io_",3)){xexecf("UPDATE expanded SET ex=0 WHERE id='%s'",id);rebuild_lpane();rebuild_rpane();}
-             else{sqlite3_stmt*s2;sqlite3_prepare_v2(db,"SELECT parent_id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&s2,0);
-                 if(sqlite3_step(s2)==SQLITE_ROW){const char*pi=(const char*)sqlite3_column_text(s2,0);
-                     if(pi){int r=qint(sqlite3_mprintf("SELECT rownum FROM lpane WHERE id='%s'",pi),-1);
-                         if(r>=0){xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0",r);rebuild_rpane();}}}
-                 sqlite3_finalize(s2);}}}break;
-    case K_TAB:xexec("UPDATE state SET focus=1-focus,dcursor=0,dscroll=0");break;
-    case'e':case'E':if(mode==0){char id[64]="";sqlite3_stmt*st;
-        sqlite3_prepare_v2(db,"SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)",-1,&st,0);
-        if(sqlite3_step(st)==SQLITE_ROW){const char*t=(const char*)sqlite3_column_text(st,0);if(t)snprintf(id,sizeof id,"%s",t);}sqlite3_finalize(st);
-        int tg=atoi(id);xexecf("WITH RECURSIVE d(t) AS(SELECT %d UNION ALL SELECT c.tgid FROM processes c JOIN d ON c.ppid=d.t)"
-            " UPDATE expanded SET ex=%d WHERE id IN(SELECT CAST(t AS TEXT) FROM d)",tg,k=='e'?1:0);
-        rebuild_lpane();rebuild_rpane();}break;
-    case'1':xexec("UPDATE state SET mode=0,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0");rebuild_lpane();rebuild_rpane();break;
-    case'2':xexec("UPDATE state SET mode=1,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0");rebuild_lpane();rebuild_rpane();break;
-    case'3':xexec("UPDATE state SET mode=2,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0");rebuild_lpane();rebuild_rpane();break;
-    case's':xexec("UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0");rebuild_lpane();rebuild_rpane();break;
-    case't':xexec("UPDATE state SET ts_mode=(ts_mode+1)%3");rebuild_rpane();break;
-    case'/':{char buf[256]="";if(line_edit("/",buf,sizeof buf)&&buf[0]){
-        sqlite3_stmt*st;sqlite3_prepare_v2(db,"UPDATE state SET search=?",-1,&st,0);
-        sqlite3_bind_text(st,1,buf,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-        do_search(buf);rebuild_lpane();jump_hit(1);}}break;
-    case'n':jump_hit(1);break;case'N':jump_hit(-1);break;
+        if(focus)  snprintf(ev,sizeof ev,"{\"input\":\"focus\",\"v\":0}");
+        else if(cur_id[0])snprintf(ev,sizeof ev,"{\"input\":\"left\",\"id\":\"%s\"}",cur_id);
+        break;
+    case K_RIGHT:case'l':
+        if(focus)  snprintf(ev,sizeof ev,"{\"input\":\"follow\"}");
+        else if(cur_id[0])snprintf(ev,sizeof ev,"{\"input\":\"right\",\"id\":\"%s\"}",cur_id);
+        else       snprintf(ev,sizeof ev,"{\"input\":\"focus\",\"v\":1}");break;
+    case'G':snprintf(ev,sizeof ev,"{\"input\":\"group\"}");break;
+    case'1':snprintf(ev,sizeof ev,"{\"input\":\"mode\",\"m\":0}");break;
+    case'2':snprintf(ev,sizeof ev,"{\"input\":\"mode\",\"m\":1}");break;
+    case'3':snprintf(ev,sizeof ev,"{\"input\":\"mode\",\"m\":2}");break;
+    case's':snprintf(ev,sizeof ev,"{\"input\":\"sort\"}");break;
+    case't':snprintf(ev,sizeof ev,"{\"input\":\"tsmode\"}");break;
+    case'n':snprintf(ev,sizeof ev,"{\"input\":\"nexthit\",\"d\":1}");break;
+    case'N':snprintf(ev,sizeof ev,"{\"input\":\"nexthit\",\"d\":-1}");break;
+    case'e':if(mode==0&&cur_id[0])snprintf(ev,sizeof ev,"{\"input\":\"expand\",\"id\":\"%s\"}",cur_id);break;
+    case'E':if(mode==0&&cur_id[0])snprintf(ev,sizeof ev,"{\"input\":\"collapse\",\"id\":\"%s\"}",cur_id);break;
+    case'v':{int lpf=qint("SELECT lp_filter FROM state",0);
+             snprintf(ev,sizeof ev,"{\"input\":\"lpfilter\",\"v\":%d}",(lpf+1)%3);}break;
+    case'V':snprintf(ev,sizeof ev,"{\"input\":\"lpfilter\",\"v\":0}");break;
     case'f':{char buf[32]="";if(line_edit("Filter: ",buf,sizeof buf)&&buf[0]){
-        for(char*p=buf;*p;p++)*p=toupper(*p);sqlite3_stmt*st;
-        sqlite3_prepare_v2(db,"UPDATE state SET evfilt=?",-1,&st,0);
-        sqlite3_bind_text(st,1,buf,-1,SQLITE_TRANSIENT);sqlite3_step(st);sqlite3_finalize(st);
-        rebuild_rpane();}}break;
-    case'F':xexec("UPDATE state SET evfilt=''");rebuild_rpane();break;
-    case'v':xexecf("UPDATE state SET lp_filter=(lp_filter+1)%%3,cursor=0,scroll=0");rebuild_lpane();rebuild_rpane();break;
-    case'V':xexec("UPDATE state SET lp_filter=0,cursor=0,scroll=0");rebuild_lpane();rebuild_rpane();break;
+             for(char*p=buf;*p;p++)*p=(char)toupper((unsigned char)*p);
+             snprintf(ev,sizeof ev,"{\"input\":\"evfilt\",\"q\":\"%s\"}",buf);}}break;
+    case'F':snprintf(ev,sizeof ev,"{\"input\":\"evfilt\",\"q\":\"\"}");break;
+    case'/':{char buf[256]="";if(line_edit("/",buf,sizeof buf)&&buf[0])
+             snprintf(ev,sizeof ev,"{\"input\":\"search\",\"q\":\"%s\"}",buf);}break;
     case'W':save_db();break;
-    case'x':run_sql();break;case'?':show_help();break;}}
+    case'x':run_sql();break;
+    case'?':show_help();break;}
+    if(ev[0]){ingest_line(ev);process_inbox();}}
 
 /* ── Headless output helpers (also used interactively) ─────────────── */
-
-static int parse_key_name(const char *n){
-    if(strcmp(n,"up")==0)return K_UP;if(strcmp(n,"down")==0)return K_DOWN;
-    if(strcmp(n,"left")==0)return K_LEFT;if(strcmp(n,"right")==0)return K_RIGHT;
-    if(strcmp(n,"pgup")==0)return K_PGUP;if(strcmp(n,"pgdn")==0)return K_PGDN;
-    if(strcmp(n,"home")==0)return K_HOME;if(strcmp(n,"end")==0)return K_END;
-    if(strcmp(n,"tab")==0)return K_TAB;if(strcmp(n,"enter")==0)return K_ENTER;
-    if(strcmp(n,"esc")==0)return K_ESC;
-    if(strlen(n)==1)return(unsigned char)n[0];
-    return K_NONE;}
 
 static void dump_lpane(void){
     printf("=== LPANE ===\n");
@@ -1120,15 +1210,18 @@ int main(int argc,char**argv){
         if(!bk)die("backup init failed");
         sqlite3_backup_step(bk,-1);sqlite3_backup_finish(bk);sqlite3_close(src);
         {char*e=0;sqlite3_exec(db,"ALTER TABLE state ADD COLUMN lp_filter INT DEFAULT 0",0,0,&e);if(e)sqlite3_free(e);}
+        {char*e=0;sqlite3_exec(db,"ALTER TABLE state ADD COLUMN selected_id TEXT DEFAULT ''",0,0,&e);if(e)sqlite3_free(e);}
         {char*e=0;sqlite3_exec(db,"CREATE TABLE inbox(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,data TEXT NOT NULL)",0,0,&e);if(e)sqlite3_free(e);}
+        {char*e=0;sqlite3_exec(db,"CREATE TABLE IF NOT EXISTS outbox(rlp INT DEFAULT 0,rrp INT DEFAULT 0)",0,0,&e);if(e)sqlite3_free(e);}
+        {char*e=0;sqlite3_exec(db,"INSERT INTO outbox SELECT 0,0 WHERE NOT EXISTS(SELECT 1 FROM outbox)",0,0,&e);if(e)sqlite3_free(e);}
         setup_app();
         if(!qint("SELECT has_fts FROM state",0))setup_fts();
         if(trace_file[0]) ingest_file(trace_file); /* optional input-event file */
     } else if(trace_file[0]){
         db_create();
         ingest_file(trace_file);
-        flush_trace_inbox();
         setup_app();
+        process_inbox();
         setup_fts();
     } else {
         db_create();
@@ -1145,7 +1238,7 @@ int main(int argc,char**argv){
     rebuild_lpane();rebuild_rpane();
 
     if(save_file[0])save_to_file(save_file);
-    flush_input_inbox();
+    process_inbox();
     if(g_headless){sqlite3_close(db);return 0;}
     if(save_file[0]&&!cmd){sqlite3_close(db);return 0;}
 
@@ -1170,7 +1263,7 @@ int main(int argc,char**argv){
                         g_rbuf[g_rbuf_len]=0;
                         xexec("BEGIN");ingest_line(g_rbuf);xexec("COMMIT");
                         g_rbuf_len=0;
-                        flush_trace_inbox();}
+                        process_inbox();}
                     setup_fts();
                     xexec("UPDATE state SET lp_filter=0");
                     close(g_trace_fd);g_trace_fd=-1;
@@ -1188,10 +1281,7 @@ int main(int argc,char**argv){
                     if(g_rbuf_len>=(int)(sizeof(g_rbuf)-1)){
                         g_rbuf[g_rbuf_len]=0;ingest_line(g_rbuf);did++;g_rbuf_len=0;}
                     xexec("COMMIT");
-                    if(did){
-                        flush_trace_inbox();
-                        xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
-                        rebuild_lpane();rebuild_rpane();}}}
+                    if(did){process_inbox();rebuild_lpane();rebuild_rpane();}}}
 
             if(g_child_pid>0){
                 int ws;if(waitpid(g_child_pid,&ws,WNOHANG)==g_child_pid)g_child_pid=0;}
@@ -1202,16 +1292,13 @@ int main(int argc,char**argv){
                 int k=readkey();
                 if(k==K_NONE){}
                 else if(k=='q'||k=='Q')break;
-                else{const char*j=key_code_to_json(k);
-                     if(j){ingest_line(j);flush_input_inbox();}
-                     render();}}
+                else{handle_key(k);render();}}
         } else {
             render();
             int k=readkey();
             if(k==K_NONE)continue;
             if(k=='q'||k=='Q')break;
-            const char*j=key_code_to_json(k);
-            if(j){ingest_line(j);flush_input_inbox();}
+            handle_key(k);
         }
     }
 
