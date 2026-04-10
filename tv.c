@@ -45,13 +45,11 @@ static void sql_regexp(sqlite3_context*ctx,int n,sqlite3_value**v){
     /* Simple substring match for now — fast, no regex library needed */
     sqlite3_result_int(ctx,strstr(str,pat)!=NULL);}
 
-/* CANON_PATH(path) — resolve . and .. components */
-static void sql_canon_path(sqlite3_context*ctx,int n,sqlite3_value**v){
-    (void)n;
-    const char*in=(const char*)sqlite3_value_text(v[0]);
-    if(!in){sqlite3_result_null(ctx);return;}
+/* canon_path_c — resolve . and .. components in-place (C utility) */
+static void canon_path_c(char *path, int maxlen){
+    if(!path||!path[0])return;
     char*parts[256];int np=0;
-    char tmp[4096];snprintf(tmp,sizeof tmp,"%s",in);
+    char tmp[4096];snprintf(tmp,sizeof tmp,"%s",path);
     int ab=(tmp[0]=='/');char*s=tmp;if(ab)s++;
     while(*s&&np<256){
         char*sl=strchr(s,'/');if(sl)*sl=0;
@@ -64,6 +62,15 @@ static void sql_canon_path(sqlite3_context*ctx,int n,sqlite3_value**v){
         int l=strlen(parts[i]);if(p+l>=(int)sizeof(out))l=(int)sizeof(out)-p-1;
         memcpy(out+p,parts[i],l);p+=l;}
     out[p]=0;
+    snprintf(path,maxlen,"%s",out);}
+
+/* CANON_PATH(path) — resolve . and .. components (SQL wrapper) */
+static void sql_canon_path(sqlite3_context*ctx,int n,sqlite3_value**v){
+    (void)n;
+    const char*in=(const char*)sqlite3_value_text(v[0]);
+    if(!in){sqlite3_result_null(ctx);return;}
+    char out[4096];snprintf(out,sizeof out,"%s",in);
+    canon_path_c(out,sizeof out);
     sqlite3_result_text(ctx,out,-1,SQLITE_TRANSIENT);}
 
 /* DIR_PART(path) — everything up to last '/' */
@@ -246,8 +253,9 @@ static void process_trace_event(const char *ln){
              const char*f=(const char*)sqlite3_column_text(st,1);if(f)snprintf(flag0,sizeof flag0,"%s",f);}
          sqlite3_finalize(st);}
 
-        /* Resolve relative path using cwd_cache */
-        if(path[0]&&path[0]!='/'){
+        /* Resolve relative path using cwd_cache; skip non-filesystem pseudo-paths */
+        {int is_pseudo=(path[0]&&!strchr("/.",path[0])&&strchr(path,':')!=NULL);
+        if(!is_pseudo&&path[0]&&path[0]!='/'){
             char cwd[4096]="";
             {sqlite3_stmt*st;
              sqlite3_prepare_v2(db,"SELECT COALESCE(cwd,'') FROM cwd_cache WHERE tgid=?",-1,&st,0);
@@ -255,6 +263,8 @@ static void process_trace_event(const char *ln){
              if(sqlite3_step(st)==SQLITE_ROW){const char*c=(const char*)sqlite3_column_text(st,0);if(c&&c[0])snprintf(cwd,sizeof cwd,"%s",c);}
              sqlite3_finalize(st);}
             if(cwd[0]){char abs[8192];snprintf(abs,sizeof abs,"%s/%s",cwd,path);snprintf(path,8192,"%s",abs);}}
+        /* Canonicalize: resolve . and .. components */
+        if(!is_pseudo&&path[0]=='/')canon_path_c(path,sizeof path);}
 
         /* Filter: read-only opens to noisy system paths */
         if(strcmp(flag0,"O_RDONLY")==0&&path[0]=='/'){
@@ -982,9 +992,9 @@ static void rebuild_dep_cmds(void){
         "  CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
         "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
         "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
-        "  printf('[%d] %s%s %s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
+        "  printf('[%%d] %%s%%s %%s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
         "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
-        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%d',x.signal)"
+        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%%d',x.signal)"
         "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
         " FROM processes p"
         " LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
@@ -1027,16 +1037,16 @@ static void rebuild_rdep_cmds(void){
             " WHERE e.dst NOT IN(SELECT path FROM dep_closure)",d+1,d);
     }
 
-    xexec(
+    xexecf(
         "INSERT INTO lpane(rownum,id,parent_id,style,text)"
         " SELECT ROW_NUMBER()OVER(ORDER BY p.last_ts DESC)-1,"
         "  CAST(p.tgid AS TEXT),NULL,"
         "  CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
         "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
         "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
-        "  printf('[%d] %s%s %s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
+        "  printf('[%%d] %%s%%s %%s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
         "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
-        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%d',x.signal)"
+        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%%d',x.signal)"
         "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
         " FROM processes p"
         " LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
