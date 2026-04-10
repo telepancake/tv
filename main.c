@@ -1826,10 +1826,6 @@ static void on_stream_end(void) {
 /* ═══════════════════════════════════════════════════════════════════ */
 extern int uproctrace_main(int argc, char **argv);
 
-
-/* ═══════════════════════════════════════════════════════════════════ */
-extern int uproctrace_main(int argc, char **argv);
-
 int main(int argc, char **argv) {
     /* --uproctrace: delegate entirely to uproctrace_main() */
     if (argc >= 2 && strcmp(argv[1], "--uproctrace") == 0)
