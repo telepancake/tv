@@ -40,6 +40,23 @@
  * Additional columns are ignored by the engine.
  *
  * ═══════════════════════════════════════════════════════════════════
+ *  ROW CACHE
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Each panel maintains an in-memory cache of up to 256 rows.  SQL is
+ * only re-executed when:
+ *   1. tui_dirty(tui, panel) is called — full cache invalidation.
+ *   2. The user scrolls outside the currently cached row window —
+ *      the needed rows are fetched on demand via
+ *      WHERE rownum>=? AND rownum<?.
+ *
+ * Repeated redraws (e.g. cursor movement within the cached window,
+ * focus changes, status bar updates) do not re-query the database.
+ *
+ * The app must call tui_dirty() after updating any SQL view that a
+ * panel reads from, to ensure the display reflects the new data.
+ *
+ * ═══════════════════════════════════════════════════════════════════
  *  LAYOUT
  * ═══════════════════════════════════════════════════════════════════
  *
