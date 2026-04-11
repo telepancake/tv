@@ -69,19 +69,15 @@ CREATE TEMP VIEW _dep_edges AS
         AND (w.flags LIKE 'O_WRONLY%' OR w.flags LIKE 'O_RDWR%'
              OR w.flags LIKE 'O_WRONLY,%' OR w.flags LIKE 'O_RDWR,%');
 
--- ── lpane VIEW for mode=0: process tree ──────────────────────────────
--- Covers both grouped (tree) and flat (list) display.
--- Reads sort_key, grouped, lp_filter from state; expand/collapse from expanded.
-CREATE TEMP VIEW _lp_procs AS
-    -- Grouped tree mode
+-- ── lpane VIEW for mode=0: process tree (grouped) ────────────────────
+CREATE TEMP VIEW _lp_procs_tree AS
     WITH RECURSIVE flat(tgid, depth, sk) AS (
         SELECT p.tgid, 0,
             CASE (SELECT sort_key FROM state)
                 WHEN 1 THEN p.first_ts WHEN 2 THEN p.last_ts
                 ELSE CAST(p.tgid AS REAL) END
         FROM processes p
-        WHERE (SELECT mode FROM state)=0 AND (SELECT grouped FROM state)=1
-            AND (p.ppid IS NULL OR p.ppid NOT IN(SELECT tgid FROM processes))
+        WHERE (p.ppid IS NULL OR p.ppid NOT IN(SELECT tgid FROM processes))
         UNION ALL
         SELECT c.tgid, flat.depth+1,
             CASE (SELECT sort_key FROM state)
@@ -149,9 +145,10 @@ CREATE TEMP VIEW _lp_procs AS
                 UNION SELECT p3.ppid FROM processes p3 JOIN visible2 v ON p3.tgid=v.tgid
                 WHERE p3.ppid IS NOT NULL AND p3.ppid IN(SELECT tgid FROM processes)
             )
-            SELECT tgid FROM visible2)))
-    UNION ALL
-    -- Flat (ungrouped) mode
+            SELECT tgid FROM visible2)));
+
+-- ── lpane VIEW for mode=0: process list (flat) ───────────────────────
+CREATE TEMP VIEW _lp_procs_flat AS
     SELECT ROW_NUMBER()OVER(ORDER BY
             CASE (SELECT sort_key FROM state)
                 WHEN 1 THEN p.first_ts WHEN 2 THEN p.last_ts
@@ -172,12 +169,10 @@ CREATE TEMP VIEW _lp_procs AS
                  ELSE '' END) AS text
     FROM processes p
     LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'
-    LEFT JOIN exit_events x ON x.eid=ev.id
-    WHERE (SELECT mode FROM state)=0 AND (SELECT grouped FROM state)=0;
+    LEFT JOIN exit_events x ON x.eid=ev.id;
 
--- ── lpane VIEW for mode=2: I/O output lines ───────────────────────────
-CREATE TEMP VIEW _lp_outputs AS
-    -- Grouped: process headers + expanded lines
+-- ── lpane VIEW for mode=2: I/O output lines (grouped) ─────────────────
+CREATE TEMP VIEW _lp_outputs_grouped AS
     SELECT ROW_NUMBER()OVER(ORDER BY sub.g_ts, sub.s_ts)-1 AS rownum,
         sub.id, sub.par AS parent_id, sub.sty AS style, sub.txt AS text
     FROM (
@@ -188,7 +183,6 @@ CREATE TEMP VIEW _lp_outputs AS
             MIN(e.ts) AS g_ts, 0.0 AS s_ts
         FROM io_events i JOIN events e ON e.id=i.eid
         JOIN processes p ON p.tgid=e.tgid
-        WHERE (SELECT mode FROM state)=2 AND (SELECT grouped FROM state)=1
         GROUP BY e.tgid
         UNION ALL
         SELECT CAST(e.id AS TEXT), 'io_'||CAST(e.tgid AS TEXT),
@@ -198,24 +192,23 @@ CREATE TEMP VIEW _lp_outputs AS
             (SELECT MIN(e2.ts) FROM events e2 JOIN io_events i2 ON i2.eid=e2.id WHERE e2.tgid=e.tgid),
             e.ts
         FROM io_events i JOIN events e ON e.id=i.eid
-        WHERE (SELECT mode FROM state)=2 AND (SELECT grouped FROM state)=1
-            AND COALESCE((SELECT ex FROM expanded WHERE id='io_'||CAST(e.tgid AS TEXT)),1)=1
-    ) sub
-    UNION ALL
-    -- Flat: all lines ordered by timestamp
+        WHERE COALESCE((SELECT ex FROM expanded WHERE id='io_'||CAST(e.tgid AS TEXT)),1)=1
+    ) sub;
+
+-- ── lpane VIEW for mode=2: I/O output lines (flat) ────────────────────
+CREATE TEMP VIEW _lp_outputs_flat AS
     SELECT ROW_NUMBER()OVER(ORDER BY e.ts)-1 AS rownum,
         CAST(e.id AS TEXT) AS id, NULL AS parent_id,
         CASE WHEN i.stream='STDERR' THEN 'error' ELSE 'normal' END AS style,
         printf('[%d] %s %s', e.tgid, i.stream,
             SUBSTR(REPLACE(COALESCE(i.data,''),char(10),'↵'),1,200)) AS text
-    FROM io_events i JOIN events e ON e.id=i.eid
-    WHERE (SELECT mode FROM state)=2 AND (SELECT grouped FROM state)=0;
+    FROM io_events i JOIN events e ON e.id=i.eid;
 
 -- ── lpane VIEWs for dep modes (3-6) using recursive transitive closure ─
 CREATE TEMP VIEW _lp_dep3 AS
     WITH RECURSIVE dc(path, depth) AS (
         SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT mode FROM state)=3 AND (SELECT dep_root FROM state)!=''
+        WHERE (SELECT dep_root FROM state)!=''
         UNION
         SELECT de.src, dc.depth+1
         FROM _dep_edges de JOIN dc ON dc.path=de.dst
@@ -237,7 +230,7 @@ CREATE TEMP VIEW _lp_dep3 AS
 CREATE TEMP VIEW _lp_dep4 AS
     WITH RECURSIVE dc(path, depth) AS (
         SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT mode FROM state)=4 AND (SELECT dep_root FROM state)!=''
+        WHERE (SELECT dep_root FROM state)!=''
         UNION
         SELECT de.dst, dc.depth+1
         FROM _dep_edges de JOIN dc ON dc.path=de.src
@@ -259,7 +252,7 @@ CREATE TEMP VIEW _lp_dep4 AS
 CREATE TEMP VIEW _lp_dep5 AS
     WITH RECURSIVE dc(path, depth) AS (
         SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT mode FROM state)=5 AND (SELECT dep_root FROM state)!=''
+        WHERE (SELECT dep_root FROM state)!=''
         UNION
         SELECT de.src, dc.depth+1
         FROM _dep_edges de JOIN dc ON dc.path=de.dst
@@ -288,7 +281,7 @@ CREATE TEMP VIEW _lp_dep5 AS
 CREATE TEMP VIEW _lp_dep6 AS
     WITH RECURSIVE dc(path, depth) AS (
         SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT mode FROM state)=6 AND (SELECT dep_root FROM state)!=''
+        WHERE (SELECT dep_root FROM state)!=''
         UNION
         SELECT de.dst, dc.depth+1
         FROM _dep_edges de JOIN dc ON dc.path=de.src
@@ -314,17 +307,23 @@ CREATE TEMP VIEW _lp_dep6 AS
         SELECT DISTINCT e.tgid FROM _dep_edges de JOIN dc ON (de.dst=dc.path OR de.src=dc.path)
         JOIN events e ON e.tgid=de.tgid);
 
--- ── lpane VIEW: union of all modes ────────────────────────────────────
+-- ── lpane VIEW: dispatch to per-mode pane sources ─────────────────────
 -- Mode=1 reads from _ftree (populated by C build_file_tree() on mode entry).
 CREATE TEMP VIEW lpane AS
-    SELECT rownum, id, parent_id, style, text FROM _lp_procs
-        WHERE (SELECT mode FROM state)=0
+    SELECT rownum, id, parent_id, style, text FROM _lp_procs_tree
+        WHERE (SELECT mode FROM state)=0 AND (SELECT grouped FROM state)=1
+    UNION ALL
+    SELECT rownum, id, parent_id, style, text FROM _lp_procs_flat
+        WHERE (SELECT mode FROM state)=0 AND (SELECT grouped FROM state)=0
     UNION ALL
     SELECT rownum, id, parent_id, style, text FROM _ftree
         WHERE (SELECT mode FROM state)=1
     UNION ALL
-    SELECT rownum, id, parent_id, style, text FROM _lp_outputs
-        WHERE (SELECT mode FROM state)=2
+    SELECT rownum, id, parent_id, style, text FROM _lp_outputs_grouped
+        WHERE (SELECT mode FROM state)=2 AND (SELECT grouped FROM state)=1
+    UNION ALL
+    SELECT rownum, id, parent_id, style, text FROM _lp_outputs_flat
+        WHERE (SELECT mode FROM state)=2 AND (SELECT grouped FROM state)=0
     UNION ALL
     SELECT rownum, id, parent_id, style, text FROM _lp_dep3
         WHERE (SELECT mode FROM state)=3

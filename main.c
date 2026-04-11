@@ -5,20 +5,17 @@
  *   • SQLite database management (open, schema, queries)
  *   • SQL custom functions (regexp, canon_path, dir_part, depth)
  *   • Trace event processing (JSONL → DB)
- *   • UI rebuild logic (lpane/rpane population)
  *   • Key dispatch (all application-specific key bindings)
- *   • Event loop (poll on tty_fd + optional trace_fd)
  *   • Headless dump functions
  *   • argv parsing and uproctrace integration
  *
- * The generic TUI engine (engine.c) provides only terminal management,
- * rendering, key reading, and line editing.  This file drives everything.
+ * The generic TUI engine (engine.c) owns terminal I/O, the event loop,
+ * rendering, navigation, and layout.  This file drives the application.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/select.h>
@@ -71,16 +68,6 @@ static int qintf(int def, const char *fmt, ...) {
     if (!sql) return def;
     int r = qint(sql, def);
     sqlite3_free(sql);
-    return r;
-}
-
-static double qdbl(const char *sql, double def) {
-    sqlite3_stmt *s;
-    double r = def;
-    if (sqlite3_prepare_v2(g_db, sql, -1, &s, 0) == SQLITE_OK) {
-        if (sqlite3_step(s) == SQLITE_ROW) r = sqlite3_column_double(s, 0);
-        sqlite3_finalize(s);
-    }
     return r;
 }
 
@@ -152,7 +139,6 @@ static void register_sql_funcs(sqlite3 *db) {
 
 /* ── Macros for SQL building ───────────────────────────────────────── */
 #define BNAME(c) "REPLACE("c",RTRIM("c",REPLACE("c",'/','')),'') "
-#define DUR(d) "CASE WHEN "d">=1 THEN printf('%%.2fs',"d") WHEN "d">=.001 THEN printf('%%.1fms',("d")*1e3) WHEN "d">0 THEN printf('%%.0fµs',("d")*1e6) ELSE '' END"
 
 /* ── Forward declarations ──────────────────────────────────────────── */
 static int handle_key(tui_t *tui, int k);
@@ -183,20 +169,6 @@ static void sync_cursor_to_state(void) {
     } else {
         xexecf("UPDATE state SET cursor=%d, dcursor=%d", lc, rc);
     }
-}
-
-static void sync_cursor_from_state(void) {
-    if (!g_tui) return;
-    int lc = qint("SELECT cursor FROM state", 0);
-    int rc = qint("SELECT dcursor FROM state", 0);
-    tui_set_cursor_idx(g_tui, "lpane", lc);
-    tui_set_cursor_idx(g_tui, "rpane", rc);
-}
-
-static void sync_focus_to_state(void) {
-    if (!g_tui) return;
-    const char *f = tui_get_focus(g_tui);
-    xexecf("UPDATE state SET focus=%d", (f && strcmp(f, "rpane") == 0) ? 1 : 0);
 }
 
 static void sync_focus_from_state(void) {
@@ -758,8 +730,6 @@ static void process_inbox_input(tui_t *tui) {
     }
 }
 
-
-
 /* ── Save DB ───────────────────────────────────────────────────────── */
 static void save_to_file(const char *path) {
     sqlite3 *dst;
@@ -1075,6 +1045,60 @@ static void rpane_section_at( int rownum, char *buf, int bsz) {
     sqlite3_finalize(st);
 }
 
+/* Toggle collapse of rpane heading section at cursor.  Returns 1 if toggled. */
+static int toggle_rpane_heading(tui_t *tui) {
+    int dc = tui_get_cursor(tui, "rpane");
+    if (dc < 0) dc = 0;
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(g_db, "SELECT COALESCE(style,'') FROM rpane WHERE rownum=?", -1, &st, 0);
+    sqlite3_bind_int(st, 1, dc);
+    int is_heading = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        is_heading = t && strcmp(t, "heading") == 0;
+    }
+    sqlite3_finalize(st);
+    if (!is_heading) return 0;
+    char sec[128] = "";
+    rpane_section_at(dc, sec, sizeof sec);
+    if (!sec[0]) return 0;
+    int is_ex = qintf(1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)", sec);
+    xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)", sec, is_ex ? 0 : 1);
+    tui_dirty(tui, "rpane");
+    return 1;
+}
+
+/* Switch to a new mode, resetting cursors and focus. */
+static void switch_mode(tui_t *tui, int new_mode) {
+    sync_cursor_to_state();
+    if (new_mode >= 3 && new_mode <= 6)
+        xexec("UPDATE state SET dep_root=COALESCE("
+              "(SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),'')");
+    xexecf("UPDATE state SET mode=%d,cursor=0,cursor_id='',scroll=0,"
+           "dscroll=0,dcursor=0,focus=0%s",
+           new_mode, (new_mode <= 2) ? ",sort_key=0" : "");
+    tui_set_cursor_idx(tui, "lpane", 0);
+    tui_set_cursor_idx(tui, "rpane", 0);
+    sync_focus_from_state();
+    if (new_mode == 1) build_file_tree();
+    tui_dirty(tui, NULL);
+}
+
+/* Get lpane row id at current cursor. */
+static void get_lpane_id(tui_t *tui, char *buf, int bsz) {
+    int cur = tui_get_cursor(tui, "lpane");
+    if (cur < 0) cur = 0;
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
+    sqlite3_bind_int(st, 1, cur);
+    buf[0] = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *t = (const char *)sqlite3_column_text(st, 0);
+        if (t) snprintf(buf, bsz, "%s", t);
+    }
+    sqlite3_finalize(st);
+}
+
 /* ── Help text ─────────────────────────────────────────────────────── */
 static const char *HELP[] = {
     "", "  Process Trace Viewer", "  ════════════════════", "",
@@ -1135,49 +1159,20 @@ static int handle_key(tui_t *tui, int k) {
         return TUI_HANDLED;
     case TUI_K_RIGHT: case 'l':
         if (focus) {
-            int dc = tui_get_cursor(tui, "rpane");
-            if (dc < 0) dc = 0;
-            char rsty[32] = "";
-            { sqlite3_stmt *st2;
-              sqlite3_prepare_v2(g_db, "SELECT COALESCE(style,'') FROM rpane WHERE rownum=?", -1, &st2, 0);
-              sqlite3_bind_int(st2, 1, dc);
-              if (sqlite3_step(st2) == SQLITE_ROW) {
-                  const char *t = (const char *)sqlite3_column_text(st2, 0);
-                  if (t) snprintf(rsty, sizeof rsty, "%s", t);
-              }
-              sqlite3_finalize(st2);
-            }
-            if (strcmp(rsty, "heading") == 0) {
-                char sec[128] = "";
-                rpane_section_at(dc, sec, sizeof sec);
-                if (sec[0]) {
-                    int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)", sec);
-                    xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)", sec, is_ex ? 0 : 1);
-                    tui_dirty(tui, "rpane");
-                }
-                return TUI_HANDLED;
-            }
+            if (toggle_rpane_heading(tui)) return TUI_HANDLED;
             follow_link(tui);
             return TUI_HANDLED;
         }
-        { char id[256] = "";
-          int cur = tui_get_cursor(tui, "lpane"); if (cur < 0) cur = 0;
-          sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
-          sqlite3_bind_int(st, 1, cur);
-          if (sqlite3_step(st) == SQLITE_ROW) {
-              const char *t = (const char *)sqlite3_column_text(st, 0);
-              if (t) snprintf(id, sizeof id, "%s", t);
-          }
-          sqlite3_finalize(st);
+        { char id[256];
+          get_lpane_id(tui, id, sizeof id);
           if ((mode == 0 || mode == 1 || mode == 2) && id[0]) {
-              int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)", id);
+              int is_ex = qintf(1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)", id);
               int has_ch = 0;
-              if (mode == 0) has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM processes WHERE ppid=%d", atoi(id));
-              else if (mode == 1) has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM _ftree WHERE parent_id='%s'", id);
+              if (mode == 0) has_ch = qintf(0, "SELECT COUNT(*)>0 FROM processes WHERE ppid=%d", atoi(id));
+              else if (mode == 1) has_ch = qintf(0, "SELECT COUNT(*)>0 FROM _ftree WHERE parent_id='%s'", id);
               else if (!strncmp(id, "io_", 3)) has_ch = 1;
               if (has_ch && !is_ex) {
-                  xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)", id);
+                  xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)", id);
                   if (mode == 1) build_file_tree();
                   tui_dirty(tui, NULL);
                   return TUI_HANDLED;
@@ -1187,40 +1182,11 @@ static int handle_key(tui_t *tui, int k) {
         return TUI_HANDLED;
     case TUI_K_LEFT: case 'h':
         if (focus) {
-            int dc = tui_get_cursor(tui, "rpane");
-            if (dc < 0) dc = 0;
-            char rsty[32] = "";
-            { sqlite3_stmt *st2;
-              sqlite3_prepare_v2(g_db, "SELECT COALESCE(style,'') FROM rpane WHERE rownum=?", -1, &st2, 0);
-              sqlite3_bind_int(st2, 1, dc);
-              if (sqlite3_step(st2) == SQLITE_ROW) {
-                  const char *t = (const char *)sqlite3_column_text(st2, 0);
-                  if (t) snprintf(rsty, sizeof rsty, "%s", t);
-              }
-              sqlite3_finalize(st2);
-            }
-            if (strcmp(rsty, "heading") == 0) {
-                char sec[128] = "";
-                rpane_section_at(dc, sec, sizeof sec);
-                if (sec[0]) {
-                    int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)", sec);
-                    xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)", sec, is_ex ? 0 : 1);
-                    tui_dirty(tui, "rpane");
-                }
-                return TUI_HANDLED;
-            }
+            toggle_rpane_heading(tui);
             return TUI_HANDLED;
         }
-        { char id[256] = "";
-          int cur = tui_get_cursor(tui, "lpane"); if (cur < 0) cur = 0;
-          sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
-          sqlite3_bind_int(st, 1, cur);
-          if (sqlite3_step(st) == SQLITE_ROW) {
-              const char *t = (const char *)sqlite3_column_text(st, 0);
-              if (t) snprintf(id, sizeof id, "%s", t);
-          }
-          sqlite3_finalize(st);
+        { char id[256];
+          get_lpane_id(tui, id, sizeof id);
           if (mode == 0 && id[0]) {
               int tgid = atoi(id);
               int has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM processes WHERE ppid=%d", tgid);
@@ -1254,20 +1220,20 @@ static int handle_key(tui_t *tui, int k) {
               }
           } else if (mode == 2 && id[0]) {
               if (!strncmp(id, "io_", 3)) {
-                  xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id);
+                  xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id);
                   tui_dirty(tui, NULL);
               } else {
                   char pid[256] = "";
                   sqlite3_stmt *s2;
-                  sqlite3_prepare_v2(g_db, "SELECT parent_id FROM lpane WHERE rownum=?", -1, &s2, 0);
-                  sqlite3_bind_int(s2, 1, cur);
+                  sqlite3_prepare_v2(g_db, "SELECT parent_id FROM lpane WHERE id=?", -1, &s2, 0);
+                  sqlite3_bind_text(s2, 1, id, -1, SQLITE_TRANSIENT);
                   if (sqlite3_step(s2) == SQLITE_ROW) {
                       const char *pi = (const char *)sqlite3_column_text(s2, 0);
                       if (pi) snprintf(pid, sizeof pid, "%s", pi);
                   }
                   sqlite3_finalize(s2);
                   if (pid[0]) {
-                      int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%s'", pid);
+                      int r = qintf(-1, "SELECT rownum FROM lpane WHERE id='%s'", pid);
                       if (r >= 0) tui_set_cursor_idx(tui, "lpane", r);
                   }
               }
@@ -1276,37 +1242,21 @@ static int handle_key(tui_t *tui, int k) {
         return TUI_HANDLED;
     case 'e': case 'E':
         if (mode == 0) {
-            char id[64] = "";
-            int cur = tui_get_cursor(tui, "lpane"); if (cur < 0) cur = 0;
-            sqlite3_stmt *st;
-            sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
-            sqlite3_bind_int(st, 1, cur);
-            if (sqlite3_step(st) == SQLITE_ROW) {
-                const char *t = (const char *)sqlite3_column_text(st, 0);
-                if (t) snprintf(id, sizeof id, "%s", t);
-            }
-            sqlite3_finalize(st);
+            char id[64];
+            get_lpane_id(tui, id, sizeof id);
             int tg = atoi(id);
             xexecf( "WITH RECURSIVE d(t) AS(SELECT %d UNION ALL SELECT c.tgid FROM processes c JOIN d ON c.ppid=d.t)"
                 " UPDATE expanded SET ex=%d WHERE id IN(SELECT CAST(t AS TEXT) FROM d)", tg, k == 'e' ? 1 : 0);
             tui_dirty(tui, NULL);
         }
         return TUI_HANDLED;
-    case '1': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=0,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); tui_dirty(tui, NULL); return TUI_HANDLED;
-    case '2': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=1,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); build_file_tree(); tui_dirty(tui, NULL); return TUI_HANDLED;
-    case '3': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=2,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); tui_dirty(tui, NULL); return TUI_HANDLED;
-    case '4': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=3,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
-    case '5': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=4,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
-    case '6': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=5,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
-    case '7': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=6,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
+    case '1': switch_mode(tui, 0); return TUI_HANDLED;
+    case '2': switch_mode(tui, 1); return TUI_HANDLED;
+    case '3': switch_mode(tui, 2); return TUI_HANDLED;
+    case '4': switch_mode(tui, 3); return TUI_HANDLED;
+    case '5': switch_mode(tui, 4); return TUI_HANDLED;
+    case '6': switch_mode(tui, 5); return TUI_HANDLED;
+    case '7': switch_mode(tui, 6); return TUI_HANDLED;
     case 'd': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET dep_filter=1-dep_filter,cursor=0,scroll=0"); tui_dirty(tui, NULL); return TUI_HANDLED;
     case 's': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0"); tui_dirty(tui, NULL); return TUI_HANDLED;
     case 't': xexec( "UPDATE state SET ts_mode=(ts_mode+1)%3"); tui_dirty(tui, "rpane"); return TUI_HANDLED;
