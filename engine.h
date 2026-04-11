@@ -17,9 +17,31 @@
  *   Read & decode keypresses             Decide what keys mean (via cb)
  *   Render panels from SQL views         Update state params in SQL
  *   Cursor navigation & scroll           Mark panels dirty after changes
- *   Column alignment & truncation        Define layout tree
+ *   Column alignment & truncation        Provide layout in _layout table
  *   Status bar rendering                 Set status text
  *   Line editor, help overlay            Provide help text
+ *   Load layout from _layout table       Populate _layout table in SQL
+ *   Headless mode for testing            Insert test input into inbox
+ *   Dump panel/state for test output     Drive tests via JSON input events
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  LIFECYCLE
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Two modes of operation:
+ *
+ *   Interactive:  tui_open(db) → opens terminal, enter raw mode
+ *   Headless:     tui_open_headless(db) → no terminal, for tests
+ *
+ * Both return the same tui_t handle.  The headless engine tracks
+ * cursor, panel row counts, focus, and navigation — everything
+ * except terminal rendering.  This means tests go through the exact
+ * same input→key dispatch→navigation→state update path as a real
+ * interactive session.
+ *
+ * After opening, call tui_load_layout(tui) to read panel definitions
+ * from the _layout table in the database (see LAYOUT FROM DB below).
+ * Then register callbacks and either tui_run() or use tui_input_key().
  *
  * ═══════════════════════════════════════════════════════════════════
  *  PANEL DATA VIEW FORMAT
@@ -60,10 +82,34 @@
  *  LAYOUT
  * ═══════════════════════════════════════════════════════════════════
  *
- * Layout is a tree of tui_box_t nodes (see below).  The application
- * builds the tree using tui_hbox(), tui_vbox(), and tui_panel_box(),
- * then passes the root to tui_set_layout().  The engine resolves
- * pixel positions on every resize.
+ * Layout can be defined two ways:
+ *
+ * 1. PROGRAMMATIC (legacy):
+ *    Build a tree of tui_box_t nodes using tui_hbox(), tui_vbox(),
+ *    tui_panel_box(), then pass the root to tui_set_layout().
+ *
+ * 2. FROM DATABASE (preferred):
+ *    Populate the _layout temp table, then call tui_load_layout(tui).
+ *    The engine reads the table and builds the layout tree internally.
+ *
+ *    CREATE TEMP TABLE _layout(
+ *        id INTEGER PRIMARY KEY,       -- node id
+ *        parent_id INT,                -- parent node (NULL=root)
+ *        type TEXT NOT NULL,           -- 'hbox','vbox','panel'
+ *        name TEXT,                    -- panel name = SQL view name
+ *        weight INT DEFAULT 1,        -- flex weight for parent split
+ *        min_size INT DEFAULT 0,      -- minimum columns/lines
+ *        flags INT DEFAULT 0,         -- TUI_PANEL_* for panels
+ *        col_name TEXT,               -- SQL column name (for panel)
+ *        col_width INT DEFAULT -1,    -- column width
+ *        col_align INT DEFAULT 0,     -- column alignment
+ *        col_overflow INT DEFAULT 1   -- column overflow mode
+ *    );
+ *
+ *    Example — two equal panels side by side:
+ *      INSERT INTO _layout VALUES(1,NULL,'hbox',NULL,1,0,0,NULL,-1,0,1);
+ *      INSERT INTO _layout VALUES(2,1,'panel','lpane',1,0,1,'text',-1,0,1);
+ *      INSERT INTO _layout VALUES(3,1,'panel','rpane',1,0,3,'text',-1,0,1);
  *
  * tui_panel_def describes how to render one panel:
  *   name       — panel and SQL view name
@@ -123,23 +169,24 @@
  *  TYPICAL USAGE
  * ═══════════════════════════════════════════════════════════════════
  *
+ *   // Interactive mode
  *   sqlite3 *db = ...;
- *   tui_t *tui = tui_open(db);
- *
- *   static tui_col_def lc[] = {{"text",-1,TUI_ALIGN_LEFT,TUI_OVERFLOW_ELLIPSIS}};
- *   static tui_panel_def lp = {"lpane", NULL, lc, 1, TUI_PANEL_CURSOR};
- *   static tui_col_def rc[] = {{"text",-1,TUI_ALIGN_LEFT,TUI_OVERFLOW_ELLIPSIS}};
- *   static tui_panel_def rp = {"rpane", NULL, rc, 1, TUI_PANEL_CURSOR|TUI_PANEL_BORDER};
- *
- *   tui_set_layout(tui, tui_hbox(2,
- *       tui_panel_box(&lp, 1, 0),
- *       tui_panel_box(&rp, 1, 0)));
- *
+ *   tui_t *tui = tui_open(db);          // or tui_open_headless(db)
+ *   tui_load_layout(tui);               // reads _layout table
+ *   tui_focus(tui, "lpane");
  *   tui_on_key(tui, my_key_cb, ctx);
- *   tui_watch_fd(tui, trace_fd, on_trace_data, ctx);
- *   tui_set_status(tui, " Ready");
  *   tui_dirty(tui, NULL);
  *   tui_run(tui);
+ *   tui_close(tui);
+ *
+ *   // Headless test mode
+ *   sqlite3 *db = ...;
+ *   tui_t *tui = tui_open_headless(db);
+ *   tui_load_layout(tui);
+ *   tui_focus(tui, "lpane");
+ *   tui_on_key(tui, my_key_cb, ctx);
+ *   tui_input_key(tui, 'j');            // simulate keypress
+ *   tui_dump(tui, "lpane", stdout);     // dump panel content
  *   tui_close(tui);
  */
 #ifndef ENGINE_H
