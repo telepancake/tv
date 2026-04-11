@@ -166,6 +166,8 @@ static void sql_is_sys_path(sqlite3_context *ctx, int n, sqlite3_value **v) {
     sqlite3_result_int(ctx, 0);
 }
 
+static void sql_build_ftree(sqlite3_context *ctx, int n, sqlite3_value **v);
+
 static void register_sql_funcs(sqlite3 *db) {
     sqlite3_create_function(db, "regexp",       2, SQLITE_UTF8, 0, sql_regexp,       0, 0);
     sqlite3_create_function(db, "canon_path",   1, SQLITE_UTF8, 0, sql_canon_path,   0, 0);
@@ -173,15 +175,12 @@ static void register_sql_funcs(sqlite3 *db) {
     sqlite3_create_function(db, "depth",        1, SQLITE_UTF8, 0, sql_depth,        0, 0);
     sqlite3_create_function(db, "resolve_path", 2, SQLITE_UTF8, 0, sql_resolve_path, 0, 0);
     sqlite3_create_function(db, "is_sys_path",  2, SQLITE_UTF8, 0, sql_is_sys_path,  0, 0);
+    sqlite3_create_function(db, "build_ftree",  0, SQLITE_UTF8, 0, sql_build_ftree,  0, 0);
 }
-
-/* ── Macros for SQL building ───────────────────────────────────────── */
-#define BNAME(c) "REPLACE("c",RTRIM("c",REPLACE("c",'/','')),'') "
 
 /* ── Forward declarations ──────────────────────────────────────────── */
 static int handle_key(tui_t *tui, int k);
 static void do_search(const char *q);
-static void build_file_tree(void);
 static void jump_hit(int dir);
 static void follow_link(tui_t *tui);
 
@@ -481,7 +480,7 @@ static void dispatch_input(tui_t *tui, const char *data) {
         sqlite3_bind_text(st, 1, arg1, -1, SQLITE_TRANSIENT);
         sqlite3_step(st); sqlite3_finalize(st);
         do_search(arg1);
-        if (qint("SELECT mode FROM state", 0) == 1) build_file_tree();
+        if (qint("SELECT mode FROM state", 0) == 1) xexec("SELECT build_ftree()");
         tui_dirty(g_tui, NULL);
     } else if (strcmp(inp, "evfilt") == 0) {
         char q[64] = "";
@@ -546,174 +545,186 @@ static void load_db(const char *path) {
     sqlite3_close(src);
 }
 
-/* ── build_file_tree: populate _ftree for mode=1 ──────────────────── */
-static void build_file_tree(void) {
-    int gr = qint( "SELECT grouped FROM state", 1);
-    int sk = qint( "SELECT sort_key FROM state", 0);
+/* ── build_ftree SQL function: populate _ftree for mode=1 ─────────── */
+/* Callable from SQL: SELECT build_ftree() */
+static void ftree_xr(sqlite3 *db, const char *sql) {
+    char *e = 0; sqlite3_exec(db, sql, 0, 0, &e); if (e) sqlite3_free(e);
+}
+static int ftree_qi(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st; int r = 0;
+    sqlite3_prepare_v2(db, sql, -1, &st, 0);
+    if (sqlite3_step(st) == SQLITE_ROW) r = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st); return r;
+}
+static void sql_build_ftree(sqlite3_context *ctx, int n, sqlite3_value **v) {
+    (void)n; (void)v;
+    sqlite3 *db = sqlite3_context_db_handle(ctx);
 
-    xexec("DELETE FROM _ftree;");
+    int gr = ftree_qi(db, "SELECT grouped FROM state");
+    int sk = ftree_qi(db, "SELECT sort_key FROM state");
+
+    ftree_xr(db,"DELETE FROM _ftree");
 
     if (!gr) {
-        const char *ob;
-        switch (sk) { case 1: ob = "MIN(e.ts)"; break; case 2: ob = "MAX(e.ts)"; break; default: ob = "o.path"; }
-        xexecf(
+        const char *sql;
+        switch (sk) {
+        case 1: sql =
             "INSERT INTO _ftree(rownum,id,parent_id,style,text)"
-            " SELECT ROW_NUMBER()OVER(ORDER BY %s)-1,o.path,NULL,"
+            " SELECT ROW_NUMBER()OVER(ORDER BY MIN(e.ts))-1,o.path,NULL,"
             "  CASE WHEN o.path IN(SELECT id FROM search_hits) THEN 'search'"
             "       WHEN SUM(CASE WHEN o.err IS NOT NULL THEN 1 ELSE 0 END)>0 THEN 'error'"
             "       ELSE 'normal' END,"
-            "  printf('%%s  [%%d opens, %%d procs%%s]',"
-            "   o.path,"
-            "   COUNT(*),COUNT(DISTINCT e.tgid),"
-            "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %%d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
-            " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path", ob);
-        return;
+            "  printf('%s  [%d opens, %d procs%s]',o.path,COUNT(*),COUNT(DISTINCT e.tgid),"
+            "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
+            " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path";
+            break;
+        case 2: sql =
+            "INSERT INTO _ftree(rownum,id,parent_id,style,text)"
+            " SELECT ROW_NUMBER()OVER(ORDER BY MAX(e.ts))-1,o.path,NULL,"
+            "  CASE WHEN o.path IN(SELECT id FROM search_hits) THEN 'search'"
+            "       WHEN SUM(CASE WHEN o.err IS NOT NULL THEN 1 ELSE 0 END)>0 THEN 'error'"
+            "       ELSE 'normal' END,"
+            "  printf('%s  [%d opens, %d procs%s]',o.path,COUNT(*),COUNT(DISTINCT e.tgid),"
+            "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
+            " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path";
+            break;
+        default: sql =
+            "INSERT INTO _ftree(rownum,id,parent_id,style,text)"
+            " SELECT ROW_NUMBER()OVER(ORDER BY o.path)-1,o.path,NULL,"
+            "  CASE WHEN o.path IN(SELECT id FROM search_hits) THEN 'search'"
+            "       WHEN SUM(CASE WHEN o.err IS NOT NULL THEN 1 ELSE 0 END)>0 THEN 'error'"
+            "       ELSE 'normal' END,"
+            "  printf('%s  [%d opens, %d procs%s]',o.path,COUNT(*),COUNT(DISTINCT e.tgid),"
+            "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
+            " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path";
+        }
+        ftree_xr(db,sql);
+        sqlite3_result_int(ctx, 1); return;
     }
 
-    /* Tree mode: build file_stats, dir_nodes, compress chains, then ftree */
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS file_stats("
-        " path TEXT NOT NULL, canon TEXT NOT NULL,"
-        " opens INT, procs INT, errs INT);"
-        "DELETE FROM file_stats;"
-        "INSERT INTO file_stats(path,canon,opens,procs,errs)"
-        " SELECT o.path,canon_path(o.path),COUNT(*),COUNT(DISTINCT e.tgid),SUM(o.err IS NOT NULL)"
-        " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path IS NOT NULL GROUP BY o.path;");
+    /* Tree mode */
+    ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _fs(path TEXT NOT NULL, canon TEXT NOT NULL,"
+       " opens INT, procs INT, errs INT);"
+       "DELETE FROM _fs;"
+       "INSERT INTO _fs SELECT o.path,canon_path(o.path),COUNT(*),"
+       " COUNT(DISTINCT e.tgid),SUM(o.err IS NOT NULL)"
+       " FROM open_events o JOIN events e ON e.id=o.eid"
+       " WHERE o.path IS NOT NULL GROUP BY o.path");
 
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS dir_nodes("
-        " id INTEGER PRIMARY KEY, path TEXT NOT NULL, parent_path TEXT, name TEXT,"
-        " opens INT DEFAULT 0, procs INT DEFAULT 0, errs INT DEFAULT 0, dead INT DEFAULT 0);"
-        "DELETE FROM dir_nodes;"
-        "WITH RECURSIVE dirs(d) AS("
-        "  SELECT DISTINCT dir_part(canon) FROM file_stats WHERE INSTR(canon,'/')>0"
-        "  UNION"
-        "  SELECT dir_part(d) FROM dirs WHERE LENGTH(d)>1 AND INSTR(d,'/')>0"
-        ")"
-        "INSERT INTO dir_nodes(path,parent_path,name)"
-        " SELECT d,"
-        "  CASE WHEN d='/' THEN NULL"
-        "   WHEN INSTR(SUBSTR(d,2),'/')=0 THEN '/'"
-        "   ELSE dir_part(d) END,"
-        "  " BNAME("d")
-        " FROM dirs WHERE d IS NOT NULL AND LENGTH(d)>0;"
-        "CREATE INDEX IF NOT EXISTS ix_dn_path ON dir_nodes(path);"
-        "CREATE INDEX IF NOT EXISTS ix_dn_par ON dir_nodes(parent_path);"
-        "UPDATE dir_nodes SET"
-        " opens=(SELECT COALESCE(SUM(f.opens),0) FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%'),"
-        " procs=(SELECT COALESCE(SUM(f.procs),0) FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%'),"
-        " errs =(SELECT COALESCE(SUM(f.errs),0)  FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%');");
+    ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _dn(id INTEGER PRIMARY KEY,"
+       " path TEXT NOT NULL, parent_path TEXT, name TEXT,"
+       " opens INT DEFAULT 0, procs INT DEFAULT 0, errs INT DEFAULT 0, dead INT DEFAULT 0);"
+       "DELETE FROM _dn;"
+       "WITH RECURSIVE dirs(d) AS("
+       "  SELECT DISTINCT dir_part(canon) FROM _fs WHERE INSTR(canon,'/')>0"
+       "  UNION SELECT dir_part(d) FROM dirs WHERE LENGTH(d)>1 AND INSTR(d,'/')>0)"
+       "INSERT INTO _dn(path,parent_path,name)"
+       " SELECT d,"
+       "  CASE WHEN d='/' THEN NULL WHEN INSTR(SUBSTR(d,2),'/')=0 THEN '/'"
+       "   ELSE dir_part(d) END,"
+       "  REPLACE(d,RTRIM(d,REPLACE(d,'/','')),'') FROM dirs WHERE d IS NOT NULL AND LENGTH(d)>0;"
+       "CREATE INDEX IF NOT EXISTS ix_dn_p ON _dn(path);"
+       "CREATE INDEX IF NOT EXISTS ix_dn_pp ON _dn(parent_path);"
+       "UPDATE _dn SET"
+       " opens=(SELECT COALESCE(SUM(f.opens),0) FROM _fs f WHERE f.canon LIKE _dn.path||'/%'),"
+       " procs=(SELECT COALESCE(SUM(f.procs),0) FROM _fs f WHERE f.canon LIKE _dn.path||'/%'),"
+       " errs =(SELECT COALESCE(SUM(f.errs),0)  FROM _fs f WHERE f.canon LIKE _dn.path||'/%')");
 
+    /* Chain compression (iterative) */
     for (int pass = 0; pass < 20; pass++) {
-        int merged = qint(
-            "SELECT COUNT(*) FROM dir_nodes p"
+        int merged = ftree_qi(db,
+            "SELECT COUNT(*) FROM _dn p"
             " WHERE p.dead=0 AND p.parent_path IS NOT NULL"
-            " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0)=1"
-            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0"
-            " AND NOT EXISTS(SELECT 1 FROM dir_nodes ch"
-            "  WHERE ch.parent_path=p.path AND ch.dead=0"
-            "  AND (SELECT COUNT(*) FROM dir_nodes gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
-            "  AND (SELECT COUNT(*) FROM file_stats f2 WHERE dir_part(f2.canon)=ch.path)=0)", 0);
+            " AND (SELECT COUNT(*) FROM _dn c WHERE c.parent_path=p.path AND c.dead=0)=1"
+            " AND (SELECT COUNT(*) FROM _fs f WHERE dir_part(f.canon)=p.path)=0"
+            " AND NOT EXISTS(SELECT 1 FROM _dn ch WHERE ch.parent_path=p.path AND ch.dead=0"
+            "  AND (SELECT COUNT(*) FROM _dn gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
+            "  AND (SELECT COUNT(*) FROM _fs f2 WHERE dir_part(f2.canon)=ch.path)=0)");
         if (!merged) break;
-        xexec(
-            "UPDATE dir_nodes SET"
-            " name=name||'/'||(SELECT c.name FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0),"
-            " opens=(SELECT c.opens FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0),"
-            " procs=(SELECT c.procs FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0),"
-            " errs=(SELECT c.errs FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0)"
-            " WHERE dead=0 AND parent_path IS NOT NULL"
-            " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=dir_nodes.path AND c.dead=0)=1"
-            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=dir_nodes.path)=0"
-            " AND NOT EXISTS(SELECT 1 FROM dir_nodes ch"
-            "  WHERE ch.parent_path=dir_nodes.path AND ch.dead=0"
-            "  AND (SELECT COUNT(*) FROM dir_nodes gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
-            "  AND (SELECT COUNT(*) FROM file_stats f2 WHERE dir_part(f2.canon)=ch.path)=0);");
-        xexec(
-            "CREATE TEMP TABLE IF NOT EXISTS _merge(pid INT, old_path TEXT, child_path TEXT);"
-            "DELETE FROM _merge;"
-            "INSERT INTO _merge SELECT p.id, p.path,"
-            " (SELECT c.path FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0 LIMIT 1)"
-            " FROM dir_nodes p WHERE p.dead=0 AND p.parent_path IS NOT NULL"
-            " AND (SELECT COUNT(*) FROM dir_nodes c WHERE c.parent_path=p.path AND c.dead=0)=1"
-            " AND (SELECT COUNT(*) FROM file_stats f WHERE dir_part(f.canon)=p.path)=0"
-            " AND NOT EXISTS(SELECT 1 FROM dir_nodes ch"
-            "  WHERE ch.parent_path=p.path AND ch.dead=0"
-            "  AND (SELECT COUNT(*) FROM dir_nodes gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
-            "  AND (SELECT COUNT(*) FROM file_stats f2 WHERE dir_part(f2.canon)=ch.path)=0);");
-        xexec(
-            "UPDATE dir_nodes SET dead=1 WHERE path IN(SELECT child_path FROM _merge) AND dead=0;");
-        xexec(
-            "UPDATE dir_nodes SET path="
-            " (SELECT m.child_path FROM _merge m WHERE m.pid=dir_nodes.id)"
-            " WHERE id IN(SELECT pid FROM _merge);");
-        xexec( "DROP TABLE IF EXISTS _merge;");
+        ftree_xr(db,"UPDATE _dn SET"
+           " name=name||'/'||(SELECT c.name FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0),"
+           " opens=(SELECT c.opens FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0),"
+           " procs=(SELECT c.procs FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0),"
+           " errs=(SELECT c.errs FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0)"
+           " WHERE dead=0 AND parent_path IS NOT NULL"
+           " AND (SELECT COUNT(*) FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0)=1"
+           " AND (SELECT COUNT(*) FROM _fs f WHERE dir_part(f.canon)=_dn.path)=0"
+           " AND NOT EXISTS(SELECT 1 FROM _dn ch WHERE ch.parent_path=_dn.path AND ch.dead=0"
+           "  AND (SELECT COUNT(*) FROM _dn gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
+           "  AND (SELECT COUNT(*) FROM _fs f2 WHERE dir_part(f2.canon)=ch.path)=0)");
+        ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _mg(pid INT, child_path TEXT);"
+           "DELETE FROM _mg;"
+           "INSERT INTO _mg SELECT p.id,"
+           " (SELECT c.path FROM _dn c WHERE c.parent_path=p.path AND c.dead=0 LIMIT 1)"
+           " FROM _dn p WHERE p.dead=0 AND p.parent_path IS NOT NULL"
+           " AND (SELECT COUNT(*) FROM _dn c WHERE c.parent_path=p.path AND c.dead=0)=1"
+           " AND (SELECT COUNT(*) FROM _fs f WHERE dir_part(f.canon)=p.path)=0"
+           " AND NOT EXISTS(SELECT 1 FROM _dn ch WHERE ch.parent_path=p.path AND ch.dead=0"
+           "  AND (SELECT COUNT(*) FROM _dn gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
+           "  AND (SELECT COUNT(*) FROM _fs f2 WHERE dir_part(f2.canon)=ch.path)=0)");
+        ftree_xr(db,"UPDATE _dn SET dead=1 WHERE path IN(SELECT child_path FROM _mg) AND dead=0");
+        ftree_xr(db,"UPDATE _dn SET path=(SELECT m.child_path FROM _mg m WHERE m.pid=_dn.id)"
+           " WHERE id IN(SELECT pid FROM _mg)");
+        ftree_xr(db,"DROP TABLE IF EXISTS _mg");
     }
 
-    xexec( "INSERT OR IGNORE INTO expanded(id,ex) SELECT path,1 FROM dir_nodes WHERE dead=0;");
+    ftree_xr(db,"INSERT OR IGNORE INTO expanded(id,ex) SELECT path,1 FROM _dn WHERE dead=0");
 
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS ftree("
-        " id INTEGER PRIMARY KEY, sort_key TEXT, path TEXT, parent_path TEXT, name TEXT,"
-        " opens INT, procs INT, errs INT, is_dir INT, depth INT);"
-        "DELETE FROM ftree;");
+    /* Build ordered tree */
+    ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _ft(id INTEGER PRIMARY KEY,"
+       " sort_key TEXT, path TEXT, parent_path TEXT, name TEXT,"
+       " opens INT, procs INT, errs INT, is_dir INT, depth INT);"
+       "DELETE FROM _ft");
+    ftree_xr(db,"INSERT INTO _ft(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+       " SELECT printf('0/%s',name),path,parent_path,name,opens,procs,errs,1,0"
+       " FROM _dn WHERE dead=0"
+       "  AND (parent_path IS NULL OR parent_path NOT IN(SELECT path FROM _dn WHERE dead=0))");
+    ftree_xr(db,"INSERT INTO _ft(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+       " SELECT printf('1/%s',REPLACE(canon,RTRIM(canon,REPLACE(canon,'/','')),'')),"
+       "  path,NULL,REPLACE(canon,RTRIM(canon,REPLACE(canon,'/','')),''),opens,procs,errs,0,0"
+       " FROM _fs WHERE INSTR(canon,'/')=0"
+       "  OR dir_part(canon) NOT IN(SELECT path FROM _dn WHERE dead=0)");
 
-    xexec(
-        "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
-        " SELECT printf('0/%s',name),"
-        "  path,parent_path,name,opens,procs,errs,1,0"
-        " FROM dir_nodes"
-        " WHERE dead=0 AND (parent_path IS NULL OR parent_path NOT IN(SELECT path FROM dir_nodes WHERE dead=0));");
-    xexec(
-        "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
-        " SELECT printf('1/%s'," BNAME("canon") "),"
-        "  path,NULL," BNAME("canon") ",opens,procs,errs,0,0"
-        " FROM file_stats"
-        " WHERE INSTR(canon,'/')=0"
-        "  OR dir_part(canon) NOT IN(SELECT path FROM dir_nodes WHERE dead=0);");
-
+    /* Expand tree depth by depth */
     for (int depth = 0; depth < 50; depth++) {
-        int has_more = qintf( 0,
-            "SELECT COUNT(*) FROM ftree t"
-            " WHERE t.depth=%d AND t.is_dir=1"
+        char sql[2048];
+        snprintf(sql, sizeof sql,
+            "SELECT COUNT(*) FROM _ft t WHERE t.depth=%d AND t.is_dir=1"
             " AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1"
-            " AND (EXISTS(SELECT 1 FROM dir_nodes d WHERE d.parent_path=t.path AND d.dead=0)"
-            "  OR EXISTS(SELECT 1 FROM file_stats f WHERE dir_part(f.canon)=t.path))",
-            depth);
-        if (!has_more) break;
-        xexecf(
-            "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
-            " SELECT t.sort_key||'/0/'||d.name,"
-            "  d.path,d.parent_path,d.name,d.opens,d.procs,d.errs,1,%d"
-            " FROM ftree t JOIN dir_nodes d ON d.parent_path=t.path"
+            " AND (EXISTS(SELECT 1 FROM _dn d WHERE d.parent_path=t.path AND d.dead=0)"
+            "  OR EXISTS(SELECT 1 FROM _fs f WHERE dir_part(f.canon)=t.path))", depth);
+        if (!ftree_qi(db,sql)) break;
+        snprintf(sql, sizeof sql,
+            "INSERT INTO _ft(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+            " SELECT t.sort_key||'/0/'||d.name,d.path,d.parent_path,d.name,"
+            " d.opens,d.procs,d.errs,1,%d FROM _ft t JOIN _dn d ON d.parent_path=t.path"
             " WHERE t.depth=%d AND t.is_dir=1 AND d.dead=0"
-            "  AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1",
-            depth + 1, depth);
-        xexecf(
-            "INSERT INTO ftree(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
-            " SELECT t.sort_key||'/1/'||" BNAME("f.canon") ","
-            "  f.path,dir_part(f.canon)," BNAME("f.canon") ",f.opens,f.procs,f.errs,0,%d"
-            " FROM ftree t JOIN file_stats f ON dir_part(f.canon)=t.path"
+            "  AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1", depth+1, depth);
+        ftree_xr(db,sql);
+        snprintf(sql, sizeof sql,
+            "INSERT INTO _ft(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
+            " SELECT t.sort_key||'/1/'||REPLACE(f.canon,RTRIM(f.canon,REPLACE(f.canon,'/','')),''),"
+            " f.path,dir_part(f.canon),REPLACE(f.canon,RTRIM(f.canon,REPLACE(f.canon,'/','')),''),"
+            " f.opens,f.procs,f.errs,0,%d FROM _ft t JOIN _fs f ON dir_part(f.canon)=t.path"
             " WHERE t.depth=%d AND t.is_dir=1"
-            "  AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1",
-            depth + 1, depth);
+            "  AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1", depth+1, depth);
+        ftree_xr(db,sql);
     }
 
-    xexec(
-        "INSERT INTO _ftree(rownum,id,parent_id,style,text)"
-        " SELECT ROW_NUMBER()OVER(ORDER BY sort_key)-1,"
-        "  path,parent_path,"
-        "  CASE WHEN path IN(SELECT id FROM search_hits) THEN 'search'"
-        "       WHEN errs>0 THEN 'error' ELSE 'normal' END,"
-        "  printf('%*s%s%s  [%d opens, %d procs%s]',"
-        "   depth*2,'',"
-        "   CASE WHEN is_dir AND COALESCE((SELECT ex FROM expanded WHERE id=path),1)=1"
-        "    THEN '▼ ' WHEN is_dir THEN '▶ ' ELSE '  ' END,"
-        "   name||CASE WHEN is_dir THEN '/' ELSE '' END,"
-        "   opens,procs,"
-        "   CASE WHEN errs>0 THEN printf(', %d errs',errs) ELSE '' END)"
-        " FROM ftree;");
+    ftree_xr(db,"INSERT INTO _ftree(rownum,id,parent_id,style,text)"
+       " SELECT ROW_NUMBER()OVER(ORDER BY sort_key)-1,path,parent_path,"
+       "  CASE WHEN path IN(SELECT id FROM search_hits) THEN 'search'"
+       "       WHEN errs>0 THEN 'error' ELSE 'normal' END,"
+       "  printf('%*s%s%s  [%d opens, %d procs%s]',depth*2,'',"
+       "   CASE WHEN is_dir AND COALESCE((SELECT ex FROM expanded WHERE id=path),1)=1"
+       "    THEN '▼ ' WHEN is_dir THEN '▶ ' ELSE '  ' END,"
+       "   name||CASE WHEN is_dir THEN '/' ELSE '' END,"
+       "   opens,procs,"
+       "   CASE WHEN errs>0 THEN printf(', %d errs',errs) ELSE '' END)"
+       " FROM _ft");
 
-    xexec( "DROP TABLE IF EXISTS ftree;DROP TABLE IF EXISTS file_stats;DROP TABLE IF EXISTS dir_nodes;");
+    ftree_xr(db,"DROP TABLE IF EXISTS _ft;DROP TABLE IF EXISTS _fs;DROP TABLE IF EXISTS _dn");
+    sqlite3_result_int(ctx, 1);
 }
 
 /* ── Search & navigation ───────────────────────────────────────────── */
@@ -792,7 +803,7 @@ static void follow_link(tui_t *tui) {
                     " UNION ALL SELECT ppid FROM processes JOIN a ON tgid=a.p WHERE ppid IS NOT NULL"
                     ")UPDATE expanded SET ex=1 WHERE id IN(SELECT CAST(p AS TEXT) FROM a)", tg);
             } else if (tm == 1) {
-                build_file_tree();
+                xexec("SELECT build_ftree()");
             }
             /* Find rownum of target in (now-current-mode) lpane view */
             sqlite3_prepare_v2(db, "SELECT rownum FROM lpane WHERE id=?", -1, &st, 0);
@@ -864,7 +875,7 @@ static void switch_mode(tui_t *tui, int new_mode) {
     tui_set_cursor_idx(tui, "lpane", 0);
     tui_set_cursor_idx(tui, "rpane", 0);
     sync_focus_from_state();
-    if (new_mode == 1) build_file_tree();
+    if (new_mode == 1) xexec("SELECT build_ftree()");
     tui_dirty(tui, NULL);
 }
 
@@ -938,7 +949,7 @@ static int handle_key(tui_t *tui, int k) {
         tui_set_cursor_idx(tui, "lpane", 0);
         tui_set_cursor_idx(tui, "rpane", 0);
         xexec( "UPDATE state SET grouped=1-grouped,cursor=0,scroll=0,dscroll=0,dcursor=0");
-        if (qint("SELECT mode FROM state", 0) == 1) build_file_tree();
+        if (qint("SELECT mode FROM state", 0) == 1) xexec("SELECT build_ftree()");
         tui_dirty(tui, NULL);
         return TUI_HANDLED;
     case TUI_K_RIGHT: case 'l':
@@ -957,7 +968,7 @@ static int handle_key(tui_t *tui, int k) {
               else if (!strncmp(id, "io_", 3)) has_ch = 1;
               if (has_ch && !is_ex) {
                   xexecf("INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)", id);
-                  if (mode == 1) build_file_tree();
+                  if (mode == 1) xexec("SELECT build_ftree()");
                   tui_dirty(tui, NULL);
                   return TUI_HANDLED;
               }
@@ -986,7 +997,7 @@ static int handle_key(tui_t *tui, int k) {
               int has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM _ftree WHERE parent_id='%s'", id);
               if (has_ch && is_ex) {
                   xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id);
-                  build_file_tree();
+                  xexec("SELECT build_ftree()");
                   tui_dirty(tui, NULL);
                   return TUI_HANDLED;
               }
@@ -1271,7 +1282,7 @@ int main(int argc, char **argv) {
     }
 
     /* Initial setup: populate _ftree if starting in file mode, then sync cursor_id */
-    if (qint("SELECT mode FROM state", 0) == 1) build_file_tree();
+    if (qint("SELECT mode FROM state", 0) == 1) xexec("SELECT build_ftree()");
     sync_cursor_id_from_pos();
 
     if (save_file[0]) save_to_file(save_file);
