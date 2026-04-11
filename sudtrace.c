@@ -1343,7 +1343,7 @@ static int run_wrapper_mode(int argc, char **argv)
             if (wpid == tgid || wpid == child)
                 emit_exit_event(wpid, wstatus);
 
-            if (wpid == child) continue;
+            if (wpid == child) break;
         }
     }
 
@@ -1480,7 +1480,7 @@ int main(int argc, char **argv)
             if (wpid == tgid || wpid == child)
                 emit_exit_event(wpid, wstatus);
 
-            if (wpid == child) continue;
+            if (wpid == child) break;
         }
     }
 

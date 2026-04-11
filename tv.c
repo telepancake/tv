@@ -1674,8 +1674,8 @@ int main(int argc,char**argv){
             if(slen<=0)die("cannot resolve /proc/self/exe");
             self_exe[slen]='\0';
 
-            if(!force_ptrace){
-                /* Look for sudtrace next to our own binary */
+            /* Look for sudtrace next to our own binary */
+            {
                 char *slash=strrchr(self_exe,'/');
                 if(slash){
                     size_t dirlen=slash-self_exe;
@@ -1684,7 +1684,14 @@ int main(int argc,char**argv){
                 } else {
                     snprintf(sudtrace_exe,sizeof sudtrace_exe,"sudtrace");
                 }
-                if(!force_sud&&access(sudtrace_exe,X_OK)==0)use_sud=1;
+            }
+
+            if(!force_ptrace&&!force_sud&&access(sudtrace_exe,X_OK)==0)
+                use_sud=1;
+            if(force_sud&&access(sudtrace_exe,X_OK)!=0){
+                fprintf(stderr,"tv: --sud requested but sudtrace not found at %s\n",
+                        sudtrace_exe);
+                use_sud=0;
             }
 
             if(use_sud&&sudtrace_exe[0]){
