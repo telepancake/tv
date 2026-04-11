@@ -95,7 +95,9 @@
  *
  * The key callback is called FIRST.  If it returns TUI_HANDLED,
  * the engine skips default navigation.  If TUI_DEFAULT, the engine
- * applies built-in movement.
+ * applies built-in movement, then calls the callback a second time
+ * with key=TUI_K_NONE so the app can observe the new cursor position
+ * (e.g. to update a cursor_id column in the state table).
  *
  * The app can move the cursor programmatically via tui_set_cursor()
  * and query it via tui_get_cursor() / tui_get_cursor_id().
