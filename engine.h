@@ -5,46 +5,52 @@
  *  OVERVIEW
  * ═══════════════════════════════════════════════════════════════════
  *
- * A terminal UI engine that renders named panels from SQLite tables.
+ * A terminal UI engine that renders named panels from SQLite views.
  * The engine owns terminal I/O, the event loop, rendering, cursor
- * navigation, scrolling, and column layout.  The application provides
- * data in SQLite tables and receives callbacks on events.
+ * navigation, scrolling, and layout.  The application provides data
+ * in SQLite views and receives callbacks on events.
  *
  *   Engine responsibilities              Application responsibilities
  *   ─────────────────────────────────    ─────────────────────────────
- *   Terminal raw mode, alt screen        Database schema & population
+ *   Terminal raw mode, alt screen        Database schema & SQL views
  *   Event loop (select on fds)           Register fds, timers, key cb
  *   Read & decode keypresses             Decide what keys mean (via cb)
- *   Render panels from SQL tables        Populate/rebuild panel tables
+ *   Render panels from SQL views         Update state params in SQL
  *   Cursor navigation & scroll           Mark panels dirty after changes
- *   Column alignment & truncation        Define panel layout (columns)
+ *   Column alignment & truncation        Define layout tree
  *   Status bar rendering                 Set status text
  *   Line editor, help overlay            Provide help text
  *
  * ═══════════════════════════════════════════════════════════════════
- *  PANEL DATA TABLE FORMAT
+ *  PANEL DATA VIEW FORMAT
  * ═══════════════════════════════════════════════════════════════════
  *
- * Each panel reads from a table whose name matches the panel name.
+ * Each panel reads from a SQL view whose name matches the panel name.
  * Required columns:
  *
+ *   rownum  INT     — 0-based row position (determines display order)
  *   id      TEXT    — unique row identifier, passed back in callbacks
  *   style   TEXT    — row style name (see STYLES)
- *   <col>   TEXT    — one per column in the panel layout definition
+ *   <col>   TEXT    — one per column in the panel definition
  *
- * Row ordering: determined by tui_panel_def.order_by (a SQL ORDER BY
- * fragment, e.g. "rownum" or "name ASC").  No explicit numbering needed.
+ * Rows are ordered by rownum ASC.  The view can compute rownum using
+ * ROW_NUMBER()OVER()-1 or any other method that produces 0-based
+ * contiguous integers.
  *
- * Additional columns for app use are ignored by the engine.
+ * Additional columns are ignored by the engine.
  *
  * ═══════════════════════════════════════════════════════════════════
- *  PANEL LAYOUT
+ *  LAYOUT
  * ═══════════════════════════════════════════════════════════════════
+ *
+ * Layout is a tree of tui_box_t nodes (see below).  The application
+ * builds the tree using tui_hbox(), tui_vbox(), and tui_panel_box(),
+ * then passes the root to tui_set_layout().  The engine resolves
+ * pixel positions on every resize.
  *
  * tui_panel_def describes how to render one panel:
- *   name       — panel and SQL table name
+ *   name       — panel and SQL view name
  *   title      — header shown at top of panel (NULL = no header)
- *   order_by   — SQL ORDER BY fragment
  *   cols/ncols — column definitions
  *   flags      — TUI_PANEL_CURSOR, TUI_PANEL_BORDER
  *
@@ -53,8 +59,6 @@
  *   width      — >0 = fixed chars, <0 = flex weight (share of rest)
  *   align      — TUI_ALIGN_LEFT / RIGHT / CENTER
  *   overflow   — TUI_OVERFLOW_TRUNCATE / ELLIPSIS
- *
- * Panel position: given as percentages (0-100) of terminal area.
  *
  * ═══════════════════════════════════════════════════════════════════
  *  STYLES
@@ -96,11 +100,7 @@
  * The key callback is called FIRST.  If it returns TUI_HANDLED,
  * the engine skips default navigation.  If TUI_DEFAULT, the engine
  * applies built-in movement, then calls the callback a second time
- * with key=TUI_K_NONE so the app can observe the new cursor position
- * (e.g. to update a cursor_id column in the state table).
- *
- * The app can move the cursor programmatically via tui_set_cursor()
- * and query it via tui_get_cursor() / tui_get_cursor_id().
+ * with key=TUI_K_NONE so the app can observe the new cursor position.
  *
  * ═══════════════════════════════════════════════════════════════════
  *  TYPICAL USAGE
@@ -109,9 +109,14 @@
  *   sqlite3 *db = ...;
  *   tui_t *tui = tui_open(db);
  *
- *   tui_col_def lc[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
- *   tui_panel_def lp = {"lpane", NULL, "rownum", lc, 1, TUI_PANEL_CURSOR};
- *   tui_add_panel(tui, &lp, 0, 0, 50, 100);
+ *   static tui_col_def lc[] = {{"text",-1,TUI_ALIGN_LEFT,TUI_OVERFLOW_ELLIPSIS}};
+ *   static tui_panel_def lp = {"lpane", NULL, lc, 1, TUI_PANEL_CURSOR};
+ *   static tui_col_def rc[] = {{"text",-1,TUI_ALIGN_LEFT,TUI_OVERFLOW_ELLIPSIS}};
+ *   static tui_panel_def rp = {"rpane", NULL, rc, 1, TUI_PANEL_CURSOR|TUI_PANEL_BORDER};
+ *
+ *   tui_set_layout(tui, tui_hbox(2,
+ *       tui_panel_box(&lp, 1, 0),
+ *       tui_panel_box(&rp, 1, 0)));
  *
  *   tui_on_key(tui, my_key_cb, ctx);
  *   tui_watch_fd(tui, trace_fd, on_trace_data, ctx);
@@ -160,17 +165,74 @@ typedef struct {
 } tui_col_def;
 
 /* ── Panel definition ──────────────────────────────────────────────── */
+/* The SQL view named `name` must have columns: rownum INT, id TEXT, style TEXT,
+ * plus one column per entry in `cols`.  Rows are ordered by rownum ASC. */
 typedef struct {
-    const char       *name;       /* panel name = SQL table name */
+    const char       *name;       /* panel name = SQL view name */
     const char       *title;      /* header title (NULL = none) */
-    const char       *order_by;   /* SQL ORDER BY fragment */
     const tui_col_def *cols;
     int               ncols;
     int               flags;      /* TUI_PANEL_* */
 } tui_panel_def;
 
-/* ── Opaque handle ─────────────────────────────────────────────────── */
+/* ── Layout tree ───────────────────────────────────────────────────── */
+/*
+ * Layout is described as a tree of tui_box_t nodes.
+ *
+ *   tui_hbox(n, child, ...)  — children placed side by side (horizontal)
+ *   tui_vbox(n, child, ...)  — children stacked vertically
+ *   tui_panel_box(def, w, m) — leaf: renders one panel
+ *
+ * Each node's `weight` and `min_size` control how space is divided among
+ * siblings in a split.  The parent iterates children:
+ *   • Fixed children (weight==0): given exactly min_size columns/lines.
+ *   • Flex children  (weight >0): given at least min_size, then share of
+ *     remaining space proportional to weight.
+ *
+ * Example — two equal panels side by side:
+ *   tui_set_layout(tui, tui_hbox(2,
+ *       tui_panel_box(&left_def,  1, 0),
+ *       tui_panel_box(&right_def, 1, 0)));
+ *
+ * Example — top row (3 equal, min 5 tall), large middle, 1-line status:
+ *   tui_box_t *top = tui_hbox(3,
+ *       tui_panel_box(&pa, 1, 0),
+ *       tui_panel_box(&pb, 1, 0),
+ *       tui_panel_box(&pc, 1, 0));
+ *   top->min_size = 5;             // enforce minimum height for this row
+ *   tui_set_layout(tui, tui_vbox(3,
+ *       top,
+ *       tui_panel_box(&main_def, 3, 0),
+ *       tui_panel_box(&stat_def, 0, 1)));  // fixed 1 line
+ */
+#define TUI_BOX_HBOX  0   /* horizontal split */
+#define TUI_BOX_VBOX  1   /* vertical split */
+#define TUI_BOX_PANEL 2   /* leaf: renders a panel */
+
+typedef struct tui_box {
+    int type;                   /* TUI_BOX_* */
+    int weight;                 /* flex weight for parent split (default 1) */
+    int min_size;               /* min cols (in HBOX) or min lines (in VBOX) */
+    const tui_panel_def *def;   /* TUI_BOX_PANEL only */
+    struct tui_box **children;  /* TUI_BOX_HBOX/VBOX only */
+    int nchildren;
+} tui_box_t;
+
+/* Opaque handle */
 typedef struct tui tui_t;
+
+/* Layout constructors.  All allocation is internal; call tui_close() to free.
+ *   tui_hbox(n, box1, box2, ...) — n children placed horizontally
+ *   tui_vbox(n, box1, box2, ...) — n children placed vertically
+ *   tui_panel_box(def, weight, min_size) — leaf panel node
+ */
+tui_box_t *tui_panel_box(const tui_panel_def *def, int weight, int min_size);
+tui_box_t *tui_hbox(int n, ...);
+tui_box_t *tui_vbox(int n, ...);
+
+/* Apply the layout tree.  Replaces any previous layout.  Panels in the tree
+ * are registered automatically; no tui_add_panel() calls needed. */
+void tui_set_layout(tui_t *tui, tui_box_t *root);
 
 /* ── Callback types ────────────────────────────────────────────────── */
 
@@ -196,9 +258,7 @@ typedef int (*tui_timer_cb)(tui_t *tui, void *ctx);
 tui_t *tui_open(sqlite3 *db);
 void   tui_close(tui_t *tui);
 
-/* Panel management */
-void        tui_add_panel(tui_t *tui, const tui_panel_def *def,
-                          int x_pct, int y_pct, int w_pct, int h_pct);
+/* Panels / layout */
 void        tui_dirty(tui_t *tui, const char *panel);  /* NULL = all */
 void        tui_focus(tui_t *tui, const char *panel);
 const char *tui_get_focus(tui_t *tui);

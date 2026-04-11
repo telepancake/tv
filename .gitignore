@@ -2,3 +2,12 @@ uproctrace
 tv
 proctrace.ko
 tv_sql.h
+gen_sql_h
+# kernel module build artifacts
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.symvers
+modules.order
