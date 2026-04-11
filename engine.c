@@ -26,7 +26,6 @@
 /* ── Panel state ───────────────────────────────────────────────────── */
 typedef struct {
     tui_panel_def def;
-    int x_pct, y_pct, w_pct, h_pct;
     int x, y, w, h;         /* resolved char positions */
     int cursor, scroll;
     int row_count;
@@ -49,6 +48,13 @@ struct tui {
 
     panel_st       panels[MAX_PANELS];
     int            npanels, focus;
+
+    tui_box_t     *layout_root;  /* root of layout tree */
+
+    /* layout node pool (avoids individual mallocs) */
+    tui_box_t      box_pool[MAX_PANELS * 4];
+    tui_box_t     *box_children[MAX_PANELS * 4 * 8];
+    int            box_pool_n, box_child_n;
 
     char           status[1024];
 
@@ -200,11 +206,11 @@ static void p_clamp(panel_st *p) {
 static void p_sync_id(tui_t *t, panel_st *p) {
     p->cursor_id[0] = '\0';
     if (p->row_count == 0) return;
-    char sql[1024];
-    snprintf(sql, sizeof sql, "SELECT id FROM \"%s\" ORDER BY %s LIMIT 1 OFFSET %d",
-             p->def.name, p->def.order_by, p->cursor);
+    char sql[256];
+    snprintf(sql, sizeof sql, "SELECT id FROM \"%s\" WHERE rownum=?", p->def.name);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, p->cursor);
         if (sqlite3_step(st) == SQLITE_ROW) {
             const char *v = (const char *)sqlite3_column_text(st, 0);
             if (v) snprintf(p->cursor_id, sizeof p->cursor_id, "%s", v);
@@ -215,10 +221,8 @@ static void p_sync_id(tui_t *t, panel_st *p) {
 
 static void p_resolve_id(tui_t *t, panel_st *p) {
     if (!p->cursor_id[0]) { p->cursor = 0; return; }
-    char sql[1024];
-    snprintf(sql, sizeof sql,
-        "SELECT _rn FROM (SELECT id,ROW_NUMBER()OVER(ORDER BY %s)-1 AS _rn FROM \"%s\") WHERE id=?",
-        p->def.order_by, p->def.name);
+    char sql[256];
+    snprintf(sql, sizeof sql, "SELECT rownum FROM \"%s\" WHERE id=? LIMIT 1", p->def.name);
     sqlite3_stmt *st;
     if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, p->cursor_id, -1, SQLITE_TRANSIENT);
@@ -228,16 +232,59 @@ static void p_resolve_id(tui_t *t, panel_st *p) {
 }
 
 /* ── Layout resolution ─────────────────────────────────────────────── */
-static void resolve_layout(tui_t *t) {
-    int ah = t->rows - 1, aw = t->cols;
-    for (int i = 0; i < t->npanels; i++) {
-        panel_st *p = &t->panels[i];
-        p->x = p->x_pct * aw / 100; p->y = p->y_pct * ah / 100;
-        p->w = p->w_pct * aw / 100; p->h = p->h_pct * ah / 100;
-        if (p->w < 1) p->w = 1; if (p->h < 1) p->h = 1;
-        if (p->x + p->w > aw) p->w = aw - p->x;
-        if (p->y + p->h > ah) p->h = ah - p->y;
+/* Recursively assign x,y,w,h to each panel in the layout tree. */
+static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
+    if (!b) return;
+    if (b->type == TUI_BOX_PANEL) {
+        panel_st *p = pfind(t, b->def->name);
+        if (p) { p->x = x; p->y = y; p->w = w < 1 ? 1 : w; p->h = h < 1 ? 1 : h; }
+        return;
     }
+    /* Split: TUI_BOX_HBOX divides width, TUI_BOX_VBOX divides height */
+    int axis = (b->type == TUI_BOX_HBOX) ? w : h;
+    int total_weight = 0, fixed_sum = 0;
+    for (int i = 0; i < b->nchildren; i++) {
+        tui_box_t *c = b->children[i];
+        if (c->weight == 0) fixed_sum += c->min_size;
+        else { total_weight += c->weight; if (c->min_size > 0) fixed_sum += c->min_size; }
+    }
+    int flex = axis - fixed_sum;
+    if (flex < 0) flex = 0;
+    int pos = (b->type == TUI_BOX_HBOX) ? x : y;
+    int remaining = axis;
+    for (int i = 0; i < b->nchildren; i++) {
+        tui_box_t *c = b->children[i];
+        int sz;
+        if (c->weight == 0) {
+            sz = c->min_size;
+        } else {
+            sz = c->min_size + (total_weight > 0 ? flex * c->weight / total_weight : 0);
+            /* Give last flex child any leftover from integer division */
+            int is_last_flex = 1;
+            for (int j = i + 1; j < b->nchildren; j++)
+                if (b->children[j]->weight > 0) { is_last_flex = 0; break; }
+            if (is_last_flex) {
+                /* remaining space minus any fixed-size children that follow */
+                int tail_fixed = 0;
+                for (int j = i + 1; j < b->nchildren; j++)
+                    if (b->children[j]->weight == 0) tail_fixed += b->children[j]->min_size;
+                sz = remaining - tail_fixed;
+            }
+        }
+        if (sz < 1) sz = 1;
+        if (b->type == TUI_BOX_HBOX)
+            resolve_box(t, c, pos, y, sz, h);
+        else
+            resolve_box(t, c, x, pos, w, sz);
+        pos += sz;
+        remaining -= sz;
+    }
+}
+
+static void resolve_layout(tui_t *t) {
+    int ah = t->rows - 1, aw = t->cols;  /* -1 for status bar */
+    if (t->layout_root)
+        resolve_box(t, t->layout_root, 0, 0, aw, ah);
 }
 
 static void resolve_col_widths(const tui_panel_def *d, int tw, int *out) {
@@ -308,7 +355,7 @@ static void render_panel(tui_t *t, panel_st *p) {
     for (int c = 0; c < d->ncols; c++)
         pos += snprintf(sql + pos, sizeof sql - pos, ",\"%s\"", d->cols[c].name);
     pos += snprintf(sql + pos, sizeof sql - pos,
-        " FROM \"%s\" ORDER BY %s LIMIT %d OFFSET %d", d->name, d->order_by, ch, p->scroll);
+        " FROM \"%s\" ORDER BY rownum LIMIT %d OFFSET %d", d->name, ch, p->scroll);
 
     sqlite3_stmt *st; int row = 0;
     if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) == SQLITE_OK) {
@@ -424,17 +471,70 @@ void tui_close(tui_t *t) {
     free(t->scr); free(t);
 }
 
-void tui_add_panel(tui_t *tui, const tui_panel_def *def,
-                   int x_pct, int y_pct, int w_pct, int h_pct) {
-    if (!tui || tui->npanels >= MAX_PANELS) return;
-    panel_st *p = &tui->panels[tui->npanels];
-    memset(p, 0, sizeof *p);
-    p->def = *def;
-    p->x_pct = x_pct; p->y_pct = y_pct; p->w_pct = w_pct; p->h_pct = h_pct;
-    p->dirty = 1;
-    if (tui->focus < 0 && (def->flags & TUI_PANEL_CURSOR))
-        tui->focus = tui->npanels;
-    tui->npanels++;
+void tui_set_layout(tui_t *tui, tui_box_t *root) {
+    if (!tui) return;
+    tui->layout_root = root;
+    /* Collect all panel definitions from the tree */
+    /* Walk tree, register panels not yet registered */
+    struct { tui_box_t *b; } stack[128];
+    int top = 0; stack[top++].b = root;
+    while (top > 0) {
+        tui_box_t *b = stack[--top].b;
+        if (!b) continue;
+        if (b->type == TUI_BOX_PANEL) {
+            if (!pfind(tui, b->def->name) && tui->npanels < MAX_PANELS) {
+                panel_st *p = &tui->panels[tui->npanels];
+                memset(p, 0, sizeof *p);
+                p->def = *b->def;
+                p->dirty = 1;
+                if (tui->focus < 0 && (b->def->flags & TUI_PANEL_CURSOR))
+                    tui->focus = tui->npanels;
+                tui->npanels++;
+            }
+        } else {
+            for (int i = 0; i < b->nchildren && top < 128; i++)
+                stack[top++].b = b->children[i];
+        }
+    }
+}
+
+tui_box_t *tui_panel_box(const tui_panel_def *def, int weight, int min_size) {
+    /* boxes are allocated from a static pool inside tui_t; but tui_panel_box
+     * is called before tui_set_layout, so we use a simple static allocator */
+    static tui_box_t pool[256];
+    static int pool_n = 0;
+    if (pool_n >= 256) return NULL;
+    tui_box_t *b = &pool[pool_n++];
+    *b = (tui_box_t){TUI_BOX_PANEL, weight, min_size, def, NULL, 0};
+    return b;
+}
+
+tui_box_t *tui_hbox(int n, ...) {
+    static tui_box_t pool[256];
+    static tui_box_t *ptrs[1024];
+    static int pool_n = 0, ptr_n = 0;
+    if (pool_n >= 256 || ptr_n + n > 1024) return NULL;
+    tui_box_t *b = &pool[pool_n++];
+    b->type = TUI_BOX_HBOX; b->weight = 1; b->min_size = 0;
+    b->def = NULL; b->children = &ptrs[ptr_n]; b->nchildren = n;
+    va_list ap; va_start(ap, n);
+    for (int i = 0; i < n; i++) ptrs[ptr_n++] = va_arg(ap, tui_box_t *);
+    va_end(ap);
+    return b;
+}
+
+tui_box_t *tui_vbox(int n, ...) {
+    static tui_box_t pool[256];
+    static tui_box_t *ptrs[1024];
+    static int pool_n = 0, ptr_n = 0;
+    if (pool_n >= 256 || ptr_n + n > 1024) return NULL;
+    tui_box_t *b = &pool[pool_n++];
+    b->type = TUI_BOX_VBOX; b->weight = 1; b->min_size = 0;
+    b->def = NULL; b->children = &ptrs[ptr_n]; b->nchildren = n;
+    va_list ap; va_start(ap, n);
+    for (int i = 0; i < n; i++) ptrs[ptr_n++] = va_arg(ap, tui_box_t *);
+    va_end(ap);
+    return b;
 }
 
 void tui_dirty(tui_t *tui, const char *panel) {

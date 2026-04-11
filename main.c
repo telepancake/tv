@@ -1554,14 +1554,16 @@ int main(int argc, char **argv) {
     if (!tui) { fprintf(stderr, "tv: cannot open terminal\n"); sqlite3_close(g_db); return 1; }
     g_tui = tui;
 
-    /* Define panels — lpane (left), rpane (right) */
+    /* Define panels and layout — lpane (left), rpane (right) */
     static tui_col_def lp_cols[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
-    static tui_panel_def lp_def = {"lpane", NULL, "rownum", lp_cols, 1, TUI_PANEL_CURSOR};
-    tui_add_panel(tui, &lp_def, 0, 0, 50, 100);
+    static tui_panel_def lp_def = {"lpane", NULL, lp_cols, 1, TUI_PANEL_CURSOR};
 
     static tui_col_def rp_cols[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
-    static tui_panel_def rp_def = {"rpane", NULL, "rownum", rp_cols, 1, TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
-    tui_add_panel(tui, &rp_def, 50, 0, 50, 100);
+    static tui_panel_def rp_def = {"rpane", NULL, rp_cols, 1, TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
+
+    tui_set_layout(tui, tui_hbox(2,
+        tui_panel_box(&lp_def, 1, 0),
+        tui_panel_box(&rp_def, 1, 0)));
 
     /* Focus starts on lpane */
     tui_focus(tui, "lpane");
