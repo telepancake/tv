@@ -162,6 +162,23 @@ CREATE TEMP TABLE IF NOT EXISTS _ftree(
     rownum INTEGER PRIMARY KEY, id TEXT NOT NULL,
     parent_id TEXT, style TEXT DEFAULT 'normal', text TEXT NOT NULL);
 
+-- ── Layout definition (read by engine via tui_load_layout) ────────────
+CREATE TEMP TABLE IF NOT EXISTS _layout(
+    id INTEGER PRIMARY KEY,
+    parent_id INT,
+    type TEXT NOT NULL,
+    name TEXT,
+    weight INT DEFAULT 1,
+    min_size INT DEFAULT 0,
+    flags INT DEFAULT 0,
+    col_name TEXT,
+    col_width INT DEFAULT -1,
+    col_align INT DEFAULT 0,
+    col_overflow INT DEFAULT 1);
+INSERT INTO _layout VALUES(1, NULL, 'hbox', NULL,  1, 0, 0, NULL, -1, 0, 1);
+INSERT INTO _layout VALUES(2, 1,    'panel','lpane',1, 0, 1, 'text', -1, 0, 1);
+INSERT INTO _layout VALUES(3, 1,    'panel','rpane',1, 0, 3, 'text', -1, 0, 1);
+
 -- ── Dependency edge VIEW (used by modes 3-6) ─────────────────────────
 -- Each row: (src=reader, dst=writer) for the same process group.
 CREATE TEMP VIEW _dep_edges AS

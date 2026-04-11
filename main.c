@@ -184,7 +184,7 @@ static void do_search(const char *q);
 static void jump_hit(int dir);
 static void follow_link(tui_t *tui);
 
-/* ── Global TUI handle (set after tui_open) ────────────────────────── */
+/* ── Global TUI handle (set after tui_open or tui_open_headless) ────── */
 static tui_t *g_tui;
 
 /* ── Sync engine cursor ↔ state table ──────────────────────────────── */
@@ -218,7 +218,7 @@ static void sync_focus_from_state(void) {
 static void update_status(void) {
     int mode = qint("SELECT mode FROM state", 0);
     int nf = qint("SELECT COUNT(*) FROM lpane", 0);
-    int cursor = g_tui ? tui_get_cursor(g_tui, "lpane") : qint("SELECT cursor FROM state", 0);
+    int cursor = tui_get_cursor(g_tui, "lpane");
     if (cursor < 0) cursor = 0;
     const char *mn[] = {"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};
     const char *tsl[] = {"abs","rel","Δ"};
@@ -322,69 +322,8 @@ static int parse_key_name(const char *n) {
     return TUI_K_NONE;
 }
 
-/* ── Headless dump functions ───────────────────────────────────────── */
-static void dump_lpane(void) {
-    printf("=== LPANE ===\n");
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(g_db,
-        "SELECT rownum,style,id,COALESCE(parent_id,''),text FROM lpane ORDER BY rownum",
-        -1, &st, 0);
-    while (sqlite3_step(st) == SQLITE_ROW)
-        printf("%d|%s|%s|%s|%s\n",
-            sqlite3_column_int(st, 0),
-            (const char *)sqlite3_column_text(st, 1),
-            (const char *)sqlite3_column_text(st, 2),
-            (const char *)sqlite3_column_text(st, 3),
-            (const char *)sqlite3_column_text(st, 4));
-    sqlite3_finalize(st);
-    printf("=== END LPANE ===\n");
-}
-
-static void dump_rpane(void) {
-    printf("=== RPANE ===\n");
-    sqlite3_stmt *st;
-    int rc = sqlite3_prepare_v2(g_db,
-        "SELECT rownum,style,text,link_mode,COALESCE(link_id,'') FROM rpane ORDER BY rownum",
-        -1, &st, 0);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "dump_rpane prepare error: %s\n", sqlite3_errmsg(g_db));
-        printf("=== END RPANE ===\n");
-        return;
-    }
-    while ((rc = sqlite3_step(st)) == SQLITE_ROW)
-        printf("%d|%s|%s|%d|%s\n",
-            sqlite3_column_int(st, 0),
-            (const char *)sqlite3_column_text(st, 1),
-            (const char *)sqlite3_column_text(st, 2),
-            sqlite3_column_int(st, 3),
-            (const char *)sqlite3_column_text(st, 4));
-    if (rc != SQLITE_DONE)
-        fprintf(stderr, "dump_rpane step error: %s\n", sqlite3_errmsg(g_db));
-    sqlite3_finalize(st);
-    printf("=== END RPANE ===\n");
-}
-
-static void dump_state(void) {
-    printf("=== STATE ===\n");
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(g_db,
-        "SELECT cursor,scroll,focus,dcursor,dscroll,ts_mode,sort_key,grouped,mode,lp_filter,"
-        "COALESCE(search,''),COALESCE(evfilt,''),rows,cols,dep_filter FROM state",
-        -1, &st, 0);
-    if (sqlite3_step(st) == SQLITE_ROW)
-        printf("cursor=%d scroll=%d focus=%d dcursor=%d dscroll=%d ts_mode=%d sort_key=%d"
-            " grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d dep_filter=%d\n",
-            sqlite3_column_int(st, 0), sqlite3_column_int(st, 1), sqlite3_column_int(st, 2),
-            sqlite3_column_int(st, 3), sqlite3_column_int(st, 4), sqlite3_column_int(st, 5),
-            sqlite3_column_int(st, 6), sqlite3_column_int(st, 7), sqlite3_column_int(st, 8),
-            sqlite3_column_int(st, 9),
-            (const char *)sqlite3_column_text(st, 10),
-            (const char *)sqlite3_column_text(st, 11),
-            sqlite3_column_int(st, 12), sqlite3_column_int(st, 13),
-            sqlite3_column_int(st, 14));
-    sqlite3_finalize(st);
-    printf("=== END STATE ===\n");
-}
+/* ── Headless dump functions — delegate to engine ──────────────────── */
+/* (dump_lpane/dump_rpane/dump_state are now in engine.c via tui_dump) */
 
 static void sync_cursor_id_from_pos(void) {
     /* Sync cursor_id in state to match current state.cursor position in lpane view. */
@@ -418,42 +357,20 @@ static void dispatch_input(tui_t *tui, const char *data) {
     if (strcmp(inp, "key") == 0) {
         int k = parse_key_name(arg1);
         if (k != TUI_K_NONE) {
-            int res = handle_key(tui, k);
-            /* In headless mode (no engine), apply default cursor navigation via state table.
-             * Mirrors the engine's built-in up/down/pgup/pgdn/home/end handling. */
-            if (res == TUI_DEFAULT && !tui) {
-                int f = qint("SELECT focus FROM state", 0);
-                int nl = qint("SELECT COUNT(*) FROM lpane", 0);
-                int nr = qint("SELECT COUNT(*) FROM rpane", 0);
-                int pg = qint("SELECT rows FROM state", 24) - 3;
-                int n = f ? nr : nl;
-                int last = n > 0 ? n - 1 : 0;
-                if (k == TUI_K_HOME || k == 'g') {
-                    if (f) xexec("UPDATE state SET dcursor=0");
-                    else   xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0");
-                } else if (k == TUI_K_END) {
-                    if (f) xexecf("UPDATE state SET dcursor=%d", last);
-                    else   xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0", last);
-                } else {
-                    int delta = (k==TUI_K_UP||k=='k') ? -1 : (k==TUI_K_DOWN||k=='j') ? 1
-                              : (k==TUI_K_PGUP) ? -pg : (k==TUI_K_PGDN) ? pg : 0;
-                    if (delta && f)
-                        xexecf("UPDATE state SET dcursor=MAX(0,MIN(dcursor+(%d),%d))", delta, last);
-                    else if (delta)
-                        xexecf("UPDATE state SET cursor=MAX(0,MIN(cursor+(%d),%d)),dscroll=0,dcursor=0", delta, last);
-                }
-                if (!f) sync_cursor_id_from_pos();
-            }
+            /* Use the engine for ALL input, headless or not.
+             * tui_input_key calls handle_key via on_key_cb, then
+             * applies default_nav for TUI_DEFAULT returns. */
+            tui_input_key(tui, k);
         }
     } else if (strcmp(inp, "print") == 0) {
-        if (strcmp(arg1, "lpane") == 0) dump_lpane();
-        else if (strcmp(arg1, "rpane") == 0) dump_rpane();
-        else if (strcmp(arg1, "state") == 0) dump_state();
+        /* Sync engine cursor to state before dumping */
+        sync_cursor_to_state();
+        tui_dump(tui, arg1, stdout);
         g_headless = 1;
     } else if (strcmp(inp, "resize") == 0) {
         if (n1 > 0 && n2 > 0) {
             xexecf("UPDATE state SET rows=%d,cols=%d", n1, n2);
-            tui_dirty(g_tui, NULL);
+            tui_dirty(tui, NULL);
         }
     } else if (strcmp(inp, "select") == 0) {
         sqlite3_stmt *st;
@@ -463,7 +380,9 @@ static void dispatch_input(tui_t *tui, const char *data) {
         sqlite3_bind_text(st, 1, arg1, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, arg1, -1, SQLITE_TRANSIENT);
         sqlite3_step(st); sqlite3_finalize(st);
-        tui_dirty(g_tui, "rpane");
+        /* Also update engine cursor */
+        tui_set_cursor(tui, "lpane", arg1);
+        tui_dirty(tui, "rpane");
     } else if (strcmp(inp, "search") == 0) {
         sqlite3_stmt *st;
         sqlite3_prepare_v2(g_db, "UPDATE state SET search=?", -1, &st, 0);
@@ -471,7 +390,7 @@ static void dispatch_input(tui_t *tui, const char *data) {
         sqlite3_step(st); sqlite3_finalize(st);
         do_search(arg1);
         if (qint("SELECT mode FROM state", 0) == 1) xexec("SELECT build_ftree()");
-        tui_dirty(g_tui, NULL);
+        tui_dirty(tui, NULL);
     } else if (strcmp(inp, "evfilt") == 0) {
         char q[64] = "";
         for (int i = 0; arg2[i] && i < 63; i++) q[i] = toupper(arg2[i]);
@@ -480,7 +399,7 @@ static void dispatch_input(tui_t *tui, const char *data) {
         sqlite3_prepare_v2(g_db, "UPDATE state SET evfilt=?", -1, &st, 0);
         sqlite3_bind_text(st, 1, q, -1, SQLITE_TRANSIENT);
         sqlite3_step(st); sqlite3_finalize(st);
-        tui_dirty(g_tui, "rpane");
+        tui_dirty(tui, "rpane");
     }
 }
 
@@ -746,7 +665,7 @@ static void do_search(const char *q) {
 
 static void jump_hit(int dir) {
     sqlite3 *db = g_db;
-    int c = g_tui ? tui_get_cursor(g_tui, "lpane") : qint( "SELECT cursor FROM state", 0);
+    int c = tui_get_cursor(g_tui, "lpane");
     if (c < 0) c = 0;
     sqlite3_stmt *st;
     const char *sql = dir > 0
@@ -765,7 +684,7 @@ static void jump_hit(int dir) {
         f = qint( sql, -1);
     }
     if (f >= 0) {
-        if (g_tui) tui_set_cursor_idx(g_tui, "lpane", f);
+        tui_set_cursor_idx(g_tui, "lpane", f);
         xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", f);
         sync_cursor_id_from_pos();
         tui_dirty(g_tui, "rpane");
@@ -774,7 +693,7 @@ static void jump_hit(int dir) {
 
 static void follow_link(tui_t *tui) {
     sqlite3 *db = g_db;
-    int dc = tui ? tui_get_cursor(tui, "rpane") : qint( "SELECT dcursor FROM state", 0);
+    int dc = tui_get_cursor(tui, "rpane");
     if (dc < 0) dc = 0;
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db, "SELECT link_mode,link_id FROM rpane WHERE rownum=? AND link_mode>=0", -1, &st, 0);
@@ -1276,26 +1195,29 @@ int main(int argc, char **argv) {
     sync_cursor_id_from_pos();
 
     if (save_file[0]) save_to_file(save_file);
-    process_inbox(NULL);
 
-    if (g_headless) { sqlite3_close(g_db); return 0; }
-    if (save_file[0] && !cmd) { sqlite3_close(g_db); return 0; }
+    /* Create engine — headless for test mode, terminal for interactive */
+    tui_t *tui;
+    int headless_mode = 0;
+    {   /* Check if there are pending input commands → headless mode */
+        int pending = qint("SELECT COUNT(*) FROM inbox WHERE kind='input'", 0);
+        if (pending > 0 || (trace_file[0] && !cmd)) headless_mode = 1;
+    }
 
-    /* ── Engine-driven event loop ──────────────────────────────── */
-    tui_t *tui = tui_open(g_db);
-    if (!tui) { fprintf(stderr, "tv: cannot open terminal\n"); sqlite3_close(g_db); return 1; }
+    if (headless_mode) {
+        tui = tui_open_headless(g_db);
+    } else {
+        tui = tui_open(g_db);
+    }
+    if (!tui) {
+        if (!headless_mode) fprintf(stderr, "tv: cannot open terminal\n");
+        sqlite3_close(g_db);
+        return headless_mode ? 0 : 1;
+    }
     g_tui = tui;
 
-    /* Define panels and layout — lpane (left), rpane (right) */
-    static tui_col_def lp_cols[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
-    static tui_panel_def lp_def = {"lpane", NULL, lp_cols, 1, TUI_PANEL_CURSOR};
-
-    static tui_col_def rp_cols[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
-    static tui_panel_def rp_def = {"rpane", NULL, rp_cols, 1, TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
-
-    tui_set_layout(tui, tui_hbox(2,
-        tui_panel_box(&lp_def, 1, 0),
-        tui_panel_box(&rp_def, 1, 0)));
+    /* Layout from _layout table in DB */
+    tui_load_layout(tui);
 
     /* Focus starts on lpane */
     tui_focus(tui, "lpane");
@@ -1303,6 +1225,17 @@ int main(int argc, char **argv) {
     /* Register key handler */
     tui_on_key(tui, on_key_cb, NULL);
 
+    /* Process any pending input commands (headless test mode) */
+    process_inbox(tui);
+
+    if (g_headless || (save_file[0] && !cmd)) {
+        g_tui = NULL;
+        tui_close(tui);
+        sqlite3_close(g_db);
+        return 0;
+    }
+
+    /* ── Engine-driven event loop ──────────────────────────────── */
     /* Set up trace fd state for callback */
     t_trace_pipe = trace_pipe;
     t_trace_fd = trace_fd;

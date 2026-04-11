@@ -558,6 +558,26 @@ tui_t *tui_open(sqlite3 *db) {
     return t;
 }
 
+tui_t *tui_open_headless(sqlite3 *db) {
+    tui_t *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->db = db; t->tty_fd = -1; t->focus = -1;
+    t->next_timer_id = 1;
+    /* Read rows/cols from state table if present */
+    {   sqlite3_stmt *st;
+        if (sqlite3_prepare_v2(db, "SELECT rows,cols FROM state", -1, &st, 0) == SQLITE_OK) {
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                int r = sqlite3_column_int(st, 0);
+                int c = sqlite3_column_int(st, 1);
+                t->rows = r > 0 ? r : 24;
+                t->cols = c > 0 ? c : 80;
+            }
+            sqlite3_finalize(st);
+        } else { t->rows = 24; t->cols = 80; }
+    }
+    return t;
+}
+
 void tui_close(tui_t *t) {
     if (!t) return;
     for (int i = 0; i < t->npanels; i++) {
@@ -600,6 +620,157 @@ void tui_set_layout(tui_t *tui, tui_box_t *root) {
                 stack[top++].b = b->children[i];
         }
     }
+}
+
+/* ── Load layout from _layout table ────────────────────────────────── */
+/*
+ * Table schema:
+ *   CREATE TABLE _layout(
+ *       id INTEGER PRIMARY KEY,          -- node id
+ *       parent_id INT,                   -- parent node id (NULL=root)
+ *       type TEXT NOT NULL,              -- 'hbox','vbox','panel'
+ *       name TEXT,                       -- panel name (= SQL view name) for type='panel'
+ *       weight INT DEFAULT 1,           -- flex weight
+ *       min_size INT DEFAULT 0,         -- minimum size
+ *       flags INT DEFAULT 0,            -- TUI_PANEL_* flags for panels
+ *       col_name TEXT,                  -- column name (for panel)
+ *       col_width INT DEFAULT -1,       -- column width
+ *       col_align INT DEFAULT 0,        -- column alignment
+ *       col_overflow INT DEFAULT 1      -- column overflow
+ *   );
+ */
+
+/* Static storage for layout loaded from DB */
+#define MAX_LAYOUT_NODES 64
+#define MAX_LAYOUT_PDEFS 16
+#define MAX_LAYOUT_CDEFS 32
+static tui_box_t      ll_boxes[MAX_LAYOUT_NODES];
+static tui_box_t     *ll_child_ptrs[MAX_LAYOUT_NODES * 4]; /* child pointer arrays */
+static tui_panel_def  ll_pdefs[MAX_LAYOUT_PDEFS];
+static tui_col_def    ll_cdefs[MAX_LAYOUT_CDEFS];
+static char           ll_strings[MAX_LAYOUT_PDEFS * 64]; /* name storage */
+static int            ll_nbox, ll_nchild, ll_npdef, ll_ncdef, ll_nstr;
+
+static char *ll_strdup(const char *s) {
+    if (!s) return NULL;
+    int len = (int)strlen(s) + 1;
+    if (ll_nstr + len > (int)sizeof(ll_strings)) return NULL;
+    char *p = ll_strings + ll_nstr;
+    memcpy(p, s, len);
+    ll_nstr += len;
+    return p;
+}
+
+void tui_load_layout(tui_t *tui) {
+    if (!tui) return;
+    sqlite3 *db = tui->db;
+
+    /* Reset static pools */
+    ll_nbox = ll_nchild = ll_npdef = ll_ncdef = ll_nstr = 0;
+
+    /* Check if _layout table exists */
+    { sqlite3_stmt *st;
+      if (sqlite3_prepare_v2(db,
+          "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='_layout'",
+          -1, &st, 0) != SQLITE_OK) return;
+      int found = (sqlite3_step(st) == SQLITE_ROW);
+      sqlite3_finalize(st);
+      if (!found) return;
+    }
+
+    /* Read all rows ordered by id */
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(db,
+        "SELECT id, parent_id, type, name, weight, min_size, flags,"
+        " col_name, col_width, col_align, col_overflow"
+        " FROM _layout ORDER BY id", -1, &st, 0) != SQLITE_OK) return;
+
+    /* Temporary storage: id→box index mapping */
+    struct { int id; int box_idx; } id_map[MAX_LAYOUT_NODES];
+    int id_parent[MAX_LAYOUT_NODES]; /* parent_id for each node */
+    int nmap = 0;
+
+    while (sqlite3_step(st) == SQLITE_ROW && nmap < MAX_LAYOUT_NODES && ll_nbox < MAX_LAYOUT_NODES) {
+        int id = sqlite3_column_int(st, 0);
+        int parent_id = sqlite3_column_type(st, 1) == SQLITE_NULL ? -1 : sqlite3_column_int(st, 1);
+        const char *type = (const char *)sqlite3_column_text(st, 2);
+        const char *name = (const char *)sqlite3_column_text(st, 3);
+        int weight = sqlite3_column_int(st, 4);
+        int min_size = sqlite3_column_int(st, 5);
+        int flags = sqlite3_column_int(st, 6);
+        const char *col_name = (const char *)sqlite3_column_text(st, 7);
+        int col_width = sqlite3_column_int(st, 8);
+        int col_align = sqlite3_column_int(st, 9);
+        int col_overflow = sqlite3_column_int(st, 10);
+
+        tui_box_t *b = &ll_boxes[ll_nbox];
+        memset(b, 0, sizeof *b);
+        b->weight = weight > 0 ? weight : 1;
+        b->min_size = min_size;
+
+        if (type && strcmp(type, "panel") == 0 && name && ll_npdef < MAX_LAYOUT_PDEFS) {
+            b->type = TUI_BOX_PANEL;
+            tui_panel_def *pd = &ll_pdefs[ll_npdef];
+            memset(pd, 0, sizeof *pd);
+            pd->name = ll_strdup(name);
+            pd->title = NULL;
+            pd->flags = flags;
+            /* Add column definition */
+            if (col_name && ll_ncdef < MAX_LAYOUT_CDEFS) {
+                tui_col_def *cd = &ll_cdefs[ll_ncdef];
+                cd->name = ll_strdup(col_name);
+                cd->width = col_width;
+                cd->align = col_align;
+                cd->overflow = col_overflow;
+                pd->cols = cd;
+                pd->ncols = 1;
+                ll_ncdef++;
+            }
+            b->def = pd;
+            ll_npdef++;
+        } else if (type && strcmp(type, "hbox") == 0) {
+            b->type = TUI_BOX_HBOX;
+        } else if (type && strcmp(type, "vbox") == 0) {
+            b->type = TUI_BOX_VBOX;
+        } else {
+            continue; /* skip unknown types */
+        }
+
+        id_map[nmap].id = id;
+        id_map[nmap].box_idx = ll_nbox;
+        id_parent[nmap] = parent_id;
+        nmap++;
+        ll_nbox++;
+    }
+    sqlite3_finalize(st);
+
+    if (nmap == 0) return;
+
+    /* Resolve parent→children relationships */
+    for (int i = 0; i < nmap; i++) {
+        tui_box_t *b = &ll_boxes[id_map[i].box_idx];
+        if (b->type == TUI_BOX_PANEL) continue;
+        /* Count children */
+        int nc = 0;
+        for (int j = 0; j < nmap; j++)
+            if (id_parent[j] == id_map[i].id) nc++;
+        if (nc == 0) continue;
+        if (ll_nchild + nc > MAX_LAYOUT_NODES * 4) continue;
+        b->children = &ll_child_ptrs[ll_nchild];
+        b->nchildren = nc;
+        int ci = 0;
+        for (int j = 0; j < nmap; j++)
+            if (id_parent[j] == id_map[i].id)
+                ll_child_ptrs[ll_nchild + ci++] = &ll_boxes[id_map[j].box_idx];
+        ll_nchild += nc;
+    }
+
+    /* Find root (parent_id == -1) */
+    tui_box_t *root = NULL;
+    for (int i = 0; i < nmap; i++)
+        if (id_parent[i] < 0) { root = &ll_boxes[id_map[i].box_idx]; break; }
+
+    if (root) tui_set_layout(tui, root);
 }
 
 tui_box_t *tui_panel_box(const tui_panel_def *def, int weight, int min_size) {
@@ -886,4 +1057,106 @@ void tui_sql_prompt(tui_t *tui) {
     sqlite3_finalize(st);
     sf(tui, "\x1b[%d;1H\x1b[2m%d rows.\x1b[0m", row + 1, nr);
     sflush(tui); while (read_key(tui) == TUI_K_NONE) ;
+}
+
+/* ── Headless input dispatch ───────────────────────────────────────── */
+void tui_input_key(tui_t *tui, int key) {
+    if (!tui) return;
+    /* Ensure panel counts are up-to-date */
+    for (int i = 0; i < tui->npanels; i++) {
+        panel_st *p = &tui->panels[i];
+        p_update_count(tui, p);
+        /* Resolve cursor_id → position if dirty */
+        if (p->dirty) { p_resolve_id(tui, p); p_clamp(p); p->dirty = 0; }
+    }
+    /* Call key callback first, just like the event loop */
+    int res = TUI_DEFAULT;
+    const char *fp = "", *fid = ""; int fc = 0;
+    if (tui->focus >= 0 && tui->focus < tui->npanels) {
+        panel_st *f = &tui->panels[tui->focus];
+        fp = f->def.name; fc = f->cursor; fid = f->cursor_id;
+    }
+    if (tui->key_cb) res = tui->key_cb(tui, key, fp, fc, fid, tui->key_ctx);
+    if (res == TUI_DEFAULT) {
+        default_nav(tui, key);
+        /* Post-nav notification */
+        if (tui->key_cb) {
+            const char *fp2 = "", *fid2 = ""; int fc2 = 0;
+            if (tui->focus >= 0 && tui->focus < tui->npanels) {
+                panel_st *f2 = &tui->panels[tui->focus];
+                fp2 = f2->def.name; fc2 = f2->cursor; fid2 = f2->cursor_id;
+            }
+            tui->key_cb(tui, TUI_K_NONE, fp2, fc2, fid2, tui->key_ctx);
+        }
+    }
+}
+
+/* ── Dump panel or state for test mode ─────────────────────────────── */
+void tui_dump(tui_t *tui, const char *what, FILE *out) {
+    if (!tui || !what || !out) return;
+    sqlite3 *db = tui->db;
+
+    if (strcmp(what, "lpane") == 0) {
+        /* Ensure fresh counts */
+        panel_st *p = pfind(tui, "lpane");
+        if (p) { p_update_count(tui, p); p_clamp(p); }
+        fprintf(out, "=== LPANE ===\n");
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(db,
+            "SELECT rownum,style,id,COALESCE(parent_id,''),text FROM lpane ORDER BY rownum",
+            -1, &st, 0);
+        while (sqlite3_step(st) == SQLITE_ROW)
+            fprintf(out, "%d|%s|%s|%s|%s\n",
+                sqlite3_column_int(st, 0),
+                (const char *)sqlite3_column_text(st, 1),
+                (const char *)sqlite3_column_text(st, 2),
+                (const char *)sqlite3_column_text(st, 3),
+                (const char *)sqlite3_column_text(st, 4));
+        sqlite3_finalize(st);
+        fprintf(out, "=== END LPANE ===\n");
+    } else if (strcmp(what, "rpane") == 0) {
+        panel_st *p = pfind(tui, "rpane");
+        if (p) { p_update_count(tui, p); p_clamp(p); }
+        fprintf(out, "=== RPANE ===\n");
+        sqlite3_stmt *st;
+        int rc = sqlite3_prepare_v2(db,
+            "SELECT rownum,style,text,link_mode,COALESCE(link_id,'') FROM rpane ORDER BY rownum",
+            -1, &st, 0);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "dump_rpane prepare error: %s\n", sqlite3_errmsg(db));
+            fprintf(out, "=== END RPANE ===\n");
+            return;
+        }
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW)
+            fprintf(out, "%d|%s|%s|%d|%s\n",
+                sqlite3_column_int(st, 0),
+                (const char *)sqlite3_column_text(st, 1),
+                (const char *)sqlite3_column_text(st, 2),
+                sqlite3_column_int(st, 3),
+                (const char *)sqlite3_column_text(st, 4));
+        if (rc != SQLITE_DONE)
+            fprintf(stderr, "dump_rpane step error: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(st);
+        fprintf(out, "=== END RPANE ===\n");
+    } else if (strcmp(what, "state") == 0) {
+        fprintf(out, "=== STATE ===\n");
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(db,
+            "SELECT cursor,scroll,focus,dcursor,dscroll,ts_mode,sort_key,grouped,mode,lp_filter,"
+            "COALESCE(search,''),COALESCE(evfilt,''),rows,cols,dep_filter FROM state",
+            -1, &st, 0);
+        if (sqlite3_step(st) == SQLITE_ROW)
+            fprintf(out, "cursor=%d scroll=%d focus=%d dcursor=%d dscroll=%d ts_mode=%d sort_key=%d"
+                " grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d dep_filter=%d\n",
+                sqlite3_column_int(st, 0), sqlite3_column_int(st, 1), sqlite3_column_int(st, 2),
+                sqlite3_column_int(st, 3), sqlite3_column_int(st, 4), sqlite3_column_int(st, 5),
+                sqlite3_column_int(st, 6), sqlite3_column_int(st, 7), sqlite3_column_int(st, 8),
+                sqlite3_column_int(st, 9),
+                (const char *)sqlite3_column_text(st, 10),
+                (const char *)sqlite3_column_text(st, 11),
+                sqlite3_column_int(st, 12), sqlite3_column_int(st, 13),
+                sqlite3_column_int(st, 14));
+        sqlite3_finalize(st);
+        fprintf(out, "=== END STATE ===\n");
+    }
 }
