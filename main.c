@@ -155,12 +155,15 @@ static void register_sql_funcs(sqlite3 *db) {
 #define DUR(d) "CASE WHEN "d">=1 THEN printf('%%.2fs',"d") WHEN "d">=.001 THEN printf('%%.1fms',("d")*1e3) WHEN "d">0 THEN printf('%%.0fµs',("d")*1e6) ELSE '' END"
 
 /* ── Forward declarations ──────────────────────────────────────────── */
-static void handle_key(tui_t *tui, int k);
+static int handle_key(tui_t *tui, int k);
 static void do_search(const char *q);
 static void rebuild_lpane(void);
 static void rebuild_rpane(void);
 static void jump_hit(int dir);
 static void follow_link(tui_t *tui);
+
+/* ── Global TUI handle (set after tui_open) ────────────────────────── */
+static tui_t *g_tui;
 
 /* ── Dirty flags (outbox) ──────────────────────────────────────────── */
 static void dirty_lp(void)   { xexec("UPDATE outbox SET rl=1"); }
@@ -173,13 +176,48 @@ static void sync_panes(void) {
     if (rl || rr) xexec("UPDATE outbox SET rl=0,rr=0");
     if (rl) rebuild_lpane();
     if (rr) rebuild_rpane();
+    if (g_tui) {
+        if (rl) tui_dirty(g_tui, "lpane");
+        if (rr) tui_dirty(g_tui, "rpane");
+    }
+}
+
+/* ── Sync engine cursor ↔ state table ──────────────────────────────── */
+static void sync_cursor_to_state(void) {
+    if (!g_tui) return;
+    int lc = tui_get_cursor(g_tui, "lpane");
+    int rc = tui_get_cursor(g_tui, "rpane");
+    if (lc < 0) lc = 0;
+    if (rc < 0) rc = 0;
+    xexecf("UPDATE state SET cursor=%d, dcursor=%d", lc, rc);
+}
+
+static void sync_cursor_from_state(void) {
+    if (!g_tui) return;
+    int lc = qint("SELECT cursor FROM state", 0);
+    int rc = qint("SELECT dcursor FROM state", 0);
+    tui_set_cursor_idx(g_tui, "lpane", lc);
+    tui_set_cursor_idx(g_tui, "rpane", rc);
+}
+
+static void sync_focus_to_state(void) {
+    if (!g_tui) return;
+    const char *f = tui_get_focus(g_tui);
+    xexecf("UPDATE state SET focus=%d", (f && strcmp(f, "rpane") == 0) ? 1 : 0);
+}
+
+static void sync_focus_from_state(void) {
+    if (!g_tui) return;
+    int f = qint("SELECT focus FROM state", 0);
+    tui_focus(g_tui, f ? "rpane" : "lpane");
 }
 
 /* ── Status bar update ─────────────────────────────────────────────── */
 static void update_status(void) {
     int mode = qint("SELECT mode FROM state", 0);
     int nf = qint("SELECT COUNT(*) FROM lpane", 0);
-    int cursor = qint("SELECT cursor FROM state", 0);
+    int cursor = g_tui ? tui_get_cursor(g_tui, "lpane") : qint("SELECT cursor FROM state", 0);
+    if (cursor < 0) cursor = 0;
     const char *mn[] = {"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};
     const char *tsl[] = {"abs","rel","Δ"};
     int tsm = qint("SELECT ts_mode FROM state", 0);
@@ -212,12 +250,8 @@ static void update_status(void) {
     p += snprintf(s + p, sizeof s - p, " | 1:proc 2:file 3:out 4:dep 5:rdep 6:dcmd 7:rcmd ?:help");
     (void)p;
 
-    /* Write to state.status for engine to render */
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(g_db, "UPDATE state SET status=?", -1, &st, 0);
-    sqlite3_bind_text(st, 1, s, -1, SQLITE_TRANSIENT);
-    sqlite3_step(st);
-    sqlite3_finalize(st);
+    if (g_tui)
+        tui_set_status(g_tui, s);
 }
 
 /* ── FTS setup ─────────────────────────────────────────────────────── */
@@ -622,7 +656,43 @@ static void dispatch_input(tui_t *tui, const char *data) {
 
     if (strcmp(inp, "key") == 0) {
         int k = parse_key_name(arg1);
-        if (k != TUI_K_NONE) handle_key(tui, k);
+        if (k != TUI_K_NONE) {
+            int res = handle_key(tui, k);
+            /* In headless mode, apply default navigation via state table */
+            if (res == TUI_DEFAULT && !tui) {
+                int focus = qint("SELECT focus FROM state", 0);
+                int nf = qint("SELECT COUNT(*) FROM lpane", 0);
+                int nrp = qint("SELECT COUNT(*) FROM rpane", 0);
+                int rows = qint("SELECT rows FROM state", 24);
+                int pg = rows - 3;
+                switch (k) {
+                case TUI_K_UP: case 'k':
+                    if (!focus) { xexec("UPDATE state SET cursor=MAX(cursor-1,0),dscroll=0,dcursor=0"); dirty_rp(); }
+                    else xexec("UPDATE state SET dcursor=MAX(dcursor-1,0)");
+                    break;
+                case TUI_K_DOWN: case 'j':
+                    if (!focus) { xexecf("UPDATE state SET cursor=MIN(cursor+1,%d),dscroll=0,dcursor=0", nf-1); dirty_rp(); }
+                    else xexecf("UPDATE state SET dcursor=MIN(dcursor+1,%d)", nrp-1);
+                    break;
+                case TUI_K_PGUP:
+                    if (!focus) { xexecf("UPDATE state SET cursor=MAX(cursor-%d,0),dscroll=0,dcursor=0", pg); dirty_rp(); }
+                    else xexecf("UPDATE state SET dcursor=MAX(dcursor-%d,0)", pg);
+                    break;
+                case TUI_K_PGDN:
+                    if (!focus) { xexecf("UPDATE state SET cursor=MIN(cursor+%d,%d),dscroll=0,dcursor=0", pg, nf-1); dirty_rp(); }
+                    else xexecf("UPDATE state SET dcursor=MIN(dcursor+%d,%d)", pg, nrp-1);
+                    break;
+                case TUI_K_HOME: case 'g':
+                    if (!focus) { xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0"); dirty_rp(); }
+                    else xexec("UPDATE state SET dcursor=0");
+                    break;
+                case TUI_K_END:
+                    if (!focus) { xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0", nf>0?nf-1:0); dirty_rp(); }
+                    else xexecf("UPDATE state SET dcursor=%d", nrp>0?nrp-1:0);
+                    break;
+                }
+            }
+        }
     } else if (strcmp(inp, "print") == 0) {
         sync_panes();
         if (strcmp(arg1, "lpane") == 0) dump_lpane();
@@ -1411,7 +1481,8 @@ static void rebuild_rpane(void) {
     sqlite3 *db = g_db;
     xexec( "DELETE FROM rpane;");
     int mode = qint( "SELECT mode FROM state", 0);
-    int cursor = qint( "SELECT cursor FROM state", 0);
+    int cursor = g_tui ? tui_get_cursor(g_tui, "lpane") : qint( "SELECT cursor FROM state", 0);
+    if (cursor < 0) cursor = 0;
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
     sqlite3_bind_int(st, 1, cursor);
@@ -1497,7 +1568,8 @@ static void do_search(const char *q) {
 
 static void jump_hit(int dir) {
     sqlite3 *db = g_db;
-    int c = qint( "SELECT cursor FROM state", 0);
+    int c = g_tui ? tui_get_cursor(g_tui, "lpane") : qint( "SELECT cursor FROM state", 0);
+    if (c < 0) c = 0;
     sqlite3_stmt *st;
     const char *sql = dir > 0
         ? "SELECT MIN(rownum) FROM lpane WHERE id IN(SELECT id FROM search_hits)AND rownum>?"
@@ -1514,12 +1586,17 @@ static void jump_hit(int dir) {
             : "SELECT MAX(rownum) FROM lpane WHERE id IN(SELECT id FROM search_hits)";
         f = qint( sql, -1);
     }
-    if (f >= 0) { xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", f); dirty_rp(); }
+    if (f >= 0) {
+        if (g_tui) tui_set_cursor_idx(g_tui, "lpane", f);
+        xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", f);
+        dirty_rp();
+    }
 }
 
 static void follow_link(tui_t *tui) {
     sqlite3 *db = g_db;
-    int dc = qint( "SELECT dcursor FROM state", 0);
+    int dc = tui ? tui_get_cursor(tui, "rpane") : qint( "SELECT dcursor FROM state", 0);
+    if (dc < 0) dc = 0;
     sqlite3_stmt *st;
     sqlite3_prepare_v2(db, "SELECT link_mode,link_id FROM rpane WHERE rownum=? AND link_mode>=0", -1, &st, 0);
     sqlite3_bind_int(st, 1, dc);
@@ -1577,56 +1654,58 @@ static const char *HELP[] = {
 };
 
 /* ── Key dispatch ──────────────────────────────────────────────────── */
-static void handle_key(tui_t *tui, int k) {
+/*
+ * handle_key() processes application-specific key bindings.
+ * Navigation keys (up/down/pgup/pgdn/home/end) are delegated to the
+ * engine's default_nav when the app doesn't handle them.
+ * Returns: TUI_HANDLED, TUI_DEFAULT, or TUI_QUIT.
+ */
+static int handle_key(tui_t *tui, int k) {
     int focus = qint( "SELECT focus FROM state", 0);
-    int nf = qint( "SELECT COUNT(*) FROM lpane", 0);
-    int nrp = qint( "SELECT COUNT(*) FROM rpane", 0);
-    int rows = qint( "SELECT rows FROM state", 24);
-    int pg = rows - 3;
     int mode = qint( "SELECT mode FROM state", 0);
 
     switch (k) {
-    /* ── cursor / scroll ─────────────────────────────────────────── */
+    /* ── cursor / scroll — let engine handle, then rebuild rpane ── */
     case TUI_K_UP: case 'k':
-        if (!focus) { xexec( "UPDATE state SET cursor=MAX(cursor-1,0),dscroll=0,dcursor=0"); dirty_rp(); }
-        else xexec( "UPDATE state SET dcursor=MAX(dcursor-1,0)");
-        break;
     case TUI_K_DOWN: case 'j':
-        if (!focus) { xexecf( "UPDATE state SET cursor=MIN(cursor+1,%d),dscroll=0,dcursor=0", nf - 1); dirty_rp(); }
-        else xexecf( "UPDATE state SET dcursor=MIN(dcursor+1,%d)", nrp - 1);
-        break;
     case TUI_K_PGUP:
-        if (!focus) { xexecf( "UPDATE state SET cursor=MAX(cursor-%d,0),dscroll=0,dcursor=0", pg); dirty_rp(); }
-        else xexecf( "UPDATE state SET dcursor=MAX(dcursor-%d,0)", pg);
-        break;
     case TUI_K_PGDN:
-        if (!focus) { xexecf( "UPDATE state SET cursor=MIN(cursor+%d,%d),dscroll=0,dcursor=0", pg, nf - 1); dirty_rp(); }
-        else xexecf( "UPDATE state SET dcursor=MIN(dcursor+%d,%d)", pg, nrp - 1);
-        break;
     case TUI_K_HOME: case 'g':
-        if (!focus) { xexec( "UPDATE state SET cursor=0,dscroll=0,dcursor=0"); dirty_rp(); }
-        else xexec( "UPDATE state SET dcursor=0");
-        break;
     case TUI_K_END:
-        if (!focus) { xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", nf > 0 ? nf - 1 : 0); dirty_rp(); }
-        else xexecf( "UPDATE state SET dcursor=%d", nrp > 0 ? nrp - 1 : 0);
-        break;
+        if (!focus) {
+            /* Engine will move lpane cursor; rebuild rpane after */
+            dirty_rp();
+        }
+        /* Return DEFAULT so engine applies navigation */
+        return TUI_DEFAULT;
+
     case TUI_K_TAB:
-        xexec( "UPDATE state SET focus=1-focus,dcursor=0,dscroll=0");
-        break;
+        { int nf = qint("SELECT focus FROM state", 0);
+          xexecf("UPDATE state SET focus=%d", nf ? 0 : 1);
+          sync_focus_from_state();
+          tui_set_cursor_idx(tui, "rpane", 0);
+        }
+        return TUI_HANDLED;
+
     case TUI_K_ENTER: case '\n':
         if (focus) follow_link(tui);
-        else xexec( "UPDATE state SET focus=1,dcursor=0,dscroll=0");
-        break;
-
+        else {
+            xexec("UPDATE state SET focus=1");
+            sync_focus_from_state();
+            tui_set_cursor_idx(tui, "rpane", 0);
+        }
+        return TUI_HANDLED;
     /* ── business logic ──────────────────────────────────────────── */
     case 'G':
+        tui_set_cursor_idx(tui, "lpane", 0);
+        tui_set_cursor_idx(tui, "rpane", 0);
         xexec( "UPDATE state SET grouped=1-grouped,cursor=0,scroll=0,dscroll=0,dcursor=0");
         dirty_both();
-        break;
+        return TUI_HANDLED;
     case TUI_K_RIGHT: case 'l':
         if (focus) {
-            int dc = qint( "SELECT dcursor FROM state", 0);
+            int dc = tui_get_cursor(tui, "rpane");
+            if (dc < 0) dc = 0;
             char rsty[32] = "";
             { sqlite3_stmt *st2;
               sqlite3_prepare_v2(g_db, "SELECT COALESCE(style,'') FROM rpane WHERE rownum=?", -1, &st2, 0);
@@ -1645,14 +1724,16 @@ static void handle_key(tui_t *tui, int k) {
                     xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)", sec, is_ex ? 0 : 1);
                     dirty_rp();
                 }
-                break;
+                return TUI_HANDLED;
             }
             follow_link(tui);
-            break;
+            return TUI_HANDLED;
         }
         { char id[256] = "";
+          int cur = tui_get_cursor(tui, "lpane"); if (cur < 0) cur = 0;
           sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)", -1, &st, 0);
+          sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
+          sqlite3_bind_int(st, 1, cur);
           if (sqlite3_step(st) == SQLITE_ROW) {
               const char *t = (const char *)sqlite3_column_text(st, 0);
               if (t) snprintf(id, sizeof id, "%s", t);
@@ -1664,13 +1745,14 @@ static void handle_key(tui_t *tui, int k) {
               if (mode == 0) has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM processes WHERE ppid=%d", atoi(id));
               else if (mode == 1) has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'", id);
               else if (!strncmp(id, "io_", 3)) has_ch = 1;
-              if (has_ch && !is_ex) { xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)", id); dirty_both(); break; }
+              if (has_ch && !is_ex) { xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)", id); dirty_both(); return TUI_HANDLED; }
           }
         }
-        break;
+        return TUI_HANDLED;
     case TUI_K_LEFT: case 'h':
         if (focus) {
-            int dc = qint( "SELECT dcursor FROM state", 0);
+            int dc = tui_get_cursor(tui, "rpane");
+            if (dc < 0) dc = 0;
             char rsty[32] = "";
             { sqlite3_stmt *st2;
               sqlite3_prepare_v2(g_db, "SELECT COALESCE(style,'') FROM rpane WHERE rownum=?", -1, &st2, 0);
@@ -1689,13 +1771,15 @@ static void handle_key(tui_t *tui, int k) {
                     xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)", sec, is_ex ? 0 : 1);
                     dirty_rp();
                 }
-                break;
+                return TUI_HANDLED;
             }
-            break;
+            return TUI_HANDLED;
         }
         { char id[256] = "";
+          int cur = tui_get_cursor(tui, "lpane"); if (cur < 0) cur = 0;
           sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)", -1, &st, 0);
+          sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
+          sqlite3_bind_int(st, 1, cur);
           if (sqlite3_step(st) == SQLITE_ROW) {
               const char *t = (const char *)sqlite3_column_text(st, 0);
               if (t) snprintf(id, sizeof id, "%s", t);
@@ -1705,16 +1789,16 @@ static void handle_key(tui_t *tui, int k) {
               int tgid = atoi(id);
               int has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM processes WHERE ppid=%d", tgid);
               int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)", id);
-              if (has_ch && is_ex) { xexecf( "UPDATE expanded SET ex=0 WHERE id='%s'", id); dirty_both(); break; }
+              if (has_ch && is_ex) { xexecf( "UPDATE expanded SET ex=0 WHERE id='%s'", id); dirty_both(); return TUI_HANDLED; }
               int ppid = qintf( -1, "SELECT ppid FROM processes WHERE tgid=%d", tgid);
               if (ppid >= 0) {
                   int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%d'", ppid);
-                  if (r >= 0) { xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", r); dirty_rp(); }
+                  if (r >= 0) { tui_set_cursor_idx(tui, "lpane", r); dirty_rp(); }
               }
           } else if (mode == 1 && id[0]) {
               int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)", id);
               int has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'", id);
-              if (has_ch && is_ex) { xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id); dirty_both(); break; }
+              if (has_ch && is_ex) { xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id); dirty_both(); return TUI_HANDLED; }
               { sqlite3_stmt *s2;
                 sqlite3_prepare_v2(g_db, "SELECT parent_id FROM lpane WHERE id=? LIMIT 1", -1, &s2, 0);
                 sqlite3_bind_text(s2, 1, id, -1, SQLITE_TRANSIENT);
@@ -1722,7 +1806,7 @@ static void handle_key(tui_t *tui, int k) {
                     const char *pi = (const char *)sqlite3_column_text(s2, 0);
                     if (pi && pi[0]) {
                         int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%s'", pi);
-                        if (r >= 0) { xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", r); dirty_rp(); }
+                        if (r >= 0) { tui_set_cursor_idx(tui, "lpane", r); dirty_rp(); }
                     }
                 }
                 sqlite3_finalize(s2);
@@ -1732,25 +1816,30 @@ static void handle_key(tui_t *tui, int k) {
                   xexecf( "UPDATE expanded SET ex=0 WHERE id='%s'", id);
                   dirty_both();
               } else {
+                  char pid[256] = "";
                   sqlite3_stmt *s2;
-                  sqlite3_prepare_v2(g_db, "SELECT parent_id FROM lpane WHERE rownum=(SELECT cursor FROM state)", -1, &s2, 0);
+                  sqlite3_prepare_v2(g_db, "SELECT parent_id FROM lpane WHERE rownum=?", -1, &s2, 0);
+                  sqlite3_bind_int(s2, 1, cur);
                   if (sqlite3_step(s2) == SQLITE_ROW) {
                       const char *pi = (const char *)sqlite3_column_text(s2, 0);
-                      if (pi) {
-                          int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%s'", pi);
-                          if (r >= 0) { xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", r); dirty_rp(); }
-                      }
+                      if (pi) snprintf(pid, sizeof pid, "%s", pi);
                   }
                   sqlite3_finalize(s2);
+                  if (pid[0]) {
+                      int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%s'", pid);
+                      if (r >= 0) { tui_set_cursor_idx(tui, "lpane", r); dirty_rp(); }
+                  }
               }
           }
         }
-        break;
+        return TUI_HANDLED;
     case 'e': case 'E':
         if (mode == 0) {
             char id[64] = "";
+            int cur = tui_get_cursor(tui, "lpane"); if (cur < 0) cur = 0;
             sqlite3_stmt *st;
-            sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)", -1, &st, 0);
+            sqlite3_prepare_v2(g_db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
+            sqlite3_bind_int(st, 1, cur);
             if (sqlite3_step(st) == SQLITE_ROW) {
                 const char *t = (const char *)sqlite3_column_text(st, 0);
                 if (t) snprintf(id, sizeof id, "%s", t);
@@ -1761,17 +1850,25 @@ static void handle_key(tui_t *tui, int k) {
                 " UPDATE expanded SET ex=%d WHERE id IN(SELECT CAST(t AS TEXT) FROM d)", tg, k == 'e' ? 1 : 0);
             dirty_both();
         }
-        break;
-    case '1': xexec( "UPDATE state SET mode=0,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); dirty_both(); break;
-    case '2': xexec( "UPDATE state SET mode=1,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); dirty_both(); break;
-    case '3': xexec( "UPDATE state SET mode=2,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); dirty_both(); break;
-    case '4': xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=3,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0"); dirty_both(); break;
-    case '5': xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=4,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0"); dirty_both(); break;
-    case '6': xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=5,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0"); dirty_both(); break;
-    case '7': xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=6,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0"); dirty_both(); break;
-    case 'd': xexec( "UPDATE state SET dep_filter=1-dep_filter,cursor=0,scroll=0"); dirty_both(); break;
-    case 's': xexec( "UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0"); dirty_both(); break;
-    case 't': xexec( "UPDATE state SET ts_mode=(ts_mode+1)%3"); dirty_rp(); break;
+        return TUI_HANDLED;
+    case '1': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=0,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); dirty_both(); return TUI_HANDLED;
+    case '2': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=1,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); dirty_both(); return TUI_HANDLED;
+    case '3': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=2,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); dirty_both(); return TUI_HANDLED;
+    case '4': { sync_cursor_to_state();
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=3,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
+    case '5': { sync_cursor_to_state();
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=4,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
+    case '6': { sync_cursor_to_state();
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=5,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
+    case '7': { sync_cursor_to_state();
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=6,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
+    case 'd': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET dep_filter=1-dep_filter,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
+    case 's': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
+    case 't': xexec( "UPDATE state SET ts_mode=(ts_mode+1)%3"); dirty_rp(); return TUI_HANDLED;
 
     /* ── interactive terminal actions ─────────────────────────────── */
     case '/': {
@@ -1786,9 +1883,9 @@ static void handle_key(tui_t *tui, int k) {
             sync_panes();
             jump_hit(1);
         }
-    } break;
-    case 'n': jump_hit(1); break;
-    case 'N': jump_hit(-1); break;
+    } return TUI_HANDLED;
+    case 'n': jump_hit(1); return TUI_HANDLED;
+    case 'N': jump_hit(-1); return TUI_HANDLED;
     case 'f': {
         char buf[32] = "";
         if (tui_line_edit(tui, "Filter: ", buf, sizeof buf) && buf[0]) {
@@ -1799,28 +1896,95 @@ static void handle_key(tui_t *tui, int k) {
             sqlite3_step(st); sqlite3_finalize(st);
             dirty_rp();
         }
-    } break;
-    case 'F': xexec( "UPDATE state SET evfilt=''"); dirty_rp(); break;
-    case 'v': xexecf( "UPDATE state SET lp_filter=(lp_filter+1)%%3,cursor=0,scroll=0"); dirty_both(); break;
-    case 'V': xexec( "UPDATE state SET lp_filter=0,cursor=0,scroll=0"); dirty_both(); break;
-    case 'W': save_db(tui); break;
-    case 'x': tui_sql_prompt(tui); break;
-    case '?': tui_show_help(tui, HELP); break;
+    } return TUI_HANDLED;
+    case 'F': xexec( "UPDATE state SET evfilt=''"); dirty_rp(); return TUI_HANDLED;
+    case 'v': tui_set_cursor_idx(tui, "lpane", 0); xexecf( "UPDATE state SET lp_filter=(lp_filter+1)%%3,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
+    case 'V': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET lp_filter=0,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
+    case 'W': save_db(tui); return TUI_HANDLED;
+    case 'x': tui_sql_prompt(tui); return TUI_HANDLED;
+    case '?': tui_show_help(tui, HELP); return TUI_HANDLED;
+    default: return TUI_DEFAULT;
     }
-    sync_panes();
 }
 
-/* ── on_key callback (returns non-zero to quit) ────────────────────── */
-static int on_key_handler(tui_t *tui, int k) {
-    if (k == 'q' || k == 'Q') return 1;
-    handle_key(tui, k);
-    return 0;
+/* ── on_key callback for engine event loop ─────────────────────────── */
+static int on_key_cb(tui_t *tui, int key, const char *panel,
+                     int cursor, const char *row_id, void *ctx) {
+    (void)panel; (void)cursor; (void)row_id; (void)ctx;
+    if (key == 'q' || key == 'Q') return TUI_QUIT;
+    int result = handle_key(tui, key);
+    /* After any key, sync engine cursor back to state table and update status */
+    sync_cursor_to_state();
+    update_status();
+    return result;
 }
 
 /* ── on_stream_end callback ────────────────────────────────────────── */
 static void on_stream_end(void) {
     setup_fts();
     xexec( "UPDATE state SET lp_filter=0");
+}
+
+/* ── Trace FD state (shared with on_trace_fd_cb) ───────────────────── */
+static char t_rbuf[1<<20];
+static int t_rbuf_len = 0;
+static FILE *t_trace_pipe = NULL;
+static int t_trace_fd = -1;
+static pid_t t_child_pid = 0;
+
+/* ── Trace FD callback for engine event loop ───────────────────────── */
+static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
+    (void)ctx;
+    int n = read(fd, t_rbuf + t_rbuf_len, (int)(sizeof(t_rbuf) - t_rbuf_len - 1));
+    if (n <= 0) {
+        if (t_rbuf_len > 0) {
+            t_rbuf[t_rbuf_len] = 0;
+            xexec("BEGIN"); ingest_line(t_rbuf); xexec("COMMIT");
+            t_rbuf_len = 0;
+            process_inbox(tui, 1);
+        }
+        on_stream_end();
+        tui_unwatch_fd(tui, fd);
+        if (t_trace_pipe) { pclose(t_trace_pipe); t_trace_pipe = NULL; t_trace_fd = -1; }
+        else { close(fd); t_trace_fd = -1; }
+        rebuild_lpane(); rebuild_rpane();
+        tui_dirty(tui, NULL);
+    } else {
+        t_rbuf_len += n;
+        int did = 0;
+        xexec("BEGIN");
+        while (1) {
+            char *nl = (char *)memchr(t_rbuf, '\n', t_rbuf_len);
+            if (!nl) break;
+            if (nl > t_rbuf && *(nl-1) == '\r') *(nl-1) = 0;
+            *nl = 0;
+            ingest_line(t_rbuf);
+            did++;
+            int used = (int)(nl - t_rbuf) + 1;
+            memmove(t_rbuf, nl + 1, t_rbuf_len - used);
+            t_rbuf_len -= used;
+        }
+        if (t_rbuf_len >= (int)(sizeof(t_rbuf) - 1)) {
+            t_rbuf[t_rbuf_len] = 0;
+            ingest_line(t_rbuf);
+            did++;
+            t_rbuf_len = 0;
+        }
+        xexec("COMMIT");
+        if (did) {
+            process_inbox(tui, 1);
+            xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
+            rebuild_lpane(); rebuild_rpane();
+            tui_dirty(tui, NULL);
+            /* Reap child */
+            if (t_child_pid > 0) {
+                int ws;
+                if (waitpid(t_child_pid, &ws, WNOHANG) == t_child_pid)
+                    t_child_pid = 0;
+            }
+        }
+    }
+    update_status();
 }
 
 /* ═══════════════════════════════════════════════════════════════════ */
@@ -1933,109 +2097,47 @@ int main(int argc, char **argv) {
     if (g_headless) { sqlite3_close(g_db); return 0; }
     if (save_file[0] && !cmd) { sqlite3_close(g_db); return 0; }
 
-    /* ── App-driven event loop ─────────────────────────────────── */
+    /* ── Engine-driven event loop ──────────────────────────────── */
     tui_t *tui = tui_open(g_db);
     if (!tui) { fprintf(stderr, "tv: cannot open terminal\n"); sqlite3_close(g_db); return 1; }
+    g_tui = tui;
 
-    /* Install SIGWINCH handler */
-    struct sigaction sa = {0};
-    sa.sa_handler = tui_sigwinch_handler;
-    sigaction(SIGWINCH, &sa, 0);
+    /* Define panels — lpane (left), rpane (right) */
+    static tui_col_def lp_cols[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
+    static tui_panel_def lp_def = {"lpane", NULL, "rownum", lp_cols, 1, TUI_PANEL_CURSOR};
+    tui_add_panel(tui, &lp_def, 0, 0, 50, 100);
 
-    /* Stream read buffer */
-    char rbuf[1<<20];
-    int rbuf_len = 0;
+    static tui_col_def rp_cols[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
+    static tui_panel_def rp_def = {"rpane", NULL, "rownum", rp_cols, 1, TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
+    tui_add_panel(tui, &rp_def, 50, 0, 50, 100);
 
-    for (;;) {
-        /* Check for terminal resize */
-        if (tui_check_resize(tui)) {
-            rebuild_lpane();
-            rebuild_rpane();
-        }
+    /* Focus starts on lpane */
+    tui_focus(tui, "lpane");
 
-        /* Update status bar and render */
-        update_status();
-        tui_render(tui);
+    /* Register key handler */
+    tui_on_key(tui, on_key_cb, NULL);
 
-        /* Poll on tty_fd + optional trace_fd */
-        fd_set rfds; FD_ZERO(&rfds);
-        int tfd = tui_fd(tui);
-        FD_SET(tfd, &rfds);
-        int mfd = tfd;
-        if (trace_fd >= 0) { FD_SET(trace_fd, &rfds); if (trace_fd > mfd) mfd = trace_fd; }
-        int sel = select(mfd + 1, &rfds, NULL, NULL, NULL);
-        if (sel < 0 && errno == EINTR) continue;
+    /* Set up trace fd state for callback */
+    t_trace_pipe = trace_pipe;
+    t_trace_fd = trace_fd;
+    t_child_pid = child_pid;
 
-        /* Trace data */
-        if (trace_fd >= 0 && sel > 0 && FD_ISSET(trace_fd, &rfds)) {
-            int n = read(trace_fd, rbuf + rbuf_len,
-                         (int)(sizeof(rbuf) - rbuf_len - 1));
-            if (n <= 0) {
-                if (rbuf_len > 0) {
-                    rbuf[rbuf_len] = 0;
-                    xexec("BEGIN");
-                    ingest_line(rbuf);
-                    xexec("COMMIT");
-                    rbuf_len = 0;
-                    process_inbox(tui, 1);
-                }
-                on_stream_end();
-                if (trace_pipe) { pclose(trace_pipe); trace_pipe = NULL; trace_fd = -1; }
-                else { close(trace_fd); trace_fd = -1; }
-                rebuild_lpane();
-                rebuild_rpane();
-            } else {
-                rbuf_len += n;
-                int did = 0;
-                xexec("BEGIN");
-                while (1) {
-                    char *nl = (char *)memchr(rbuf, '\n', rbuf_len);
-                    if (!nl) break;
-                    if (nl > rbuf && *(nl - 1) == '\r') *(nl - 1) = 0;
-                    *nl = 0;
-                    ingest_line(rbuf);
-                    did++;
-                    int used = (int)(nl - rbuf) + 1;
-                    memmove(rbuf, nl + 1, rbuf_len - used);
-                    rbuf_len -= used;
-                }
-                if (rbuf_len >= (int)(sizeof(rbuf) - 1)) {
-                    rbuf[rbuf_len] = 0;
-                    ingest_line(rbuf);
-                    did++;
-                    rbuf_len = 0;
-                }
-                xexec("COMMIT");
-                if (did) {
-                    process_inbox(tui, 1);
-                    xexec("UPDATE state SET base_ts="
-                        "(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
-                    rebuild_lpane();
-                    rebuild_rpane();
-                }
-            }
-        }
+    /* Register trace fd if active */
+    if (trace_fd >= 0)
+        tui_watch_fd(tui, trace_fd, on_trace_fd_cb, NULL);
 
-        /* Reap child */
-        if (child_pid > 0) {
-            int ws;
-            if (waitpid(child_pid, &ws, WNOHANG) == child_pid)
-                child_pid = 0;
-        }
+    /* Initial status + dirty all */
+    update_status();
+    tui_dirty(tui, NULL);
 
-        /* Keyboard */
-        if (sel > 0 && FD_ISSET(tfd, &rfds)) {
-            int k = tui_read_key(tui);
-            if (k != TUI_K_NONE) {
-                if (on_key_handler(tui, k)) break;
-            }
-        }
-    }
+    /* Run the event loop */
+    tui_run(tui);
 
+    g_tui = NULL;
     tui_close(tui);
-    if (trace_pipe) { pclose(trace_pipe); trace_pipe = NULL; trace_fd = -1; }
-    else if (trace_fd >= 0) { close(trace_fd); trace_fd = -1; }
-    if (child_pid > 0) { kill(child_pid, SIGTERM); waitpid(child_pid, NULL, 0); }
+    if (t_trace_pipe) { pclose(t_trace_pipe); t_trace_pipe = NULL; }
+    else if (t_trace_fd >= 0) { close(t_trace_fd); t_trace_fd = -1; }
+    if (t_child_pid > 0) { kill(t_child_pid, SIGTERM); waitpid(t_child_pid, NULL, 0); }
     sqlite3_close(g_db);
     return 0;
 }

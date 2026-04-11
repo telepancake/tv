@@ -1,101 +1,121 @@
 /*
- * engine.h — Generic two-pane TUI engine.
+ * engine.h — Generic panel-based TUI engine.
  *
  * ═══════════════════════════════════════════════════════════════════
  *  OVERVIEW
  * ═══════════════════════════════════════════════════════════════════
  *
- * This engine renders a two-pane terminal UI: a scrollable left list
- * and a scrollable right detail pane, plus a bottom status bar.  It
- * knows nothing about what is being displayed — processes, files,
- * htop rows, Norton Commander panels, Lotus 123 cells, whatever.
+ * A terminal UI engine that renders named panels from SQLite tables.
+ * The engine owns terminal I/O, the event loop, rendering, cursor
+ * navigation, scrolling, and column layout.  The application provides
+ * data in SQLite tables and receives callbacks on events.
  *
- * The application is responsible for:
- *   • Managing the SQLite database (opening, schema, populating data)
- *   • The event loop (poll/select/kqueue, reading fds, timers)
- *   • Populating the display tables (lpane, rpane) before each render
- *   • Handling keypresses (engine reads keys; app decides what they mean)
- *
- * The engine provides:
- *   • Terminal management (raw mode, alternate screen, cleanup)
- *   • Key reading from the terminal fd
- *   • Rendering the two-pane layout from display tables in a DB
- *   • A line editor for interactive prompts
- *   • Help screen display
- *   • Screen-buffer utilities
+ *   Engine responsibilities              Application responsibilities
+ *   ─────────────────────────────────    ─────────────────────────────
+ *   Terminal raw mode, alt screen        Database schema & population
+ *   Event loop (select on fds)           Register fds, timers, key cb
+ *   Read & decode keypresses             Decide what keys mean (via cb)
+ *   Render panels from SQL tables        Populate/rebuild panel tables
+ *   Cursor navigation & scroll           Mark panels dirty after changes
+ *   Column alignment & truncation        Define panel layout (columns)
+ *   Status bar rendering                 Set status text
+ *   Line editor, help overlay            Provide help text
  *
  * ═══════════════════════════════════════════════════════════════════
- *  DISPLAY TABLES  (the contract between app and engine)
+ *  PANEL DATA TABLE FORMAT
  * ═══════════════════════════════════════════════════════════════════
  *
- * The engine reads from these tables in the sqlite3* you give it.
- * The app must CREATE them and keep them populated.  The engine never
- * writes to them except where noted below.
+ * Each panel reads from a table whose name matches the panel name.
+ * Required columns:
  *
- *   lpane — left pane content
- *   ─────────────────────────────────────────────────────────────────
- *   rownum  INTEGER PRIMARY KEY   — 0-based sequential row index
- *   id      TEXT NOT NULL         — app-defined row identifier
- *   style   TEXT DEFAULT 'normal' — rendering style (see STYLES)
- *   text    TEXT NOT NULL         — display text (may contain ANSI)
+ *   id      TEXT    — unique row identifier, passed back in callbacks
+ *   style   TEXT    — row style name (see STYLES)
+ *   <col>   TEXT    — one per column in the panel layout definition
  *
- *   rpane — right pane content
- *   ─────────────────────────────────────────────────────────────────
- *   rownum  INTEGER PRIMARY KEY   — 0-based sequential row index
- *   style   TEXT DEFAULT 'normal' — rendering style (see STYLES)
- *   text    TEXT NOT NULL         — display text (may contain ANSI)
+ * Row ordering: determined by tui_panel_def.order_by (a SQL ORDER BY
+ * fragment, e.g. "rownum" or "name ASC").  No explicit numbering needed.
  *
- *   state — UI navigation state
- *   ─────────────────────────────────────────────────────────────────
- *   cursor   INT  — lpane cursor position (0-based rownum)
- *   scroll   INT  — lpane scroll offset
- *   focus    INT  — 0 = left pane focused, 1 = right pane focused
- *   dcursor  INT  — rpane cursor position
- *   dscroll  INT  — rpane scroll offset
- *   rows     INT  — terminal height (engine writes on resize)
- *   cols     INT  — terminal width  (engine writes on resize)
- *   status   TEXT — text for the status bar (app-provided)
+ * Additional columns for app use are ignored by the engine.
  *
- *   The engine WRITES to state: rows, cols (on tui_resize).
- *   The engine READS: cursor, scroll, focus, dcursor, dscroll, rows,
- *                     cols, status.
- *   The app is responsible for all other writes to state (updating
- *   cursor, scroll, focus, etc. in response to keys).
+ * ═══════════════════════════════════════════════════════════════════
+ *  PANEL LAYOUT
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * tui_panel_def describes how to render one panel:
+ *   name       — panel and SQL table name
+ *   title      — header shown at top of panel (NULL = no header)
+ *   order_by   — SQL ORDER BY fragment
+ *   cols/ncols — column definitions
+ *   flags      — TUI_PANEL_CURSOR, TUI_PANEL_BORDER
+ *
+ * tui_col_def describes one column:
+ *   name       — SQL column name
+ *   width      — >0 = fixed chars, <0 = flex weight (share of rest)
+ *   align      — TUI_ALIGN_LEFT / RIGHT / CENTER
+ *   overflow   — TUI_OVERFLOW_TRUNCATE / ELLIPSIS
+ *
+ * Panel position: given as percentages (0-100) of terminal area.
  *
  * ═══════════════════════════════════════════════════════════════════
  *  STYLES
  * ═══════════════════════════════════════════════════════════════════
  *
- *   The style column maps to ANSI colors:
- *     "normal"    — default terminal color
- *     "error"     — red
- *     "green"     — green
- *     "yellow"    — yellow
- *     "cyan"      — cyan
- *     "cyan_bold" — bold cyan
- *     "heading"   — bold yellow
- *     "search"    — bold magenta
- *     "dim"       — dim
+ *   "normal"    — default terminal color
+ *   "error"     — red
+ *   "green"     — green
+ *   "yellow"    — yellow
+ *   "cyan"      — cyan
+ *   "cyan_bold" — bold cyan
+ *   "heading"   — bold yellow
+ *   "search"    — bold magenta
+ *   "dim"       — dim
+ *   "bold"      — bold
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  EVENT LOOP
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * tui_run() runs a select()-based loop.  The app registers:
+ *   • FD watchers via tui_watch_fd() — fires when fd is readable
+ *   • Timers via tui_add_timer() — fires after N ms
+ *   • Key handler via tui_on_key() — called per keypress with
+ *     focused panel, cursor index, and row id
+ *
+ * After each callback, dirty panels are re-rendered automatically.
+ * Terminal resize (SIGWINCH) is handled internally.
+ *
+ * ═══════════════════════════════════════════════════════════════════
+ *  NAVIGATION
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * For panels with TUI_PANEL_CURSOR, the engine handles:
+ *   up/down/j/k  — move cursor one row
+ *   pgup/pgdn    — move cursor one page
+ *   home/g/end   — jump to first/last row
+ *
+ * The key callback is called FIRST.  If it returns TUI_HANDLED,
+ * the engine skips default navigation.  If TUI_DEFAULT, the engine
+ * applies built-in movement.
+ *
+ * The app can move the cursor programmatically via tui_set_cursor()
+ * and query it via tui_get_cursor() / tui_get_cursor_id().
  *
  * ═══════════════════════════════════════════════════════════════════
  *  TYPICAL USAGE
  * ═══════════════════════════════════════════════════════════════════
  *
- *   sqlite3 *db = ...;          // app opens & populates DB
- *   tui_t *tui = tui_open(db);  // engine opens terminal
+ *   sqlite3 *db = ...;
+ *   tui_t *tui = tui_open(db);
  *
- *   // app event loop:
- *   for (;;) {
- *       rebuild_lpane(db);       // app populates lpane
- *       rebuild_rpane(db);       // app populates rpane
- *       tui_render(tui);         // engine draws from tables
+ *   tui_col_def lc[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS}};
+ *   tui_panel_def lp = {"lpane", NULL, "rownum", lc, 1, TUI_PANEL_CURSOR};
+ *   tui_add_panel(tui, &lp, 0, 0, 50, 100);
  *
- *       // app does select/poll on tui_fd(tui) + its own fds
- *       int k = tui_read_key(tui);
- *       if (k == 'q') break;
- *       handle_key(db, k);       // app updates state/tables
- *   }
- *
+ *   tui_on_key(tui, my_key_cb, ctx);
+ *   tui_watch_fd(tui, trace_fd, on_trace_data, ctx);
+ *   tui_set_status(tui, " Ready");
+ *   tui_dirty(tui, NULL);
+ *   tui_run(tui);
  *   tui_close(tui);
  */
 #ifndef ENGINE_H
@@ -114,170 +134,99 @@ enum {
     TUI_K_BS    = 127
 };
 
-/* ── Opaque TUI handle ─────────────────────────────────────────────── */
+/* Key callback return values */
+#define TUI_HANDLED  1   /* app handled; skip default navigation */
+#define TUI_DEFAULT  0   /* apply default navigation */
+#define TUI_QUIT    -1   /* exit the event loop */
+
+/* Column alignment */
+enum { TUI_ALIGN_LEFT = 0, TUI_ALIGN_RIGHT, TUI_ALIGN_CENTER };
+
+/* Column overflow */
+enum { TUI_OVERFLOW_TRUNCATE = 0, TUI_OVERFLOW_ELLIPSIS };
+
+/* Panel flags */
+#define TUI_PANEL_CURSOR  0x01
+#define TUI_PANEL_BORDER  0x02
+
+/* ── Column definition ─────────────────────────────────────────────── */
+typedef struct {
+    const char *name;       /* SQL column name */
+    int         width;      /* >0 = fixed chars, <0 = flex weight */
+    int         align;      /* TUI_ALIGN_* */
+    int         overflow;   /* TUI_OVERFLOW_* */
+} tui_col_def;
+
+/* ── Panel definition ──────────────────────────────────────────────── */
+typedef struct {
+    const char       *name;       /* panel name = SQL table name */
+    const char       *title;      /* header title (NULL = none) */
+    const char       *order_by;   /* SQL ORDER BY fragment */
+    const tui_col_def *cols;
+    int               ncols;
+    int               flags;      /* TUI_PANEL_* */
+} tui_panel_def;
+
+/* ── Opaque handle ─────────────────────────────────────────────────── */
 typedef struct tui tui_t;
 
-/* ═══════════════════════════════════════════════════════════════════
- *  LIFECYCLE
- * ═══════════════════════════════════════════════════════════════════ */
+/* ── Callback types ────────────────────────────────────────────────── */
 
 /*
- * tui_open — initialise terminal for TUI rendering.
- *
- * Opens /dev/tty, enters raw mode / alternate screen, registers
- * atexit cleanup, and writes initial rows/cols into state table.
- *
- * db:  The app's SQLite database.  Must already contain the state
- *      table with rows and cols columns.  Engine will UPDATE them.
- *
- * Returns an opaque handle, or NULL on failure.
+ * Key callback.  Return TUI_HANDLED, TUI_DEFAULT, or TUI_QUIT.
+ *   panel  — focused panel name ("" if none)
+ *   cursor — 0-based cursor index in focused panel
+ *   row_id — id column value of cursor row ("" if empty)
  */
+typedef int (*tui_key_cb)(tui_t *tui, int key,
+                          const char *panel, int cursor,
+                          const char *row_id, void *ctx);
+
+/* FD callback.  Called when fd is readable. */
+typedef void (*tui_fd_cb)(tui_t *tui, int fd, void *ctx);
+
+/* Timer callback.  Return 1 to repeat, 0 to cancel. */
+typedef int (*tui_timer_cb)(tui_t *tui, void *ctx);
+
+/* ═══════════════════════════════════════════════════════════════════ */
+
+/* Lifecycle */
 tui_t *tui_open(sqlite3 *db);
+void   tui_close(tui_t *tui);
 
-/*
- * tui_close — restore terminal and free resources.
- *
- * Restores the original terminal state (cooked mode, main screen,
- * visible cursor).  Safe to call with NULL.
- */
-void tui_close(tui_t *tui);
+/* Panel management */
+void        tui_add_panel(tui_t *tui, const tui_panel_def *def,
+                          int x_pct, int y_pct, int w_pct, int h_pct);
+void        tui_dirty(tui_t *tui, const char *panel);  /* NULL = all */
+void        tui_focus(tui_t *tui, const char *panel);
+const char *tui_get_focus(tui_t *tui);
 
-/* ═══════════════════════════════════════════════════════════════════
- *  TERMINAL QUERIES
- * ═══════════════════════════════════════════════════════════════════ */
+/* Cursor */
+void        tui_set_cursor(tui_t *tui, const char *panel, const char *id);
+void        tui_set_cursor_idx(tui_t *tui, const char *panel, int idx);
+int         tui_get_cursor(tui_t *tui, const char *panel);
+const char *tui_get_cursor_id(tui_t *tui, const char *panel);
+int         tui_row_count(tui_t *tui, const char *panel);
 
-/*
- * tui_fd — return the file descriptor for the terminal.
- *
- * The app should include this fd in its poll/select set to know when
- * keyboard input is available.  Returns -1 if tui is NULL.
- */
-int tui_fd(tui_t *tui);
+/* Event loop */
+void tui_on_key(tui_t *tui, tui_key_cb cb, void *ctx);
+void tui_watch_fd(tui_t *tui, int fd, tui_fd_cb cb, void *ctx);
+void tui_unwatch_fd(tui_t *tui, int fd);
+int  tui_add_timer(tui_t *tui, int ms, tui_timer_cb cb, void *ctx);
+void tui_remove_timer(tui_t *tui, int timer_id);
+void tui_run(tui_t *tui);
+void tui_quit(tui_t *tui);
 
-/* ═══════════════════════════════════════════════════════════════════
- *  INPUT
- * ═══════════════════════════════════════════════════════════════════ */
+/* Status bar */
+void tui_set_status(tui_t *tui, const char *text);
 
-/*
- * tui_read_key — read one keypress from the terminal.
- *
- * Non-blocking if no data is available (returns TUI_K_NONE).
- * Decodes ANSI escape sequences into TUI_K_* constants.
- * Single printable bytes are returned as-is (e.g. 'q', '/').
- */
-int tui_read_key(tui_t *tui);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  RENDERING
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * tui_render — draw the two-pane layout to the terminal.
- *
- * Reads from lpane, rpane, and state tables in the DB.
- *
- * Layout:
- *   rows 1..rows-1  — content area
- *   row  rows       — status bar (from state.status)
- *
- * Left pane occupies cols/2 columns; right pane gets the rest.
- * If the right pane would be < 20 columns, it is hidden and the
- * left pane uses the full width.
- *
- * Cursor highlight: the row at state.cursor gets inverse video.
- * If state.focus=0, the cursor is bold+inverse; if focus=1, just
- * inverse.  Similarly for rpane with state.dcursor.
- *
- * The engine adjusts scroll/dscroll to keep cursors visible, and
- * writes the adjusted values back to state.
- */
-void tui_render(tui_t *tui);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  RESIZE
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * tui_check_resize — query actual terminal size and update state.
- *
- * Call this after SIGWINCH or at the top of each loop iteration.
- * Returns 1 if the size changed, 0 otherwise.
- * Updates state.rows and state.cols if changed.
- */
-int tui_check_resize(tui_t *tui);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  LINE EDITOR
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * tui_line_edit — interactive single-line text editor.
- *
- * Draws a prompt on the bottom row, lets the user type, and returns
- * when Enter or Esc is pressed.
- *
- * prompt: displayed before the text (e.g. "/", "SQL> ")
- * buf:    in/out buffer; pre-populated text is shown initially
- * bsz:   size of buf in bytes
- *
- * Returns 1 on Enter (accept), 0 on Esc (cancel).
- * buf is updated in-place with the edited text.
- */
-int tui_line_edit(tui_t *tui, const char *prompt, char *buf, int bsz);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  HELP SCREEN
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * tui_show_help — display a full-screen help overlay.
- *
- * lines: NULL-terminated array of strings, one per line.
- * Clears the screen, shows the lines in cyan, then blocks until
- * any key is pressed.
- */
+/* Interactive utilities */
+int  tui_line_edit(tui_t *tui, const char *prompt, char *buf, int bsz);
 void tui_show_help(tui_t *tui, const char **lines);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  SQL PROMPT
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * tui_sql_prompt — interactive SQL query and result display.
- *
- * Prompts the user for a SQL statement, executes it against the DB,
- * and shows the results in a table.  Blocks until any key is pressed
- * after showing results.
- */
 void tui_sql_prompt(tui_t *tui);
 
-/* ═══════════════════════════════════════════════════════════════════
- *  HEADLESS OUTPUT
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * tui_dump_table — print contents of a display table to stdout.
- *
- * table: one of "lpane", "rpane", "state".
- *
- * Prints a section header ("=== LPANE ==="), one row per line with
- * pipe-delimited fields, then a footer ("=== END LPANE ===").
- * For "state", prints key=value pairs on one line.
- *
- * This does not require the terminal to be open; it works headless.
- */
-void tui_dump_table(sqlite3 *db, const char *table);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  SIGWINCH SUPPORT
- * ═══════════════════════════════════════════════════════════════════ */
-
-/*
- * tui_sigwinch_handler — signal handler for SIGWINCH.
- *
- * Install this with sigaction(SIGWINCH, ...) if you want automatic
- * resize detection via tui_check_resize().
- */
-void tui_sigwinch_handler(int sig);
+/* Terminal info */
+int tui_rows(tui_t *tui);
+int tui_cols(tui_t *tui);
 
 #endif /* ENGINE_H */
