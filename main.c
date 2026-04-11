@@ -157,39 +157,32 @@ static void register_sql_funcs(sqlite3 *db) {
 /* ── Forward declarations ──────────────────────────────────────────── */
 static int handle_key(tui_t *tui, int k);
 static void do_search(const char *q);
-static void rebuild_lpane(void);
-static void rebuild_rpane(void);
+static void build_file_tree(void);
 static void jump_hit(int dir);
 static void follow_link(tui_t *tui);
 
 /* ── Global TUI handle (set after tui_open) ────────────────────────── */
 static tui_t *g_tui;
 
-/* ── Dirty flags (outbox) ──────────────────────────────────────────── */
-static void dirty_lp(void)   { xexec("UPDATE outbox SET rl=1"); }
-static void dirty_rp(void)   { xexec("UPDATE outbox SET rr=1"); }
-static void dirty_both(void) { xexec("UPDATE outbox SET rl=1,rr=1"); }
-
-static void sync_panes(void) {
-    int rl = qint("SELECT rl FROM outbox", 0);
-    int rr = qint("SELECT rr FROM outbox", 0);
-    if (rl || rr) xexec("UPDATE outbox SET rl=0,rr=0");
-    if (rl) rebuild_lpane();
-    if (rr) rebuild_rpane();
-    if (g_tui) {
-        if (rl) tui_dirty(g_tui, "lpane");
-        if (rr) tui_dirty(g_tui, "rpane");
-    }
-}
-
 /* ── Sync engine cursor ↔ state table ──────────────────────────────── */
 static void sync_cursor_to_state(void) {
     if (!g_tui) return;
     int lc = tui_get_cursor(g_tui, "lpane");
+    const char *lcid = tui_get_cursor_id(g_tui, "lpane");
     int rc = tui_get_cursor(g_tui, "rpane");
     if (lc < 0) lc = 0;
     if (rc < 0) rc = 0;
-    xexecf("UPDATE state SET cursor=%d, dcursor=%d", lc, rc);
+    if (lcid && lcid[0]) {
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(g_db, "UPDATE state SET cursor=?, cursor_id=?, dcursor=?",
+                           -1, &st, 0);
+        sqlite3_bind_int(st, 1, lc);
+        sqlite3_bind_text(st, 2, lcid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 3, rc);
+        sqlite3_step(st); sqlite3_finalize(st);
+    } else {
+        xexecf("UPDATE state SET cursor=%d, dcursor=%d", lc, rc);
+    }
 }
 
 static void sync_cursor_from_state(void) {
@@ -595,16 +588,23 @@ static void dump_lpane(void) {
 static void dump_rpane(void) {
     printf("=== RPANE ===\n");
     sqlite3_stmt *st;
-    sqlite3_prepare_v2(g_db,
+    int rc = sqlite3_prepare_v2(g_db,
         "SELECT rownum,style,text,link_mode,COALESCE(link_id,'') FROM rpane ORDER BY rownum",
         -1, &st, 0);
-    while (sqlite3_step(st) == SQLITE_ROW)
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "dump_rpane prepare error: %s\n", sqlite3_errmsg(g_db));
+        printf("=== END RPANE ===\n");
+        return;
+    }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW)
         printf("%d|%s|%s|%d|%s\n",
             sqlite3_column_int(st, 0),
             (const char *)sqlite3_column_text(st, 1),
             (const char *)sqlite3_column_text(st, 2),
             sqlite3_column_int(st, 3),
             (const char *)sqlite3_column_text(st, 4));
+    if (rc != SQLITE_DONE)
+        fprintf(stderr, "dump_rpane step error: %s\n", sqlite3_errmsg(g_db));
     sqlite3_finalize(st);
     printf("=== END RPANE ===\n");
 }
@@ -629,6 +629,12 @@ static void dump_state(void) {
             sqlite3_column_int(st, 14));
     sqlite3_finalize(st);
     printf("=== END STATE ===\n");
+}
+
+static void sync_cursor_id_from_pos(void) {
+    /* Sync cursor_id in state to match current state.cursor position in lpane view. */
+    xexec("UPDATE state SET cursor_id=COALESCE("
+          "(SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),'')");
 }
 
 static void dispatch_input(tui_t *tui, const char *data) {
@@ -667,55 +673,59 @@ static void dispatch_input(tui_t *tui, const char *data) {
                 int pg = rows - 3;
                 switch (k) {
                 case TUI_K_UP: case 'k':
-                    if (!focus) { xexec("UPDATE state SET cursor=MAX(cursor-1,0),dscroll=0,dcursor=0"); dirty_rp(); }
+                    if (!focus) xexec("UPDATE state SET cursor=MAX(cursor-1,0),dscroll=0,dcursor=0");
                     else xexec("UPDATE state SET dcursor=MAX(dcursor-1,0)");
                     break;
                 case TUI_K_DOWN: case 'j':
-                    if (!focus) { xexecf("UPDATE state SET cursor=MIN(cursor+1,%d),dscroll=0,dcursor=0", nf-1); dirty_rp(); }
+                    if (!focus) xexecf("UPDATE state SET cursor=MIN(cursor+1,%d),dscroll=0,dcursor=0", nf-1);
                     else xexecf("UPDATE state SET dcursor=MIN(dcursor+1,%d)", nrp-1);
                     break;
                 case TUI_K_PGUP:
-                    if (!focus) { xexecf("UPDATE state SET cursor=MAX(cursor-%d,0),dscroll=0,dcursor=0", pg); dirty_rp(); }
+                    if (!focus) xexecf("UPDATE state SET cursor=MAX(cursor-%d,0),dscroll=0,dcursor=0", pg);
                     else xexecf("UPDATE state SET dcursor=MAX(dcursor-%d,0)", pg);
                     break;
                 case TUI_K_PGDN:
-                    if (!focus) { xexecf("UPDATE state SET cursor=MIN(cursor+%d,%d),dscroll=0,dcursor=0", pg, nf-1); dirty_rp(); }
+                    if (!focus) xexecf("UPDATE state SET cursor=MIN(cursor+%d,%d),dscroll=0,dcursor=0", pg, nf-1);
                     else xexecf("UPDATE state SET dcursor=MIN(dcursor+%d,%d)", pg, nrp-1);
                     break;
                 case TUI_K_HOME: case 'g':
-                    if (!focus) { xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0"); dirty_rp(); }
+                    if (!focus) xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0");
                     else xexec("UPDATE state SET dcursor=0");
                     break;
                 case TUI_K_END:
-                    if (!focus) { xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0", nf>0?nf-1:0); dirty_rp(); }
+                    if (!focus) xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0", nf>0?nf-1:0);
                     else xexecf("UPDATE state SET dcursor=%d", nrp>0?nrp-1:0);
                     break;
                 }
+                if (!focus) sync_cursor_id_from_pos();
             }
         }
     } else if (strcmp(inp, "print") == 0) {
-        sync_panes();
         if (strcmp(arg1, "lpane") == 0) dump_lpane();
         else if (strcmp(arg1, "rpane") == 0) dump_rpane();
         else if (strcmp(arg1, "state") == 0) dump_state();
         g_headless = 1;
     } else if (strcmp(inp, "resize") == 0) {
-        if (n1 > 0 && n2 > 0) { xexecf("UPDATE state SET rows=%d,cols=%d", n1, n2); dirty_both(); }
+        if (n1 > 0 && n2 > 0) {
+            xexecf("UPDATE state SET rows=%d,cols=%d", n1, n2);
+            tui_dirty(g_tui, NULL);
+        }
     } else if (strcmp(inp, "select") == 0) {
         sqlite3_stmt *st;
         sqlite3_prepare_v2(g_db,
             "UPDATE state SET cursor=COALESCE((SELECT rownum FROM lpane WHERE id=?),(SELECT cursor FROM state)),"
-            "dscroll=0,dcursor=0", -1, &st, 0);
+            "cursor_id=?,dscroll=0,dcursor=0", -1, &st, 0);
         sqlite3_bind_text(st, 1, arg1, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, arg1, -1, SQLITE_TRANSIENT);
         sqlite3_step(st); sqlite3_finalize(st);
-        dirty_rp();
+        tui_dirty(g_tui, "rpane");
     } else if (strcmp(inp, "search") == 0) {
         sqlite3_stmt *st;
         sqlite3_prepare_v2(g_db, "UPDATE state SET search=?", -1, &st, 0);
         sqlite3_bind_text(st, 1, arg1, -1, SQLITE_TRANSIENT);
         sqlite3_step(st); sqlite3_finalize(st);
         do_search(arg1);
-        dirty_both();
+        tui_dirty(g_tui, NULL);
     } else if (strcmp(inp, "evfilt") == 0) {
         char q[64] = "";
         for (int i = 0; arg2[i] && i < 63; i++) q[i] = toupper(arg2[i]);
@@ -724,9 +734,8 @@ static void dispatch_input(tui_t *tui, const char *data) {
         sqlite3_prepare_v2(g_db, "UPDATE state SET evfilt=?", -1, &st, 0);
         sqlite3_bind_text(st, 1, q, -1, SQLITE_TRANSIENT);
         sqlite3_step(st); sqlite3_finalize(st);
-        dirty_rp();
+        tui_dirty(g_tui, "rpane");
     }
-    sync_panes();
 }
 
 static void process_inbox_input(tui_t *tui) {
@@ -782,126 +791,23 @@ static void load_db(const char *path) {
     sqlite3_close(src);
 }
 
-static void apply_lp_filter(void) {
-    int filt = qint( "SELECT lp_filter FROM state", 0);
-    if (!filt) return;
-
-    if (filt == 1) {
-        xexec(
-            "WITH RECURSIVE"
-            " failed(tgid) AS("
-            "  SELECT p.tgid FROM processes p"
-            "  JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
-            "  JOIN exit_events x ON x.eid=ev.id"
-            "  WHERE x.signal IS NOT NULL"
-            "   OR(x.code IS NOT NULL AND x.code!=0"
-            "      AND EXISTS(SELECT 1 FROM open_events o JOIN events e ON e.id=o.eid"
-            "       WHERE e.tgid=p.tgid"
-            "        AND(o.flags LIKE 'O_WRONLY%' OR o.flags LIKE 'O_RDWR%')))"
-            " ),"
-            " visible(tgid) AS("
-            "  SELECT tgid FROM failed"
-            "  UNION SELECT p2.ppid FROM processes p2 JOIN visible v ON p2.tgid=v.tgid"
-            "   WHERE p2.ppid IS NOT NULL AND p2.ppid IN(SELECT tgid FROM processes)"
-            " )"
-            " UPDATE lpane SET visible=0"
-            "  WHERE CAST(id AS INT) NOT IN(SELECT tgid FROM visible)");
-    } else if (filt == 2) {
-        xexec(
-            "WITH RECURSIVE"
-            " running(tgid) AS("
-            "  SELECT tgid FROM processes"
-            "  WHERE NOT EXISTS("
-            "   SELECT 1 FROM events WHERE events.tgid=processes.tgid AND events.event='EXIT')"
-            " ),"
-            " visible(tgid) AS("
-            "  SELECT tgid FROM running"
-            "  UNION SELECT p2.ppid FROM processes p2 JOIN visible v ON p2.tgid=v.tgid"
-            "   WHERE p2.ppid IS NOT NULL AND p2.ppid IN(SELECT tgid FROM processes)"
-            " )"
-            " UPDATE lpane SET visible=0"
-            "  WHERE CAST(id AS INT) NOT IN(SELECT tgid FROM visible)");
-    }
-
-    xexec(
-        "CREATE TEMP TABLE _lp AS"
-        " SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,id,parent_id,style,text,1 AS visible FROM lpane WHERE visible=1;"
-        "DELETE FROM lpane;"
-        "INSERT INTO lpane(rownum,id,parent_id,style,text,visible) SELECT*FROM _lp;"
-        "DROP TABLE _lp;");
-}
-
-/* ── Rebuild lpane: processes ──────────────────────────────────────── */
-static void rebuild_procs(void) {
+/* ── build_file_tree: populate _ftree for mode=1 ──────────────────── */
+static void build_file_tree(void) {
     int gr = qint( "SELECT grouped FROM state", 1);
     int sk = qint( "SELECT sort_key FROM state", 0);
-    const char *bo, *co, *fo;
-    switch (sk) {
-        case 1: bo = "p2.first_ts"; co = "c.first_ts"; fo = "p.first_ts"; break;
-        case 2: bo = "p2.last_ts";  co = "c.last_ts";  fo = "p.last_ts";  break;
-        default: bo = "p2.tgid";    co = "c.tgid";     fo = "p.tgid";     break;
-    }
-    if (gr) {
-        xexec( "INSERT OR IGNORE INTO expanded(id,ex) SELECT CAST(tgid AS TEXT),1 FROM processes;");
-        char sql[8192]; snprintf(sql, sizeof sql,
-            "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-            " SELECT ROW_NUMBER()OVER()-1,CAST(f.tgid AS TEXT),CAST(p.ppid AS TEXT),"
-            "  CASE WHEN f.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
-            "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
-            "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
-            "  printf('%%*s%%s[%%d] %%s%%s%%s %%s',f.depth*2,'',"
-            "   CASE WHEN NOT EXISTS(SELECT 1 FROM processes WHERE ppid=f.tgid) THEN '  '"
-            "        WHEN COALESCE((SELECT ex FROM expanded WHERE id=CAST(f.tgid AS TEXT)),1) THEN '▼ ' ELSE '▶ ' END,"
-            "   f.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
-            "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
-            "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%%d',x.signal)"
-            "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END,"
-            "   CASE WHEN(SELECT COUNT(*)FROM processes WHERE ppid=f.tgid)>0"
-            "    THEN printf(' (%%d)',(WITH RECURSIVE d(t) AS(SELECT tgid FROM processes WHERE ppid=f.tgid"
-            "     UNION ALL SELECT c2.tgid FROM processes c2 JOIN d ON c2.ppid=d.t)SELECT COUNT(*)FROM d))ELSE'' END,"
-            "   " DUR("p.last_ts-p.first_ts") ")"
-            " FROM(WITH RECURSIVE flat(tgid,depth,sk) AS("
-            "  SELECT p2.tgid,0,%s FROM processes p2"
-            "   WHERE p2.ppid IS NULL OR p2.ppid NOT IN(SELECT tgid FROM processes)"
-            "  UNION ALL SELECT c.tgid,flat.depth+1,%s FROM processes c"
-            "   JOIN flat ON c.ppid=flat.tgid"
-            "   JOIN expanded ex ON ex.id=CAST(flat.tgid AS TEXT) WHERE ex.ex=1 ORDER BY 3"
-            " )SELECT tgid,depth FROM flat)f"
-            " JOIN processes p ON p.tgid=f.tgid"
-            " LEFT JOIN events ev ON ev.tgid=f.tgid AND ev.event='EXIT'"
-            " LEFT JOIN exit_events x ON x.eid=ev.id", bo, co);
-        xexec( sql);
-    } else {
-        xexecf(
-            "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-            " SELECT ROW_NUMBER()OVER(ORDER BY %s)-1,CAST(p.tgid AS TEXT),CAST(p.ppid AS TEXT),"
-            "  CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
-            "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
-            "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
-            "  printf('[%%d] %%s%%s %%s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
-            "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
-            "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%%d',x.signal)"
-            "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
-            " FROM processes p LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
-            " LEFT JOIN exit_events x ON x.eid=ev.id", fo);
-    }
-}
 
-/* ── Rebuild lpane: files ──────────────────────────────────────────── */
-static void rebuild_files(void) {
-    int gr = qint( "SELECT grouped FROM state", 1);
-    int sk = qint( "SELECT sort_key FROM state", 0);
+    xexec("DELETE FROM _ftree;");
 
     if (!gr) {
         const char *ob;
         switch (sk) { case 1: ob = "MIN(e.ts)"; break; case 2: ob = "MAX(e.ts)"; break; default: ob = "o.path"; }
         xexecf(
-            "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+            "INSERT INTO _ftree(rownum,id,parent_id,style,text)"
             " SELECT ROW_NUMBER()OVER(ORDER BY %s)-1,o.path,NULL,"
             "  CASE WHEN o.path IN(SELECT id FROM search_hits) THEN 'search'"
             "       WHEN SUM(CASE WHEN o.err IS NOT NULL THEN 1 ELSE 0 END)>0 THEN 'error'"
             "       ELSE 'normal' END,"
-            "  printf('%%s  \x1b[36m[%%d opens, %%d procs%%s]\x1b[0m',"
+            "  printf('%%s  [%%d opens, %%d procs%%s]',"
             "   o.path,"
             "   COUNT(*),COUNT(DISTINCT e.tgid),"
             "   CASE WHEN SUM(o.err IS NOT NULL)>0 THEN printf(', %%d errs',SUM(o.err IS NOT NULL)) ELSE '' END)"
@@ -909,7 +815,7 @@ static void rebuild_files(void) {
         return;
     }
 
-    /* Tree mode */
+    /* Tree mode: build file_stats, dir_nodes, compress chains, then ftree */
     xexec(
         "CREATE TEMP TABLE IF NOT EXISTS file_stats("
         " path TEXT NOT NULL, canon TEXT NOT NULL,"
@@ -943,7 +849,6 @@ static void rebuild_files(void) {
         " procs=(SELECT COALESCE(SUM(f.procs),0) FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%'),"
         " errs =(SELECT COALESCE(SUM(f.errs),0)  FROM file_stats f WHERE f.canon LIKE dir_nodes.path||'/%');");
 
-    /* Collapse single-child directory chains */
     for (int pass = 0; pass < 20; pass++) {
         int merged = qint(
             "SELECT COUNT(*) FROM dir_nodes p"
@@ -1039,504 +944,21 @@ static void rebuild_files(void) {
     }
 
     xexec(
-        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
+        "INSERT INTO _ftree(rownum,id,parent_id,style,text)"
         " SELECT ROW_NUMBER()OVER(ORDER BY sort_key)-1,"
         "  path,parent_path,"
         "  CASE WHEN path IN(SELECT id FROM search_hits) THEN 'search'"
         "       WHEN errs>0 THEN 'error' ELSE 'normal' END,"
-        "  printf('%*s%s%s%s  \x1b[36m[%d opens, %d procs%s]\x1b[0m',"
+        "  printf('%*s%s%s  [%d opens, %d procs%s]',"
         "   depth*2,'',"
         "   CASE WHEN is_dir AND COALESCE((SELECT ex FROM expanded WHERE id=path),1)=1"
         "    THEN '▼ ' WHEN is_dir THEN '▶ ' ELSE '  ' END,"
-        "   CASE WHEN is_dir THEN '\x1b[1m' ELSE '\x1b[32m' END,"
-        "   name||CASE WHEN is_dir THEN '/\x1b[0m' ELSE '\x1b[0m' END,"
+        "   name||CASE WHEN is_dir THEN '/' ELSE '' END,"
         "   opens,procs,"
         "   CASE WHEN errs>0 THEN printf(', %d errs',errs) ELSE '' END)"
         " FROM ftree;");
 
     xexec( "DROP TABLE IF EXISTS ftree;DROP TABLE IF EXISTS file_stats;DROP TABLE IF EXISTS dir_nodes;");
-}
-
-/* ── Rebuild lpane: outputs ────────────────────────────────────────── */
-static void rebuild_outputs(void) {
-    int gr = qint( "SELECT grouped FROM state", 1);
-    if (gr) {
-        xexec( "INSERT OR IGNORE INTO expanded(id,ex)"
-            " SELECT DISTINCT 'io_'||CAST(e.tgid AS TEXT),1 FROM io_events i JOIN events e ON e.id=i.eid;");
-        xexec(
-            "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-            " SELECT ROW_NUMBER()OVER(ORDER BY sub.g_ts,sub.s_ts)-1,sub.id,sub.par,sub.sty,sub.txt FROM("
-            "  SELECT 'io_'||CAST(e.tgid AS TEXT) AS id,NULL AS par,'cyan_bold' AS sty,"
-            "   printf('── PID %d %s (%d lines) ──',e.tgid,COALESCE(" BNAME("p.exe") ",'?'),COUNT(*)) AS txt,"
-            "   MIN(e.ts) AS g_ts,0.0 AS s_ts"
-            "  FROM io_events i JOIN events e ON e.id=i.eid JOIN processes p ON p.tgid=e.tgid GROUP BY e.tgid"
-            "  UNION ALL"
-            "  SELECT CAST(e.id AS TEXT),'io_'||CAST(e.tgid AS TEXT),"
-            "   CASE WHEN i.stream='STDERR' THEN 'error' ELSE 'normal' END,"
-            "   printf('  %s %s',i.stream,SUBSTR(REPLACE(COALESCE(i.data,''),char(10),'↵'),1,200)),"
-            "   (SELECT MIN(e2.ts) FROM events e2 JOIN io_events i2 ON i2.eid=e2.id WHERE e2.tgid=e.tgid),e.ts"
-            "  FROM io_events i JOIN events e ON e.id=i.eid"
-            "  WHERE EXISTS(SELECT 1 FROM expanded WHERE id='io_'||CAST(e.tgid AS TEXT) AND ex=1)"
-            " )sub;");
-    } else {
-        xexec(
-            "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-            " SELECT ROW_NUMBER()OVER(ORDER BY e.ts)-1,CAST(e.id AS TEXT),NULL,"
-            "  CASE WHEN i.stream='STDERR' THEN 'error' ELSE 'normal' END,"
-            "  printf('[%d] %s %s',e.tgid,i.stream,SUBSTR(REPLACE(COALESCE(i.data,''),char(10),'↵'),1,200))"
-            " FROM io_events i JOIN events e ON e.id=i.eid ORDER BY e.ts;");
-    }
-}
-
-/* ── Dependency views ──────────────────────────────────────────────── */
-static void build_dep_edges(void) {
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS dep_edges("
-        " src TEXT NOT NULL, dst TEXT NOT NULL, tgid INT NOT NULL);"
-        "DELETE FROM dep_edges;"
-        "INSERT INTO dep_edges(src,dst,tgid)"
-        " SELECT DISTINCT r.path, w.path, er.tgid"
-        " FROM open_events r"
-        " JOIN events er ON er.id=r.eid"
-        " JOIN open_events w"
-        " JOIN events ew ON ew.id=w.eid"
-        " WHERE er.tgid=ew.tgid"
-        "  AND r.path IS NOT NULL AND w.path IS NOT NULL"
-        "  AND r.path!=w.path"
-        "  AND (r.flags LIKE 'O_RDONLY%' OR r.flags LIKE 'O_RDWR%')"
-        "  AND (w.flags LIKE 'O_WRONLY%' OR w.flags LIKE 'O_RDWR%' OR w.flags LIKE 'O_WRONLY,%' OR w.flags LIKE 'O_RDWR,%');"
-        "CREATE INDEX IF NOT EXISTS ix_de_dst ON dep_edges(dst);"
-        "CREATE INDEX IF NOT EXISTS ix_de_src ON dep_edges(src);");
-}
-
-static void rebuild_deps(void) {
-    build_dep_edges();
-    int df = qint( "SELECT dep_filter FROM state", 0);
-    char root[4096] = "";
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db, "SELECT dep_root FROM state", -1, &st, 0);
-      if (sqlite3_step(st) == SQLITE_ROW) {
-          const char *t = (const char *)sqlite3_column_text(st, 0);
-          if (t) snprintf(root, sizeof root, "%s", t);
-      }
-      sqlite3_finalize(st);
-    }
-    if (!root[0]) { xexec( "DROP TABLE IF EXISTS dep_edges;"); return; }
-
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
-        "DELETE FROM dep_closure;");
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)", -1, &st, 0);
-      sqlite3_bind_text(st, 1, root, -1, SQLITE_TRANSIENT);
-      sqlite3_step(st); sqlite3_finalize(st);
-    }
-    for (int d = 0; d < 100; d++) {
-        int added = qintf( 0,
-            "SELECT COUNT(*) FROM dep_edges e"
-            " JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
-            " WHERE e.src NOT IN(SELECT path FROM dep_closure)", d);
-        if (!added) break;
-        xexecf(
-            "INSERT OR IGNORE INTO dep_closure(path,depth)"
-            " SELECT DISTINCT e.src,%d"
-            " FROM dep_edges e JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
-            " WHERE e.src NOT IN(SELECT path FROM dep_closure)", d + 1, d);
-    }
-
-    const char *filt = df ? "AND EXISTS(SELECT 1 FROM open_events o2 JOIN events e2 ON e2.id=o2.eid"
-        " WHERE o2.path=dc.path AND (o2.flags LIKE 'O_WRONLY%%' OR o2.flags LIKE 'O_RDWR%%'"
-        " OR o2.flags LIKE 'O_WRONLY,%%' OR o2.flags LIKE 'O_RDWR,%%'))" : "";
-
-    xexecf(
-        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-        " SELECT ROW_NUMBER()OVER(ORDER BY dc.depth,dc.path)-1,dc.path,NULL,"
-        "  CASE WHEN dc.depth=0 THEN 'cyan_bold'"
-        "       WHEN dc.path IN(SELECT id FROM search_hits) THEN 'search'"
-        "       ELSE 'normal' END,"
-        "  printf('%%*s%%s',dc.depth*2,''," BNAME("dc.path") ")"
-        " FROM dep_closure dc WHERE 1=1 %s ORDER BY dc.depth,dc.path", filt);
-
-    xexec( "DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
-}
-
-static void rebuild_rdeps(void) {
-    build_dep_edges();
-    int df = qint( "SELECT dep_filter FROM state", 0);
-    char root[4096] = "";
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db, "SELECT dep_root FROM state", -1, &st, 0);
-      if (sqlite3_step(st) == SQLITE_ROW) {
-          const char *t = (const char *)sqlite3_column_text(st, 0);
-          if (t) snprintf(root, sizeof root, "%s", t);
-      }
-      sqlite3_finalize(st);
-    }
-    if (!root[0]) { xexec( "DROP TABLE IF EXISTS dep_edges;"); return; }
-
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
-        "DELETE FROM dep_closure;");
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)", -1, &st, 0);
-      sqlite3_bind_text(st, 1, root, -1, SQLITE_TRANSIENT);
-      sqlite3_step(st); sqlite3_finalize(st);
-    }
-    for (int d = 0; d < 100; d++) {
-        int added = qintf( 0,
-            "SELECT COUNT(*) FROM dep_edges e"
-            " JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
-            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)", d);
-        if (!added) break;
-        xexecf(
-            "INSERT OR IGNORE INTO dep_closure(path,depth)"
-            " SELECT DISTINCT e.dst,%d"
-            " FROM dep_edges e JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
-            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)", d + 1, d);
-    }
-
-    const char *filt = df ? "AND EXISTS(SELECT 1 FROM open_events o2 JOIN events e2 ON e2.id=o2.eid"
-        " WHERE o2.path=dc.path AND (o2.flags LIKE 'O_WRONLY%%' OR o2.flags LIKE 'O_RDWR%%'"
-        " OR o2.flags LIKE 'O_WRONLY,%%' OR o2.flags LIKE 'O_RDWR,%%'))" : "";
-
-    xexecf(
-        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-        " SELECT ROW_NUMBER()OVER(ORDER BY dc.depth,dc.path)-1,dc.path,NULL,"
-        "  CASE WHEN dc.depth=0 THEN 'cyan_bold'"
-        "       WHEN dc.path IN(SELECT id FROM search_hits) THEN 'search'"
-        "       ELSE 'normal' END,"
-        "  printf('%%*s%%s',dc.depth*2,''," BNAME("dc.path") ")"
-        " FROM dep_closure dc WHERE 1=1 %s ORDER BY dc.depth,dc.path", filt);
-
-    xexec( "DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
-}
-
-static void rebuild_dep_cmds(void) {
-    build_dep_edges();
-    char root[4096] = "";
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db, "SELECT dep_root FROM state", -1, &st, 0);
-      if (sqlite3_step(st) == SQLITE_ROW) {
-          const char *t = (const char *)sqlite3_column_text(st, 0);
-          if (t) snprintf(root, sizeof root, "%s", t);
-      }
-      sqlite3_finalize(st);
-    }
-    if (!root[0]) { xexec( "DROP TABLE IF EXISTS dep_edges;"); return; }
-
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
-        "DELETE FROM dep_closure;");
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)", -1, &st, 0);
-      sqlite3_bind_text(st, 1, root, -1, SQLITE_TRANSIENT);
-      sqlite3_step(st); sqlite3_finalize(st);
-    }
-    for (int d = 0; d < 100; d++) {
-        int added = qintf( 0,
-            "SELECT COUNT(*) FROM dep_edges e"
-            " JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
-            " WHERE e.src NOT IN(SELECT path FROM dep_closure)", d);
-        if (!added) break;
-        xexecf(
-            "INSERT OR IGNORE INTO dep_closure(path,depth)"
-            " SELECT DISTINCT e.src,%d"
-            " FROM dep_edges e JOIN dep_closure c ON c.path=e.dst AND c.depth=%d"
-            " WHERE e.src NOT IN(SELECT path FROM dep_closure)", d + 1, d);
-    }
-
-    xexecf(
-        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-        " SELECT ROW_NUMBER()OVER(ORDER BY p.last_ts DESC)-1,"
-        "  CAST(p.tgid AS TEXT),NULL,"
-        "  CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
-        "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
-        "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
-        "  printf('[%%d] %%s%%s %%s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
-        "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
-        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%%d',x.signal)"
-        "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
-        " FROM processes p"
-        " LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
-        " LEFT JOIN exit_events x ON x.eid=ev.id"
-        " WHERE p.tgid IN("
-        "  SELECT DISTINCT e.tgid FROM dep_edges e"
-        "  JOIN dep_closure dc ON (e.dst=dc.path OR e.src=dc.path)"
-        " )"
-        " ORDER BY p.last_ts DESC");
-
-    xexec( "DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
-}
-
-static void rebuild_rdep_cmds(void) {
-    build_dep_edges();
-    char root[4096] = "";
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db, "SELECT dep_root FROM state", -1, &st, 0);
-      if (sqlite3_step(st) == SQLITE_ROW) {
-          const char *t = (const char *)sqlite3_column_text(st, 0);
-          if (t) snprintf(root, sizeof root, "%s", t);
-      }
-      sqlite3_finalize(st);
-    }
-    if (!root[0]) { xexec( "DROP TABLE IF EXISTS dep_edges;"); return; }
-
-    xexec(
-        "CREATE TEMP TABLE IF NOT EXISTS dep_closure(path TEXT PRIMARY KEY,depth INT);"
-        "DELETE FROM dep_closure;");
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "INSERT OR IGNORE INTO dep_closure(path,depth) VALUES(?1,0)", -1, &st, 0);
-      sqlite3_bind_text(st, 1, root, -1, SQLITE_TRANSIENT);
-      sqlite3_step(st); sqlite3_finalize(st);
-    }
-    for (int d = 0; d < 100; d++) {
-        int added = qintf( 0,
-            "SELECT COUNT(*) FROM dep_edges e"
-            " JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
-            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)", d);
-        if (!added) break;
-        xexecf(
-            "INSERT OR IGNORE INTO dep_closure(path,depth)"
-            " SELECT DISTINCT e.dst,%d"
-            " FROM dep_edges e JOIN dep_closure c ON c.path=e.src AND c.depth=%d"
-            " WHERE e.dst NOT IN(SELECT path FROM dep_closure)", d + 1, d);
-    }
-
-    xexecf(
-        "INSERT INTO lpane(rownum,id,parent_id,style,text)"
-        " SELECT ROW_NUMBER()OVER(ORDER BY p.last_ts DESC)-1,"
-        "  CAST(p.tgid AS TEXT),NULL,"
-        "  CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'"
-        "       WHEN x.code IS NOT NULL AND x.code!=0 THEN 'error'"
-        "       WHEN x.signal IS NOT NULL THEN 'error' ELSE 'normal' END,"
-        "  printf('[%%d] %%s%%s %%s',p.tgid,COALESCE(" BNAME("p.exe") ",'?'),"
-        "   CASE WHEN x.code IS NOT NULL AND x.code!=0 THEN ' ✗'"
-        "        WHEN x.signal IS NOT NULL THEN printf(' ⚡%%d',x.signal)"
-        "        WHEN x.code IS NOT NULL THEN ' ✓' ELSE '' END," DUR("p.last_ts-p.first_ts") ")"
-        " FROM processes p"
-        " LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'"
-        " LEFT JOIN exit_events x ON x.eid=ev.id"
-        " WHERE p.tgid IN("
-        "  SELECT DISTINCT e.tgid FROM dep_edges e"
-        "  JOIN dep_closure dc ON (e.dst=dc.path OR e.src=dc.path)"
-        " )"
-        " ORDER BY p.last_ts DESC");
-
-    xexec( "DROP TABLE IF EXISTS dep_closure;DROP TABLE IF EXISTS dep_edges;");
-}
-
-/* ── Main rebuild_lpane callback ───────────────────────────────────── */
-static void rebuild_lpane(void) {
-    xexec( "DELETE FROM lpane;");
-    int mode = qint( "SELECT mode FROM state", 0);
-    switch (mode) {
-        case 0: rebuild_procs(); break;
-        case 1: rebuild_files(); break;
-        case 2: rebuild_outputs(); break;
-        case 3: rebuild_deps(); break;
-        case 4: rebuild_rdeps(); break;
-        case 5: rebuild_dep_cmds(); break;
-        case 6: rebuild_rdep_cmds(); break;
-    }
-    if (mode == 0) apply_lp_filter();
-    xexec( "UPDATE state SET cursor=MIN(cursor,MAX((SELECT COUNT(*)-1 FROM lpane),0));");
-}
-
-/* ── Rebuild rpane: process detail ─────────────────────────────────── */
-static void rpane_proc( int tgid) {
-    int tsm = qint( "SELECT ts_mode FROM state", 0);
-    double bts = qdbl( "SELECT base_ts FROM state", 0);
-    char ef[64] = "";
-    { sqlite3_stmt *s;
-      sqlite3_prepare_v2(g_db, "SELECT evfilt FROM state", -1, &s, 0);
-      if (sqlite3_step(s) == SQLITE_ROW) {
-          const char *t = (const char *)sqlite3_column_text(s, 0);
-          if (t && t[0]) snprintf(ef, sizeof ef, "%s", t);
-      }
-      sqlite3_finalize(s);
-    }
-
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(0,'heading','─── Process ───',-1,'','process')");
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 1,'cyan',printf('TGID:  %%d',tgid),-1,'','process' FROM processes WHERE tgid=%d", tgid);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 2,'cyan',printf('PPID:  %%d',ppid),0,CAST(ppid AS TEXT),'process' FROM processes WHERE tgid=%d AND ppid IS NOT NULL", tgid);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 3,'green',printf('EXE:   %%s',COALESCE(exe,'?')),-1,'','process' FROM processes WHERE tgid=%d", tgid);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 4,'green',printf('CWD:   %%s',COALESCE(cwd,'?')),-1,'','process' FROM processes WHERE tgid=%d", tgid);
-    /* Argv */
-    xexecf( "WITH RECURSIVE sp(i,rest,line) AS("
-        " SELECT 0,SUBSTR(argv,INSTR(argv,char(10))+1),"
-        "  CASE WHEN INSTR(argv,char(10))>0 THEN SUBSTR(argv,1,INSTR(argv,char(10))-1) ELSE argv END"
-        "  FROM processes WHERE tgid=%d AND argv IS NOT NULL"
-        " UNION ALL SELECT i+1,"
-        "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,INSTR(rest,char(10))+1) ELSE '' END,"
-        "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,1,INSTR(rest,char(10))-1) ELSE rest END"
-        "  FROM sp WHERE LENGTH(rest)>0"
-        ")INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 10+i,'normal',printf('  [%%d] %%s',i,line),-1,'','process' FROM sp", tgid);
-    /* Exit */
-    xexecf(
-        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 200,"
-        " CASE WHEN x.signal IS NOT NULL THEN 'error' WHEN x.code!=0 THEN 'error' ELSE 'green' END,"
-        " CASE WHEN x.signal IS NOT NULL THEN printf('Exit: signal %%d%%s',x.signal,"
-        "   CASE WHEN x.core_dumped THEN ' (core)' ELSE '' END)"
-        "  ELSE printf('Exit: %%s code=%%d',COALESCE(x.status,'?'),COALESCE(x.code,-1)) END,"
-        " -1,'','process' FROM events ev JOIN exit_events x ON x.eid=ev.id WHERE ev.tgid=%d AND ev.event='EXIT'", tgid);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 201,'cyan','Duration: '||" DUR("last_ts-first_ts") ",-1,'','process' FROM processes WHERE tgid=%d", tgid);
-    /* Children */
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(300,'heading',printf('─── Children (%%d) ───',"
-        "(SELECT COUNT(*) FROM processes WHERE ppid=%d)),-1,'','children')", tgid);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 300+ROW_NUMBER()OVER(ORDER BY first_ts),'normal',"
-        " printf('  [%%d] %%s',tgid,COALESCE(" BNAME("exe") ",'?')),0,CAST(tgid AS TEXT),'children'"
-        " FROM processes WHERE ppid=%d ORDER BY first_ts LIMIT 50", tgid);
-    /* Events */
-    char fc[128] = "";
-    if (ef[0]) snprintf(fc, sizeof fc, " AND e.event='%s'", ef);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(500,'heading',printf('─── Events (%%d)%%s ───',"
-        "(SELECT COUNT(*) FROM events WHERE tgid=%d),"
-        "CASE WHEN '%s'!='' THEN printf(' [%%s]','%s') ELSE '' END),-1,'','events')", tgid, ef, ef);
-    xexecf(
-        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 501+ROW_NUMBER()OVER(ORDER BY e.ts),"
-        " CASE WHEN e.event='EXEC' THEN 'cyan_bold'"
-        "      WHEN e.event='EXIT' AND(COALESCE(x.code,0)!=0 OR x.signal IS NOT NULL) THEN 'error'"
-        "      WHEN e.event='EXIT' THEN 'green'"
-        "      WHEN e.event='OPEN' AND o.err IS NOT NULL THEN 'error'"
-        "      WHEN e.event='OPEN' THEN 'green'"
-        "      WHEN e.event IN('STDERR','STDOUT') THEN 'yellow' ELSE 'normal' END,"
-        " printf('%%s %%-6s %%s',"
-        "  CASE %d WHEN 0 THEN printf('%%.6f',e.ts)"
-        "   WHEN 1 THEN printf('+%%.6f',e.ts-%f)"
-        "   ELSE printf('Δ%%.6f',e.ts-COALESCE(LAG(e.ts)OVER(ORDER BY e.ts),e.ts)) END,"
-        "  e.event,"
-        "  CASE WHEN e.event='OPEN' THEN printf('%%s [%%s]%%s%%s',COALESCE(o.path,'?'),COALESCE(o.flags,'?'),"
-        "    CASE WHEN o.fd IS NOT NULL THEN printf(' fd=%%d',o.fd) ELSE '' END,"
-        "    CASE WHEN o.err IS NOT NULL THEN printf(' err=%%d',o.err) ELSE '' END)"
-        "   WHEN e.event IN('STDERR','STDOUT') THEN SUBSTR(REPLACE(COALESCE(i.data,''),char(10),'↵'),1,200)"
-        "   WHEN e.event='EXIT' THEN CASE WHEN x.signal IS NOT NULL THEN printf('signal=%%d',x.signal)"
-        "    ELSE printf('%%s code=%%d',COALESCE(x.status,'?'),COALESCE(x.code,-1)) END"
-        "   ELSE '' END),"
-        " CASE WHEN e.event='OPEN' THEN 1 WHEN e.event IN('STDERR','STDOUT') THEN 2 ELSE -1 END,"
-        " CASE WHEN e.event='OPEN' THEN COALESCE(o.path,'') WHEN e.event IN('STDERR','STDOUT') THEN CAST(e.id AS TEXT) ELSE '' END,"
-        " 'events'"
-        " FROM events e LEFT JOIN open_events o ON o.eid=e.id LEFT JOIN io_events i ON i.eid=e.id"
-        " LEFT JOIN exit_events x ON x.eid=e.id WHERE e.tgid=%d%s ORDER BY e.ts LIMIT 5000",
-        tsm, bts, tgid, fc);
-}
-
-static void rpane_file( const char *path) {
-    sqlite3 *db = g_db;
-    int tsm = qint( "SELECT ts_mode FROM state", 0);
-    double bts = qdbl( "SELECT base_ts FROM state", 0);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(0,'heading','─── File ───',-1,'','file')");
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db, "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(1,'green',printf('Path: %s',?),-1,'','file')", -1, &st, 0);
-    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT); sqlite3_step(st); sqlite3_finalize(st);
-    sqlite3_prepare_v2(db,
-        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 2,'cyan',printf('Opens: %d  Errors: %d  Procs: %d',"
-        " COUNT(*),SUM(o.err IS NOT NULL),COUNT(DISTINCT e.tgid)),-1,'','file'"
-        " FROM open_events o JOIN events e ON e.id=o.eid WHERE o.path=?", -1, &st, 0);
-    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT); sqlite3_step(st); sqlite3_finalize(st);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(10,'heading','─── Accesses ───',-1,'','accesses')");
-    sqlite3_prepare_v2(db,
-        "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 11+ROW_NUMBER()OVER(ORDER BY e.ts),"
-        " CASE WHEN o.err IS NOT NULL THEN 'error' ELSE 'green' END,"
-        " printf('%s  PID %d (%s)  [%s]%s%s',"
-        "  CASE ?2 WHEN 0 THEN printf('%.6f',e.ts) WHEN 1 THEN printf('+%.6f',e.ts-?3)"
-        "   ELSE printf('Δ%.6f',e.ts-COALESCE(LAG(e.ts)OVER(ORDER BY e.ts),e.ts)) END,"
-        "  e.tgid,COALESCE(" BNAME("p.exe") ",'?'),COALESCE(o.flags,'?'),"
-        "  CASE WHEN o.fd IS NOT NULL THEN printf(' fd=%d',o.fd) ELSE '' END,"
-        "  CASE WHEN o.err IS NOT NULL THEN printf(' err=%d',o.err) ELSE '' END),"
-        " 0,CAST(e.tgid AS TEXT),'accesses'"
-        " FROM open_events o JOIN events e ON e.id=o.eid JOIN processes p ON p.tgid=e.tgid"
-        " WHERE o.path=?1 ORDER BY e.ts LIMIT 5000", -1, &st, 0);
-    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 2, tsm);
-    sqlite3_bind_double(st, 3, bts);
-    sqlite3_step(st); sqlite3_finalize(st);
-}
-
-static void rpane_output( const char *id) {
-    if (!strncmp(id, "io_", 3)) { rpane_proc(atoi(id + 3)); return; }
-    int eid = atoi(id);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(0,'heading','─── Output ───',-1,'','output')");
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 1,'cyan',printf('Stream: %%s  PID: %%d',i.stream,e.tgid),"
-        "0,CAST(e.tgid AS TEXT),'output' FROM io_events i JOIN events e ON e.id=i.eid WHERE e.id=%d", eid);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 2,'green',printf('Process: %%s',COALESCE(p.exe,'?')),"
-        "0,CAST(p.tgid AS TEXT),'output' FROM events e JOIN processes p ON p.tgid=e.tgid WHERE e.id=%d", eid);
-    xexecf( "INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) VALUES(5,'heading','─── Content ───',-1,'','content')");
-    xexecf( "WITH RECURSIVE sp(i,rest,line) AS("
-        " SELECT 0,SUBSTR(data,INSTR(data,char(10))+1),"
-        "  CASE WHEN INSTR(data,char(10))>0 THEN SUBSTR(data,1,INSTR(data,char(10))-1) ELSE data END"
-        "  FROM io_events WHERE eid=%d"
-        " UNION ALL SELECT i+1,"
-        "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,INSTR(rest,char(10))+1) ELSE '' END,"
-        "  CASE WHEN INSTR(rest,char(10))>0 THEN SUBSTR(rest,1,INSTR(rest,char(10))-1) ELSE rest END"
-        "  FROM sp WHERE LENGTH(rest)>0"
-        ")INSERT INTO rpane(rownum,style,text,link_mode,link_id,section) SELECT 10+i,'normal',line,-1,'','content' FROM sp", eid);
-}
-
-/* ── Main rebuild_rpane callback ───────────────────────────────────── */
-static void rebuild_rpane(void) {
-    sqlite3 *db = g_db;
-    xexec( "DELETE FROM rpane;");
-    int mode = qint( "SELECT mode FROM state", 0);
-    int cursor = g_tui ? tui_get_cursor(g_tui, "lpane") : qint( "SELECT cursor FROM state", 0);
-    if (cursor < 0) cursor = 0;
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(db, "SELECT id FROM lpane WHERE rownum=?", -1, &st, 0);
-    sqlite3_bind_int(st, 1, cursor);
-    char id[4096] = "";
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        const char *t = (const char *)sqlite3_column_text(st, 0);
-        if (t) snprintf(id, sizeof id, "%s", t);
-    }
-    sqlite3_finalize(st);
-    if (!id[0]) return;
-    switch (mode) {
-        case 0: rpane_proc(atoi(id)); break;
-        case 1: rpane_file(id); break;
-        case 2: rpane_output(id); break;
-        case 3: case 4: rpane_file(id); break;
-        case 5: case 6: rpane_proc(atoi(id)); break;
-    }
-
-    /* Section collapse */
-    xexec(
-        "UPDATE rpane SET visible=0"
-        " WHERE style!='heading'"
-        "  AND section IN("
-        "   SELECT section FROM rpane WHERE style='heading'"
-        "    AND COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)=0);"
-        "UPDATE rpane SET text=REPLACE(text,'───','▶──')"
-        " WHERE style='heading'"
-        "  AND COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)=0;"
-        "UPDATE rpane SET text=REPLACE(text,'▶──','───')"
-        " WHERE style='heading'"
-        "  AND COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)=1;");
-
-    xexec( "CREATE TEMP TABLE _rp AS SELECT ROW_NUMBER()OVER(ORDER BY rownum)-1 AS rn,"
-        "style,text,link_mode,link_id,section,visible FROM rpane WHERE visible=1;"
-        "DELETE FROM rpane;INSERT INTO rpane(rownum,style,text,link_mode,link_id,section,visible) SELECT*FROM _rp;DROP TABLE _rp;");
-
-    /* Highlight search matches */
-    { char sq[256] = "";
-      { sqlite3_stmt *st2;
-        sqlite3_prepare_v2(db, "SELECT search FROM state", -1, &st2, 0);
-        if (sqlite3_step(st2) == SQLITE_ROW) {
-            const char *t = (const char *)sqlite3_column_text(st2, 0);
-            if (t && t[0]) snprintf(sq, sizeof sq, "%s", t);
-        }
-        sqlite3_finalize(st2);
-      }
-      if (sq[0]) {
-          char lk[260]; snprintf(lk, sizeof lk, "%%%s%%", sq);
-          sqlite3_stmt *st2;
-          sqlite3_prepare_v2(db, "UPDATE rpane SET style='search' WHERE style='normal' AND text LIKE ?", -1, &st2, 0);
-          sqlite3_bind_text(st2, 1, lk, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st2); sqlite3_finalize(st2);
-      }
-    }
 }
 
 /* ── Search & navigation ───────────────────────────────────────────── */
@@ -1589,7 +1011,8 @@ static void jump_hit(int dir) {
     if (f >= 0) {
         if (g_tui) tui_set_cursor_idx(g_tui, "lpane", f);
         xexecf( "UPDATE state SET cursor=%d,dscroll=0,dcursor=0", f);
-        dirty_rp();
+        sync_cursor_id_from_pos();
+        tui_dirty(g_tui, "rpane");
     }
 }
 
@@ -1606,21 +1029,31 @@ static void follow_link(tui_t *tui) {
         if (ti && ti[0]) {
             char tid[4096]; snprintf(tid, sizeof tid, "%s", ti);
             sqlite3_finalize(st);
-            xexecf( "UPDATE state SET mode=%d,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0", tm);
+            xexecf( "UPDATE state SET mode=%d,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0", tm);
             if (tm == 0) {
                 int tg = atoi(tid);
                 xexecf(
                     "WITH RECURSIVE a(p) AS(SELECT ppid FROM processes WHERE tgid=%d"
                     " UNION ALL SELECT ppid FROM processes JOIN a ON tgid=a.p WHERE ppid IS NOT NULL"
                     ")UPDATE expanded SET ex=1 WHERE id IN(SELECT CAST(p AS TEXT) FROM a)", tg);
+            } else if (tm == 1) {
+                build_file_tree();
             }
-            rebuild_lpane();
+            /* Find rownum of target in (now-current-mode) lpane view */
             sqlite3_prepare_v2(db, "SELECT rownum FROM lpane WHERE id=?", -1, &st, 0);
             sqlite3_bind_text(st, 1, tid, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(st) == SQLITE_ROW)
-                xexecf( "UPDATE state SET cursor=%d", sqlite3_column_int(st, 0));
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                int r = sqlite3_column_int(st, 0);
+                xexecf( "UPDATE state SET cursor=%d,cursor_id=?", r);
+                sqlite3_stmt *s2;
+                sqlite3_prepare_v2(db, "UPDATE state SET cursor_id=?", -1, &s2, 0);
+                sqlite3_bind_text(s2, 1, tid, -1, SQLITE_TRANSIENT);
+                sqlite3_step(s2); sqlite3_finalize(s2);
+                if (tui) tui_set_cursor_idx(tui, "lpane", r);
+            }
             sqlite3_finalize(st);
-            dirty_rp();
+            sync_focus_from_state();
+            tui_dirty(tui, NULL);
             return;
         }
     }
@@ -1672,11 +1105,7 @@ static int handle_key(tui_t *tui, int k) {
     case TUI_K_PGDN:
     case TUI_K_HOME: case 'g':
     case TUI_K_END:
-        if (!focus) {
-            /* Engine will move lpane cursor; rebuild rpane after */
-            dirty_rp();
-        }
-        /* Return DEFAULT so engine applies navigation */
+        /* Engine will move cursor; post-nav TUI_K_NONE callback updates cursor_id + rpane */
         return TUI_DEFAULT;
 
     case TUI_K_TAB:
@@ -1700,7 +1129,8 @@ static int handle_key(tui_t *tui, int k) {
         tui_set_cursor_idx(tui, "lpane", 0);
         tui_set_cursor_idx(tui, "rpane", 0);
         xexec( "UPDATE state SET grouped=1-grouped,cursor=0,scroll=0,dscroll=0,dcursor=0");
-        dirty_both();
+        if (qint("SELECT mode FROM state", 0) == 1) build_file_tree();
+        tui_dirty(tui, NULL);
         return TUI_HANDLED;
     case TUI_K_RIGHT: case 'l':
         if (focus) {
@@ -1722,7 +1152,7 @@ static int handle_key(tui_t *tui, int k) {
                 if (sec[0]) {
                     int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)", sec);
                     xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)", sec, is_ex ? 0 : 1);
-                    dirty_rp();
+                    tui_dirty(tui, "rpane");
                 }
                 return TUI_HANDLED;
             }
@@ -1743,9 +1173,14 @@ static int handle_key(tui_t *tui, int k) {
               int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)", id);
               int has_ch = 0;
               if (mode == 0) has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM processes WHERE ppid=%d", atoi(id));
-              else if (mode == 1) has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'", id);
+              else if (mode == 1) has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM _ftree WHERE parent_id='%s'", id);
               else if (!strncmp(id, "io_", 3)) has_ch = 1;
-              if (has_ch && !is_ex) { xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)", id); dirty_both(); return TUI_HANDLED; }
+              if (has_ch && !is_ex) {
+                  xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',1)", id);
+                  if (mode == 1) build_file_tree();
+                  tui_dirty(tui, NULL);
+                  return TUI_HANDLED;
+              }
           }
         }
         return TUI_HANDLED;
@@ -1769,7 +1204,7 @@ static int handle_key(tui_t *tui, int k) {
                 if (sec[0]) {
                     int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='rp_%s'),1)", sec);
                     xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('rp_%s',%d)", sec, is_ex ? 0 : 1);
-                    dirty_rp();
+                    tui_dirty(tui, "rpane");
                 }
                 return TUI_HANDLED;
             }
@@ -1789,24 +1224,29 @@ static int handle_key(tui_t *tui, int k) {
               int tgid = atoi(id);
               int has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM processes WHERE ppid=%d", tgid);
               int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)", id);
-              if (has_ch && is_ex) { xexecf( "UPDATE expanded SET ex=0 WHERE id='%s'", id); dirty_both(); return TUI_HANDLED; }
+              if (has_ch && is_ex) { xexecf( "UPDATE expanded SET ex=0 WHERE id='%s'", id); tui_dirty(tui, NULL); return TUI_HANDLED; }
               int ppid = qintf( -1, "SELECT ppid FROM processes WHERE tgid=%d", tgid);
               if (ppid >= 0) {
                   int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%d'", ppid);
-                  if (r >= 0) { tui_set_cursor_idx(tui, "lpane", r); dirty_rp(); }
+                  if (r >= 0) tui_set_cursor_idx(tui, "lpane", r);
               }
           } else if (mode == 1 && id[0]) {
               int is_ex = qintf( 1, "SELECT COALESCE((SELECT ex FROM expanded WHERE id='%s'),1)", id);
-              int has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM lpane WHERE parent_id='%s'", id);
-              if (has_ch && is_ex) { xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id); dirty_both(); return TUI_HANDLED; }
+              int has_ch = qintf( 0, "SELECT COUNT(*)>0 FROM _ftree WHERE parent_id='%s'", id);
+              if (has_ch && is_ex) {
+                  xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id);
+                  build_file_tree();
+                  tui_dirty(tui, NULL);
+                  return TUI_HANDLED;
+              }
               { sqlite3_stmt *s2;
-                sqlite3_prepare_v2(g_db, "SELECT parent_id FROM lpane WHERE id=? LIMIT 1", -1, &s2, 0);
+                sqlite3_prepare_v2(g_db, "SELECT parent_id FROM _ftree WHERE id=? LIMIT 1", -1, &s2, 0);
                 sqlite3_bind_text(s2, 1, id, -1, SQLITE_TRANSIENT);
                 if (sqlite3_step(s2) == SQLITE_ROW) {
                     const char *pi = (const char *)sqlite3_column_text(s2, 0);
                     if (pi && pi[0]) {
                         int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%s'", pi);
-                        if (r >= 0) { tui_set_cursor_idx(tui, "lpane", r); dirty_rp(); }
+                        if (r >= 0) tui_set_cursor_idx(tui, "lpane", r);
                     }
                 }
                 sqlite3_finalize(s2);
@@ -1814,7 +1254,7 @@ static int handle_key(tui_t *tui, int k) {
           } else if (mode == 2 && id[0]) {
               if (!strncmp(id, "io_", 3)) {
                   xexecf( "UPDATE expanded SET ex=0 WHERE id='%s'", id);
-                  dirty_both();
+                  tui_dirty(tui, NULL);
               } else {
                   char pid[256] = "";
                   sqlite3_stmt *s2;
@@ -1827,7 +1267,7 @@ static int handle_key(tui_t *tui, int k) {
                   sqlite3_finalize(s2);
                   if (pid[0]) {
                       int r = qintf( -1, "SELECT rownum FROM lpane WHERE id='%s'", pid);
-                      if (r >= 0) { tui_set_cursor_idx(tui, "lpane", r); dirty_rp(); }
+                      if (r >= 0) tui_set_cursor_idx(tui, "lpane", r);
                   }
               }
           }
@@ -1848,27 +1288,27 @@ static int handle_key(tui_t *tui, int k) {
             int tg = atoi(id);
             xexecf( "WITH RECURSIVE d(t) AS(SELECT %d UNION ALL SELECT c.tgid FROM processes c JOIN d ON c.ppid=d.t)"
                 " UPDATE expanded SET ex=%d WHERE id IN(SELECT CAST(t AS TEXT) FROM d)", tg, k == 'e' ? 1 : 0);
-            dirty_both();
+            tui_dirty(tui, NULL);
         }
         return TUI_HANDLED;
-    case '1': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=0,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); dirty_both(); return TUI_HANDLED;
-    case '2': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=1,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); dirty_both(); return TUI_HANDLED;
-    case '3': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=2,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); dirty_both(); return TUI_HANDLED;
+    case '1': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=0,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); tui_dirty(tui, NULL); return TUI_HANDLED;
+    case '2': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=1,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); build_file_tree(); tui_dirty(tui, NULL); return TUI_HANDLED;
+    case '3': tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); xexec( "UPDATE state SET mode=2,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0,sort_key=0"); sync_focus_from_state(); tui_dirty(tui, NULL); return TUI_HANDLED;
     case '4': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=3,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=3,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
     case '5': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=4,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=4,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
     case '6': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=5,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=5,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
     case '7': { sync_cursor_to_state();
-                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=6,cursor=0,scroll=0,dscroll=0,dcursor=0,focus=0");
-                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); dirty_both(); } return TUI_HANDLED;
-    case 'd': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET dep_filter=1-dep_filter,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
-    case 's': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
-    case 't': xexec( "UPDATE state SET ts_mode=(ts_mode+1)%3"); dirty_rp(); return TUI_HANDLED;
+                xexec( "UPDATE state SET dep_root=COALESCE((SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),''),mode=6,cursor=0,cursor_id='',scroll=0,dscroll=0,dcursor=0,focus=0");
+                tui_set_cursor_idx(tui, "lpane", 0); tui_set_cursor_idx(tui, "rpane", 0); sync_focus_from_state(); tui_dirty(tui, NULL); } return TUI_HANDLED;
+    case 'd': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET dep_filter=1-dep_filter,cursor=0,scroll=0"); tui_dirty(tui, NULL); return TUI_HANDLED;
+    case 's': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET sort_key=(sort_key+1)%3,cursor=0,scroll=0"); tui_dirty(tui, NULL); return TUI_HANDLED;
+    case 't': xexec( "UPDATE state SET ts_mode=(ts_mode+1)%3"); tui_dirty(tui, "rpane"); return TUI_HANDLED;
 
     /* ── interactive terminal actions ─────────────────────────────── */
     case '/': {
@@ -1879,8 +1319,7 @@ static int handle_key(tui_t *tui, int k) {
             sqlite3_bind_text(st, 1, buf, -1, SQLITE_TRANSIENT);
             sqlite3_step(st); sqlite3_finalize(st);
             do_search(buf);
-            dirty_both();
-            sync_panes();
+            tui_dirty(tui, NULL);
             jump_hit(1);
         }
     } return TUI_HANDLED;
@@ -1894,12 +1333,12 @@ static int handle_key(tui_t *tui, int k) {
             sqlite3_prepare_v2(g_db, "UPDATE state SET evfilt=?", -1, &st, 0);
             sqlite3_bind_text(st, 1, buf, -1, SQLITE_TRANSIENT);
             sqlite3_step(st); sqlite3_finalize(st);
-            dirty_rp();
+            tui_dirty(tui, "rpane");
         }
     } return TUI_HANDLED;
-    case 'F': xexec( "UPDATE state SET evfilt=''"); dirty_rp(); return TUI_HANDLED;
-    case 'v': tui_set_cursor_idx(tui, "lpane", 0); xexecf( "UPDATE state SET lp_filter=(lp_filter+1)%%3,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
-    case 'V': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET lp_filter=0,cursor=0,scroll=0"); dirty_both(); return TUI_HANDLED;
+    case 'F': xexec( "UPDATE state SET evfilt=''"); tui_dirty(tui, "rpane"); return TUI_HANDLED;
+    case 'v': tui_set_cursor_idx(tui, "lpane", 0); xexecf( "UPDATE state SET lp_filter=(lp_filter+1)%%3,cursor=0,scroll=0"); tui_dirty(tui, NULL); return TUI_HANDLED;
+    case 'V': tui_set_cursor_idx(tui, "lpane", 0); xexec( "UPDATE state SET lp_filter=0,cursor=0,scroll=0"); tui_dirty(tui, NULL); return TUI_HANDLED;
     case 'W': save_db(tui); return TUI_HANDLED;
     case 'x': tui_sql_prompt(tui); return TUI_HANDLED;
     case '?': tui_show_help(tui, HELP); return TUI_HANDLED;
@@ -1910,7 +1349,21 @@ static int handle_key(tui_t *tui, int k) {
 /* ── on_key callback for engine event loop ─────────────────────────── */
 static int on_key_cb(tui_t *tui, int key, const char *panel,
                      int cursor, const char *row_id, void *ctx) {
-    (void)panel; (void)cursor; (void)row_id; (void)ctx;
+    (void)ctx;
+    /* TUI_K_NONE: post-navigation notification — engine has moved cursor */
+    if (key == TUI_K_NONE) {
+        if (panel && strcmp(panel, "lpane") == 0 && row_id && row_id[0]) {
+            sqlite3_stmt *st;
+            sqlite3_prepare_v2(g_db,
+                "UPDATE state SET cursor=?, cursor_id=?", -1, &st, 0);
+            sqlite3_bind_int(st, 1, cursor);
+            sqlite3_bind_text(st, 2, row_id, -1, SQLITE_TRANSIENT);
+            sqlite3_step(st); sqlite3_finalize(st);
+            tui_dirty(tui, "rpane");
+        }
+        update_status();
+        return TUI_HANDLED;
+    }
     if (key == 'q' || key == 'Q') return TUI_QUIT;
     int result = handle_key(tui, key);
     /* After any key, sync engine cursor back to state table and update status */
@@ -1947,7 +1400,6 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
         tui_unwatch_fd(tui, fd);
         if (t_trace_pipe) { pclose(t_trace_pipe); t_trace_pipe = NULL; t_trace_fd = -1; }
         else { close(fd); t_trace_fd = -1; }
-        rebuild_lpane(); rebuild_rpane();
         tui_dirty(tui, NULL);
     } else {
         t_rbuf_len += n;
@@ -1974,7 +1426,6 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
         if (did) {
             process_inbox(tui, 1);
             xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
-            rebuild_lpane(); rebuild_rpane();
             tui_dirty(tui, NULL);
             /* Reap child */
             if (t_child_pid > 0) {
@@ -2087,9 +1538,9 @@ int main(int argc, char **argv) {
         xexec("UPDATE state SET lp_filter=2");
     }
 
-    /* Initial rebuild + process inbox */
-    rebuild_lpane();
-    rebuild_rpane();
+    /* Initial setup: populate _ftree if starting in file mode, then sync cursor_id */
+    if (qint("SELECT mode FROM state", 0) == 1) build_file_tree();
+    sync_cursor_id_from_pos();
 
     if (save_file[0]) save_to_file(save_file);
     process_inbox(NULL, 0);

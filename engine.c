@@ -596,7 +596,18 @@ void tui_run(tui_t *tui) {
                 int res = TUI_DEFAULT;
                 if (tui->key_cb) res = tui->key_cb(tui, k, fp, fc, fid, tui->key_ctx);
                 if (res == TUI_QUIT) break;
-                if (res == TUI_DEFAULT) default_nav(tui, k);
+                if (res == TUI_DEFAULT) {
+                    default_nav(tui, k);
+                    /* Notify app of updated cursor position (TUI_K_NONE = post-nav). */
+                    if (tui->key_cb) {
+                        const char *fp2 = "", *fid2 = ""; int fc2 = 0;
+                        if (tui->focus >= 0 && tui->focus < tui->npanels) {
+                            panel_st *f2 = &tui->panels[tui->focus];
+                            fp2 = f2->def.name; fc2 = f2->cursor; fid2 = f2->cursor_id;
+                        }
+                        tui->key_cb(tui, TUI_K_NONE, fp2, fc2, fid2, tui->key_ctx);
+                    }
+                }
             }
         }
     }
