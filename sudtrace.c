@@ -1124,6 +1124,40 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         _exit(127);
     }
 
+    /* For PIE/ET_DYN binaries (e.g. ld.so), p_vaddr starts at 0.
+     * We need to pick a base address because mmap(0, ..., MAP_FIXED) fails
+     * due to vm.mmap_min_addr.  For ET_EXEC, base stays 0 (use as-is). */
+    unsigned long load_base = 0;
+    if (ehdr.e_type == ET_DYN) {
+        /* Find total memory span of all PT_LOAD segments */
+        unsigned long lo = ~0UL, hi = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            Elf64_Phdr phdr;
+            if (pread(fd, &phdr, sizeof(phdr),
+                      ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+                continue;
+            if (phdr.p_type != PT_LOAD) continue;
+            unsigned long seg_lo = phdr.p_vaddr & ~0xfffUL;
+            unsigned long seg_hi = (phdr.p_vaddr + phdr.p_memsz + 0xfff)
+                                    & ~0xfffUL;
+            if (seg_lo < lo) lo = seg_lo;
+            if (seg_hi > hi) hi = seg_hi;
+        }
+        if (hi > lo) {
+            /* Ask kernel for a suitable address range */
+            void *hint = mmap(NULL, hi - lo, PROT_NONE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (hint == MAP_FAILED) {
+                fprintf(stderr, "sudtrace: cannot reserve %lu bytes for PIE\n",
+                        hi - lo);
+                close(fd);
+                _exit(127);
+            }
+            load_base = (unsigned long)hint - lo;
+            munmap(hint, hi - lo);
+        }
+    }
+
     /* Load PT_LOAD segments */
     for (int i = 0; i < ehdr.e_phnum; i++) {
         Elf64_Phdr phdr;
@@ -1133,8 +1167,9 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
 
         if (phdr.p_type != PT_LOAD) continue;
 
-        unsigned long page_offset = phdr.p_vaddr & 0xfff;
-        unsigned long map_addr = phdr.p_vaddr - page_offset;
+        unsigned long vaddr = load_base + phdr.p_vaddr;
+        unsigned long page_offset = vaddr & 0xfff;
+        unsigned long map_addr = vaddr - page_offset;
         unsigned long map_size = phdr.p_memsz + page_offset;
         map_size = (map_size + 0xfff) & ~0xfffUL;
 
@@ -1165,8 +1200,6 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
 
         mprotect(mapped, map_size, prot);
     }
-
-    close(fd);
 
     /* Install SIGSYS handler */
     struct sigaction sa;
@@ -1235,22 +1268,68 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         sp[idx++] = (unsigned long)environ[i];
     sp[idx++] = 0;
 
-    /* Copy auxv, patching relevant entries */
+    /* Copy auxv, patching relevant entries for the loaded ELF.
+     * ld.so needs AT_PHDR pointing at its own program headers in memory,
+     * and AT_BASE = 0 (it IS the interpreter, there is no separate one). */
     {
-        int aux_fd = open("/proc/self/auxv", O_RDONLY);
-        if (aux_fd >= 0) {
+        /* Find where phdr table sits in memory */
+        unsigned long phdr_addr = 0;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            Elf64_Phdr phdr;
+            if (pread(fd, &phdr, sizeof(phdr),
+                      ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+                continue;
+            if (phdr.p_type == PT_PHDR) {
+                phdr_addr = load_base + phdr.p_vaddr;
+                break;
+            }
+        }
+        /* Fallback: assume phdr table is at file offset e_phoff within
+         * the first PT_LOAD segment */
+        if (!phdr_addr) {
+            for (int i = 0; i < ehdr.e_phnum; i++) {
+                Elf64_Phdr phdr;
+                if (pread(fd, &phdr, sizeof(phdr),
+                          ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+                    continue;
+                if (phdr.p_type == PT_LOAD &&
+                    ehdr.e_phoff >= phdr.p_offset &&
+                    ehdr.e_phoff < phdr.p_offset + phdr.p_filesz) {
+                    phdr_addr = load_base + phdr.p_vaddr +
+                                (ehdr.e_phoff - phdr.p_offset);
+                    break;
+                }
+            }
+        }
+        /* Last resort: compute from vaddr of first LOAD + e_phoff */
+        if (!phdr_addr)
+            phdr_addr = load_base + ehdr.e_phoff;
+
+        int aux_fd2 = open("/proc/self/auxv", O_RDONLY);
+        if (aux_fd2 >= 0) {
             Elf64_auxv_t avbuf[64];
-            ssize_t n = read(aux_fd, avbuf, sizeof(avbuf));
-            close(aux_fd);
+            ssize_t n = read(aux_fd2, avbuf, sizeof(avbuf));
+            close(aux_fd2);
             if (n > 0) {
                 int auxc = n / sizeof(Elf64_auxv_t);
                 for (int i = 0; i < auxc; i++) {
-                    if (avbuf[i].a_type == AT_ENTRY)
-                        avbuf[i].a_un.a_val = ehdr.e_entry;
-                    if (avbuf[i].a_type == AT_PHNUM)
+                    switch (avbuf[i].a_type) {
+                    case AT_ENTRY:
+                        avbuf[i].a_un.a_val = load_base + ehdr.e_entry;
+                        break;
+                    case AT_PHDR:
+                        avbuf[i].a_un.a_val = phdr_addr;
+                        break;
+                    case AT_PHNUM:
                         avbuf[i].a_un.a_val = ehdr.e_phnum;
-                    if (avbuf[i].a_type == AT_PHENT)
+                        break;
+                    case AT_PHENT:
                         avbuf[i].a_un.a_val = ehdr.e_phentsize;
+                        break;
+                    case AT_BASE:
+                        avbuf[i].a_un.a_val = 0;
+                        break;
+                    }
 
                     sp[idx++] = avbuf[i].a_type;
                     sp[idx++] = avbuf[i].a_un.a_val;
@@ -1264,8 +1343,8 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     /* Enable interception */
     sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 
-    /* Jump to the entry point */
-    unsigned long entry = ehdr.e_entry;
+    /* Jump to the entry point (adjusted for PIE load base) */
+    unsigned long entry = load_base + ehdr.e_entry;
 
     __asm__ volatile(
         "mov %0, %%rsp\n\t"
