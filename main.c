@@ -511,7 +511,7 @@ static void sql_build_ftree(sqlite3_context *ctx, int n, sqlite3_value **v) {
         sqlite3_result_int(ctx, 1); return;
     }
 
-    /* Tree mode */
+    /* Tree mode — simple directory tree, no path compression */
     ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _fs(path TEXT NOT NULL, canon TEXT NOT NULL,"
        " opens INT, procs INT, errs INT);"
        "DELETE FROM _fs;"
@@ -522,7 +522,7 @@ static void sql_build_ftree(sqlite3_context *ctx, int n, sqlite3_value **v) {
 
     ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _dn(id INTEGER PRIMARY KEY,"
        " path TEXT NOT NULL, parent_path TEXT, name TEXT,"
-       " opens INT DEFAULT 0, procs INT DEFAULT 0, errs INT DEFAULT 0, dead INT DEFAULT 0);"
+       " opens INT DEFAULT 0, procs INT DEFAULT 0, errs INT DEFAULT 0);"
        "DELETE FROM _dn;"
        "WITH RECURSIVE dirs(d) AS("
        "  SELECT DISTINCT dir_part(canon) FROM _fs WHERE INSTR(canon,'/')>0"
@@ -539,45 +539,7 @@ static void sql_build_ftree(sqlite3_context *ctx, int n, sqlite3_value **v) {
        " procs=(SELECT COALESCE(SUM(f.procs),0) FROM _fs f WHERE f.canon LIKE _dn.path||'/%'),"
        " errs =(SELECT COALESCE(SUM(f.errs),0)  FROM _fs f WHERE f.canon LIKE _dn.path||'/%')");
 
-    /* Chain compression (iterative) */
-    for (int pass = 0; pass < 20; pass++) {
-        int merged = ftree_qi(db,
-            "SELECT COUNT(*) FROM _dn p"
-            " WHERE p.dead=0 AND p.parent_path IS NOT NULL"
-            " AND (SELECT COUNT(*) FROM _dn c WHERE c.parent_path=p.path AND c.dead=0)=1"
-            " AND (SELECT COUNT(*) FROM _fs f WHERE dir_part(f.canon)=p.path)=0"
-            " AND NOT EXISTS(SELECT 1 FROM _dn ch WHERE ch.parent_path=p.path AND ch.dead=0"
-            "  AND (SELECT COUNT(*) FROM _dn gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
-            "  AND (SELECT COUNT(*) FROM _fs f2 WHERE dir_part(f2.canon)=ch.path)=0)");
-        if (!merged) break;
-        ftree_xr(db,"UPDATE _dn SET"
-           " name=name||'/'||(SELECT c.name FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0),"
-           " opens=(SELECT c.opens FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0),"
-           " procs=(SELECT c.procs FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0),"
-           " errs=(SELECT c.errs FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0)"
-           " WHERE dead=0 AND parent_path IS NOT NULL"
-           " AND (SELECT COUNT(*) FROM _dn c WHERE c.parent_path=_dn.path AND c.dead=0)=1"
-           " AND (SELECT COUNT(*) FROM _fs f WHERE dir_part(f.canon)=_dn.path)=0"
-           " AND NOT EXISTS(SELECT 1 FROM _dn ch WHERE ch.parent_path=_dn.path AND ch.dead=0"
-           "  AND (SELECT COUNT(*) FROM _dn gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
-           "  AND (SELECT COUNT(*) FROM _fs f2 WHERE dir_part(f2.canon)=ch.path)=0)");
-        ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _mg(pid INT, child_path TEXT);"
-           "DELETE FROM _mg;"
-           "INSERT INTO _mg SELECT p.id,"
-           " (SELECT c.path FROM _dn c WHERE c.parent_path=p.path AND c.dead=0 LIMIT 1)"
-           " FROM _dn p WHERE p.dead=0 AND p.parent_path IS NOT NULL"
-           " AND (SELECT COUNT(*) FROM _dn c WHERE c.parent_path=p.path AND c.dead=0)=1"
-           " AND (SELECT COUNT(*) FROM _fs f WHERE dir_part(f.canon)=p.path)=0"
-           " AND NOT EXISTS(SELECT 1 FROM _dn ch WHERE ch.parent_path=p.path AND ch.dead=0"
-           "  AND (SELECT COUNT(*) FROM _dn gc WHERE gc.parent_path=ch.path AND gc.dead=0)=1"
-           "  AND (SELECT COUNT(*) FROM _fs f2 WHERE dir_part(f2.canon)=ch.path)=0)");
-        ftree_xr(db,"UPDATE _dn SET dead=1 WHERE path IN(SELECT child_path FROM _mg) AND dead=0");
-        ftree_xr(db,"UPDATE _dn SET path=(SELECT m.child_path FROM _mg m WHERE m.pid=_dn.id)"
-           " WHERE id IN(SELECT pid FROM _mg)");
-        ftree_xr(db,"DROP TABLE IF EXISTS _mg");
-    }
-
-    ftree_xr(db,"INSERT OR IGNORE INTO expanded(id,ex) SELECT path,1 FROM _dn WHERE dead=0");
+    ftree_xr(db,"INSERT OR IGNORE INTO expanded(id,ex) SELECT path,1 FROM _dn");
 
     /* Build ordered tree */
     ftree_xr(db,"CREATE TEMP TABLE IF NOT EXISTS _ft(id INTEGER PRIMARY KEY,"
@@ -586,13 +548,13 @@ static void sql_build_ftree(sqlite3_context *ctx, int n, sqlite3_value **v) {
        "DELETE FROM _ft");
     ftree_xr(db,"INSERT INTO _ft(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
        " SELECT printf('0/%s',name),path,parent_path,name,opens,procs,errs,1,0"
-       " FROM _dn WHERE dead=0"
-       "  AND (parent_path IS NULL OR parent_path NOT IN(SELECT path FROM _dn WHERE dead=0))");
+       " FROM _dn"
+       "  WHERE parent_path IS NULL OR parent_path NOT IN(SELECT path FROM _dn)");
     ftree_xr(db,"INSERT INTO _ft(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
        " SELECT printf('1/%s',REPLACE(canon,RTRIM(canon,REPLACE(canon,'/','')),'')),"
        "  path,NULL,REPLACE(canon,RTRIM(canon,REPLACE(canon,'/','')),''),opens,procs,errs,0,0"
        " FROM _fs WHERE INSTR(canon,'/')=0"
-       "  OR dir_part(canon) NOT IN(SELECT path FROM _dn WHERE dead=0)");
+       "  OR dir_part(canon) NOT IN(SELECT path FROM _dn)");
 
     /* Expand tree depth by depth */
     for (int depth = 0; depth < 50; depth++) {
@@ -600,14 +562,14 @@ static void sql_build_ftree(sqlite3_context *ctx, int n, sqlite3_value **v) {
         snprintf(sql, sizeof sql,
             "SELECT COUNT(*) FROM _ft t WHERE t.depth=%d AND t.is_dir=1"
             " AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1"
-            " AND (EXISTS(SELECT 1 FROM _dn d WHERE d.parent_path=t.path AND d.dead=0)"
+            " AND (EXISTS(SELECT 1 FROM _dn d WHERE d.parent_path=t.path)"
             "  OR EXISTS(SELECT 1 FROM _fs f WHERE dir_part(f.canon)=t.path))", depth);
         if (!ftree_qi(db,sql)) break;
         snprintf(sql, sizeof sql,
             "INSERT INTO _ft(sort_key,path,parent_path,name,opens,procs,errs,is_dir,depth)"
             " SELECT t.sort_key||'/0/'||d.name,d.path,d.parent_path,d.name,"
             " d.opens,d.procs,d.errs,1,%d FROM _ft t JOIN _dn d ON d.parent_path=t.path"
-            " WHERE t.depth=%d AND t.is_dir=1 AND d.dead=0"
+            " WHERE t.depth=%d AND t.is_dir=1"
             "  AND COALESCE((SELECT ex FROM expanded WHERE id=t.path),1)=1", depth+1, depth);
         ftree_xr(db,sql);
         snprintf(sql, sizeof sql,
