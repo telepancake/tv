@@ -419,40 +419,30 @@ static void dispatch_input(tui_t *tui, const char *data) {
         int k = parse_key_name(arg1);
         if (k != TUI_K_NONE) {
             int res = handle_key(tui, k);
-            /* In headless mode, apply default navigation via state table */
+            /* In headless mode (no engine), apply default cursor navigation via state table.
+             * Mirrors the engine's built-in up/down/pgup/pgdn/home/end handling. */
             if (res == TUI_DEFAULT && !tui) {
-                int focus = qint("SELECT focus FROM state", 0);
-                int nf = qint("SELECT COUNT(*) FROM lpane", 0);
-                int nrp = qint("SELECT COUNT(*) FROM rpane", 0);
-                int rows = qint("SELECT rows FROM state", 24);
-                int pg = rows - 3;
-                switch (k) {
-                case TUI_K_UP: case 'k':
-                    if (!focus) xexec("UPDATE state SET cursor=MAX(cursor-1,0),dscroll=0,dcursor=0");
-                    else xexec("UPDATE state SET dcursor=MAX(dcursor-1,0)");
-                    break;
-                case TUI_K_DOWN: case 'j':
-                    if (!focus) xexecf("UPDATE state SET cursor=MIN(cursor+1,%d),dscroll=0,dcursor=0", nf-1);
-                    else xexecf("UPDATE state SET dcursor=MIN(dcursor+1,%d)", nrp-1);
-                    break;
-                case TUI_K_PGUP:
-                    if (!focus) xexecf("UPDATE state SET cursor=MAX(cursor-%d,0),dscroll=0,dcursor=0", pg);
-                    else xexecf("UPDATE state SET dcursor=MAX(dcursor-%d,0)", pg);
-                    break;
-                case TUI_K_PGDN:
-                    if (!focus) xexecf("UPDATE state SET cursor=MIN(cursor+%d,%d),dscroll=0,dcursor=0", pg, nf-1);
-                    else xexecf("UPDATE state SET dcursor=MIN(dcursor+%d,%d)", pg, nrp-1);
-                    break;
-                case TUI_K_HOME: case 'g':
-                    if (!focus) xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0");
-                    else xexec("UPDATE state SET dcursor=0");
-                    break;
-                case TUI_K_END:
-                    if (!focus) xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0", nf>0?nf-1:0);
-                    else xexecf("UPDATE state SET dcursor=%d", nrp>0?nrp-1:0);
-                    break;
+                int f = qint("SELECT focus FROM state", 0);
+                int nl = qint("SELECT COUNT(*) FROM lpane", 0);
+                int nr = qint("SELECT COUNT(*) FROM rpane", 0);
+                int pg = qint("SELECT rows FROM state", 24) - 3;
+                int n = f ? nr : nl;
+                int last = n > 0 ? n - 1 : 0;
+                if (k == TUI_K_HOME || k == 'g') {
+                    if (f) xexec("UPDATE state SET dcursor=0");
+                    else   xexec("UPDATE state SET cursor=0,dscroll=0,dcursor=0");
+                } else if (k == TUI_K_END) {
+                    if (f) xexecf("UPDATE state SET dcursor=%d", last);
+                    else   xexecf("UPDATE state SET cursor=%d,dscroll=0,dcursor=0", last);
+                } else {
+                    int delta = (k==TUI_K_UP||k=='k') ? -1 : (k==TUI_K_DOWN||k=='j') ? 1
+                              : (k==TUI_K_PGUP) ? -pg : (k==TUI_K_PGDN) ? pg : 0;
+                    if (delta && f)
+                        xexecf("UPDATE state SET dcursor=MAX(0,MIN(dcursor+(%d),%d))", delta, last);
+                    else if (delta)
+                        xexecf("UPDATE state SET cursor=MAX(0,MIN(cursor+(%d),%d)),dscroll=0,dcursor=0", delta, last);
                 }
-                if (!focus) sync_cursor_id_from_pos();
+                if (!f) sync_cursor_id_from_pos();
             }
         }
     } else if (strcmp(inp, "print") == 0) {
