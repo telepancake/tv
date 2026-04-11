@@ -1340,6 +1340,8 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         }
     }
 
+    close(fd);
+
     /* Enable interception */
     sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 
