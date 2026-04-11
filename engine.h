@@ -273,7 +273,11 @@ typedef int (*tui_timer_cb)(tui_t *tui, void *ctx);
 
 /* Lifecycle */
 tui_t *tui_open(sqlite3 *db);
+tui_t *tui_open_headless(sqlite3 *db);   /* no terminal; for testing */
 void   tui_close(tui_t *tui);
+
+/* Layout from DB */
+void tui_load_layout(tui_t *tui);  /* read _layout table */
 
 /* Panels / layout */
 void        tui_dirty(tui_t *tui, const char *panel);  /* NULL = all */
@@ -298,6 +302,12 @@ void tui_quit(tui_t *tui);
 
 /* Status bar */
 void tui_set_status(tui_t *tui, const char *text);
+
+/* Headless input dispatch */
+void tui_input_key(tui_t *tui, int key);  /* simulate keypress */
+
+/* Dump panel/state for tests */
+void tui_dump(tui_t *tui, const char *what, FILE *out);  /* "lpane","rpane","state" */
 
 /* Interactive utilities */
 int  tui_line_edit(tui_t *tui, const char *prompt, char *buf, int bsz);
