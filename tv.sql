@@ -27,6 +27,113 @@ CREATE TABLE cwd_cache(tgid INTEGER PRIMARY KEY, cwd TEXT);
 CREATE TABLE inbox(
     id INTEGER PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL);
 
+CREATE TABLE IF NOT EXISTS _config(key TEXT PRIMARY KEY, val TEXT);
+CREATE TABLE IF NOT EXISTS expanded(id TEXT PRIMARY KEY, ex INT DEFAULT 1);
+
+-- ── Trace ingestion trigger ───────────────────────────────────────────
+-- Processes inbox rows with kind='trace', inserting into normalized tables.
+-- Uses custom SQL functions: canon_path(), resolve_path(), is_sys_path().
+CREATE TRIGGER _ingest_trace AFTER INSERT ON inbox WHEN NEW.kind='trace'
+BEGIN
+    -- Ensure process stub exists (skip own tgid, skip if no event)
+    INSERT OR IGNORE INTO processes(tgid,pid,ppid,nspid,nstgid,first_ts,last_ts)
+        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.pid'),
+               json_extract(NEW.data,'$.ppid'),json_extract(NEW.data,'$.nspid'),
+               json_extract(NEW.data,'$.nstgid'),json_extract(NEW.data,'$.ts'),
+               json_extract(NEW.data,'$.ts')
+        WHERE json_extract(NEW.data,'$.event') IS NOT NULL
+          AND json_extract(NEW.data,'$.tgid') IS NOT NULL
+          AND CAST(json_extract(NEW.data,'$.tgid') AS TEXT)
+              != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'');
+    INSERT OR IGNORE INTO expanded(id,ex)
+        SELECT CAST(json_extract(NEW.data,'$.tgid') AS TEXT), 1
+        WHERE json_extract(NEW.data,'$.event') IS NOT NULL
+          AND json_extract(NEW.data,'$.tgid') IS NOT NULL
+          AND CAST(json_extract(NEW.data,'$.tgid') AS TEXT)
+              != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'');
+
+    -- CWD
+    INSERT OR REPLACE INTO cwd_cache(tgid,cwd)
+        SELECT CAST(json_extract(NEW.data,'$.tgid') AS INT),
+               json_extract(NEW.data,'$.path')
+        WHERE json_extract(NEW.data,'$.event')='CWD';
+    UPDATE processes SET cwd=json_extract(NEW.data,'$.path')
+        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
+          AND json_extract(NEW.data,'$.event')='CWD';
+
+    -- EXEC
+    UPDATE processes SET
+        exe=json_extract(NEW.data,'$.exe'),
+        argv=CASE WHEN json_type(NEW.data,'$.argv')='array' THEN
+            (SELECT GROUP_CONCAT(value,char(10)) FROM json_each(json_extract(NEW.data,'$.argv')))
+            ELSE NULL END,
+        env=CASE WHEN json_type(NEW.data,'$.env')='object' THEN
+            (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(NEW.data,'$.env')))
+            ELSE NULL END,
+        auxv=CASE WHEN json_type(NEW.data,'$.auxv')='object' THEN
+            (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(NEW.data,'$.auxv')))
+            ELSE NULL END,
+        first_ts=MIN(first_ts,json_extract(NEW.data,'$.ts')),
+        last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts'))
+        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
+          AND json_extract(NEW.data,'$.event')='EXEC';
+    INSERT INTO events(tgid,ts,event)
+        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),'EXEC'
+        WHERE json_extract(NEW.data,'$.event')='EXEC';
+
+    -- OPEN: resolve path, filter system paths for O_RDONLY
+    INSERT INTO events(tgid,ts,event)
+        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),'OPEN'
+        WHERE json_extract(NEW.data,'$.event')='OPEN'
+          AND NOT is_sys_path(
+              resolve_path(json_extract(NEW.data,'$.path'),
+                  (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT))),
+              COALESCE(json_extract(NEW.data,'$.flags[0]'),'O_RDONLY'));
+    INSERT INTO open_events(eid,path,flags,fd,err)
+        SELECT last_insert_rowid(),
+            resolve_path(json_extract(NEW.data,'$.path'),
+                (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT))),
+            CASE WHEN json_type(NEW.data,'$.flags')='array' THEN
+                (SELECT GROUP_CONCAT(value,'|') FROM json_each(json_extract(NEW.data,'$.flags')))
+                ELSE NULL END,
+            json_extract(NEW.data,'$.fd'), json_extract(NEW.data,'$.err')
+        WHERE json_extract(NEW.data,'$.event')='OPEN' AND changes()>0;
+    UPDATE processes SET
+        last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts')),
+        first_ts=MIN(first_ts,json_extract(NEW.data,'$.ts'))
+        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
+          AND json_extract(NEW.data,'$.event')='OPEN';
+
+    -- EXIT
+    INSERT INTO events(tgid,ts,event)
+        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),'EXIT'
+        WHERE json_extract(NEW.data,'$.event')='EXIT';
+    INSERT INTO exit_events(eid,status,code,signal,core_dumped,raw)
+        SELECT last_insert_rowid(),json_extract(NEW.data,'$.status'),
+               json_extract(NEW.data,'$.code'),json_extract(NEW.data,'$.signal'),
+               json_extract(NEW.data,'$.core_dumped'),json_extract(NEW.data,'$.raw')
+        WHERE json_extract(NEW.data,'$.event')='EXIT';
+    UPDATE processes SET last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts'))
+        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
+          AND json_extract(NEW.data,'$.event')='EXIT';
+
+    -- STDOUT / STDERR
+    INSERT INTO events(tgid,ts,event)
+        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),
+               json_extract(NEW.data,'$.event')
+        WHERE json_extract(NEW.data,'$.event') IN ('STDOUT','STDERR');
+    INSERT INTO io_events(eid,stream,len,data)
+        SELECT last_insert_rowid(),json_extract(NEW.data,'$.event'),
+               json_extract(NEW.data,'$.len'),json_extract(NEW.data,'$.data')
+        WHERE json_extract(NEW.data,'$.event') IN ('STDOUT','STDERR');
+    UPDATE processes SET last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts'))
+        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
+          AND json_extract(NEW.data,'$.event') IN ('STDOUT','STDERR');
+
+    -- Delete processed row
+    DELETE FROM inbox WHERE id=NEW.id;
+END;
+
 --%% SETUP
 CREATE INDEX IF NOT EXISTS ix_ev_tg ON events(tgid);
 CREATE INDEX IF NOT EXISTS ix_ev_ts ON events(ts);

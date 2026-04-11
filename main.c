@@ -130,11 +130,49 @@ static void sql_depth(sqlite3_context *ctx, int n, sqlite3_value **v) {
     sqlite3_result_int(ctx, d);
 }
 
+/* resolve_path(raw_path, cwd) → canonical absolute path.
+ * Handles pseudo-paths (no leading / or ., contains :), relative paths, and absolute paths. */
+static void sql_resolve_path(sqlite3_context *ctx, int n, sqlite3_value **v) {
+    (void)n;
+    const char *raw = (const char *)sqlite3_value_text(v[0]);
+    const char *cwd = (const char *)sqlite3_value_text(v[1]);
+    if (!raw || !raw[0]) { sqlite3_result_null(ctx); return; }
+    /* Pseudo paths (no leading / or ., contains :) → keep as-is */
+    if (raw[0] != '/' && raw[0] != '.' && strchr(raw, ':')) {
+        sqlite3_result_text(ctx, raw, -1, SQLITE_TRANSIENT); return;
+    }
+    char out[8192];
+    if (raw[0] != '/') {
+        if (cwd && cwd[0]) snprintf(out, sizeof out, "%s/%s", cwd, raw);
+        else snprintf(out, sizeof out, "%s", raw);
+    } else {
+        snprintf(out, sizeof out, "%s", raw);
+    }
+    if (out[0] == '/') canon_path_c(out, sizeof out);
+    sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
+}
+
+/* is_sys_path(resolved_path, flag0) → 1 if this is an O_RDONLY open of a system path. */
+static void sql_is_sys_path(sqlite3_context *ctx, int n, sqlite3_value **v) {
+    (void)n;
+    const char *path = (const char *)sqlite3_value_text(v[0]);
+    const char *flag = (const char *)sqlite3_value_text(v[1]);
+    if (!path || !flag || path[0] != '/' || strcmp(flag, "O_RDONLY") != 0) {
+        sqlite3_result_int(ctx, 0); return;
+    }
+    static const char *sys[] = {"/usr/","/lib/","/lib64/","/bin/","/sbin/","/opt/","/srv/",NULL};
+    for (int i = 0; sys[i]; i++)
+        if (strncmp(path, sys[i], strlen(sys[i])) == 0) { sqlite3_result_int(ctx, 1); return; }
+    sqlite3_result_int(ctx, 0);
+}
+
 static void register_sql_funcs(sqlite3 *db) {
-    sqlite3_create_function(db, "regexp",     2, SQLITE_UTF8, 0, sql_regexp,     0, 0);
-    sqlite3_create_function(db, "canon_path", 1, SQLITE_UTF8, 0, sql_canon_path, 0, 0);
-    sqlite3_create_function(db, "dir_part",   1, SQLITE_UTF8, 0, sql_dir_part,   0, 0);
-    sqlite3_create_function(db, "depth",      1, SQLITE_UTF8, 0, sql_depth,      0, 0);
+    sqlite3_create_function(db, "regexp",       2, SQLITE_UTF8, 0, sql_regexp,       0, 0);
+    sqlite3_create_function(db, "canon_path",   1, SQLITE_UTF8, 0, sql_canon_path,   0, 0);
+    sqlite3_create_function(db, "dir_part",     1, SQLITE_UTF8, 0, sql_dir_part,     0, 0);
+    sqlite3_create_function(db, "depth",        1, SQLITE_UTF8, 0, sql_depth,        0, 0);
+    sqlite3_create_function(db, "resolve_path", 2, SQLITE_UTF8, 0, sql_resolve_path, 0, 0);
+    sqlite3_create_function(db, "is_sys_path",  2, SQLITE_UTF8, 0, sql_is_sys_path,  0, 0);
 }
 
 /* ── Macros for SQL building ───────────────────────────────────────── */
@@ -256,270 +294,16 @@ static void ingest_file(const char *path) {
 }
 
 /* ── Process one JSONL line from the trace ─────────────────────────── */
-static int g_own_tgid;
-
-static void process_trace_event(const char *ln) {
-    if (!ln || ln[0] != '{') return;
-
-    char ev[32] = ""; int tgid = 0;
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "SELECT COALESCE(json_extract(?1,'$.event'),''),"
-          " COALESCE(CAST(json_extract(?1,'$.tgid')AS INT),0)",
-          -1, &st, 0);
-      sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-      if (sqlite3_step(st) == SQLITE_ROW) {
-          const char *e = (const char *)sqlite3_column_text(st, 0);
-          if (e) snprintf(ev, sizeof ev, "%s", e);
-          tgid = sqlite3_column_int(st, 1);
-      }
-      sqlite3_finalize(st);
-    }
-    if (!ev[0] || !tgid || tgid == g_own_tgid) return;
-
-    /* Ensure process stub */
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "INSERT OR IGNORE INTO processes(tgid,pid,ppid,nspid,nstgid,first_ts,last_ts)"
-          " VALUES(json_extract(?1,'$.tgid'),json_extract(?1,'$.pid'),json_extract(?1,'$.ppid'),"
-          "  json_extract(?1,'$.nspid'),json_extract(?1,'$.nstgid'),"
-          "  json_extract(?1,'$.ts'),json_extract(?1,'$.ts'))",
-          -1, &st, 0);
-      sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-      sqlite3_step(st); sqlite3_finalize(st);
-    }
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "INSERT OR IGNORE INTO expanded(id,ex) VALUES(CAST(json_extract(?1,'$.tgid')AS TEXT),1)",
-          -1, &st, 0);
-      sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-      sqlite3_step(st); sqlite3_finalize(st);
-    }
-
-    if (strcmp(ev, "CWD") == 0) {
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT OR REPLACE INTO cwd_cache(tgid,cwd)"
-              " VALUES(CAST(json_extract(?1,'$.tgid')AS INT),json_extract(?1,'$.path'))",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "UPDATE processes SET cwd=json_extract(?1,'$.path')"
-              " WHERE tgid=CAST(json_extract(?1,'$.tgid')AS INT)",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        return;
-    }
-
-    if (strcmp(ev, "EXEC") == 0) {
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "UPDATE processes SET"
-              " exe=json_extract(?1,'$.exe'),"
-              " argv=CASE WHEN json_type(?1,'$.argv')='array' THEN"
-              "  (SELECT GROUP_CONCAT(value,char(10)) FROM json_each(json_extract(?1,'$.argv')))"
-              "  ELSE NULL END,"
-              " env=CASE WHEN json_type(?1,'$.env')='object' THEN"
-              "  (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(?1,'$.env')))"
-              "  ELSE NULL END,"
-              " auxv=CASE WHEN json_type(?1,'$.auxv')='object' THEN"
-              "  (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(?1,'$.auxv')))"
-              "  ELSE NULL END,"
-              " first_ts=MIN(first_ts,json_extract(?1,'$.ts')),"
-              " last_ts=MAX(last_ts,json_extract(?1,'$.ts'))"
-              " WHERE tgid=CAST(json_extract(?1,'$.tgid')AS INT)",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT INTO events(tgid,ts,event)"
-              " VALUES(json_extract(?1,'$.tgid'),json_extract(?1,'$.ts'),'EXEC')",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        return;
-    }
-
-    if (strcmp(ev, "OPEN") == 0) {
-        char path[8192] = ""; char flag0[32] = "O_RDONLY";
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "SELECT COALESCE(json_extract(?1,'$.path'),''),"
-              " COALESCE(json_extract(?1,'$.flags[0]'),'O_RDONLY')",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          if (sqlite3_step(st) == SQLITE_ROW) {
-              const char *p = (const char *)sqlite3_column_text(st, 0);
-              if (p) snprintf(path, sizeof path, "%s", p);
-              const char *f = (const char *)sqlite3_column_text(st, 1);
-              if (f) snprintf(flag0, sizeof flag0, "%s", f);
-          }
-          sqlite3_finalize(st);
-        }
-
-        { int is_pseudo = (path[0] && !strchr("/.", path[0]) && strchr(path, ':') != NULL);
-          if (!is_pseudo && path[0] && path[0] != '/') {
-              char cwd[4096] = "";
-              { sqlite3_stmt *st;
-                sqlite3_prepare_v2(g_db, "SELECT COALESCE(cwd,'') FROM cwd_cache WHERE tgid=?", -1, &st, 0);
-                sqlite3_bind_int(st, 1, tgid);
-                if (sqlite3_step(st) == SQLITE_ROW) {
-                    const char *c = (const char *)sqlite3_column_text(st, 0);
-                    if (c && c[0]) snprintf(cwd, sizeof cwd, "%s", c);
-                }
-                sqlite3_finalize(st);
-              }
-              if (cwd[0]) { char abs[8192]; snprintf(abs, sizeof abs, "%s/%s", cwd, path); snprintf(path, 8192, "%s", abs); }
-          }
-          if (!is_pseudo && path[0] == '/') canon_path_c(path, sizeof path);
-        }
-
-        if (strcmp(flag0, "O_RDONLY") == 0 && path[0] == '/') {
-            static const char *sys[] = {"/usr/","/lib/","/lib64/","/bin/","/sbin/","/opt/","/srv/",NULL};
-            for (int i = 0; sys[i]; i++) if (strncmp(path, sys[i], strlen(sys[i])) == 0) return;
-        }
-
-        long long eid;
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT INTO events(tgid,ts,event)"
-              " VALUES(json_extract(?1,'$.tgid'),json_extract(?1,'$.ts'),'OPEN')",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        eid = sqlite3_last_insert_rowid(g_db);
-
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT INTO open_events(eid,path,flags,fd,err) VALUES(?1,?2,"
-              " CASE WHEN json_type(?3,'$.flags')='array' THEN"
-              "  (SELECT GROUP_CONCAT(value,'|') FROM json_each(json_extract(?3,'$.flags')))"
-              "  ELSE NULL END,"
-              " json_extract(?3,'$.fd'),json_extract(?3,'$.err'))",
-              -1, &st, 0);
-          sqlite3_bind_int64(st, 1, eid);
-          sqlite3_bind_text(st, 2, path, -1, SQLITE_TRANSIENT);
-          sqlite3_bind_text(st, 3, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "UPDATE processes SET"
-              " last_ts=MAX(last_ts,json_extract(?1,'$.ts')),"
-              " first_ts=MIN(first_ts,json_extract(?1,'$.ts'))"
-              " WHERE tgid=CAST(json_extract(?1,'$.tgid')AS INT)",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        return;
-    }
-
-    if (strcmp(ev, "EXIT") == 0) {
-        long long eid;
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT INTO events(tgid,ts,event)"
-              " VALUES(json_extract(?1,'$.tgid'),json_extract(?1,'$.ts'),'EXIT')",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        eid = sqlite3_last_insert_rowid(g_db);
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT INTO exit_events(eid,status,code,signal,core_dumped,raw)"
-              " VALUES(?1,json_extract(?2,'$.status'),json_extract(?2,'$.code'),"
-              "  json_extract(?2,'$.signal'),json_extract(?2,'$.core_dumped'),json_extract(?2,'$.raw'))",
-              -1, &st, 0);
-          sqlite3_bind_int64(st, 1, eid);
-          sqlite3_bind_text(st, 2, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "UPDATE processes SET last_ts=MAX(last_ts,json_extract(?1,'$.ts'))"
-              " WHERE tgid=CAST(json_extract(?1,'$.tgid')AS INT)",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        return;
-    }
-
-    if (strcmp(ev, "STDOUT") == 0 || strcmp(ev, "STDERR") == 0) {
-        long long eid;
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT INTO events(tgid,ts,event)"
-              " VALUES(json_extract(?1,'$.tgid'),json_extract(?1,'$.ts'),?2)",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_bind_text(st, 2, ev, -1, SQLITE_STATIC);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        eid = sqlite3_last_insert_rowid(g_db);
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "INSERT INTO io_events(eid,stream,len,data)"
-              " VALUES(?1,?2,json_extract(?3,'$.len'),json_extract(?3,'$.data'))",
-              -1, &st, 0);
-          sqlite3_bind_int64(st, 1, eid);
-          sqlite3_bind_text(st, 2, ev, -1, SQLITE_STATIC);
-          sqlite3_bind_text(st, 3, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db,
-              "UPDATE processes SET last_ts=MAX(last_ts,json_extract(?1,'$.ts'))"
-              " WHERE tgid=CAST(json_extract(?1,'$.tgid')AS INT)",
-              -1, &st, 0);
-          sqlite3_bind_text(st, 1, ln, -1, SQLITE_TRANSIENT);
-          sqlite3_step(st); sqlite3_finalize(st);
-        }
-        return;
-    }
-}
-
-/* ── Process inbox ─────────────────────────────────────────────────── */
-static void process_inbox_trace(void) {
-    static char buf[1 << 20];
-    xexec("BEGIN");
-    for (;;) {
-        long long id = -1; buf[0] = 0;
-        { sqlite3_stmt *st;
-          sqlite3_prepare_v2(g_db, "SELECT id,data FROM inbox WHERE kind='trace' ORDER BY id LIMIT 1", -1, &st, 0);
-          if (sqlite3_step(st) == SQLITE_ROW) {
-              id = sqlite3_column_int64(st, 0);
-              const char *d = (const char *)sqlite3_column_text(st, 1);
-              if (d) snprintf(buf, sizeof buf - 1, "%s", d);
-          }
-          sqlite3_finalize(st);
-        }
-        if (id < 0) break;
-        xexecf("DELETE FROM inbox WHERE id=%lld", id);
-        process_trace_event(buf);
-    }
-    xexec("COMMIT");
-}
+/* Trace events are now processed by the _ingest_trace trigger in tv.sql.
+ * The trigger fires on INSERT INTO inbox WHERE kind='trace'.
+ * No C-side trace processing needed — ingest_line() does the INSERT. */
 
 static int g_headless;
 
 static void process_inbox_input(tui_t *tui);
 
-static void process_inbox(tui_t *tui, int trace_only) {
-    process_inbox_trace();
-    if (!trace_only) process_inbox_input(tui);
+static void process_inbox(tui_t *tui) {
+    process_inbox_input(tui);
 }
 
 /* ── Input dispatch ────────────────────────────────────────────────── */
@@ -1345,7 +1129,6 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
             t_rbuf[t_rbuf_len] = 0;
             xexec("BEGIN"); ingest_line(t_rbuf); xexec("COMMIT");
             t_rbuf_len = 0;
-            process_inbox(tui, 1);
         }
         on_stream_end();
         tui_unwatch_fd(tui, fd);
@@ -1375,7 +1158,6 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
         }
         xexec("COMMIT");
         if (did) {
-            process_inbox(tui, 1);
             xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
             tui_dirty(tui, NULL);
             /* Reap child */
@@ -1445,13 +1227,12 @@ int main(int argc, char **argv) {
     } else if (trace_file[0]) {
         xexec(tv_sql_schema);
         ingest_file(trace_file);
-        process_inbox(NULL, 1);
         xexec(tv_sql_setup);
         setup_fts();
     } else {
         xexec(tv_sql_schema);
         xexec(tv_sql_setup);
-        g_own_tgid = (int)getpid();
+        xexecf("INSERT OR REPLACE INTO _config(key,val) VALUES('own_tgid','%d')", (int)getpid());
         if (!force_ptrace)
             trace_fd = open("/proc/proctrace/new", O_RDONLY);
         if (trace_fd >= 0) {
@@ -1494,7 +1275,7 @@ int main(int argc, char **argv) {
     sync_cursor_id_from_pos();
 
     if (save_file[0]) save_to_file(save_file);
-    process_inbox(NULL, 0);
+    process_inbox(NULL);
 
     if (g_headless) { sqlite3_close(g_db); return 0; }
     if (save_file[0] && !cmd) { sqlite3_close(g_db); return 0; }
