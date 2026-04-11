@@ -23,6 +23,19 @@
 #define MAX_WATCHES 16
 #define MAX_TIMERS  16
 
+/* ── Row cache ─────────────────────────────────────────────────────── */
+#define PANEL_CACHE_ROWS  256   /* rows cached per panel per window */
+#define PANEL_NCOLS_MAX    32   /* max columns per panel */
+#define PANEL_CACHE_POOL  (256*1024)  /* string pool bytes per panel */
+
+/* One cached row: column values stored as offsets into cache_pool.
+ * offset == -1 means SQL NULL. */
+typedef struct {
+    int id_off;
+    int style_off;
+    int col_off[PANEL_NCOLS_MAX];
+} pcache_row_t;
+
 /* ── Panel state ───────────────────────────────────────────────────── */
 typedef struct {
     tui_panel_def def;
@@ -31,6 +44,13 @@ typedef struct {
     int row_count;
     int dirty;
     char cursor_id[4096];
+
+    /* Row cache — populated on first render after dirty, updated on scroll */
+    pcache_row_t *cache_rows; /* [PANEL_CACHE_ROWS], malloced */
+    char         *cache_pool; /* [PANEL_CACHE_POOL], malloced */
+    int           cache_pool_pos;
+    int           cache_start;  /* rownum of cache_rows[0] */
+    int           cache_count;  /* 0 = invalid/empty */
 } panel_st;
 
 typedef struct { int fd; tui_fd_cb cb; void *ctx; int active; } fd_watch;
@@ -50,11 +70,6 @@ struct tui {
     int            npanels, focus;
 
     tui_box_t     *layout_root;  /* root of layout tree */
-
-    /* layout node pool (avoids individual mallocs) */
-    tui_box_t      box_pool[MAX_PANELS * 4];
-    tui_box_t     *box_children[MAX_PANELS * 4 * 8];
-    int            box_pool_n, box_child_n;
 
     char           status[1024];
 
@@ -206,6 +221,16 @@ static void p_clamp(panel_st *p) {
 static void p_sync_id(tui_t *t, panel_st *p) {
     p->cursor_id[0] = '\0';
     if (p->row_count == 0) return;
+    /* Use cache if cursor row is within it — avoids a DB round-trip */
+    int ci = p->cursor - p->cache_start;
+    if (p->cache_count > 0 && p->cache_rows && p->cache_pool &&
+        ci >= 0 && ci < p->cache_count &&
+        p->cache_rows[ci].id_off >= 0) {
+        snprintf(p->cursor_id, sizeof p->cursor_id, "%s",
+                 p->cache_pool + p->cache_rows[ci].id_off);
+        return;
+    }
+    /* Fall back to DB */
     char sql[256];
     snprintf(sql, sizeof sql, "SELECT id FROM \"%s\" WHERE rownum=?", p->def.name);
     sqlite3_stmt *st;
@@ -229,6 +254,62 @@ static void p_resolve_id(tui_t *t, panel_st *p) {
         if (sqlite3_step(st) == SQLITE_ROW) p->cursor = sqlite3_column_int(st, 0);
         sqlite3_finalize(st);
     }
+}
+
+/* ── Row cache helpers ─────────────────────────────────────────────── */
+static int pool_add(panel_st *p, const unsigned char *s) {
+    if (!s) return -1;
+    int len = (int)strlen((const char *)s) + 1;
+    if (p->cache_pool_pos + len > PANEL_CACHE_POOL) return -1;
+    int off = p->cache_pool_pos;
+    memcpy(p->cache_pool + off, s, len);
+    p->cache_pool_pos += len;
+    return off;
+}
+
+/* Load (or reload) PANEL_CACHE_ROWS rows starting at `from_row` from the DB. */
+static void p_load_cache(tui_t *t, panel_st *p, int from_row) {
+    if (!p->cache_rows || !p->cache_pool) return;
+    if (from_row < 0) from_row = 0;
+    p->cache_pool_pos = 0;
+    p->cache_count    = 0;
+    p->cache_start    = from_row;
+
+    char sql[4096]; int pos = 0;
+    pos += snprintf(sql + pos, sizeof sql - pos, "SELECT id,style");
+    int nc = p->def.ncols < PANEL_NCOLS_MAX ? p->def.ncols : PANEL_NCOLS_MAX;
+    for (int c = 0; c < nc; c++)
+        pos += snprintf(sql + pos, sizeof sql - pos, ",\"%s\"", p->def.cols[c].name);
+    pos += snprintf(sql + pos, sizeof sql - pos,
+        " FROM \"%s\" WHERE rownum>=? AND rownum<? ORDER BY rownum",
+        p->def.name);
+
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) != SQLITE_OK) return;
+    sqlite3_bind_int(st, 1, from_row);
+    sqlite3_bind_int(st, 2, from_row + PANEL_CACHE_ROWS);
+    while (sqlite3_step(st) == SQLITE_ROW && p->cache_count < PANEL_CACHE_ROWS) {
+        pcache_row_t *r = &p->cache_rows[p->cache_count];
+        r->id_off    = pool_add(p, sqlite3_column_text(st, 0));
+        r->style_off = pool_add(p, sqlite3_column_text(st, 1));
+        for (int c = 0; c < nc; c++)
+            r->col_off[c] = pool_add(p, sqlite3_column_text(st, 2 + c));
+        for (int c = nc; c < PANEL_NCOLS_MAX; c++)
+            r->col_off[c] = -1;
+        p->cache_count++;
+    }
+    sqlite3_finalize(st);
+}
+
+/* Ensure cache covers row `rn`. Loads if not covered. */
+static void p_ensure_cached(tui_t *t, panel_st *p, int rn) {
+    if (p->cache_count > 0 &&
+        rn >= p->cache_start &&
+        rn < p->cache_start + p->cache_count) return;
+    /* Load a window that covers rn, biased slightly before it for upward scrolling */
+    int ahead = PANEL_CACHE_ROWS / 4;
+    int from  = rn > ahead ? rn - ahead : 0;
+    p_load_cache(t, p, from);
 }
 
 /* ── Layout resolution ─────────────────────────────────────────────── */
@@ -350,36 +431,47 @@ static void render_panel(tui_t *t, panel_st *p) {
     if (d->flags & TUI_PANEL_BORDER) pw--;
     resolve_col_widths(d, pw, cw);
 
-    char sql[4096]; int pos = 0;
-    pos += snprintf(sql + pos, sizeof sql - pos, "SELECT id,style");
-    for (int c = 0; c < d->ncols; c++)
-        pos += snprintf(sql + pos, sizeof sql - pos, ",\"%s\"", d->cols[c].name);
-    pos += snprintf(sql + pos, sizeof sql - pos,
-        " FROM \"%s\" ORDER BY rownum LIMIT %d OFFSET %d", d->name, ch, p->scroll);
-
-    sqlite3_stmt *st; int row = 0;
-    if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) == SQLITE_OK) {
-        while (sqlite3_step(st) == SQLITE_ROW && row < ch) {
-            int sr = cy + row + 1, sc = p->x + 1;
-            if (d->flags & TUI_PANEL_BORDER) sc++;
-            sf(t, "\x1b[%d;%dH", sr, sc);
-            int idx = p->scroll + row;
-            int is_cur = (d->flags & TUI_PANEL_CURSOR) && idx == p->cursor;
-            if (is_cur && focused) sp(t, "\x1b[1;7m");
-            else if (is_cur) sp(t, "\x1b[7m");
-            else sp(t, style_ansi((const char *)sqlite3_column_text(st, 1)));
-            for (int c = 0; c < d->ncols; c++) {
-                const char *v = (const char *)sqlite3_column_text(st, 2 + c);
-                sput_field(t, v ? v : "", cw[c], d->cols[c].align, d->cols[c].overflow);
-            }
-            sp(t, "\x1b[0m"); row++;
-        }
-        sqlite3_finalize(st);
+    /* Ensure the cache covers the visible viewport [scroll, scroll+ch).
+     * If the viewport extends beyond the current cache window, load on demand. */
+    if (p->cache_rows && p->cache_pool && p->row_count > 0) {
+        p_ensure_cached(t, p, p->scroll);
+        /* Also ensure the last visible row is covered (load again if needed) */
+        int last_vis = p->scroll + ch - 1;
+        if (last_vis >= p->row_count) last_vis = p->row_count - 1;
+        if (last_vis >= p->cache_start + p->cache_count)
+            p_ensure_cached(t, p, last_vis);
     }
-    while (row < ch) {
-        sf(t, "\x1b[%d;%dH\x1b[0m", cy + row + 1, p->x + 1);
-        for (int c = 0; c < p->w; c++) sp(t, " ");
-        row++;
+
+    int row = 0;
+    int nc = d->ncols < PANEL_NCOLS_MAX ? d->ncols : PANEL_NCOLS_MAX;
+    for (int rn = p->scroll; row < ch; rn++, row++) {
+        int sr = cy + row + 1, sc = p->x + 1;
+        if (d->flags & TUI_PANEL_BORDER) sc++;
+        sf(t, "\x1b[%d;%dH", sr, sc);
+
+        int ci = rn - p->cache_start;
+        int has_row = (p->cache_rows && p->cache_pool &&
+                       p->cache_count > 0 &&
+                       ci >= 0 && ci < p->cache_count);
+        if (!has_row) {
+            /* Past end of data — blank line */
+            sp(t, "\x1b[0m");
+            for (int c = 0; c < pw; c++) sp(t, " ");
+            continue;
+        }
+        pcache_row_t *r = &p->cache_rows[ci];
+        int is_cur = (d->flags & TUI_PANEL_CURSOR) && rn == p->cursor;
+        if (is_cur && focused) sp(t, "\x1b[1;7m");
+        else if (is_cur) sp(t, "\x1b[7m");
+        else {
+            const char *sty = (r->style_off >= 0) ? p->cache_pool + r->style_off : "";
+            sp(t, style_ansi(sty));
+        }
+        for (int c = 0; c < nc; c++) {
+            const char *v = (r->col_off[c] >= 0) ? p->cache_pool + r->col_off[c] : "";
+            sput_field(t, v, cw[c], d->cols[c].align, d->cols[c].overflow);
+        }
+        sp(t, "\x1b[0m");
     }
     if (d->flags & TUI_PANEL_BORDER)
         for (int r = 0; r < p->h; r++)
@@ -401,6 +493,8 @@ static void render_all(tui_t *t) {
             p_update_count(t, p);
             p_resolve_id(t, p);
             p_clamp(p);
+            /* Invalidate cache so render_panel re-fetches from DB */
+            p->cache_count = 0;
             p_sync_id(t, p);
             p->dirty = 0;
         }
@@ -466,6 +560,10 @@ tui_t *tui_open(sqlite3 *db) {
 
 void tui_close(tui_t *t) {
     if (!t) return;
+    for (int i = 0; i < t->npanels; i++) {
+        free(t->panels[i].cache_rows);
+        free(t->panels[i].cache_pool);
+    }
     tty_restore(t);
     if (t == g_atexit_tui) g_atexit_tui = NULL;
     free(t->scr); free(t);
@@ -474,7 +572,6 @@ void tui_close(tui_t *t) {
 void tui_set_layout(tui_t *tui, tui_box_t *root) {
     if (!tui) return;
     tui->layout_root = root;
-    /* Collect all panel definitions from the tree */
     /* Walk tree, register panels not yet registered */
     struct { tui_box_t *b; } stack[128];
     int top = 0; stack[top++].b = root;
@@ -487,6 +584,13 @@ void tui_set_layout(tui_t *tui, tui_box_t *root) {
                 memset(p, 0, sizeof *p);
                 p->def = *b->def;
                 p->dirty = 1;
+                /* Allocate row cache */
+                p->cache_rows = malloc(PANEL_CACHE_ROWS * sizeof(pcache_row_t));
+                p->cache_pool = malloc(PANEL_CACHE_POOL);
+                if (!p->cache_rows || !p->cache_pool) {
+                    free(p->cache_rows); p->cache_rows = NULL;
+                    free(p->cache_pool); p->cache_pool = NULL;
+                }
                 if (tui->focus < 0 && (b->def->flags & TUI_PANEL_CURSOR))
                     tui->focus = tui->npanels;
                 tui->npanels++;
