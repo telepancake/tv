@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS state(
 INSERT OR IGNORE INTO state(base_ts)
     VALUES((SELECT COALESCE(MIN(ts),0) FROM events));
 CREATE TABLE IF NOT EXISTS search_hits(id TEXT PRIMARY KEY);
--- Placeholder temp table for mode=1 (file tree), populated by C build_file_tree().
+-- Temp table for file tree (mode=1), populated by build_ftree() SQL function.
 CREATE TEMP TABLE IF NOT EXISTS _ftree(
     rownum INTEGER PRIMARY KEY, id TEXT NOT NULL,
     parent_id TEXT, style TEXT DEFAULT 'normal', text TEXT NOT NULL);
