@@ -725,6 +725,7 @@ static void dispatch_input(tui_t *tui, const char *data) {
         sqlite3_bind_text(st, 1, arg1, -1, SQLITE_TRANSIENT);
         sqlite3_step(st); sqlite3_finalize(st);
         do_search(arg1);
+        if (qint("SELECT mode FROM state", 0) == 1) build_file_tree();
         tui_dirty(g_tui, NULL);
     } else if (strcmp(inp, "evfilt") == 0) {
         char q[64] = "";
@@ -1253,7 +1254,7 @@ static int handle_key(tui_t *tui, int k) {
               }
           } else if (mode == 2 && id[0]) {
               if (!strncmp(id, "io_", 3)) {
-                  xexecf( "UPDATE expanded SET ex=0 WHERE id='%s'", id);
+                  xexecf( "INSERT OR REPLACE INTO expanded(id,ex) VALUES('%s',0)", id);
                   tui_dirty(tui, NULL);
               } else {
                   char pid[256] = "";
