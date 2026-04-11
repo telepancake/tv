@@ -1606,7 +1606,7 @@ int main(int argc,char**argv){
         /* Shift argv so uproctrace_main sees: tv [opts] -- cmd ... */
         return uproctrace_main(argc-1,argv+1);}
 
-    int load_mode=0;int force_ptrace=0;
+    int load_mode=0;int force_ptrace=0;int force_sud=0;
     char load_file[256]="";char trace_file[256]="";
     char save_file[256]="";char**cmd=NULL;
     for(int i=1;i<argc;i++){
@@ -1614,14 +1614,16 @@ int main(int argc,char**argv){
         else if(strcmp(argv[i],"--trace")==0&&i+1<argc)snprintf(trace_file,sizeof trace_file,"%s",argv[++i]);
         else if(strcmp(argv[i],"--save")==0&&i+1<argc)snprintf(save_file,sizeof save_file,"%s",argv[++i]);
         else if(strcmp(argv[i],"--ptrace")==0)force_ptrace=1;
+        else if(strcmp(argv[i],"--sud")==0)force_sud=1;
         else if(strcmp(argv[i],"--")==0&&i+1<argc){cmd=argv+i+1;break;}}
     if(!load_mode&&!trace_file[0]&&!cmd){
-        fprintf(stderr,"Usage: tv [--ptrace] -- <command> [args...]\n"
+        fprintf(stderr,"Usage: tv [--ptrace|--sud] -- <command> [args...]\n"
             "       tv --load <file.db>\n"
             "       tv --trace <file.jsonl> [--save <file.db>]\n"
             "       tv --load <file.db> --trace <input.jsonl>\n"
             "       tv --uproctrace [-o FILE] -- <command> [args...]\n"
             "\n  --ptrace   Force ptrace backend (default: use proctrace kernel module if available)\n"
+            "  --sud      Force SUD (Syscall User Dispatch) backend\n"
             "  --uproctrace  Run as trace-only tool (write JSONL to stdout, no TUI)\n"
             "\n  Input events in trace streams: {\"input\":\"key\",\"key\":\"j\"}\n"
             "  {\"input\":\"resize\",\"rows\":50,\"cols\":120}\n"
@@ -1653,7 +1655,7 @@ int main(int argc,char**argv){
         db_create();
         setup_app();
         g_own_tgid=(int)getpid();
-        if(!force_ptrace){
+        if(!force_ptrace&&!force_sud){
             g_trace_fd=open("/proc/proctrace/new",O_RDONLY);
         }
         if(g_trace_fd>=0){
@@ -1662,35 +1664,79 @@ int main(int argc,char**argv){
             if(g_child_pid<0){close(g_trace_fd);die("fork");}
             if(g_child_pid==0){execvp(cmd[0],cmd);perror(cmd[0]);_exit(127);}
         } else {
-            /* Fall back to ptrace via built-in uproctrace.
-             * popen ourselves with --uproctrace to trace the command,
-             * reading JSONL from its stdout. */
+            /* Try sudtrace (SUD backend) if --sud is forced or if we find
+             * the sudtrace binary next to ourselves and the kernel supports
+             * SUD.  Falls through to ptrace if sudtrace is unavailable. */
+            int use_sud=force_sud;
+            char sudtrace_exe[4096]="";
             char self_exe[4096];
             ssize_t slen=readlink("/proc/self/exe",self_exe,sizeof(self_exe)-1);
             if(slen<=0)die("cannot resolve /proc/self/exe");
             self_exe[slen]='\0';
 
-            /* Build command: <self_exe> --uproctrace -- cmd args... */
-            size_t cmdlen=strlen(self_exe)+strlen(" --uproctrace --")+1;
-            for(char**p=cmd;*p;p++)cmdlen+=strlen(*p)*4+3; /* worst-case: every char is a quote */
-            char *popen_cmd=malloc(cmdlen);
-            if(!popen_cmd)die("malloc");
-            char *w=popen_cmd;
-            w+=sprintf(w,"%s --uproctrace --",self_exe);
-            for(char**p=cmd;*p;p++){
-                /* simple shell quoting with single quotes */
-                *w++=' '; *w++='\'';
-                for(const char*c=*p;*c;c++){
-                    if(*c=='\''){*w++='\'';*w++='\\';*w++='\'';*w++='\'';}
-                    else *w++=*c;}
-                *w++='\'';}
-            *w='\0';
+            if(!force_ptrace){
+                /* Look for sudtrace next to our own binary */
+                char *slash=strrchr(self_exe,'/');
+                if(slash){
+                    size_t dirlen=slash-self_exe;
+                    snprintf(sudtrace_exe,sizeof sudtrace_exe,
+                             "%.*s/sudtrace",(int)dirlen,self_exe);
+                } else {
+                    snprintf(sudtrace_exe,sizeof sudtrace_exe,"sudtrace");
+                }
+                if(!force_sud&&access(sudtrace_exe,X_OK)==0)use_sud=1;
+            }
 
-            FILE *pp=popen(popen_cmd,"r");
-            free(popen_cmd);
-            if(!pp)die("popen uproctrace failed");
-            g_trace_pipe=pp;
-            g_trace_fd=fileno(pp);
+            if(use_sud&&sudtrace_exe[0]){
+                /* Build command: sudtrace -- cmd args... */
+                size_t cmdlen=strlen(sudtrace_exe)+strlen(" -- ")+1;
+                for(char**p=cmd;*p;p++)cmdlen+=strlen(*p)*4+3;
+                char *popen_cmd=malloc(cmdlen);
+                if(!popen_cmd)die("malloc");
+                char *w=popen_cmd;
+                w+=sprintf(w,"%s --",sudtrace_exe);
+                for(char**p=cmd;*p;p++){
+                    *w++=' '; *w++='\'';
+                    for(const char*c=*p;*c;c++){
+                        if(*c=='\''){*w++='\'';*w++='\\';*w++='\'';*w++='\'';}
+                        else *w++=*c;}
+                    *w++='\'';}
+                *w='\0';
+
+                FILE *pp=popen(popen_cmd,"r");
+                free(popen_cmd);
+                if(pp){
+                    g_trace_pipe=pp;
+                    g_trace_fd=fileno(pp);
+                } else {
+                    use_sud=0; /* fall through to ptrace */
+                }
+            } else {
+                use_sud=0;
+            }
+
+            if(!use_sud){
+                /* Fall back to ptrace via built-in uproctrace. */
+                size_t cmdlen=strlen(self_exe)+strlen(" --uproctrace --")+1;
+                for(char**p=cmd;*p;p++)cmdlen+=strlen(*p)*4+3;
+                char *popen_cmd=malloc(cmdlen);
+                if(!popen_cmd)die("malloc");
+                char *w=popen_cmd;
+                w+=sprintf(w,"%s --uproctrace --",self_exe);
+                for(char**p=cmd;*p;p++){
+                    *w++=' '; *w++='\'';
+                    for(const char*c=*p;*c;c++){
+                        if(*c=='\''){*w++='\'';*w++='\\';*w++='\'';*w++='\'';}
+                        else *w++=*c;}
+                    *w++='\'';}
+                *w='\0';
+
+                FILE *pp=popen(popen_cmd,"r");
+                free(popen_cmd);
+                if(!pp)die("popen uproctrace failed");
+                g_trace_pipe=pp;
+                g_trace_fd=fileno(pp);
+            }
         }
         xexec("UPDATE state SET lp_filter=2");
     }

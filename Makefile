@@ -6,7 +6,7 @@ SIGN    := $(KDIR)/scripts/sign-file
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv
+all: tv sudtrace
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 # Generate a MOK keypair (one-time).  After this, run:
@@ -42,6 +42,9 @@ install:
 
 tv: tv.c uproctrace.c
 	cc -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -o tv tv.c uproctrace.c sqlite3.c -static -lm
+
+sudtrace: sudtrace.c sudtrace.lds
+	cc -O2 -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm
 
 .PHONY: all keygen sign load unload clean install test
 test: tv
