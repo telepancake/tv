@@ -777,73 +777,64 @@ CREATE TEMP TABLE IF NOT EXISTS _outbox(
 
 CREATE TEMP TRIGGER _dispatch_key AFTER INSERT ON inbox WHEN NEW.kind='key'
 BEGIN
-    -- Extract fields once into a readable form.
-    -- k=key code, cid=cursor row id, foc=focused panel index,
-    -- m=mode, gr=grouped, vh=visible height (rows-2 for status+border)
-
     -- ── quit ──
     INSERT INTO _outbox(cmd) SELECT 'quit'
         WHERE json_extract(NEW.data,'$.key') IN (113, 81);
 
-    -- ── navigation: up/k ──
-    UPDATE state SET
-        cursor = MAX(cursor - 1, 0)
-        WHERE json_extract(NEW.data,'$.key') IN (256, 107);
-    -- ── navigation: down/j ──
+    -- ── navigation: up/k (lpane) ──
+    UPDATE state SET cursor = MAX(cursor - 1, 0)
+        WHERE json_extract(NEW.data,'$.key') IN (256, 107)
+          AND json_extract(NEW.data,'$.focus') = 0;
+    -- ── navigation: up/k (rpane) ──
+    UPDATE state SET dcursor = MAX(dcursor - 1, 0)
+        WHERE json_extract(NEW.data,'$.key') IN (256, 107)
+          AND json_extract(NEW.data,'$.focus') = 1;
+    -- ── navigation: down/j (lpane) ──
     UPDATE state SET
         cursor = MIN(cursor + 1,
             (SELECT MAX(COUNT(*)-1, 0) FROM lpane))
         WHERE json_extract(NEW.data,'$.key') IN (257, 106)
           AND json_extract(NEW.data,'$.focus') = 0;
+    -- ── navigation: down/j (rpane) ──
     UPDATE state SET
         dcursor = MIN(dcursor + 1,
             (SELECT MAX(COUNT(*)-1, 0) FROM rpane))
         WHERE json_extract(NEW.data,'$.key') IN (257, 106)
           AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: up/k (rpane when focused) ──
-    UPDATE state SET
-        dcursor = MAX(dcursor - 1, 0)
-        WHERE json_extract(NEW.data,'$.key') IN (256, 107)
-          AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: up/k (lpane when focused) — already done above ──
-    -- Restrict the lpane cursor update to focus=0:
-    -- (We need to redo this properly — the first UP update above
-    --  doesn't check focus. Let me restructure.)
-
-    -- ── navigation: pgup ──
-    UPDATE state SET
-        cursor = MAX(cursor - MAX(rows - 3, 1), 0)
+    -- ── navigation: pgup (lpane) ──
+    UPDATE state SET cursor = MAX(cursor - MAX(rows - 3, 1), 0)
         WHERE json_extract(NEW.data,'$.key') = 260
           AND json_extract(NEW.data,'$.focus') = 0;
-    UPDATE state SET
-        dcursor = MAX(dcursor - MAX(rows - 3, 1), 0)
+    -- ── navigation: pgup (rpane) ──
+    UPDATE state SET dcursor = MAX(dcursor - MAX(rows - 3, 1), 0)
         WHERE json_extract(NEW.data,'$.key') = 260
           AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: pgdn ──
+    -- ── navigation: pgdn (lpane) ──
     UPDATE state SET
         cursor = MIN(cursor + MAX(rows - 3, 1),
             (SELECT MAX(COUNT(*)-1, 0) FROM lpane))
         WHERE json_extract(NEW.data,'$.key') = 261
           AND json_extract(NEW.data,'$.focus') = 0;
+    -- ── navigation: pgdn (rpane) ──
     UPDATE state SET
         dcursor = MIN(dcursor + MAX(rows - 3, 1),
             (SELECT MAX(COUNT(*)-1, 0) FROM rpane))
         WHERE json_extract(NEW.data,'$.key') = 261
           AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: home/g ──
+    -- ── navigation: home/g (lpane) ──
     UPDATE state SET cursor = 0
         WHERE json_extract(NEW.data,'$.key') IN (262, 103)
           AND json_extract(NEW.data,'$.focus') = 0;
+    -- ── navigation: home/g (rpane) ──
     UPDATE state SET dcursor = 0
         WHERE json_extract(NEW.data,'$.key') IN (262, 103)
           AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: end ──
-    UPDATE state SET
-        cursor = (SELECT MAX(COUNT(*)-1, 0) FROM lpane)
+    -- ── navigation: end (lpane) ──
+    UPDATE state SET cursor = (SELECT MAX(COUNT(*)-1, 0) FROM lpane)
         WHERE json_extract(NEW.data,'$.key') = 263
           AND json_extract(NEW.data,'$.focus') = 0;
-    UPDATE state SET
-        dcursor = (SELECT MAX(COUNT(*)-1, 0) FROM rpane)
+    -- ── navigation: end (rpane) ──
+    UPDATE state SET dcursor = (SELECT MAX(COUNT(*)-1, 0) FROM rpane)
         WHERE json_extract(NEW.data,'$.key') = 263
           AND json_extract(NEW.data,'$.focus') = 1;
 
@@ -1075,10 +1066,12 @@ BEGIN
     INSERT INTO _outbox(cmd) SELECT 'show_help'
         WHERE json_extract(NEW.data,'$.key') = 63;
 
-    -- ── build_ftree after mode change to file mode, or G toggle ──
+    -- ── build_ftree after any change that affects file tree ────────────
+    -- Mode switch to file mode (key '2'=50), G toggle (71),
+    -- expand/collapse in file mode (right/l=259,108  left/h=258,104)
     SELECT build_ftree()
-        WHERE ((SELECT mode FROM state) = 1)
-          AND json_extract(NEW.data,'$.key') IN (50, 71);
+        WHERE (SELECT mode FROM state) = 1
+          AND json_extract(NEW.data,'$.key') IN (50, 71, 258, 259, 104, 108);
 
     -- ── Clean up inbox ──
     DELETE FROM inbox WHERE id = NEW.id;
