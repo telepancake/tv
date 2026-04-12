@@ -1458,7 +1458,7 @@ static int is_wrapper_mode(int argc, char **argv)
      * may belong to the wrapped command (e.g.
      *   sudtrace tv --uproctrace -o x -- /bin/echo hello
      * where "--" separates uproctrace's options from its command). */
-    if (argv[1][0] == '-') return 0;
+    if (!argv[1] || argv[1][0] == '-') return 0;
     return 1;
 }
 
