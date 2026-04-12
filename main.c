@@ -60,16 +60,6 @@ static int qint(const char *sql, int def) {
     return r;
 }
 
-static int qintf(int def, const char *fmt, ...) {
-    va_list a;
-    va_start(a, fmt);
-    char *sql = sqlite3_vmprintf(fmt, a);
-    va_end(a);
-    if (!sql) return def;
-    int r = qint(sql, def);
-    sqlite3_free(sql);
-    return r;
-}
 
 /* ── SQL custom functions ──────────────────────────────────────────── */
 
