@@ -26,8 +26,6 @@ CREATE TABLE exit_events(
 CREATE TABLE cwd_cache(tgid INTEGER PRIMARY KEY, cwd TEXT);
 CREATE TABLE inbox(
     id INTEGER PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL);
-CREATE TABLE outbox(
-    id INTEGER PRIMARY KEY, cmd TEXT NOT NULL, arg TEXT DEFAULT '');
 
 CREATE TABLE IF NOT EXISTS _config(key TEXT PRIMARY KEY, val TEXT);
 CREATE TABLE IF NOT EXISTS expanded(id TEXT PRIMARY KEY, ex INT DEFAULT 1);
@@ -774,6 +772,21 @@ CREATE TEMP TABLE IF NOT EXISTS _outbox(
 --
 -- The trigger updates state/expanded directly and only emits _outbox
 -- rows for operations that need terminal I/O.
+
+-- ══════════════════════════════════════════════════════════════════════
+-- Key dispatch trigger
+-- ══════════════════════════════════════════════════════════════════════
+-- Fires on INSERT INTO inbox(kind,data) VALUES('key', json_object(...)).
+-- JSON fields: key (int), panel (text), cursor (int), row_id (text),
+--              focus (int: 0=lpane, 1=rpane), rows (int).
+--
+-- Key code reference (from engine.h TUI_K_* constants):
+--   256=UP  257=DOWN  258=LEFT  259=RIGHT  260=PGUP  261=PGDN
+--   262=HOME  263=END  9=TAB  13=ENTER  27=ESC  127=BS
+--   ASCII: 47='/'  49='1'..55='7'  63='?'  69='E'  70='F'  71='G'
+--   78='N'  81='Q'  86='V'  87='W'  100='d'  101='e'  102='f'
+--   103='g'  104='h'  106='j'  107='k'  108='l'  110='n'  113='q'
+--   115='s'  116='t'  118='v'  120='x'
 
 CREATE TEMP TRIGGER _dispatch_key AFTER INSERT ON inbox WHEN NEW.kind='key'
 BEGIN
