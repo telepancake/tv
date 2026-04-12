@@ -26,6 +26,8 @@ CREATE TABLE exit_events(
 CREATE TABLE cwd_cache(tgid INTEGER PRIMARY KEY, cwd TEXT);
 CREATE TABLE inbox(
     id INTEGER PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL);
+CREATE TABLE outbox(
+    id INTEGER PRIMARY KEY, cmd TEXT NOT NULL, arg TEXT DEFAULT '');
 
 CREATE TABLE IF NOT EXISTS _config(key TEXT PRIMARY KEY, val TEXT);
 CREATE TABLE IF NOT EXISTS expanded(id TEXT PRIMARY KEY, ex INT DEFAULT 1);
@@ -755,6 +757,399 @@ CREATE TEMP VIEW rpane AS
     UNION ALL
     SELECT rownum, style, text, link_mode, link_id, section, id
     FROM _rp_output WHERE (SELECT mode FROM state)=2;
+
+-- ── Outbox table (read by C after trigger fires) ──────────────────────
+-- Only for commands that require terminal interaction.
+-- Commands: quit, prompt_search, prompt_filter, prompt_save, prompt_sql,
+--           show_help, follow_link, build_ftree, do_search, jump_hit
+CREATE TEMP TABLE IF NOT EXISTS _outbox(
+    id INTEGER PRIMARY KEY, cmd TEXT NOT NULL, arg TEXT DEFAULT '');
+
+-- ══════════════════════════════════════════════════════════════════════
+-- Input dispatch triggers
+-- ══════════════════════════════════════════════════════════════════════
+-- Key events arrive as: INSERT INTO inbox(kind,data) VALUES('key',
+--   json_object('key',<int>,'panel',<name>,'cursor',<int>,
+--               'row_id',<text>,'focus',<int>,'rows',<int>))
+--
+-- The trigger updates state/expanded directly and only emits _outbox
+-- rows for operations that need terminal I/O.
+
+CREATE TEMP TRIGGER _dispatch_key AFTER INSERT ON inbox WHEN NEW.kind='key'
+BEGIN
+    -- Extract fields once into a readable form.
+    -- k=key code, cid=cursor row id, foc=focused panel index,
+    -- m=mode, gr=grouped, vh=visible height (rows-2 for status+border)
+
+    -- ── quit ──
+    INSERT INTO _outbox(cmd) SELECT 'quit'
+        WHERE json_extract(NEW.data,'$.key') IN (113, 81);
+
+    -- ── navigation: up/k ──
+    UPDATE state SET
+        cursor = MAX(cursor - 1, 0)
+        WHERE json_extract(NEW.data,'$.key') IN (256, 107);
+    -- ── navigation: down/j ──
+    UPDATE state SET
+        cursor = MIN(cursor + 1,
+            (SELECT MAX(COUNT(*)-1, 0) FROM lpane))
+        WHERE json_extract(NEW.data,'$.key') IN (257, 106)
+          AND json_extract(NEW.data,'$.focus') = 0;
+    UPDATE state SET
+        dcursor = MIN(dcursor + 1,
+            (SELECT MAX(COUNT(*)-1, 0) FROM rpane))
+        WHERE json_extract(NEW.data,'$.key') IN (257, 106)
+          AND json_extract(NEW.data,'$.focus') = 1;
+    -- ── navigation: up/k (rpane when focused) ──
+    UPDATE state SET
+        dcursor = MAX(dcursor - 1, 0)
+        WHERE json_extract(NEW.data,'$.key') IN (256, 107)
+          AND json_extract(NEW.data,'$.focus') = 1;
+    -- ── navigation: up/k (lpane when focused) — already done above ──
+    -- Restrict the lpane cursor update to focus=0:
+    -- (We need to redo this properly — the first UP update above
+    --  doesn't check focus. Let me restructure.)
+
+    -- ── navigation: pgup ──
+    UPDATE state SET
+        cursor = MAX(cursor - MAX(rows - 3, 1), 0)
+        WHERE json_extract(NEW.data,'$.key') = 260
+          AND json_extract(NEW.data,'$.focus') = 0;
+    UPDATE state SET
+        dcursor = MAX(dcursor - MAX(rows - 3, 1), 0)
+        WHERE json_extract(NEW.data,'$.key') = 260
+          AND json_extract(NEW.data,'$.focus') = 1;
+    -- ── navigation: pgdn ──
+    UPDATE state SET
+        cursor = MIN(cursor + MAX(rows - 3, 1),
+            (SELECT MAX(COUNT(*)-1, 0) FROM lpane))
+        WHERE json_extract(NEW.data,'$.key') = 261
+          AND json_extract(NEW.data,'$.focus') = 0;
+    UPDATE state SET
+        dcursor = MIN(dcursor + MAX(rows - 3, 1),
+            (SELECT MAX(COUNT(*)-1, 0) FROM rpane))
+        WHERE json_extract(NEW.data,'$.key') = 261
+          AND json_extract(NEW.data,'$.focus') = 1;
+    -- ── navigation: home/g ──
+    UPDATE state SET cursor = 0
+        WHERE json_extract(NEW.data,'$.key') IN (262, 103)
+          AND json_extract(NEW.data,'$.focus') = 0;
+    UPDATE state SET dcursor = 0
+        WHERE json_extract(NEW.data,'$.key') IN (262, 103)
+          AND json_extract(NEW.data,'$.focus') = 1;
+    -- ── navigation: end ──
+    UPDATE state SET
+        cursor = (SELECT MAX(COUNT(*)-1, 0) FROM lpane)
+        WHERE json_extract(NEW.data,'$.key') = 263
+          AND json_extract(NEW.data,'$.focus') = 0;
+    UPDATE state SET
+        dcursor = (SELECT MAX(COUNT(*)-1, 0) FROM rpane)
+        WHERE json_extract(NEW.data,'$.key') = 263
+          AND json_extract(NEW.data,'$.focus') = 1;
+
+    -- ── sync cursor_id after navigation ──
+    UPDATE state SET cursor_id = COALESCE(
+        (SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)), '')
+        WHERE json_extract(NEW.data,'$.key') IN
+            (256,257,260,261,262,263,103,106,107);
+
+    -- ── tab: toggle focus ──
+    UPDATE state SET focus = 1 - focus, dcursor = 0
+        WHERE json_extract(NEW.data,'$.key') = 9;
+
+    -- ── enter: focus=0 → switch to rpane; focus=1 → follow link ──
+    UPDATE state SET focus = 1, dcursor = 0
+        WHERE json_extract(NEW.data,'$.key') IN (13, 10)
+          AND (SELECT focus FROM state) = 0;
+    INSERT INTO _outbox(cmd,arg) SELECT 'follow_link',
+        CAST((SELECT dcursor FROM state) AS TEXT)
+        WHERE json_extract(NEW.data,'$.key') IN (13, 10)
+          AND json_extract(NEW.data,'$.focus') = 1;
+
+    -- ── G: toggle grouped ──
+    UPDATE state SET grouped = 1 - grouped,
+        cursor = 0, cursor_id = '', scroll = 0, dscroll = 0, dcursor = 0
+        WHERE json_extract(NEW.data,'$.key') = 71;
+
+    -- ── right/l: expand or enter detail ──
+    -- If focus=1 and rpane cursor is on heading, toggle it
+    INSERT OR REPLACE INTO expanded(id, ex)
+        SELECT 'rp_' || section,
+            CASE WHEN COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)
+                 THEN 0 ELSE 1 END
+        FROM rpane
+        WHERE json_extract(NEW.data,'$.key') IN (259, 108)
+          AND json_extract(NEW.data,'$.focus') = 1
+          AND rpane.rownum = (SELECT dcursor FROM state)
+          AND rpane.style = 'heading';
+    -- If focus=1 and rpane cursor is NOT heading, follow link
+    INSERT INTO _outbox(cmd,arg) SELECT 'follow_link',
+        CAST((SELECT dcursor FROM state) AS TEXT)
+        WHERE json_extract(NEW.data,'$.key') IN (259, 108)
+          AND json_extract(NEW.data,'$.focus') = 1
+          AND NOT EXISTS(SELECT 1 FROM rpane
+              WHERE rownum=(SELECT dcursor FROM state) AND style='heading');
+    -- If focus=0, expand current node if it has children and is collapsed
+    INSERT OR REPLACE INTO expanded(id, ex)
+        SELECT json_extract(NEW.data,'$.row_id'), 1
+        WHERE json_extract(NEW.data,'$.key') IN (259, 108)
+          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.row_id') != ''
+          AND (SELECT mode FROM state) IN (0, 1, 2)
+          AND COALESCE((SELECT ex FROM expanded
+              WHERE id=json_extract(NEW.data,'$.row_id')), 1) = 0;
+
+    -- ── left/h: collapse or go to parent ──
+    -- If focus=1, toggle rpane heading
+    INSERT OR REPLACE INTO expanded(id, ex)
+        SELECT 'rp_' || section,
+            CASE WHEN COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)
+                 THEN 0 ELSE 1 END
+        FROM rpane
+        WHERE json_extract(NEW.data,'$.key') IN (258, 104)
+          AND json_extract(NEW.data,'$.focus') = 1
+          AND rpane.rownum = (SELECT dcursor FROM state)
+          AND rpane.style = 'heading';
+    -- If focus=0, mode=0 (procs): collapse if expanded+has children
+    UPDATE expanded SET ex = 0
+        WHERE json_extract(NEW.data,'$.key') IN (258, 104)
+          AND json_extract(NEW.data,'$.focus') = 0
+          AND (SELECT mode FROM state) = 0
+          AND id = json_extract(NEW.data,'$.row_id')
+          AND ex = 1
+          AND EXISTS(SELECT 1 FROM processes
+              WHERE ppid = CAST(json_extract(NEW.data,'$.row_id') AS INT));
+    -- If focus=0, mode=0, not expanded or no children → jump to parent
+    UPDATE state SET cursor = COALESCE(
+        (SELECT rownum FROM lpane WHERE id = CAST(
+            (SELECT ppid FROM processes
+             WHERE tgid = CAST(json_extract(NEW.data,'$.row_id') AS INT))
+            AS TEXT)),
+        cursor)
+        WHERE json_extract(NEW.data,'$.key') IN (258, 104)
+          AND json_extract(NEW.data,'$.focus') = 0
+          AND (SELECT mode FROM state) = 0
+          AND json_extract(NEW.data,'$.row_id') != ''
+          AND (NOT EXISTS(SELECT 1 FROM processes
+                  WHERE ppid = CAST(json_extract(NEW.data,'$.row_id') AS INT))
+               OR COALESCE((SELECT ex FROM expanded
+                   WHERE id = json_extract(NEW.data,'$.row_id')), 1) = 0);
+    -- If focus=0, mode=1 (files): collapse if expanded dir
+    INSERT OR REPLACE INTO expanded(id, ex)
+        SELECT json_extract(NEW.data,'$.row_id'), 0
+        WHERE json_extract(NEW.data,'$.key') IN (258, 104)
+          AND json_extract(NEW.data,'$.focus') = 0
+          AND (SELECT mode FROM state) = 1
+          AND json_extract(NEW.data,'$.row_id') != ''
+          AND COALESCE((SELECT ex FROM expanded
+              WHERE id=json_extract(NEW.data,'$.row_id')), 1) = 1
+          AND EXISTS(SELECT 1 FROM _ftree
+              WHERE parent_id=json_extract(NEW.data,'$.row_id'));
+    -- mode=1: if not expandable, go to parent
+    UPDATE state SET cursor = COALESCE(
+        (SELECT rownum FROM lpane WHERE id =
+            (SELECT parent_id FROM _ftree
+             WHERE id = json_extract(NEW.data,'$.row_id') LIMIT 1)),
+        cursor)
+        WHERE json_extract(NEW.data,'$.key') IN (258, 104)
+          AND json_extract(NEW.data,'$.focus') = 0
+          AND (SELECT mode FROM state) = 1
+          AND json_extract(NEW.data,'$.row_id') != ''
+          AND (NOT EXISTS(SELECT 1 FROM _ftree
+                   WHERE parent_id=json_extract(NEW.data,'$.row_id'))
+               OR COALESCE((SELECT ex FROM expanded
+                   WHERE id=json_extract(NEW.data,'$.row_id')), 1) = 0);
+    -- mode=2 (output): collapse io_ group or go to parent
+    INSERT OR REPLACE INTO expanded(id, ex)
+        SELECT json_extract(NEW.data,'$.row_id'), 0
+        WHERE json_extract(NEW.data,'$.key') IN (258, 104)
+          AND json_extract(NEW.data,'$.focus') = 0
+          AND (SELECT mode FROM state) = 2
+          AND json_extract(NEW.data,'$.row_id') LIKE 'io_%';
+    UPDATE state SET cursor = COALESCE(
+        (SELECT rownum FROM lpane
+         WHERE id = (SELECT parent_id FROM lpane
+                     WHERE id = json_extract(NEW.data,'$.row_id'))),
+        cursor)
+        WHERE json_extract(NEW.data,'$.key') IN (258, 104)
+          AND json_extract(NEW.data,'$.focus') = 0
+          AND (SELECT mode FROM state) = 2
+          AND json_extract(NEW.data,'$.row_id') NOT LIKE 'io_%'
+          AND json_extract(NEW.data,'$.row_id') != '';
+
+    -- Sync cursor_id after left/right
+    UPDATE state SET cursor_id = COALESCE(
+        (SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)), '')
+        WHERE json_extract(NEW.data,'$.key') IN (258,259,104,108);
+
+    -- ── e/E: expand/collapse all descendants (mode=0) ──
+    UPDATE expanded SET ex = 1
+        WHERE json_extract(NEW.data,'$.key') = 101
+          AND (SELECT mode FROM state) = 0
+          AND id IN (
+            WITH RECURSIVE d(t) AS (
+                SELECT CAST(json_extract(NEW.data,'$.row_id') AS INT)
+                UNION ALL
+                SELECT c.tgid FROM processes c JOIN d ON c.ppid = d.t
+            ) SELECT CAST(t AS TEXT) FROM d);
+    UPDATE expanded SET ex = 0
+        WHERE json_extract(NEW.data,'$.key') = 69
+          AND (SELECT mode FROM state) = 0
+          AND id IN (
+            WITH RECURSIVE d(t) AS (
+                SELECT CAST(json_extract(NEW.data,'$.row_id') AS INT)
+                UNION ALL
+                SELECT c.tgid FROM processes c JOIN d ON c.ppid = d.t
+            ) SELECT CAST(t AS TEXT) FROM d);
+
+    -- ── mode switches 1-7 ──
+    -- First capture dep_root for modes 3-6
+    UPDATE state SET dep_root = COALESCE(
+        (SELECT id FROM lpane WHERE rownum = (SELECT cursor FROM state)), '')
+        WHERE json_extract(NEW.data,'$.key') IN (52, 53, 54, 55);
+    -- Switch mode, reset cursors
+    UPDATE state SET
+        mode = json_extract(NEW.data,'$.key') - 49,
+        cursor = 0, cursor_id = '', scroll = 0,
+        dscroll = 0, dcursor = 0, focus = 0,
+        sort_key = CASE WHEN json_extract(NEW.data,'$.key') <= 51
+                        THEN 0 ELSE sort_key END
+        WHERE json_extract(NEW.data,'$.key') IN (49, 50, 51, 52, 53, 54, 55);
+
+    -- ── d: toggle dep filter ──
+    UPDATE state SET dep_filter = 1 - dep_filter, cursor = 0, scroll = 0
+        WHERE json_extract(NEW.data,'$.key') = 100;
+
+    -- ── s: cycle sort ──
+    UPDATE state SET sort_key = (sort_key + 1) % 3, cursor = 0, scroll = 0
+        WHERE json_extract(NEW.data,'$.key') = 115;
+
+    -- ── t: cycle timestamp mode ──
+    UPDATE state SET ts_mode = (ts_mode + 1) % 3
+        WHERE json_extract(NEW.data,'$.key') = 116;
+
+    -- ── v: cycle proc filter ──
+    UPDATE state SET lp_filter = (lp_filter + 1) % 3, cursor = 0, scroll = 0
+        WHERE json_extract(NEW.data,'$.key') = 118;
+    -- ── V: clear proc filter ──
+    UPDATE state SET lp_filter = 0, cursor = 0, scroll = 0
+        WHERE json_extract(NEW.data,'$.key') = 86;
+    -- ── F: clear event filter ──
+    UPDATE state SET evfilt = ''
+        WHERE json_extract(NEW.data,'$.key') = 70;
+
+    -- ── n: next search hit ──
+    UPDATE state SET cursor = COALESCE(
+        (SELECT MIN(rownum) FROM lpane
+         WHERE id IN (SELECT id FROM search_hits)
+           AND rownum > (SELECT cursor FROM state)),
+        (SELECT MIN(rownum) FROM lpane
+         WHERE id IN (SELECT id FROM search_hits)),
+        (SELECT cursor FROM state)),
+        dscroll = 0, dcursor = 0
+        WHERE json_extract(NEW.data,'$.key') = 110;
+    -- ── N: prev search hit ──
+    UPDATE state SET cursor = COALESCE(
+        (SELECT MAX(rownum) FROM lpane
+         WHERE id IN (SELECT id FROM search_hits)
+           AND rownum < (SELECT cursor FROM state)),
+        (SELECT MAX(rownum) FROM lpane
+         WHERE id IN (SELECT id FROM search_hits)),
+        (SELECT cursor FROM state)),
+        dscroll = 0, dcursor = 0
+        WHERE json_extract(NEW.data,'$.key') = 78;
+    -- Sync cursor_id after n/N
+    UPDATE state SET cursor_id = COALESCE(
+        (SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)), '')
+        WHERE json_extract(NEW.data,'$.key') IN (110, 78);
+
+    -- ── Interactive commands → outbox only ──
+    INSERT INTO _outbox(cmd) SELECT 'prompt_search'
+        WHERE json_extract(NEW.data,'$.key') = 47;
+    INSERT INTO _outbox(cmd) SELECT 'prompt_filter'
+        WHERE json_extract(NEW.data,'$.key') = 102;
+    INSERT INTO _outbox(cmd) SELECT 'prompt_save'
+        WHERE json_extract(NEW.data,'$.key') = 87;
+    INSERT INTO _outbox(cmd) SELECT 'prompt_sql'
+        WHERE json_extract(NEW.data,'$.key') = 120;
+    INSERT INTO _outbox(cmd) SELECT 'show_help'
+        WHERE json_extract(NEW.data,'$.key') = 63;
+
+    -- ── build_ftree after mode change to file mode, or G toggle ──
+    SELECT build_ftree()
+        WHERE ((SELECT mode FROM state) = 1)
+          AND json_extract(NEW.data,'$.key') IN (50, 71);
+
+    -- ── Clean up inbox ──
+    DELETE FROM inbox WHERE id = NEW.id;
+END;
+
+-- ── Input dispatch trigger ────────────────────────────────────────────
+-- Handles: resize, select, search, evfilt, print
+CREATE TEMP TRIGGER _dispatch_input AFTER INSERT ON inbox WHEN NEW.kind='input'
+BEGIN
+    -- resize
+    UPDATE state SET
+        rows = json_extract(NEW.data,'$.rows'),
+        cols = json_extract(NEW.data,'$.cols')
+        WHERE json_extract(NEW.data,'$.input') = 'resize'
+          AND json_extract(NEW.data,'$.rows') > 0
+          AND json_extract(NEW.data,'$.cols') > 0;
+
+    -- select: move cursor to row with given id
+    UPDATE state SET
+        cursor = COALESCE(
+            (SELECT rownum FROM lpane WHERE id = json_extract(NEW.data,'$.id')),
+            cursor),
+        cursor_id = COALESCE(json_extract(NEW.data,'$.id'), cursor_id),
+        dscroll = 0, dcursor = 0
+        WHERE json_extract(NEW.data,'$.input') = 'select';
+
+    -- search: populate search_hits, then jump to first hit
+    DELETE FROM search_hits
+        WHERE json_extract(NEW.data,'$.input') = 'search';
+    UPDATE state SET search = COALESCE(json_extract(NEW.data,'$.q'), '')
+        WHERE json_extract(NEW.data,'$.input') = 'search';
+    -- search mode 0,5,6: processes
+    INSERT OR IGNORE INTO search_hits(id)
+        SELECT CAST(tgid AS TEXT) FROM processes
+        WHERE json_extract(NEW.data,'$.input') = 'search'
+          AND (SELECT mode FROM state) IN (0, 5, 6)
+          AND json_extract(NEW.data,'$.q') != ''
+          AND (CAST(tgid AS TEXT) LIKE '%'||json_extract(NEW.data,'$.q')||'%'
+               OR exe LIKE '%'||json_extract(NEW.data,'$.q')||'%'
+               OR argv LIKE '%'||json_extract(NEW.data,'$.q')||'%');
+    -- search mode 1,3,4: files
+    INSERT OR IGNORE INTO search_hits(id)
+        SELECT DISTINCT path FROM open_events
+        WHERE json_extract(NEW.data,'$.input') = 'search'
+          AND (SELECT mode FROM state) IN (1, 3, 4)
+          AND json_extract(NEW.data,'$.q') != ''
+          AND path LIKE '%'||json_extract(NEW.data,'$.q')||'%';
+    -- search mode 2: output
+    INSERT OR IGNORE INTO search_hits(id)
+        SELECT CAST(e.id AS TEXT) FROM io_events i
+        JOIN events e ON e.id = i.eid
+        WHERE json_extract(NEW.data,'$.input') = 'search'
+          AND (SELECT mode FROM state) = 2
+          AND json_extract(NEW.data,'$.q') != ''
+          AND i.data LIKE '%'||json_extract(NEW.data,'$.q')||'%';
+    -- rebuild file tree after search in file mode (to pick up search styling)
+    SELECT build_ftree()
+        WHERE json_extract(NEW.data,'$.input') = 'search'
+          AND (SELECT mode FROM state) = 1;
+
+    -- evfilt
+    UPDATE state SET evfilt = UPPER(COALESCE(json_extract(NEW.data,'$.q'), ''))
+        WHERE json_extract(NEW.data,'$.input') = 'evfilt';
+
+    -- print: emit outbox command for C to handle
+    INSERT INTO _outbox(cmd, arg)
+        SELECT 'print', COALESCE(json_extract(NEW.data,'$.what'), '')
+        WHERE json_extract(NEW.data,'$.input') = 'print';
+
+    DELETE FROM inbox WHERE id = NEW.id;
+END;
 
 --%% FTS
 CREATE VIRTUAL TABLE fts USING fts5(
