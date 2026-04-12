@@ -1015,6 +1015,33 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     long ret;
 
     /*
+     * ptrace(PTRACE_TRACEME) — a child process wants a ptrace-based
+     * tracer (e.g. nested uproctrace, fakeroot-ng) to trace it.
+     *
+     * Execute the real ptrace call, then disable SUD for this process.
+     * Rationale: ptrace and SUD both intercept syscalls.  If both are
+     * active, ptrace sees the SIGSYS handler's internal syscalls instead
+     * of the original ones, which confuses the sub-tracer.  Disabling
+     * SUD lets the sub-tracer get clean syscall visibility while
+     * sudtrace's parent still monitors this process via waitpid()
+     * for EXEC/EXIT events.
+     */
+    if (nr == SYS_ptrace && a0 == 0 /* PTRACE_TRACEME */) {
+        long r = syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, NULL, NULL);
+        if (r == 0) {
+            /* Disable SUD: the sub-tracer now manages this process. */
+            prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF,
+                  0, 0, 0);
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            /* SUD is off; don't set selector to BLOCK. */
+            return;
+        }
+        uc->uc_mcontext.gregs[REG_RAX] = -errno;
+        sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
+        return;
+    }
+
+    /*
      * Special handling for execve: rewrite argv to go through sudtrace.
      */
     if (nr == SYS_execve) {
@@ -1421,11 +1448,17 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
 static int is_wrapper_mode(int argc, char **argv)
 {
     if (argc < 2) return 0;
+    /* Wrapper mode: sudtrace was re-invoked to SUD-trace a specific
+     * binary, e.g.  sudtrace /path/to/binary [args...]
+     *
+     * Normal mode always has a leading flag (e.g. -o) or "--" before
+     * the command.  Wrapper mode has a plain path as argv[1].
+     *
+     * We must NOT scan the rest of argv for "--" because that "--"
+     * may belong to the wrapped command (e.g.
+     *   sudtrace tv --uproctrace -o x -- /bin/echo hello
+     * where "--" separates uproctrace's options from its command). */
     if (argv[1][0] == '-') return 0;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--") == 0)
-            return 0;
-    }
     return 1;
 }
 
