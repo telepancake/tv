@@ -489,12 +489,7 @@ static void emit_cwd_event(pid_t pid)
     if (pos > 0) emit_raw(line, pos);
 }
 
-/*
- * emit_exec_event — emit EXEC event for a child process.
- * If fallback_argv is provided (non-NULL), use it when /proc reads fail
- * (e.g. child exited too quickly after exec).
- */
-static void emit_exec_event_ex(pid_t pid, char **fallback_argv)
+static void emit_exec_event(pid_t pid)
 {
     pid_t tgid = get_tgid(pid);
     pid_t ppid = get_ppid(pid);
@@ -506,14 +501,6 @@ static void emit_exec_event_ex(pid_t pid, char **fallback_argv)
     char exe_esc[PATH_MAX * 2];
     if (exe) json_escape(exe_esc, sizeof(exe_esc), exe, strlen(exe));
 
-    /* Fallback exe from argv[0] */
-    char fb_exe_esc[PATH_MAX * 2];
-    if (!exe && fallback_argv && fallback_argv[0]) {
-        exe = fallback_argv[0];
-        json_escape(fb_exe_esc, sizeof(fb_exe_esc), exe, strlen(exe));
-        memcpy(exe_esc, fb_exe_esc, sizeof(fb_exe_esc));
-    }
-
     size_t argv_len = 0;
     char *argv_raw = read_proc_file(pid, "cmdline", ARGV_MAX_READ, &argv_len);
     char *argv_j = NULL;
@@ -521,33 +508,6 @@ static void emit_exec_event_ex(pid_t pid, char **fallback_argv)
         argv_j = malloc(argv_len * 6 + 64);
         if (argv_j)
             json_argv_array(argv_j, argv_len * 6 + 64, argv_raw, argv_len);
-    }
-
-    /* Fallback argv from provided array */
-    char *fb_argv_j = NULL;
-    if (!argv_j && fallback_argv) {
-        /* Build a cmdline-style buffer from fallback_argv */
-        size_t total = 0;
-        for (int i = 0; fallback_argv[i]; i++)
-            total += strlen(fallback_argv[i]) + 1;
-        if (total > 0) {
-            char *fb_raw = malloc(total);
-            if (fb_raw) {
-                size_t off = 0;
-                for (int i = 0; fallback_argv[i]; i++) {
-                    size_t len = strlen(fallback_argv[i]);
-                    memcpy(fb_raw + off, fallback_argv[i], len);
-                    fb_raw[off + len] = '\0';
-                    off += len + 1;
-                }
-                fb_argv_j = malloc(total * 6 + 64);
-                if (fb_argv_j)
-                    json_argv_array(fb_argv_j, total * 6 + 64, fb_raw, total);
-                free(fb_raw);
-            }
-        }
-        argv_j = fb_argv_j;
-        fb_argv_j = NULL; /* ownership transferred */
     }
 
     size_t env_len = 0;
@@ -580,11 +540,6 @@ static void emit_exec_event_ex(pid_t pid, char **fallback_argv)
 
     free(env_j); free(env_raw);
     free(argv_j); free(argv_raw);
-}
-
-static void emit_exec_event(pid_t pid)
-{
-    emit_exec_event_ex(pid, NULL);
 }
 
 static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
@@ -849,16 +804,6 @@ static int check_shebang(const char *path, char *interp, size_t interp_sz,
     return 1;
 }
 
-/*
- * check_elf_dynamic — classify an ELF binary.
- *
- * Returns:
- *   1  — dynamic: has PT_INTERP (needs ld.so), interp[] filled in
- *   0  — static executable (ET_EXEC, no PT_INTERP)
- *   2  — position-independent / interpreter (ET_DYN, no PT_INTERP),
- *         e.g. ld-linux-x86-64.so.2 or a static-PIE binary
- *  -1  — not a 64-bit ELF or read error
- */
 static int check_elf_dynamic(const char *path, char *interp, size_t interp_sz)
 {
     int fd = open(path, O_RDONLY);
@@ -905,14 +850,6 @@ static int check_elf_dynamic(const char *path, char *interp, size_t interp_sz)
     }
 
     close(fd);
-
-    /* No PT_INTERP.  Distinguish ET_DYN (interpreter/static-PIE) from
-     * ET_EXEC (traditional statically-linked binary).  We can only load
-     * ET_DYN binaries in wrapper mode; ET_EXEC ones have glibc init
-     * requirements that the simple ELF loader cannot satisfy. */
-    if (ehdr.e_type == ET_DYN)
-        return 2;
-
     return 0;
 }
 
@@ -948,13 +885,7 @@ static int resolve_path(const char *cmd, char *out, size_t out_sz)
  * 1. Resolve the target command to a full path
  * 2. If it starts with #!, prepend the interpreter to argv and restart
  * 3. If it is a dynamically linked ELF, prepend PT_INTERP to argv
- * 4. If it is an ET_DYN binary without PT_INTERP (e.g. ld-linux.so),
- *    prepend sudtrace itself (wrapper mode can load these)
- * 5. If it is a statically linked ET_EXEC, leave argv as-is
- *    (the simple ELF loader cannot handle glibc static init; the
- *    binary will be exec'd directly, losing SUD tracing but running
- *    correctly — this enables nested ptrace-based tools like
- *    uproctrace and fakeroot-ng)
+ * 4. If it is a statically linked ELF, prepend sudtrace itself to argv
  *
  * Final result: e.g. sudtrace /lib/ld-linux-x86-64.so.2 /bin/sh script.sh
  */
@@ -1009,10 +940,7 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
             continue;
         }
 
-        if (dyn == 2) {
-            /* ET_DYN without PT_INTERP (e.g. ld-linux.so, static-PIE).
-             * These can be loaded by the simple wrapper-mode ELF loader,
-             * so prepend sudtrace to enter wrapper mode. */
+        if (dyn == 0) {
             if (nargs + 1 >= max_args) {
                 max_args = nargs + 8;
                 args = realloc(args, (max_args + 1) * sizeof(char *));
@@ -1072,31 +1000,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     long a5  = (long)uc->uc_mcontext.gregs[REG_R9];
 
     long ret;
-
-    /*
-     * ptrace(PTRACE_TRACEME) — a child wants its parent to trace it
-     * via ptrace (e.g. nested uproctrace or fakeroot-ng).  Execute the
-     * real ptrace call, then disable SUD so the sub-tracer can interact
-     * with this process using normal ptrace operations.  Without this,
-     * SUD would intercept every syscall before ptrace could see it.
-     */
-#ifndef PTRACE_TRACEME
-#define PTRACE_TRACEME 0
-#endif
-    if (nr == SYS_ptrace && a0 == PTRACE_TRACEME) {
-        long r = syscall(SYS_ptrace, PTRACE_TRACEME, 0, NULL, NULL);
-        if (r == 0) {
-            /* Disable SUD: the sub-tracer now manages this process. */
-            prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF,
-                  0, 0, 0);
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            /* SUD is off; don't set selector to BLOCK. */
-            return;
-        }
-        uc->uc_mcontext.gregs[REG_RAX] = -errno;
-        sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
-        return;
-    }
 
     /*
      * Special handling for execve: rewrite argv to go through sudtrace.
@@ -1505,7 +1408,7 @@ static int run_wrapper_mode(int argc, char **argv)
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event_ex(child, argv + 1);
+    emit_exec_event(child);
     emit_inherited_open_events(child);
 
     for (;;) {
@@ -1641,7 +1544,7 @@ int main(int argc, char **argv)
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event_ex(child, argv + cmd_start);
+    emit_exec_event(child);
     emit_inherited_open_events(child);
 
     /* Main wait loop */
