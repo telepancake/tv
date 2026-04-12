@@ -659,6 +659,16 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
     if (pos > 0) emit_raw(line, pos);
 }
 
+/* Static buffers for emit_write_event — avoids malloc() which is not
+ * async-signal-safe.  This function is called from the SIGSYS handler
+ * while the traced program may hold malloc's internal lock (e.g. inside
+ * fprintf → write).  The buffers are protected by the emit_lock() /
+ * emit_unlock() spinlock that already serialises output. */
+#define WRITE_ESCAPED_MAX  (WRITE_CAPTURE_MAX * 6 + 4)
+#define WRITE_LINE_MAX     (WRITE_CAPTURE_MAX * 6 + 512)
+static char g_write_escaped_buf[WRITE_ESCAPED_MAX];
+static char g_write_line_buf[WRITE_LINE_MAX];
+
 static void emit_write_event(pid_t pid, const char *stream,
                              const void *data_buf, size_t count)
 {
@@ -670,20 +680,27 @@ static void emit_write_event(pid_t pid, const char *stream,
     size_t to_read = count;
     if (to_read > WRITE_CAPTURE_MAX) to_read = WRITE_CAPTURE_MAX;
 
-    char *escaped = malloc(to_read * 6 + 4);
-    if (!escaped) return;
-    json_escape(escaped, to_read * 6 + 4, data_buf, to_read);
+    /* Use static buffers under lock instead of malloc — the SIGSYS handler
+     * cannot safely call malloc (the interrupted code may hold the heap lock). */
+    emit_lock();
 
-    char *line = malloc(to_read * 6 + 512);
-    if (!line) { free(escaped); return; }
+    json_escape(g_write_escaped_buf, WRITE_ESCAPED_MAX, data_buf, to_read);
 
-    int pos = json_header(line, to_read * 6 + 512, stream, pid, tgid, ppid,
-                          &ts);
-    pos += snprintf(line + pos, to_read * 6 + 512 - pos,
-        ",\"len\":%zu,\"data\":%s}\n", to_read, escaped);
+    int pos = json_header(g_write_line_buf, WRITE_LINE_MAX, stream,
+                          pid, tgid, ppid, &ts);
+    pos += snprintf(g_write_line_buf + pos, WRITE_LINE_MAX - pos,
+        ",\"len\":%zu,\"data\":%s}\n", to_read, g_write_escaped_buf);
 
-    if (pos > 0) emit_raw(line, pos);
-    free(line); free(escaped);
+    if (pos > 0) {
+        size_t off = 0;
+        while (off < (size_t)pos) {
+            ssize_t n = write(g_out_fd, g_write_line_buf + off, pos - off);
+            if (n <= 0) break;
+            off += n;
+        }
+    }
+
+    emit_unlock();
 }
 
 static void emit_exit_event(pid_t pid, int status)
