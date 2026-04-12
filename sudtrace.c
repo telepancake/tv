@@ -95,24 +95,37 @@ extern char __sud_end[];
 /* ================================================================
  * SUD selector byte.
  *
- * SUD checks this byte before delivering SIGSYS.  When ALLOW, the
- * syscall proceeds normally; when BLOCK, the kernel sends SIGSYS.
+ * SUD checks a per-task selector byte before delivering SIGSYS:
+ *   1. If selector == ALLOW → syscall proceeds (no SIGSYS)
+ *   2. If selector == BLOCK → check instruction pointer:
+ *        - If IP is in [__sud_begin, __sud_end) → allow (our code)
+ *        - Otherwise → deliver SIGSYS
  *
- * In normal mode (parent process), this is a plain global variable.
- * In wrapper mode, it's allocated via mmap so that it survives the
- * loaded binary's glibc TLS re-initialization (which would relocate
- * a __thread variable to a new address, leaving the kernel's stored
- * selector pointer dangling — effectively disabling SUD).
+ * Since sudtrace is statically linked, ALL code (including libc's
+ * syscall wrappers) lives within [__sud_begin, __sud_end).  This
+ * means the SIGSYS handler can make real syscalls without ever
+ * toggling the selector — the kernel allows them based on IP alone.
  *
- * g_sud_selector_ptr is what the SIGSYS handler and emit functions
- * use; it always points to the actual selector byte the kernel knows
- * about, regardless of TLS changes.
+ * We keep the selector at BLOCK permanently.  This is critical for
+ * multi-threaded programs: new threads inherit the parent's SUD
+ * config including the same selector byte.  Because no thread ever
+ * sets selector = ALLOW, there is no race between threads in the
+ * SIGSYS handler — a thread setting BLOCK can't interfere with
+ * another thread mid-syscall.
+ *
+ * The selector byte is in a dedicated mmap page so it survives the
+ * loaded binary's glibc TLS re-initialisation.
  * ================================================================ */
 static volatile unsigned char sud_selector_storage
-    = SYSCALL_DISPATCH_FILTER_ALLOW;
+    = SYSCALL_DISPATCH_FILTER_BLOCK;
+
+/* Pointer to the active selector byte.  In wrapper mode, this is
+ * redirected to an mmap'd page; in normal mode, it stays on the
+ * global above (which is never actually checked by the kernel
+ * because the parent process doesn't enable SUD). */
 static volatile unsigned char *g_sud_selector_ptr = &sud_selector_storage;
 
-/* Convenience macro so existing code can keep using sud_selector */
+/* Convenience macro — only meaningful in wrapper-mode child process. */
 #define sud_selector (*g_sud_selector_ptr)
 
 /* ================================================================
@@ -147,15 +160,12 @@ static void emit_unlock(void)
 static void emit_raw(const char *buf, size_t len)
 {
     emit_lock();
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     size_t off = 0;
     while (off < len) {
         ssize_t n = write(g_out_fd, buf + off, len - off);
         if (n <= 0) break;
         off += n;
     }
-    sud_selector = saved;
     emit_unlock();
 }
 
@@ -165,10 +175,7 @@ static void emit_raw(const char *buf, size_t len)
 
 static void get_timestamp_raw(struct timespec *ts)
 {
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     clock_gettime(CLOCK_REALTIME, ts);
-    sud_selector = saved;
 }
 
 /* ================================================================
@@ -295,16 +302,13 @@ static ssize_t read_proc_raw(pid_t pid, const char *name,
 {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, name);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { sud_selector = saved; return -1; }
+    if (fd < 0) return -1;
     ssize_t total = 0, n;
     while ((size_t)total < bufsz &&
            (n = read(fd, buf + total, bufsz - total)) > 0)
         total += n;
     close(fd);
-    sud_selector = saved;
     if (total > 0 && (size_t)total < bufsz) buf[total] = '\0';
     return total;
 }
@@ -314,18 +318,15 @@ static char *read_proc_file(pid_t pid, const char *name, size_t max,
 {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, name);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { sud_selector = saved; return NULL; }
+    if (fd < 0) return NULL;
     char *buf = malloc(max + 1);
-    if (!buf) { close(fd); sud_selector = saved; return NULL; }
+    if (!buf) { close(fd); return NULL; }
     size_t total = 0;
     ssize_t n;
     while (total < max && (n = read(fd, buf + total, max - total)) > 0)
         total += n;
     close(fd);
-    sud_selector = saved;
     if (total == 0) { free(buf); return NULL; }
     buf[total] = '\0';
     if (out_len) *out_len = total;
@@ -336,10 +337,7 @@ static char *read_proc_exe(pid_t pid, char *buf, size_t bufsz)
 {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/exe", (int)pid);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     ssize_t n = readlink(path, buf, bufsz - 1);
-    sud_selector = saved;
     if (n <= 0) return NULL;
     buf[n] = '\0';
     const char *del = " (deleted)";
@@ -353,10 +351,7 @@ static char *read_proc_cwd(pid_t pid, char *buf, size_t bufsz)
 {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/cwd", (int)pid);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     ssize_t n = readlink(path, buf, bufsz - 1);
-    sud_selector = saved;
     if (n <= 0) return NULL;
     buf[n] = '\0';
     return buf;
@@ -387,13 +382,10 @@ static ssize_t read_proc_mem(pid_t pid, unsigned long addr, void *buf,
 {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/mem", (int)pid);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { sud_selector = saved; return -1; }
+    if (fd < 0) return -1;
     ssize_t n = pread(fd, buf, len, (off_t)addr);
     close(fd);
-    sud_selector = saved;
     return n;
 }
 
@@ -401,15 +393,12 @@ static int format_auxv_json(pid_t pid, char *buf, int buflen)
 {
     char path[256];
     snprintf(path, sizeof(path), "/proc/%d/auxv", (int)pid);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { sud_selector = saved; return 0; }
+    if (fd < 0) return 0;
 
     unsigned char raw[4096];
     ssize_t n = read(fd, raw, sizeof(raw));
     close(fd);
-    sud_selector = saved;
     if (n <= 0) return 0;
 
     int pos = 0, first = 1;
@@ -563,26 +552,18 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
     char link_path[256], link_target[PATH_MAX];
     snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%d",
              (int)pid, fd_num);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     ssize_t n = readlink(link_path, link_target, sizeof(link_target) - 1);
-    sud_selector = saved;
     if (n <= 0) return;
     link_target[n] = '\0';
 
     struct stat st;
-    saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     if (fstatat(AT_FDCWD, link_path, &st, 0) < 0)
         memset(&st, 0, sizeof(st));
-    sud_selector = saved;
 
     char fdinfo_path[256], fdinfo_buf[512];
     snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo/%d",
              (int)pid, fd_num);
     int flags = O_RDONLY;
-    saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     int fi = open(fdinfo_path, O_RDONLY);
     if (fi >= 0) {
         ssize_t r = read(fi, fdinfo_buf, sizeof(fdinfo_buf) - 1);
@@ -593,7 +574,6 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
             if (fp) flags = (int)strtol(fp + 6, NULL, 8);
         }
     }
-    sud_selector = saved;
 
     char path_esc[PATH_MAX * 2];
     json_escape(path_esc, sizeof(path_esc), link_target, strlen(link_target));
@@ -621,25 +601,16 @@ static void emit_inherited_open_events(pid_t pid)
 
     char dir_path[256];
     snprintf(dir_path, sizeof(dir_path), "/proc/%d/fd", (int)pid);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     DIR *d = opendir(dir_path);
-    sud_selector = saved;
     if (!d) return;
 
     struct dirent *ent;
-    saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
         int fd_num = atoi(ent->d_name);
-        sud_selector = saved;
         emit_inherited_open_for_fd(pid, tgid, ppid, &ts, fd_num);
-        saved = sud_selector;
-        sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     }
     closedir(d);
-    sud_selector = saved;
 }
 
 static void emit_open_event(pid_t pid, const char *path, int flags,
@@ -664,14 +635,11 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
         struct stat st;
         snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%ld", (int)pid,
                  fd_or_err);
-        unsigned char saved = sud_selector;
-        sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
         if (fstatat(AT_FDCWD, fd_path, &st, 0) == 0) {
             ino_nr = st.st_ino;
             dev_major = major(st.st_dev);
             dev_minor = minor(st.st_dev);
         }
-        sud_selector = saved;
     }
 
     char line[PATH_MAX * 2 + 512];
@@ -761,10 +729,7 @@ static int fd1_is_creator_stdout(pid_t pid)
     char link_path[256];
     struct stat st;
     snprintf(link_path, sizeof(link_path), "/proc/%d/fd/1", (int)pid);
-    unsigned char saved = sud_selector;
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
     int r = stat(link_path, &st);
-    sud_selector = saved;
     if (r < 0) return 0;
     return (st.st_dev == g_creator_stdout_st.st_dev &&
             st.st_ino == g_creator_stdout_st.st_ino);
@@ -999,7 +964,12 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     (void)sig;
     (void)info;
 
-    sud_selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+    /* No selector toggling needed: all syscalls made from within
+     * sudtrace's code are in the allowed IP range [__sud_begin,
+     * __sud_end) and pass the kernel's SUD check regardless of the
+     * selector byte value.  This is critical for multi-threaded
+     * programs — a shared selector byte with toggling would race
+     * between concurrent SIGSYS handlers on different threads. */
 
     pid_t tid = (pid_t)syscall(SYS_gettid);
 
@@ -1033,11 +1003,9 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF,
                   0, 0, 0);
             uc->uc_mcontext.gregs[REG_RAX] = 0;
-            /* SUD is off; don't set selector to BLOCK. */
             return;
         }
         uc->uc_mcontext.gregs[REG_RAX] = -errno;
-        sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
         return;
     }
 
@@ -1074,7 +1042,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         }
 
         uc->uc_mcontext.gregs[REG_RAX] = ret;
-        sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
         return;
     }
 
@@ -1082,7 +1049,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     if (nr == SYS_execveat) {
         ret = syscall(SYS_execveat, a0, a1, a2, a3, a4);
         uc->uc_mcontext.gregs[REG_RAX] = ret;
-        sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
         return;
     }
 #endif
@@ -1124,7 +1090,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     }
 
     uc->uc_mcontext.gregs[REG_RAX] = ret;
-    sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 }
 
 /* ================================================================
@@ -1241,34 +1206,34 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         mprotect(mapped, map_size, prot);
     }
 
-    /* Install SIGSYS handler */
+    /* Install SIGSYS handler.
+     *
+     * We deliberately do NOT use SA_ONSTACK.  The handler runs on the
+     * calling thread's own stack instead.  This is critical for multi-
+     * threaded programs: sigaltstack is per-thread, and new threads
+     * created by the traced binary won't have one set up.  Using
+     * SA_ONSTACK would crash those threads with SIGSEGV when SIGSYS
+     * is delivered.  All thread stacks (main + pthread-created) are
+     * large enough (≥ 2 MB) for the handler's needs. */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = sigsys_handler;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGSYS, &sa, NULL) < 0) {
         perror("sudtrace: sigaction(SIGSYS)");
         _exit(127);
     }
 
-    /* Set up an alternate signal stack */
-    size_t altstack_sz = 64 * 1024;
-    void *altstack = mmap(NULL, altstack_sz, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (altstack != MAP_FAILED) {
-        stack_t ss = {
-            .ss_sp = altstack,
-            .ss_size = altstack_sz,
-            .ss_flags = 0
-        };
-        sigaltstack(&ss, NULL);
-    }
-
     /* Allocate the SUD selector byte in a dedicated mmap page.
      * This survives the loaded binary's glibc TLS re-initialization,
      * which would otherwise move __thread storage to a new address
-     * and leave the kernel's stored selector pointer dangling. */
+     * and leave the kernel's stored selector pointer dangling.
+     *
+     * The selector stays at BLOCK permanently.  The handler never
+     * toggles it — sudtrace's own syscalls pass because their IP
+     * is in the allowed range, not because of the selector value.
+     * This eliminates races between threads sharing the selector. */
     void *sel_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (sel_page == MAP_FAILED) {
@@ -1276,7 +1241,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         _exit(127);
     }
     volatile unsigned char *sel = (volatile unsigned char *)sel_page;
-    *sel = SYSCALL_DISPATCH_FILTER_ALLOW;
+    *sel = SYSCALL_DISPATCH_FILTER_BLOCK;
     g_sud_selector_ptr = sel;
 
     /* Enable SUD */
@@ -1395,9 +1360,6 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     }
 
     close(fd);
-
-    /* Enable interception */
-    sud_selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 
     /* Jump to the entry point (adjusted for PIE load base) */
     unsigned long entry = load_base + ehdr.e_entry;
