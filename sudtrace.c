@@ -93,14 +93,27 @@ extern char __sud_end[];
 #define SUD_OUTPUT_FD      1023
 
 /* ================================================================
- * Per-thread SUD selector byte.
+ * SUD selector byte.
  *
  * SUD checks this byte before delivering SIGSYS.  When ALLOW, the
  * syscall proceeds normally; when BLOCK, the kernel sends SIGSYS.
- * Each thread in a traced process inherits this via fork().
+ *
+ * In normal mode (parent process), this is a plain global variable.
+ * In wrapper mode, it's allocated via mmap so that it survives the
+ * loaded binary's glibc TLS re-initialization (which would relocate
+ * a __thread variable to a new address, leaving the kernel's stored
+ * selector pointer dangling — effectively disabling SUD).
+ *
+ * g_sud_selector_ptr is what the SIGSYS handler and emit functions
+ * use; it always points to the actual selector byte the kernel knows
+ * about, regardless of TLS changes.
  * ================================================================ */
-static __thread volatile unsigned char sud_selector
+static volatile unsigned char sud_selector_storage
     = SYSCALL_DISPATCH_FILTER_ALLOW;
+static volatile unsigned char *g_sud_selector_ptr = &sud_selector_storage;
+
+/* Convenience macro so existing code can keep using sud_selector */
+#define sud_selector (*g_sud_selector_ptr)
 
 /* ================================================================
  * Global state
@@ -1225,12 +1238,26 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         sigaltstack(&ss, NULL);
     }
 
+    /* Allocate the SUD selector byte in a dedicated mmap page.
+     * This survives the loaded binary's glibc TLS re-initialization,
+     * which would otherwise move __thread storage to a new address
+     * and leave the kernel's stored selector pointer dangling. */
+    void *sel_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (sel_page == MAP_FAILED) {
+        perror("sudtrace: mmap selector");
+        _exit(127);
+    }
+    volatile unsigned char *sel = (volatile unsigned char *)sel_page;
+    *sel = SYSCALL_DISPATCH_FILTER_ALLOW;
+    g_sud_selector_ptr = sel;
+
     /* Enable SUD */
     unsigned long off = (unsigned long)__sud_begin;
     unsigned long len = (unsigned long)__sud_end - (unsigned long)__sud_begin;
 
     if (prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON,
-              off, len, (unsigned long)&sud_selector) < 0) {
+              off, len, (unsigned long)sel) < 0) {
         perror("sudtrace: prctl(PR_SET_SYSCALL_USER_DISPATCH)");
         fprintf(stderr, "  Requires CONFIG_SYSCALL_USER_DISPATCH=y "
                 "(Linux 5.11+).\n");
@@ -1348,8 +1375,21 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     /* Jump to the entry point (adjusted for PIE load base) */
     unsigned long entry = load_base + ehdr.e_entry;
 
+    /*
+     * Jump to the loaded ELF's entry point with a clean register state.
+     *
+     * We must zero all general-purpose registers before entering the loaded
+     * binary (the ABI requires an unspecified initial state except rsp).
+     * However, the compiler may place the 'entry' value in any register
+     * (including callee-saved r12–r15 or rbx).  If we zero that register
+     * before using it, we jump to address 0 → SIGSEGV.
+     *
+     * Fix: set rsp first, push the entry address onto the new stack,
+     * zero all registers, then 'ret' pops the entry address into rip.
+     */
     __asm__ volatile(
-        "mov %0, %%rsp\n\t"
+        "mov %0, %%rsp\n\t"       /* switch to the new stack */
+        "push %1\n\t"             /* save entry address on stack */
         "xor %%rax, %%rax\n\t"
         "xor %%rbx, %%rbx\n\t"
         "xor %%rcx, %%rcx\n\t"
@@ -1365,7 +1405,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         "xor %%r13, %%r13\n\t"
         "xor %%r14, %%r14\n\t"
         "xor %%r15, %%r15\n\t"
-        "jmp *%1\n\t"
+        "ret\n\t"                  /* pop entry address → rip */
         :
         : "r"(sp), "r"(entry)
         : "memory"
