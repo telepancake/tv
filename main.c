@@ -40,7 +40,7 @@ static int g_pending_trace_rows;
 enum {
     LIVE_TRACE_BATCH_ROWS = 256,
     LIVE_TRACE_BATCH_MS = 50,
-    CURSOR_EVENT_DEBOUNCE_MS = 200
+    CURSOR_EVENT_DEBOUNCE_MS = 200,
 };
 
 static void xexec(const char *sql) {
@@ -263,7 +263,7 @@ static void update_status(void) {
     (void)p;
 
     if (g_tui)
-    tui_set_status(g_tui, s);
+        tui_set_status(g_tui, s);
 }
 
 static int g_cursor_event_timer = -1;
@@ -912,7 +912,7 @@ static void process_inbox(tui_t *tui) {
                   "INSERT INTO inbox(kind,data) VALUES('input',?)", -1, &st, 0);
               sqlite3_bind_text(st, 1, data, -1, SQLITE_TRANSIENT);
               sqlite3_step(st); sqlite3_finalize(st);
-             }
+            }
             sync_engine_from_state();
             tui_dirty(tui, NULL);
             process_outbox(tui);
