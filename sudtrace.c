@@ -72,6 +72,9 @@
 #ifndef SYSCALL_DISPATCH_FILTER_BLOCK
 #define SYSCALL_DISPATCH_FILTER_BLOCK 1
 #endif
+#ifndef SA_RESTORER
+#define SA_RESTORER 0x04000000
+#endif
 
 /* ================================================================
  * Linker-provided symbols marking sudtrace's own address range.
@@ -160,6 +163,18 @@ static inline long raw_syscall6(long nr, long a0, long a1, long a2,
     );
     return ret;
 }
+
+void sud_rt_sigreturn_restorer(void);
+
+__asm__(
+    "    .text\n"
+    "    .type sud_rt_sigreturn_restorer, @function\n"
+    "sud_rt_sigreturn_restorer:\n"
+    "    mov  $15, %eax\n"
+    "    syscall\n"
+    "    hlt\n"
+    "    .size sud_rt_sigreturn_restorer, .-sud_rt_sigreturn_restorer\n"
+);
 
 /* ================================================================
  * Raw clone3/clone — special assembly for thread-creating syscalls.
@@ -1902,7 +1917,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      *
      * Two cases:
      *
-     * A) CLONE_VM set (thread creation, e.g. pthread_create):
+     * A) CLONE_VM with a separate child stack (pthread/clone3 spawn):
      *    The child starts executing inside this handler on a NEW stack.
      *    The compiler's RSP-relative code for local variables (including
      *    `uc`) references wrong addresses on the new stack → SIGSEGV.
@@ -1911,27 +1926,36 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      *    register state from the ucontext and jumps directly to the
      *    program's saved RIP.  The child never returns to C code here.
      *
-     * B) CLONE_VM not set (fork, e.g. fork()/vfork()):
-     *    The child gets its own address space (COW).  It continues
-     *    executing inside the handler on its own copy of the stack, with
-     *    all local variables intact.  The clone_raw assembly would break
-     *    because its sync_flag write goes to the child's COW page (the
-     *    parent never sees it and spins forever).  Use raw_syscall6
-     *    instead — the child returns normally through the handler and
-     *    the signal frame is cleaned up by rt_sigreturn as usual.
+     * B) Anything else (fork/vfork without a reusable post-syscall state):
+     *    The child can return through the handler normally via
+     *    rt_sigreturn, or for clone3 vfork-style spawns we can force
+     *    glibc's vfork fallback by reporting ENOSYS.
      */
 #ifndef CLONE_VM
 #define CLONE_VM 0x00000100
 #endif
+#ifndef CLONE_VFORK
+#define CLONE_VFORK 0x00004000
+#endif
+#ifndef CLONE_THREAD
+#define CLONE_THREAD 0x00010000
+#endif
 #ifdef SYS_clone3
     if (nr == SYS_clone3) {
-        /* clone3: flags are at offset 0 of the clone_args struct */
+        /* clone3: flags are at offset 0, stack at offset 40 */
         unsigned long long c3_flags = 0;
+        unsigned long long c3_stack = 0;
         if (a0)
             c3_flags = *(unsigned long long *)a0;
-        if (c3_flags & CLONE_VM) {
+        if (a0)
+            c3_stack = *(unsigned long long *)((char *)a0 + 40);
+        if ((c3_flags & (CLONE_VM | CLONE_THREAD)) ==
+            (CLONE_VM | CLONE_THREAD) && c3_stack) {
             ret = clone3_raw(a0, a1, uc);
             /* Only parent reaches here; child jumped to program's RIP */
+        } else if (c3_flags & CLONE_VFORK) {
+            /* glibc falls back to vfork/clone when clone3 reports ENOSYS */
+            ret = -ENOSYS;
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
@@ -1942,7 +1966,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 #endif
     if (nr == SYS_clone) {
         /* clone: flags are in a0 (rdi) */
-        if ((unsigned long)a0 & CLONE_VM) {
+        unsigned long c_flags = (unsigned long)a0;
+        if ((c_flags & CLONE_VM) && a1) {
             ret = clone_raw(a0, a1, a2, a3, a4, uc);
             /* Only parent reaches here */
         } else {
@@ -1952,6 +1977,29 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
+
+#ifdef SYS_rt_sigaction
+    if (nr == SYS_rt_sigaction) {
+        struct kernel_sigaction {
+            void (*handler)(int);
+            unsigned long flags;
+            void (*restorer)(void);
+            unsigned long mask;
+        };
+        const struct kernel_sigaction *act =
+            (const struct kernel_sigaction *)a1;
+        if (act) {
+            struct kernel_sigaction patched = *act;
+            patched.flags |= SA_RESTORER;
+            patched.restorer = sud_rt_sigreturn_restorer;
+            ret = raw_syscall6(nr, a0, (long)&patched, a2, a3, a4, a5);
+        } else {
+            ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+        }
+        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        return;
+    }
+#endif
 
     /* Execute the real syscall using raw inline assembly.
      *
