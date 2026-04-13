@@ -268,12 +268,23 @@ static void update_status(void) {
         tui_set_status(g_tui, s);
 }
 
+/* Cursor debounce state is only touched from the main TUI thread. */
 static int g_cursor_event_timer = -1;
-static int g_cursor_event_use_timer = 0;
+static int g_cursor_event_timer_enabled = 0;
 static char g_pending_cursor_panel[CURSOR_EVENT_PANEL_MAX];
 static char g_pending_cursor_row_id[CURSOR_EVENT_ROW_ID_MAX];
 
 static void flush_pending_cursor_event(tui_t *tui);
+
+static void copy_cstr(char *dst, size_t dstsz, const char *src) {
+    size_t n;
+    if (!dst || dstsz == 0) return;
+    src = src ? src : "";
+    n = strlen(src);
+    if (n >= dstsz) n = dstsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
 
 static int on_cursor_event_timer(tui_t *tui, void *ctx) {
     (void)ctx;
@@ -287,10 +298,10 @@ static void queue_cursor_event(tui_t *tui, const char *panel, const char *row_id
         tui_remove_timer(tui, g_cursor_event_timer);
         g_cursor_event_timer = -1;
     }
-    snprintf(g_pending_cursor_panel, sizeof(g_pending_cursor_panel), "%s", panel ? panel : "");
-    snprintf(g_pending_cursor_row_id, sizeof(g_pending_cursor_row_id), "%s", row_id ? row_id : "");
+    copy_cstr(g_pending_cursor_panel, sizeof(g_pending_cursor_panel), panel);
+    copy_cstr(g_pending_cursor_row_id, sizeof(g_pending_cursor_row_id), row_id);
     if (!g_pending_cursor_panel[0]) return;
-    if (g_cursor_event_use_timer) {
+    if (g_cursor_event_timer_enabled) {
         g_cursor_event_timer = tui_add_timer(tui, CURSOR_EVENT_DEBOUNCE_MS, on_cursor_event_timer, NULL);
         if (g_cursor_event_timer < 0) flush_pending_cursor_event(tui);
     }
@@ -1183,7 +1194,7 @@ int main(int argc, char **argv) {
         return headless_mode ? 0 : 1;
     }
     g_tui = tui;
-    g_cursor_event_use_timer = !headless_mode;
+    g_cursor_event_timer_enabled = !headless_mode;
     g_cursor_event_timer = -1;
     g_pending_cursor_panel[0] = '\0';
     g_pending_cursor_row_id[0] = '\0';
