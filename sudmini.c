@@ -256,7 +256,7 @@ void *malloc(size_t size)
     size_t total = sizeof(struct mini_alloc_hdr) + size;
     size_t page = mini_page_size();
     size_t map_len = (total + page - 1) & ~(page - 1);
-    void *base = (void *)mini_syscall6(
+    long syscall_ret = mini_syscall6(
 #if defined(__x86_64__)
         SYS_mmap,
         0, map_len, PROT_READ | PROT_WRITE,
@@ -267,10 +267,11 @@ void *malloc(size_t size)
         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0
 #endif
     );
-    if ((long)base < 0) {
-        g_errno_value = (int)-(long)base;
+    if ((unsigned long)syscall_ret >= (unsigned long)-4095) {
+        g_errno_value = (int)-syscall_ret;
         return NULL;
     }
+    void *base = (void *)syscall_ret;
     struct mini_alloc_hdr *hdr = (struct mini_alloc_hdr *)base;
     hdr->map_len = map_len;
     hdr->user_len = size;

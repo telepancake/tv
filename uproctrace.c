@@ -1710,6 +1710,155 @@ static int resolve_sudtrace_exe(char *buf, size_t bufsz)
     return access(buf, X_OK) == 0 ? 0 : -1;
 }
 
+static int resolve_exec_path(const char *cmd, char *out, size_t out_sz)
+{
+    if (!cmd || !cmd[0] || out_sz == 0)
+        return -1;
+    if (cmd[0] == '/' || cmd[0] == '.') {
+        if (realpath(cmd, out) != NULL)
+            return 0;
+        if (snprintf(out, out_sz, "%s", cmd) >= (int)out_sz)
+            return -1;
+        return access(out, X_OK) == 0 ? 0 : -1;
+    }
+
+    const char *path_env = getenv("PATH");
+    if (!path_env || !path_env[0])
+        path_env = "/usr/bin:/bin";
+
+    char path_copy[4096];
+    if (snprintf(path_copy, sizeof(path_copy), "%s", path_env) >= (int)sizeof(path_copy))
+        return -1;
+
+    char *saveptr = NULL;
+    for (char *dir = strtok_r(path_copy, ":", &saveptr);
+         dir; dir = strtok_r(NULL, ":", &saveptr)) {
+        if (snprintf(out, out_sz, "%s/%s", dir, cmd) >= (int)out_sz)
+            continue;
+        if (access(out, X_OK) == 0)
+            return 0;
+    }
+
+    return -1;
+}
+
+static int check_shebang(const char *path, char *interp, size_t interp_sz,
+                         char *interp_arg, size_t arg_sz)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n < 3) return 0;
+    buf[n] = '\0';
+
+    if (buf[0] != '#' || buf[1] != '!')
+        return 0;
+
+    char *nl = strchr(buf + 2, '\n');
+    if (nl) *nl = '\0';
+
+    char *p = buf + 2;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) return 0;
+
+    char *end = p;
+    while (*end && *end != ' ' && *end != '\t') end++;
+
+    size_t ilen = (size_t)(end - p);
+    if (ilen >= interp_sz) ilen = interp_sz - 1;
+    memcpy(interp, p, ilen);
+    interp[ilen] = '\0';
+
+    if (interp_arg && arg_sz > 0) {
+        interp_arg[0] = '\0';
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end) {
+            size_t alen = strlen(end);
+            if (alen >= arg_sz) alen = arg_sz - 1;
+            memcpy(interp_arg, end, alen);
+            interp_arg[alen] = '\0';
+        }
+    }
+
+    return 1;
+}
+
+static int read_elf_class(const char *path, int *elf_class)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+
+    unsigned char ident[EI_NIDENT];
+    ssize_t n = read(fd, ident, sizeof(ident));
+    close(fd);
+    if (n != (ssize_t)sizeof(ident))
+        return -1;
+    if (memcmp(ident, ELFMAG, SELFMAG) != 0)
+        return -1;
+    if (ident[EI_CLASS] != ELFCLASS32 && ident[EI_CLASS] != ELFCLASS64)
+        return -1;
+    if (elf_class)
+        *elf_class = ident[EI_CLASS];
+    return 0;
+}
+
+static int resolve_command_elf_class(const char *cmd, int *elf_class)
+{
+    char current[PATH_MAX];
+    if (resolve_exec_path(cmd, current, sizeof(current)) != 0)
+        return -1;
+
+    for (int depth = 0; depth < 16; depth++) {
+        char interp[PATH_MAX], interp_arg[256];
+        if (check_shebang(current, interp, sizeof(interp), interp_arg, sizeof(interp_arg))) {
+            (void)interp_arg;
+            if (resolve_exec_path(interp, current, sizeof(current)) != 0)
+                return -1;
+            continue;
+        }
+        return read_elf_class(current, elf_class);
+    }
+
+    return -1;
+}
+
+static int resolve_sud_launcher_exe(char *buf, size_t bufsz,
+                                    const char *sudtrace_exe, char **cmd)
+{
+    int elf_class = 0;
+    if (resolve_command_elf_class(cmd[0], &elf_class) != 0) {
+        if (snprintf(buf, bufsz, "%s", sudtrace_exe) >= (int)bufsz)
+            return -1;
+        return 0;
+    }
+
+    char launcher[PATH_MAX];
+    if (strchr(sudtrace_exe, '/')) {
+        char base[PATH_MAX];
+        if (snprintf(base, sizeof(base), "%s", sudtrace_exe) >= (int)sizeof(base))
+            return -1;
+        char *slash = strrchr(base, '/');
+        if (slash) {
+            *slash = '\0';
+            if (snprintf(launcher, sizeof(launcher), "%s/%s", base,
+                         elf_class == ELFCLASS32 ? "sud32" : "sud64")
+                < (int)sizeof(launcher) && access(launcher, X_OK) == 0) {
+                if (snprintf(buf, bufsz, "%s", launcher) >= (int)bufsz)
+                    return -1;
+                return 0;
+            }
+        }
+    }
+
+    if (snprintf(buf, bufsz, "%s", sudtrace_exe) >= (int)bufsz)
+        return -1;
+    return 0;
+}
+
 static int kernel_supports_sud(void)
 {
     errno = 0;
@@ -1992,6 +2141,13 @@ static int build_exec_argv(char ***out_argv, const char *exe,
 
 static int run_sud_trace(char **cmd, const char *outfile, const char *sudtrace_exe)
 {
+    char sud_launcher_exe[PATH_MAX];
+    if (resolve_sud_launcher_exe(sud_launcher_exe, sizeof(sud_launcher_exe),
+                                 sudtrace_exe, cmd) != 0) {
+        fprintf(stderr, "uproctrace: cannot resolve sud launcher\n");
+        return 1;
+    }
+
     if (trace_output_uses_zstd(outfile)) {
         int pipefd[2];
         if (pipe(pipefd) < 0) {
@@ -2016,12 +2172,12 @@ static int run_sud_trace(char **cmd, const char *outfile, const char *sudtrace_e
             close(pipefd[0]);
             if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
             close(pipefd[1]);
-            if (build_exec_argv(&sub_argv, sudtrace_exe, NULL, !g_trace_exec_env, cmd) != 0)
+            if (build_exec_argv(&sub_argv, sud_launcher_exe, NULL, !g_trace_exec_env, cmd) != 0)
                 _exit(127);
-            if (strchr(sudtrace_exe, '/'))
-                execv(sudtrace_exe, sub_argv);
+            if (strchr(sud_launcher_exe, '/'))
+                execv(sud_launcher_exe, sub_argv);
             else
-                execvp(sudtrace_exe, sub_argv);
+                execvp(sud_launcher_exe, sub_argv);
             perror("exec sudtrace");
             _exit(127);
         }
@@ -2042,12 +2198,12 @@ static int run_sud_trace(char **cmd, const char *outfile, const char *sudtrace_e
     }
     if (child == 0) {
         char **sub_argv = NULL;
-        if (build_exec_argv(&sub_argv, sudtrace_exe, outfile, !g_trace_exec_env, cmd) != 0)
+        if (build_exec_argv(&sub_argv, sud_launcher_exe, outfile, !g_trace_exec_env, cmd) != 0)
             _exit(127);
-        if (strchr(sudtrace_exe, '/'))
-            execv(sudtrace_exe, sub_argv);
+        if (strchr(sud_launcher_exe, '/'))
+            execv(sud_launcher_exe, sub_argv);
         else
-            execvp(sudtrace_exe, sub_argv);
+            execvp(sud_launcher_exe, sub_argv);
         perror("exec sudtrace");
         _exit(127);
     }
