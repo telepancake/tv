@@ -75,6 +75,12 @@
 #ifndef SA_RESTORER
 #define SA_RESTORER 0x04000000
 #endif
+#ifndef SYS_rt_sigreturn
+#define SYS_rt_sigreturn 15
+#endif
+
+#define STR_VALUE(x) #x
+#define STR(x) STR_VALUE(x)
 
 /* ================================================================
  * Linker-provided symbols marking sudtrace's own address range.
@@ -91,7 +97,7 @@ extern char __sud_end[];
 #define ARGV_MAX_READ      32768
 #define ENV_MAX_READ       65536
 #define LINE_MAX_BUF       (PATH_MAX * 8 + 262144 + 1024)
-#define CLONE_ARGS_STACK_OFFSET 40
+#define CLONE_ARGS_STACK_OFFSET 40 /* struct clone_args.stack */
 
 /* Reserve a high FD for our output so children are unlikely to clobber it */
 #define SUD_OUTPUT_FD      1023
@@ -171,7 +177,7 @@ __asm__(
     "    .text\n"
     "    .type sud_rt_sigreturn_restorer, @function\n"
     "sud_rt_sigreturn_restorer:\n"
-    "    mov  $15, %eax\n"
+    "    mov  $" STR(SYS_rt_sigreturn) ", %eax\n"
     "    syscall\n"
     "    hlt\n"
     "    .size sud_rt_sigreturn_restorer, .-sud_rt_sigreturn_restorer\n"
@@ -1969,7 +1975,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     if (nr == SYS_clone) {
         /* clone: flags are in a0 (rdi) */
         unsigned long c_flags = (unsigned long)a0;
-        if ((c_flags & CLONE_VM) && a1) {
+        if ((c_flags & CLONE_VM) && a1 != 0) {
             ret = clone_raw(a0, a1, a2, a3, a4, uc);
             /* Only parent reaches here */
         } else {
