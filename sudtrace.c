@@ -2184,7 +2184,11 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 
 #ifdef SYS_vfork
     if (nr == SYS_vfork) {
-        ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+        /* Real vfork shares the parent's live stack frame. If the child hits
+         * another SIGSYS before exec, the kernel can overwrite the parent's
+         * suspended signal frame and corrupt its eventual rt_sigreturn state.
+         * Emulate vfork with a plain fork so parent/child stacks diverge. */
+        ret = raw_syscall6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
         if (ret == 0)
             prepare_child_sud();
         uc->uc_mcontext.gregs[REG_RAX] = ret;
