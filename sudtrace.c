@@ -2166,7 +2166,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     if (nr == SYS_clone) {
         /* clone: flags are in a0 (rdi) */
         unsigned long c_flags = (unsigned long)a0;
-        if ((c_flags & CLONE_VM) && !(c_flags & CLONE_VFORK) && a1 != 0) {
+        if ((c_flags & CLONE_VM) && a1 != 0) {
             ret = clone_raw(a0, a1, a2, a3, a4, uc);
             /* Only parent reaches here */
         } else {
