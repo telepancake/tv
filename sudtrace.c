@@ -2366,6 +2366,11 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     *sel = SYSCALL_DISPATCH_FILTER_BLOCK;
     g_sud_selector_ptr = sel;
 
+    /* Wrapper-mode execs can inherit a blocked SIGSYS mask from traced
+     * vfork/clone children.  Unblock it before enabling SUD so the
+     * handler actually runs in this freshly exec'd sudtrace instance. */
+    unblock_sigsys_raw();
+
     /* Enable SUD */
     unsigned long off = (unsigned long)__sud_begin;
     unsigned long len = (unsigned long)__sud_end - (unsigned long)__sud_begin;
