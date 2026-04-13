@@ -2111,8 +2111,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
-            if (ret == 0)
-                prepare_child_sud();
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
@@ -2127,8 +2125,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
-            if (ret == 0)
-                prepare_child_sud();
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
@@ -2169,15 +2165,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * wrapper would map every error to -1, which breaks glibc internals
      * in the traced program (e.g. clone3→clone fallback in pthread_create). */
     ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
-
-#ifdef SYS_fork
-    if (nr == SYS_fork && ret == 0)
-        prepare_child_sud();
-#endif
-#ifdef SYS_vfork
-    if (nr == SYS_vfork && ret == 0)
-        prepare_child_sud();
-#endif
 
     /* Post-syscall tracing */
 
