@@ -291,15 +291,15 @@ CREATE TEMP VIEW _dep_reads AS
     SELECT DISTINCT e.tgid, o.path
     FROM open_events o JOIN events e ON e.id=o.eid
     WHERE o.path IS NOT NULL
-        AND (o.flags LIKE 'O_RDONLY%' OR o.flags LIKE 'O_RDWR%'
-             OR o.flags LIKE 'O_RDONLY,%' OR o.flags LIKE 'O_RDWR,%');
+        AND (instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_RDONLY|')>0
+             OR instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_RDWR|')>0);
 
 CREATE TEMP VIEW _dep_writes AS
     SELECT DISTINCT e.tgid, o.path
     FROM open_events o JOIN events e ON e.id=o.eid
     WHERE o.path IS NOT NULL
-        AND (o.flags LIKE 'O_WRONLY%' OR o.flags LIKE 'O_RDWR%'
-             OR o.flags LIKE 'O_WRONLY,%' OR o.flags LIKE 'O_RDWR,%');
+        AND (instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_WRONLY|')>0
+             OR instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_RDWR|')>0);
 
 CREATE TEMP VIEW _dep_written_paths AS
     SELECT DISTINCT path FROM _dep_writes;

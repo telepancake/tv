@@ -10,7 +10,7 @@ set -eo pipefail
 cd "$(dirname "$0")/.."
 TV=./tv
 TRACE=tests/trace.jsonl
-TV_TIMEOUT=${TV_TIMEOUT:-5}
+TV_TIMEOUT=${TV_TIMEOUT:-5s}
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -34,7 +34,7 @@ DRIVE_RC=0
 drive_trace() {
     printf '%s\n' "$2" > "$TMPDIR/input.jsonl"
     set +e
-    cat "$1" "$TMPDIR/input.jsonl" | timeout "${TV_TIMEOUT}s" "$TV" --trace /dev/stdin > "$TMPDIR/drive.out" 2>&1
+    cat "$1" "$TMPDIR/input.jsonl" | timeout "$TV_TIMEOUT" "$TV" --trace /dev/stdin > "$TMPDIR/drive.out" 2>&1
     DRIVE_RC=$?
     set -e
     cat "$TMPDIR/drive.out"
