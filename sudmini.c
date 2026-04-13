@@ -581,6 +581,10 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
 #if defined(__x86_64__)
     long ret = mini_syscall6(SYS_mmap, (long)addr, len, prot, flags, fd, offset);
 #else
+    if (((uint64_t)offset & ((1ULL << MINI_MMAP2_SHIFT) - 1)) != 0) {
+        g_errno_value = EINVAL;
+        return MAP_FAILED;
+    }
     /* SYS_mmap2 uses offsets in 4096-byte units. */
     long ret = mini_syscall6(SYS_mmap2, (long)addr, len, prot, flags, fd,
                              (long)((uint64_t)offset >> MINI_MMAP2_SHIFT));
