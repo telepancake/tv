@@ -287,17 +287,68 @@ INSERT INTO _layout VALUES(3, 1,    'panel','rpane',1, 0, 3, 'text', -1, 0, 1);
 
 -- ── Dependency edge VIEW (used by modes 3-6) ─────────────────────────
 -- Each row: (src=reader, dst=writer) for the same process group.
+CREATE TEMP VIEW _dep_open_paths AS
+    SELECT e.tgid, o.path,
+        '|' || replace(COALESCE(o.flags,''), ',', '|') || '|' AS normalized_flags
+    FROM open_events o JOIN events e ON e.id=o.eid
+    WHERE o.path IS NOT NULL;
+
+CREATE TEMP VIEW _dep_reads AS
+    SELECT DISTINCT tgid, path
+    FROM _dep_open_paths
+    WHERE instr(normalized_flags, '|O_RDONLY|')>0
+       OR instr(normalized_flags, '|O_RDWR|')>0;
+
+CREATE TEMP VIEW _dep_writes AS
+    SELECT DISTINCT tgid, path
+    FROM _dep_open_paths
+    WHERE instr(normalized_flags, '|O_WRONLY|')>0
+       OR instr(normalized_flags, '|O_RDWR|')>0;
+
+CREATE TEMP VIEW _dep_written_paths AS
+    SELECT DISTINCT path FROM _dep_writes;
+
 CREATE TEMP VIEW _dep_edges AS
-    SELECT DISTINCT er.tgid,
-        r.path AS src, w.path AS dst
-    FROM open_events r JOIN events er ON er.id=r.eid
-    JOIN open_events w JOIN events ew ON ew.id=w.eid
-    WHERE er.tgid=ew.tgid
-        AND r.path IS NOT NULL AND w.path IS NOT NULL
-        AND r.path != w.path
-        AND (r.flags LIKE 'O_RDONLY%' OR r.flags LIKE 'O_RDWR%')
-        AND (w.flags LIKE 'O_WRONLY%' OR w.flags LIKE 'O_RDWR%'
-             OR w.flags LIKE 'O_WRONLY,%' OR w.flags LIKE 'O_RDWR,%');
+    SELECT r.tgid, r.path AS src, w.path AS dst
+    FROM _dep_reads r
+    JOIN _dep_writes w ON w.tgid=r.tgid
+    WHERE r.path != w.path;
+
+CREATE TEMP VIEW _dep_root AS
+    SELECT dep_root AS path FROM state
+    WHERE dep_root!='';
+
+CREATE TEMP VIEW _dep_walk_rev AS
+    WITH RECURSIVE walk(path, depth, trail) AS (
+        -- char(31) keeps path membership checks unambiguous without colliding
+        -- with normal filesystem path characters.
+        SELECT path, 0, char(31) || path || char(31)
+        FROM _dep_root
+        UNION ALL
+        SELECT de.src, walk.depth+1, walk.trail || de.src || char(31)
+        FROM _dep_edges de
+        JOIN walk ON walk.path=de.dst
+        WHERE instr(walk.trail, char(31) || de.src || char(31))=0
+    )
+    SELECT path, MIN(depth) AS depth
+    FROM walk
+    GROUP BY path;
+
+CREATE TEMP VIEW _dep_walk_fwd AS
+    WITH RECURSIVE walk(path, depth, trail) AS (
+        -- char(31) keeps path membership checks unambiguous without colliding
+        -- with normal filesystem path characters.
+        SELECT path, 0, char(31) || path || char(31)
+        FROM _dep_root
+        UNION ALL
+        SELECT de.dst, walk.depth+1, walk.trail || de.dst || char(31)
+        FROM _dep_edges de
+        JOIN walk ON walk.path=de.src
+        WHERE instr(walk.trail, char(31) || de.dst || char(31))=0
+    )
+    SELECT path, MIN(depth) AS depth
+    FROM walk
+    GROUP BY path;
 
 -- ── lpane VIEW for mode=0: process tree (grouped) ────────────────────
 CREATE TEMP VIEW _lp_procs_tree AS
@@ -436,13 +487,6 @@ CREATE TEMP VIEW _lp_outputs_flat AS
 
 -- ── lpane VIEWs for dep modes (3-6) using recursive transitive closure ─
 CREATE TEMP VIEW _lp_dep3 AS
-    WITH RECURSIVE dc(path, depth) AS (
-        SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT dep_root FROM state)!=''
-        UNION
-        SELECT de.src, dc.depth+1
-        FROM _dep_edges de JOIN dc ON dc.path=de.dst
-    )
     SELECT ROW_NUMBER()OVER(ORDER BY depth, path)-1 AS rownum,
         path AS id, NULL AS parent_id,
         CASE WHEN depth=0 THEN 'cyan_bold'
@@ -450,21 +494,11 @@ CREATE TEMP VIEW _lp_dep3 AS
              ELSE 'normal' END AS style,
         printf('%*s%s', depth*2, '',
             REPLACE(path,RTRIM(path,REPLACE(path,'/','')),'')) AS text
-    FROM dc
+    FROM _dep_walk_rev
     WHERE ((SELECT dep_filter FROM state)=0
-        OR EXISTS(SELECT 1 FROM open_events o2 JOIN events e2 ON e2.id=o2.eid
-                  WHERE o2.path=dc.path
-                    AND (o2.flags LIKE 'O_WRONLY%' OR o2.flags LIKE 'O_RDWR%'
-                         OR o2.flags LIKE 'O_WRONLY,%' OR o2.flags LIKE 'O_RDWR,%')));
+        OR path IN(SELECT path FROM _dep_written_paths));
 
 CREATE TEMP VIEW _lp_dep4 AS
-    WITH RECURSIVE dc(path, depth) AS (
-        SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT dep_root FROM state)!=''
-        UNION
-        SELECT de.dst, dc.depth+1
-        FROM _dep_edges de JOIN dc ON dc.path=de.src
-    )
     SELECT ROW_NUMBER()OVER(ORDER BY depth, path)-1 AS rownum,
         path AS id, NULL AS parent_id,
         CASE WHEN depth=0 THEN 'cyan_bold'
@@ -472,21 +506,11 @@ CREATE TEMP VIEW _lp_dep4 AS
              ELSE 'normal' END AS style,
         printf('%*s%s', depth*2, '',
             REPLACE(path,RTRIM(path,REPLACE(path,'/','')),'')) AS text
-    FROM dc
+    FROM _dep_walk_fwd
     WHERE ((SELECT dep_filter FROM state)=0
-        OR EXISTS(SELECT 1 FROM open_events o2 JOIN events e2 ON e2.id=o2.eid
-                  WHERE o2.path=dc.path
-                    AND (o2.flags LIKE 'O_WRONLY%' OR o2.flags LIKE 'O_RDWR%'
-                         OR o2.flags LIKE 'O_WRONLY,%' OR o2.flags LIKE 'O_RDWR,%')));
+        OR path IN(SELECT path FROM _dep_written_paths));
 
 CREATE TEMP VIEW _lp_dep5 AS
-    WITH RECURSIVE dc(path, depth) AS (
-        SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT dep_root FROM state)!=''
-        UNION
-        SELECT de.src, dc.depth+1
-        FROM _dep_edges de JOIN dc ON dc.path=de.dst
-    )
     SELECT ROW_NUMBER()OVER(ORDER BY p.last_ts DESC)-1 AS rownum,
         CAST(p.tgid AS TEXT) AS id, NULL AS parent_id,
         CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'
@@ -505,17 +529,11 @@ CREATE TEMP VIEW _lp_dep5 AS
     LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'
     LEFT JOIN exit_events x ON x.eid=ev.id
     WHERE p.tgid IN(
-        SELECT DISTINCT e.tgid FROM _dep_edges de JOIN dc ON (de.dst=dc.path OR de.src=dc.path)
-        JOIN events e ON e.tgid=de.tgid);
+        SELECT DISTINCT de.tgid
+        FROM _dep_edges de
+        JOIN _dep_walk_rev dc ON (de.dst=dc.path OR de.src=dc.path));
 
 CREATE TEMP VIEW _lp_dep6 AS
-    WITH RECURSIVE dc(path, depth) AS (
-        SELECT (SELECT dep_root FROM state), 0
-        WHERE (SELECT dep_root FROM state)!=''
-        UNION
-        SELECT de.dst, dc.depth+1
-        FROM _dep_edges de JOIN dc ON dc.path=de.src
-    )
     SELECT ROW_NUMBER()OVER(ORDER BY p.last_ts DESC)-1 AS rownum,
         CAST(p.tgid AS TEXT) AS id, NULL AS parent_id,
         CASE WHEN p.tgid IN(SELECT CAST(id AS INT) FROM search_hits) THEN 'search'
@@ -534,8 +552,9 @@ CREATE TEMP VIEW _lp_dep6 AS
     LEFT JOIN events ev ON ev.tgid=p.tgid AND ev.event='EXIT'
     LEFT JOIN exit_events x ON x.eid=ev.id
     WHERE p.tgid IN(
-        SELECT DISTINCT e.tgid FROM _dep_edges de JOIN dc ON (de.dst=dc.path OR de.src=dc.path)
-        JOIN events e ON e.tgid=de.tgid);
+        SELECT DISTINCT de.tgid
+        FROM _dep_edges de
+        JOIN _dep_walk_fwd dc ON (de.dst=dc.path OR de.src=dc.path));
 
 -- ── lpane VIEW: dispatch to per-mode pane sources ─────────────────────
 -- Mode=1 reads from _ftree (populated by C build_file_tree() on mode entry).
