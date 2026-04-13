@@ -658,6 +658,7 @@ static int g_out_fd = -1;           /* fd for JSONL output */
 static struct stat g_creator_stdout_st;
 static int g_creator_stdout_valid;
 static char g_self_exe[PATH_MAX];   /* path to sudtrace binary itself */
+static int g_trace_exec_env = 1;
 
 /* ================================================================
  * Low-level output — write(2) directly, bypassing stdio.
@@ -1092,13 +1093,16 @@ static void emit_exec_event(pid_t pid)
             json_argv_array(argv_j, argv_len * 6 + 64, argv_raw, argv_len);
     }
 
-    size_t env_len = 0;
-    char *env_raw = read_proc_file(pid, "environ", ENV_MAX_READ, &env_len);
     char *env_j = NULL;
-    if (env_raw && env_len > 0) {
-        env_j = malloc(env_len * 6 + 64);
-        if (env_j)
-            json_env_object(env_j, env_len * 6 + 64, env_raw, env_len);
+    char *env_raw = NULL;
+    if (g_trace_exec_env) {
+        size_t env_len = 0;
+        env_raw = read_proc_file(pid, "environ", ENV_MAX_READ, &env_len);
+        if (env_raw && env_len > 0) {
+            env_j = malloc(env_len * 6 + 64);
+            if (env_j)
+                json_env_object(env_j, env_len * 6 + 64, env_raw, env_len);
+        }
     }
 
     char auxv_buf[4096];
@@ -1109,12 +1113,20 @@ static void emit_exec_event(pid_t pid)
     if (line) {
         int pos = json_header(line, LINE_MAX_BUF, "EXEC", pid, tgid, ppid,
                               &ts);
-        pos += snprintf(line + pos, LINE_MAX_BUF - pos,
-            ",\"exe\":%s,\"argv\":%s,\"env\":%s,\"auxv\":{%s}}\n",
-            exe ? exe_esc : "null",
-            argv_j ? argv_j : "[]",
-            env_j ? env_j : "{}",
-            auxv_buf[0] ? auxv_buf : "");
+        if (g_trace_exec_env) {
+            pos += snprintf(line + pos, LINE_MAX_BUF - pos,
+                ",\"exe\":%s,\"argv\":%s,\"env\":%s,\"auxv\":{%s}}\n",
+                exe ? exe_esc : "null",
+                argv_j ? argv_j : "[]",
+                env_j ? env_j : "{}",
+                auxv_buf[0] ? auxv_buf : "");
+        } else {
+            pos += snprintf(line + pos, LINE_MAX_BUF - pos,
+                ",\"exe\":%s,\"argv\":%s,\"auxv\":{%s}}\n",
+                exe ? exe_esc : "null",
+                argv_j ? argv_j : "[]",
+                auxv_buf[0] ? auxv_buf : "");
+        }
         if (pos > 0 && pos < LINE_MAX_BUF)
             emit_raw(line, pos);
         free(line);
@@ -1650,7 +1662,7 @@ static int resolve_path(const char *cmd, char *out, size_t out_sz)
  */
 static char **build_exec_argv(int orig_argc, char **orig_argv)
 {
-    int max_args = orig_argc + 8;
+    int max_args = orig_argc + 9;
     char **args = calloc(max_args + 1, sizeof(char *));
     if (!args) return NULL;
 
@@ -1707,6 +1719,15 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
             memmove(args + 1, args, (nargs + 1) * sizeof(char *));
             args[0] = strdup(g_self_exe);
             nargs++;
+            if (!g_trace_exec_env) {
+                if (nargs + 1 >= max_args) {
+                    max_args = nargs + 8;
+                    args = realloc(args, (max_args + 1) * sizeof(char *));
+                }
+                memmove(args + 2, args + 1, nargs * sizeof(char *));
+                args[1] = strdup("--no-env");
+                nargs++;
+            }
             break;
         }
 
@@ -1731,7 +1752,7 @@ static void free_exec_argv(char **args)
  */
 static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
 {
-    int max_args = orig_argc + 16;
+    int max_args = orig_argc + 17;
     char **args = arena_alloc((max_args + 1) * sizeof(char *));
     if (!args) return NULL;
 
@@ -1796,6 +1817,18 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
             memmove(args + 1, args, (nargs + 1) * sizeof(char *));
             args[0] = arena_strdup(g_self_exe);
             nargs++;
+            if (!g_trace_exec_env) {
+                if (nargs + 1 >= max_args) {
+                    max_args = nargs + 8;
+                    char **new_args = arena_alloc((max_args + 1) * sizeof(char *));
+                    if (!new_args) return args;
+                    memcpy(new_args, args, (nargs + 1) * sizeof(char *));
+                    args = new_args;
+                }
+                memmove(args + 2, args + 1, nargs * sizeof(char *));
+                args[1] = arena_strdup("--no-env");
+                nargs++;
+            }
             break;
         }
 
@@ -2382,15 +2415,23 @@ static int is_wrapper_mode(int argc, char **argv)
      * may belong to the wrapped command (e.g.
      *   sudtrace tv --uproctrace -o x -- /bin/echo hello
      * where "--" separates uproctrace's options from its command). */
-    if (!argv[1] || argv[1][0] == '-') return 0;
+    int i = 1;
+    while (i < argc && argv[i] && strcmp(argv[i], "--no-env") == 0)
+        i++;
+    if (i >= argc || !argv[i] || argv[i][0] == '-') return 0;
     return 1;
 }
 
 static int run_wrapper_mode(int argc, char **argv)
 {
+    int argi = 1;
+    while (argi < argc && argv[argi] && strcmp(argv[argi], "--no-env") == 0) {
+        g_trace_exec_env = 0;
+        argi++;
+    }
     char resolved[PATH_MAX];
-    if (!resolve_path(argv[1], resolved, sizeof(resolved))) {
-        fprintf(stderr, "sudtrace: cannot find '%s'\n", argv[1]);
+    if (!resolve_path(argv[argi], resolved, sizeof(resolved))) {
+        fprintf(stderr, "sudtrace: cannot find '%s'\n", argv[argi]);
         return 127;
     }
 
@@ -2398,7 +2439,7 @@ static int run_wrapper_mode(int argc, char **argv)
     if (child < 0) { perror("sudtrace: fork"); return 127; }
 
     if (child == 0) {
-        load_and_run_elf(resolved, argc - 1, argv + 1);
+        load_and_run_elf(resolved, argc - argi, argv + argi);
     }
 
     /* Parent: emit initial events, then monitor */
@@ -2435,7 +2476,7 @@ static int run_wrapper_mode(int argc, char **argv)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [-o FILE] -- command [args...]\n"
+        "Usage: %s [-o FILE] [--no-env] -- command [args...]\n"
         "\n"
         "Syscall User Dispatch (SUD) based process tracer.\n"
         "Produces JSONL event stream compatible with proctrace/uproctrace.\n",
@@ -2482,6 +2523,8 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             outfile = argv[++i];
+        } else if (strcmp(argv[i], "--no-env") == 0) {
+            g_trace_exec_env = 0;
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);

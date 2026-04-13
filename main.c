@@ -1070,26 +1070,29 @@ int main(int argc, char **argv) {
 
     int load_mode = 0;
     enum live_trace_backend live_backend = LIVE_TRACE_BACKEND_AUTO;
+    int no_env = 0;
     char load_file[256] = "", trace_file[256] = "", save_file[256] = "";
     char **cmd = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--load") == 0 && i + 1 < argc) { load_mode = 1; snprintf(load_file, sizeof load_file, "%s", argv[++i]); }
         else if (strcmp(argv[i], "--trace") == 0 && i + 1 < argc) snprintf(trace_file, sizeof trace_file, "%s", argv[++i]);
         else if (strcmp(argv[i], "--save") == 0 && i + 1 < argc) snprintf(save_file, sizeof save_file, "%s", argv[++i]);
+        else if (strcmp(argv[i], "--no-env") == 0) no_env = 1;
         else if (strcmp(argv[i], "--module") == 0) live_backend = LIVE_TRACE_BACKEND_MODULE;
         else if (strcmp(argv[i], "--sud") == 0) live_backend = LIVE_TRACE_BACKEND_SUD;
         else if (strcmp(argv[i], "--ptrace") == 0) live_backend = LIVE_TRACE_BACKEND_PTRACE;
         else if (strcmp(argv[i], "--") == 0 && i + 1 < argc) { cmd = argv + i + 1; break; }
     }
     if (!load_mode && !trace_file[0] && !cmd) {
-        fprintf(stderr, "Usage: tv [--module|--sud|--ptrace] -- <command> [args...]\n"
+        fprintf(stderr, "Usage: tv [--no-env] [--module|--sud|--ptrace] -- <command> [args...]\n"
             "       tv --load <file.db>\n"
             "       tv --trace <file.jsonl[.zst]> [--save <file.db>]\n"
             "       tv --load <file.db> --trace <input.jsonl[.zst]>\n"
-            "       tv --uproctrace [-o FILE[.zst]] [--module|--sud|--ptrace|--backend auto|module|sud|ptrace] -- <command> [args...]\n"
+            "       tv --uproctrace [-o FILE[.zst]] [--no-env] [--module|--sud|--ptrace|--backend auto|module|sud|ptrace] -- <command> [args...]\n"
             "\n  --ptrace   Force ptrace backend (default: use proctrace kernel module if available)\n"
             "  --sud      Force sudtrace backend\n"
             "  --module   Force proctrace kernel module backend\n"
+            "  --no-env   Omit EXEC environment variables from generated traces\n"
             "  --uproctrace  Run as trace-only tool (write JSONL to stdout, no TUI)\n"
             "\n  Input events in trace streams: {\"input\":\"key\",\"key\":\"j\"}\n"
             "  {\"input\":\"resize\",\"rows\":50,\"cols\":120}\n"
@@ -1147,6 +1150,7 @@ int main(int argc, char **argv) {
             size_t cmdc = 0;
             while (cmd[cmdc]) cmdc++;
             size_t extra = 2 + cmdc + 1;
+            if (no_env) extra++;
             if (live_backend != LIVE_TRACE_BACKEND_AUTO) extra++;
             char **uargv = calloc(extra, sizeof(*uargv));
             if (!uargv) {
@@ -1155,6 +1159,7 @@ int main(int argc, char **argv) {
             }
             size_t ui = 0;
             uargv[ui++] = "--uproctrace";
+            if (no_env) uargv[ui++] = "--no-env";
             if (live_backend == LIVE_TRACE_BACKEND_MODULE) uargv[ui++] = "--module";
             else if (live_backend == LIVE_TRACE_BACKEND_SUD) uargv[ui++] = "--sud";
             else if (live_backend == LIVE_TRACE_BACKEND_PTRACE) uargv[ui++] = "--ptrace";
