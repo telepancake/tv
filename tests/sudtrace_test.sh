@@ -68,6 +68,11 @@ int main(void) {
 EOF
 gcc -o "$TMPDIR/threads" "$TMPDIR/threads.c" -lpthread
 
+cat > "$TMPDIR/Makefile" << 'EOF'
+all:
+	/bin/echo build-ok
+EOF
+
 # ── Test: basic single-threaded tracing ────────────────────────────────
 
 if [ -x "$SUDTRACE" ]; then
@@ -95,6 +100,13 @@ for attempt in 1 2 3; do
     run_test "threads attempt $attempt: stderr captured" \
         'grep -q "done" "$TMPDIR/threads_${attempt}.jsonl"'
 done
+
+OUT=$("$SUDTRACE" -o "$TMPDIR/make.jsonl" -- make -f "$TMPDIR/Makefile" 2>&1)
+run_test "make: external command traced without SIGSYS crash" \
+    'printf "%s\n" "$OUT" | grep -q "build-ok"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/make.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/make.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/make.jsonl"'
 
 else
     echo "  SKIP  sudtrace not built (run 'make sudtrace' first)"
