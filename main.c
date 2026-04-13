@@ -70,7 +70,7 @@ static int qint(const char *sql, int def) {
 
 static long long monotonic_millis(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
@@ -282,7 +282,7 @@ static void ingest_line(const char *ln) {
     sqlite3_bind_text(st, 2, ln, -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
     sqlite3_reset(st);
-    if (kind[0] == 't') g_pending_trace_rows++;
+    if (strcmp(kind, "trace") == 0) g_pending_trace_rows++;
 }
 
 static void process_trace_batch(void) {
@@ -800,7 +800,7 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
             t_rbuf_len = 0;
             flushed = 1;
         }
-        if (!flushed && g_pending_trace_rows > 0) {
+        if (!flushed && t_pending_live_trace_rows > 0) {
             xexec("BEGIN");
             process_trace_batch();
             xexec("COMMIT");
@@ -839,11 +839,13 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
         }
         if (did) {
             long long now = monotonic_millis();
-            if (t_pending_live_trace_rows == 0)
+            if (t_pending_live_trace_rows == 0 && now >= 0)
                 t_live_trace_batch_start_ms = now;
             t_pending_live_trace_rows += did;
             if (t_pending_live_trace_rows >= LIVE_TRACE_BATCH_ROWS
-                || (now - t_live_trace_batch_start_ms) >= LIVE_TRACE_BATCH_MS) {
+                || now < 0
+                || (t_live_trace_batch_start_ms > 0
+                    && (now - t_live_trace_batch_start_ms) >= LIVE_TRACE_BATCH_MS)) {
                 process_trace_batch();
                 t_pending_live_trace_rows = 0;
                 t_live_trace_batch_start_ms = 0;
