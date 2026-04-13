@@ -7,6 +7,8 @@ set -eo pipefail
 
 cd "$(dirname "$0")/.."
 SUDTRACE=./sudtrace
+SUD32=./sud32
+TV=./tv
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -128,6 +130,26 @@ run_test "static32: traced through sud32 wrapper" \
     'grep -q "\"STDERR\"" "$TMPDIR/static32.jsonl"' \
     'grep -q "hi32" "$TMPDIR/static32.jsonl"' \
     '! grep -q "\"signal\"" "$TMPDIR/static32.jsonl"'
+
+if [ -x "$TV" ]; then
+OUT=$("$TV" --uproctrace --sud -o "$TMPDIR/up_static32.jsonl" -- "$TMPDIR/static32" 2>&1)
+run_test "uproctrace --sud: static32 uses matching sud launcher" \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/up_static32.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/up_static32.jsonl"' \
+    'grep -q "\"STDERR\"" "$TMPDIR/up_static32.jsonl"' \
+    'grep -q "hi32" "$TMPDIR/up_static32.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/up_static32.jsonl"'
+fi
+fi
+
+if [ -x "$SUD32" ]; then
+OUT=$("$SUD32" -o "$TMPDIR/sud32_hello.jsonl" -- "$TMPDIR/hello" 2>&1)
+run_test "sud32: mixed-arch launch selects traceable wrapper" \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/sud32_hello.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/sud32_hello.jsonl"' \
+    'grep -q "\"STDERR\"" "$TMPDIR/sud32_hello.jsonl"' \
+    'grep -q "hello world" "$TMPDIR/sud32_hello.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/sud32_hello.jsonl"'
 fi
 
 else
