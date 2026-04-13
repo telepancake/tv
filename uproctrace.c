@@ -69,6 +69,7 @@ struct trace_output {
     int use_zstd;
     int error;
     int closing;
+    pid_t compressor_pid;
     char *ring;
     size_t ring_size;
     size_t head;
@@ -1715,6 +1716,7 @@ static int trace_output_uses_zstd(const char *outfile)
 
 static int open_trace_output(const char *outfile)
 {
+    int want_zstd = trace_output_uses_zstd(outfile);
     memset(&g_out, 0, sizeof(g_out));
     g_out.ring_size = TRACE_OUT_RING_SIZE;
     g_out.ring = malloc(g_out.ring_size);
@@ -1726,7 +1728,42 @@ static int open_trace_output(const char *outfile)
     pthread_cond_init(&g_out.can_read, NULL);
     pthread_cond_init(&g_out.can_write, NULL);
 
-    if (outfile) {
+    if (outfile && want_zstd) {
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            perror("pipe");
+            free(g_out.ring);
+            g_out.ring = NULL;
+            return -1;
+        }
+        g_out.compressor_pid = fork();
+        if (g_out.compressor_pid < 0) {
+            perror("fork");
+            close(pipefd[0]);
+            close(pipefd[1]);
+            free(g_out.ring);
+            g_out.ring = NULL;
+            return -1;
+        }
+        if (g_out.compressor_pid == 0) {
+            if (dup2(pipefd[0], STDIN_FILENO) < 0) _exit(127);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            execlp("zstd", "zstd", "-q", "-T0", "-f", "-o", outfile, (char *)NULL);
+            _exit(127);
+        }
+        close(pipefd[0]);
+        g_out.stream = fdopen(pipefd[1], "wb");
+        if (!g_out.stream) {
+            perror("fdopen");
+            close(pipefd[1]);
+            waitpid(g_out.compressor_pid, NULL, 0);
+            free(g_out.ring);
+            g_out.ring = NULL;
+            return -1;
+        }
+        g_out.owns_stream = 1;
+    } else if (outfile) {
         g_out.stream = fopen(outfile, "wb");
         if (!g_out.stream) {
             perror("fopen");
@@ -1740,34 +1777,11 @@ static int open_trace_output(const char *outfile)
         g_out.owns_stream = 0;
     }
     setvbuf(g_out.stream, NULL, _IOFBF, TRACE_OUT_RING_SIZE);
-    g_out.use_zstd = trace_output_uses_zstd(outfile);
-    if (g_out.use_zstd) {
-        g_out.zstd_cctx = ZSTD_createCCtx();
-        g_out.zstd_out_cap = ZSTD_CStreamOutSize();
-        g_out.zstd_out_buf = malloc(g_out.zstd_out_cap);
-        if (!g_out.zstd_cctx || !g_out.zstd_out_buf) {
-            perror("malloc");
-            if (g_out.owns_stream) fclose(g_out.stream);
-            free(g_out.zstd_out_buf);
-            if (g_out.zstd_cctx) ZSTD_freeCCtx(g_out.zstd_cctx);
-            free(g_out.ring);
-            g_out.ring = NULL;
-            return -1;
-        }
-        if (ZSTD_isError(ZSTD_CCtx_setParameter(g_out.zstd_cctx, ZSTD_c_compressionLevel, 3))
-            || ZSTD_isError(ZSTD_CCtx_setParameter(g_out.zstd_cctx, ZSTD_c_nbWorkers, 2))) {
-            fprintf(stderr, "uproctrace: zstd output setup failed\n");
-            if (g_out.owns_stream) fclose(g_out.stream);
-            free(g_out.zstd_out_buf);
-            ZSTD_freeCCtx(g_out.zstd_cctx);
-            free(g_out.ring);
-            g_out.ring = NULL;
-            return -1;
-        }
-    }
+    g_out.use_zstd = 0;
     if (pthread_create(&g_out.writer, NULL, trace_output_writer_main, &g_out) != 0) {
         perror("pthread_create");
         if (g_out.owns_stream) fclose(g_out.stream);
+        if (g_out.compressor_pid > 0) waitpid(g_out.compressor_pid, NULL, 0);
         free(g_out.zstd_out_buf);
         if (g_out.zstd_cctx) ZSTD_freeCCtx(g_out.zstd_cctx);
         free(g_out.ring);
@@ -1796,6 +1810,12 @@ static int close_trace_output(const char *outfile)
         rc = -1;
     else if (!outfile)
         fflush(g_out.stream);
+    if (g_out.compressor_pid > 0) {
+        int status;
+        if (waitpid(g_out.compressor_pid, &status, 0) < 0
+            || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            rc = -1;
+    }
     pthread_cond_destroy(&g_out.can_read);
     pthread_cond_destroy(&g_out.can_write);
     pthread_mutex_destroy(&g_out.lock);
