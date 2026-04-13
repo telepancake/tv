@@ -108,6 +108,31 @@ cat > "$TMPDIR/dep_cycle.jsonl" <<'EOF'
 {"event":"OPEN","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.011,"path":"a","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4}
 {"event":"EXIT","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.020,"status":"exited","code":0,"raw":0}
 EOF
+
+python - <<'PY' > "$TMPDIR/dep_dense.jsonl"
+import json
+
+pid = 3000
+ts = 10.0
+width = 5
+depth = 7
+
+for layer in range(depth):
+    for src in range(width):
+        for dst in range(width):
+            records = [
+                {"event":"CWD","tgid":pid,"pid":pid,"ppid":1,"nspid":pid,"nstgid":pid,"ts":round(ts,3),"path":"/tmp"},
+                {"event":"EXEC","tgid":pid,"pid":pid,"ppid":1,"nspid":pid,"nstgid":pid,"ts":round(ts+0.001,3),"exe":"/usr/bin/tool","argv":["tool"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}},
+                {"event":"OPEN","tgid":pid,"pid":pid,"ppid":1,"nspid":pid,"nstgid":pid,"ts":round(ts+0.010,3),"path":f"l{layer}_{src}","flags":["O_RDONLY"],"fd":3},
+                {"event":"OPEN","tgid":pid,"pid":pid,"ppid":1,"nspid":pid,"nstgid":pid,"ts":round(ts+0.011,3),"path":f"l{layer+1}_{dst}","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4},
+                {"event":"EXIT","tgid":pid,"pid":pid,"ppid":1,"nspid":pid,"nstgid":pid,"ts":round(ts+0.020,3),"status":"exited","code":0,"raw":0},
+            ]
+            for record in records:
+                print(json.dumps(record))
+            pid += 1
+            ts += 0.1
+PY
+
 echo "Ingesting compressed trace and saving DB…"
 zstd -q -f "$TRACE" -o "$TMPDIR/trace.jsonl.zst"
 "$TV" --trace "$TMPDIR/trace.jsonl.zst" --save "$TMPDIR/test_zstd.db"
@@ -467,6 +492,32 @@ run_test "rdep_view: cycle terminates and de-dupes" \
     'assert_line_match t "$OUT" "mode=4"' \
     'assert_occurrences t "$OUT" "|/tmp/a|" 1' \
     'assert_occurrences t "$OUT" "|/tmp/b|" 1'
+
+OUT=$(drive_trace "$TMPDIR/dep_dense.jsonl" '{"input":"resize","rows":30,"cols":100}
+{"input":"key","key":"2"}
+{"input":"select","id":"/tmp/l7_0"}
+{"input":"key","key":"4"}
+{"input":"print","what":"state"}
+{"input":"print","what":"lpane"}')
+run_test "dep_view: dense graph terminates without path explosion" \
+    'assert_ok_or_timeout t "$DRIVE_RC"' \
+    'assert_line_match t "$OUT" "mode=3"' \
+    'assert_occurrences t "$OUT" "|/tmp/l7_0|" 1' \
+    'assert_occurrences t "$OUT" "|/tmp/l0_0|" 1' \
+    'assert_occurrences t "$OUT" "|/tmp/l3_4|" 1'
+
+OUT=$(drive_trace "$TMPDIR/dep_dense.jsonl" '{"input":"resize","rows":30,"cols":100}
+{"input":"key","key":"2"}
+{"input":"select","id":"/tmp/l0_0"}
+{"input":"key","key":"5"}
+{"input":"print","what":"state"}
+{"input":"print","what":"lpane"}')
+run_test "rdep_view: dense graph terminates without path explosion" \
+    'assert_ok_or_timeout t "$DRIVE_RC"' \
+    'assert_line_match t "$OUT" "mode=4"' \
+    'assert_occurrences t "$OUT" "|/tmp/l0_0|" 1' \
+    'assert_occurrences t "$OUT" "|/tmp/l7_0|" 1' \
+    'assert_occurrences t "$OUT" "|/tmp/l4_3|" 1'
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test: output view
