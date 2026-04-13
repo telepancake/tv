@@ -90,7 +90,7 @@ static void build_dep_walk_table(const char *table, const char *next_expr,
 
     n = snprintf(sql, sizeof sql, "DELETE FROM %s", table);
     if (n < 0 || (size_t)n >= sizeof sql) {
-        fprintf(stderr, "tv: dependency cache SQL overflow\n");
+        fprintf(stderr, "tv: dependency cache SQL overflow (%s delete)\n", table);
         exit(1);
     }
     if (sqlite3_prepare_v2(g_db, sql, -1, &clear_st, 0) != SQLITE_OK) goto done;
@@ -99,7 +99,7 @@ static void build_dep_walk_table(const char *table, const char *next_expr,
 
     n = snprintf(sql, sizeof sql, "INSERT OR IGNORE INTO %s(path,depth) VALUES(?1,0)", table);
     if (n < 0 || (size_t)n >= sizeof sql) {
-        fprintf(stderr, "tv: dependency cache SQL overflow\n");
+        fprintf(stderr, "tv: dependency cache SQL overflow (%s seed)\n", table);
         exit(1);
     }
     if (sqlite3_prepare_v2(g_db, sql, -1, &seed_st, 0) != SQLITE_OK) goto done;
@@ -114,7 +114,7 @@ static void build_dep_walk_table(const char *table, const char *next_expr,
                  " WHERE w.depth=?1",
                  table, next_expr, table, join_cond);
     if (n < 0 || (size_t)n >= sizeof sql) {
-        fprintf(stderr, "tv: dependency cache SQL overflow\n");
+        fprintf(stderr, "tv: dependency cache SQL overflow (%s step)\n", table);
         exit(1);
     }
     if (sqlite3_prepare_v2(g_db, sql, -1, &step_st, 0) != SQLITE_OK) goto done;
@@ -137,7 +137,7 @@ done:
 
 static void ensure_dep_walk_cache(void) {
     sqlite3_stmt *st = NULL;
-    char root[CURSOR_EVENT_ROW_ID_MAX] = "";
+    char state_dep_root[CURSOR_EVENT_ROW_ID_MAX] = "";
     int mode = 0;
 
     if (sqlite3_prepare_v2(g_db,
@@ -145,23 +145,24 @@ static void ensure_dep_walk_cache(void) {
         return;
     if (sqlite3_step(st) == SQLITE_ROW) {
         mode = sqlite3_column_int(st, 0);
-        copy_cstr(root, sizeof root, (const char *)sqlite3_column_text(st, 1));
+        copy_cstr(state_dep_root, sizeof state_dep_root,
+                  (const char *)sqlite3_column_text(st, 1));
     }
     sqlite3_finalize(st);
 
-    if (!g_dep_walk_cache_dirty && strcmp(g_dep_walk_root, root) == 0) return;
+    if (!g_dep_walk_cache_dirty && strcmp(g_dep_walk_root, state_dep_root) == 0) return;
     if (mode < 3 || mode > 6) {
-        copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, root);
+        copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, state_dep_root);
         g_dep_walk_cache_dirty = 0;
         return;
     }
 
     xexec("SAVEPOINT dep_walk_cache");
-    build_dep_walk_table("_dep_walk_rev", "de.src", "w.path=de.dst", root);
-    build_dep_walk_table("_dep_walk_fwd", "de.dst", "w.path=de.src", root);
+    build_dep_walk_table("_dep_walk_rev", "de.src", "w.path=de.dst", state_dep_root);
+    build_dep_walk_table("_dep_walk_fwd", "de.dst", "w.path=de.src", state_dep_root);
     xexec("RELEASE dep_walk_cache");
 
-    copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, root);
+    copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, state_dep_root);
     g_dep_walk_cache_dirty = 0;
 }
 
