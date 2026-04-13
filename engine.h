@@ -145,8 +145,8 @@
  * tui_run() runs a select()-based loop.  The app registers:
  *   • FD watchers via tui_watch_fd() — fires when fd is readable
  *   • Timers via tui_add_timer() — fires after N ms
- *   • Key handler via tui_on_key() — called per keypress with
- *     focused panel, cursor index, and row id
+ *   • Key handler via tui_on_key() — called for semantic cursor updates
+ *     and non-navigation keys with focused panel and row id
  *
  * After each callback, dirty panels are re-rendered automatically.
  * Terminal resize (SIGWINCH) is handled internally.
@@ -160,10 +160,15 @@
  *   pgup/pgdn    — move cursor one page
  *   home/g/end   — jump to first/last row
  *
- * The key callback is called FIRST.  If it returns TUI_HANDLED,
- * the engine skips default navigation.  If TUI_DEFAULT, the engine
- * applies built-in movement, then calls the callback a second time
- * with key=TUI_K_NONE so the app can observe the new cursor position.
+ * The engine owns cursor/focus movement:
+ *   up/down/j/k, pgup/pgdn, home/g/end, tab
+ *
+ * After any engine-owned navigation, the key callback is invoked with
+ * key=TUI_K_NONE so the application can observe the focused panel and
+ * row id now under the cursor.
+ *
+ * For other keys, the callback is invoked with the raw key value and
+ * may return TUI_HANDLED, TUI_DEFAULT, or TUI_QUIT.
  *
  * ═══════════════════════════════════════════════════════════════════
  *  TYPICAL USAGE
@@ -352,6 +357,7 @@ void tui_set_status(tui_t *tui, const char *text);
 
 /* Headless input dispatch */
 void tui_input_key(tui_t *tui, int key);  /* simulate keypress */
+void tui_resize(tui_t *tui, int rows, int cols);
 
 /* Dump panel/state for tests */
 void tui_dump(tui_t *tui, const char *what, FILE *out);  /* "lpane","rpane","state" */

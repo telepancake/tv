@@ -30,109 +30,203 @@ CREATE TABLE inbox(
 CREATE TABLE IF NOT EXISTS _config(key TEXT PRIMARY KEY, val TEXT);
 CREATE TABLE IF NOT EXISTS expanded(id TEXT PRIMARY KEY, ex INT DEFAULT 1);
 
--- ── Trace ingestion trigger ───────────────────────────────────────────
--- Processes inbox rows with kind='trace', inserting into normalized tables.
--- Uses custom SQL functions: canon_path(), resolve_path(), is_sys_path().
-CREATE TRIGGER _ingest_trace AFTER INSERT ON inbox WHEN NEW.kind='trace'
-BEGIN
-    -- Ensure process stub exists (skip own tgid, skip if no event)
-    INSERT OR IGNORE INTO processes(tgid,pid,ppid,nspid,nstgid,first_ts,last_ts)
-        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.pid'),
-               json_extract(NEW.data,'$.ppid'),json_extract(NEW.data,'$.nspid'),
-               json_extract(NEW.data,'$.nstgid'),json_extract(NEW.data,'$.ts'),
-               json_extract(NEW.data,'$.ts')
-        WHERE json_extract(NEW.data,'$.event') IS NOT NULL
-          AND json_extract(NEW.data,'$.tgid') IS NOT NULL
-          AND CAST(json_extract(NEW.data,'$.tgid') AS TEXT)
-              != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'');
-    INSERT OR IGNORE INTO expanded(id,ex)
-        SELECT CAST(json_extract(NEW.data,'$.tgid') AS TEXT), 1
-        WHERE json_extract(NEW.data,'$.event') IS NOT NULL
-          AND json_extract(NEW.data,'$.tgid') IS NOT NULL
-          AND CAST(json_extract(NEW.data,'$.tgid') AS TEXT)
-              != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'');
-
-    -- CWD
-    INSERT OR REPLACE INTO cwd_cache(tgid,cwd)
-        SELECT CAST(json_extract(NEW.data,'$.tgid') AS INT),
-               json_extract(NEW.data,'$.path')
-        WHERE json_extract(NEW.data,'$.event')='CWD';
-    UPDATE processes SET cwd=json_extract(NEW.data,'$.path')
-        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
-          AND json_extract(NEW.data,'$.event')='CWD';
-
-    -- EXEC
-    UPDATE processes SET
-        exe=json_extract(NEW.data,'$.exe'),
-        argv=CASE WHEN json_type(NEW.data,'$.argv')='array' THEN
-            (SELECT GROUP_CONCAT(value,char(10)) FROM json_each(json_extract(NEW.data,'$.argv')))
-            ELSE NULL END,
-        env=CASE WHEN json_type(NEW.data,'$.env')='object' THEN
-            (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(NEW.data,'$.env')))
-            ELSE NULL END,
-        auxv=CASE WHEN json_type(NEW.data,'$.auxv')='object' THEN
-            (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(NEW.data,'$.auxv')))
-            ELSE NULL END,
-        first_ts=MIN(first_ts,json_extract(NEW.data,'$.ts')),
-        last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts'))
-        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
-          AND json_extract(NEW.data,'$.event')='EXEC';
-    INSERT INTO events(tgid,ts,event)
-        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),'EXEC'
-        WHERE json_extract(NEW.data,'$.event')='EXEC';
-
-    -- OPEN: resolve path, filter system paths for O_RDONLY
-    INSERT INTO events(tgid,ts,event)
-        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),'OPEN'
-        WHERE json_extract(NEW.data,'$.event')='OPEN'
-          AND NOT is_sys_path(
-              resolve_path(json_extract(NEW.data,'$.path'),
-                  (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT))),
-              COALESCE(json_extract(NEW.data,'$.flags[0]'),'O_RDONLY'));
-    INSERT INTO open_events(eid,path,flags,fd,err)
-        SELECT last_insert_rowid(),
-            resolve_path(json_extract(NEW.data,'$.path'),
-                (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT))),
-            CASE WHEN json_type(NEW.data,'$.flags')='array' THEN
-                (SELECT GROUP_CONCAT(value,'|') FROM json_each(json_extract(NEW.data,'$.flags')))
-                ELSE NULL END,
-            json_extract(NEW.data,'$.fd'), json_extract(NEW.data,'$.err')
-        WHERE json_extract(NEW.data,'$.event')='OPEN' AND changes()>0;
-    UPDATE processes SET
-        last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts')),
-        first_ts=MIN(first_ts,json_extract(NEW.data,'$.ts'))
-        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
-          AND json_extract(NEW.data,'$.event')='OPEN';
-
-    -- EXIT
-    INSERT INTO events(tgid,ts,event)
-        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),'EXIT'
-        WHERE json_extract(NEW.data,'$.event')='EXIT';
-    INSERT INTO exit_events(eid,status,code,signal,core_dumped,raw)
-        SELECT last_insert_rowid(),json_extract(NEW.data,'$.status'),
-               json_extract(NEW.data,'$.code'),json_extract(NEW.data,'$.signal'),
-               json_extract(NEW.data,'$.core_dumped'),json_extract(NEW.data,'$.raw')
-        WHERE json_extract(NEW.data,'$.event')='EXIT';
-    UPDATE processes SET last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts'))
-        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
-          AND json_extract(NEW.data,'$.event')='EXIT';
-
-    -- STDOUT / STDERR
-    INSERT INTO events(tgid,ts,event)
-        SELECT json_extract(NEW.data,'$.tgid'),json_extract(NEW.data,'$.ts'),
-               json_extract(NEW.data,'$.event')
-        WHERE json_extract(NEW.data,'$.event') IN ('STDOUT','STDERR');
-    INSERT INTO io_events(eid,stream,len,data)
-        SELECT last_insert_rowid(),json_extract(NEW.data,'$.event'),
-               json_extract(NEW.data,'$.len'),json_extract(NEW.data,'$.data')
-        WHERE json_extract(NEW.data,'$.event') IN ('STDOUT','STDERR');
-    UPDATE processes SET last_ts=MAX(last_ts,json_extract(NEW.data,'$.ts'))
-        WHERE tgid=CAST(json_extract(NEW.data,'$.tgid') AS INT)
-          AND json_extract(NEW.data,'$.event') IN ('STDOUT','STDERR');
-
-    -- Delete processed row
-    DELETE FROM inbox WHERE id=NEW.id;
-END;
+--%% INGEST
+WITH src AS (
+    SELECT DISTINCT
+        CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
+        CAST(json_extract(data,'$.pid') AS INT) AS pid,
+        CAST(json_extract(data,'$.ppid') AS INT) AS ppid,
+        CAST(json_extract(data,'$.nspid') AS INT) AS nspid,
+        CAST(json_extract(data,'$.nstgid') AS INT) AS nstgid,
+        CAST(json_extract(data,'$.ts') AS REAL) AS ts
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event') IS NOT NULL
+      AND json_extract(data,'$.tgid') IS NOT NULL
+      AND CAST(json_extract(data,'$.tgid') AS TEXT)
+          != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'')
+)
+INSERT OR IGNORE INTO processes(tgid,pid,ppid,nspid,nstgid,first_ts,last_ts)
+    SELECT tgid,pid,ppid,nspid,nstgid,ts,ts FROM src;
+WITH src AS (
+    SELECT DISTINCT CAST(json_extract(data,'$.tgid') AS TEXT) AS id
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event') IS NOT NULL
+      AND json_extract(data,'$.tgid') IS NOT NULL
+      AND CAST(json_extract(data,'$.tgid') AS TEXT)
+          != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'')
+)
+INSERT OR IGNORE INTO expanded(id,ex)
+    SELECT id,1 FROM src;
+WITH src AS (
+    SELECT id,
+           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
+           json_extract(data,'$.path') AS path
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event')='CWD'
+), last_cwd AS (
+    SELECT s.tgid, s.path
+    FROM src s
+    WHERE s.id = (SELECT MAX(s2.id) FROM src s2 WHERE s2.tgid=s.tgid)
+)
+INSERT OR REPLACE INTO cwd_cache(tgid,cwd)
+    SELECT tgid,path FROM last_cwd;
+WITH src AS (
+    SELECT id,
+           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
+           json_extract(data,'$.path') AS path
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event')='CWD'
+), last_cwd AS (
+    SELECT s.tgid, s.path
+    FROM src s
+    WHERE s.id = (SELECT MAX(s2.id) FROM src s2 WHERE s2.tgid=s.tgid)
+)
+UPDATE processes
+SET cwd=(SELECT path FROM last_cwd WHERE tgid=processes.tgid)
+WHERE tgid IN (SELECT tgid FROM last_cwd);
+WITH src AS (
+    SELECT id,
+           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
+           data
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event')='EXEC'
+), last_exec AS (
+    SELECT s.tgid, s.data
+    FROM src s
+    WHERE s.id = (SELECT MAX(s2.id) FROM src s2 WHERE s2.tgid=s.tgid)
+)
+UPDATE processes
+SET exe=(SELECT json_extract(data,'$.exe') FROM last_exec WHERE tgid=processes.tgid),
+    argv=(SELECT CASE WHEN json_type(data,'$.argv')='array' THEN
+                (SELECT GROUP_CONCAT(value,char(10)) FROM json_each(json_extract(data,'$.argv')))
+                ELSE NULL END
+          FROM last_exec WHERE tgid=processes.tgid),
+    env=(SELECT CASE WHEN json_type(data,'$.env')='object' THEN
+                (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(data,'$.env')))
+                ELSE NULL END
+         FROM last_exec WHERE tgid=processes.tgid),
+    auxv=(SELECT CASE WHEN json_type(data,'$.auxv')='object' THEN
+                 (SELECT GROUP_CONCAT(key||'='||value,char(10)) FROM json_each(json_extract(data,'$.auxv')))
+                 ELSE NULL END
+          FROM last_exec WHERE tgid=processes.tgid)
+WHERE tgid IN (SELECT tgid FROM last_exec);
+WITH src AS (
+    SELECT id,
+           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
+           CAST(json_extract(data,'$.ts') AS REAL) AS ts,
+           json_extract(data,'$.event') AS event
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event') IS NOT NULL
+)
+INSERT INTO events(id,tgid,ts,event)
+    SELECT id,tgid,ts,event
+    FROM src
+    WHERE event IN ('EXEC','EXIT','STDOUT','STDERR');
+WITH src AS (
+    SELECT s.id,
+           CAST(json_extract(s.data,'$.tgid') AS INT) AS tgid,
+           CAST(json_extract(s.data,'$.ts') AS REAL) AS ts,
+           resolve_path(
+               json_extract(s.data,'$.path'),
+               COALESCE(
+                   (SELECT json_extract(c.data,'$.path')
+                    FROM inbox c
+                    WHERE c.kind='trace'
+                      AND json_extract(c.data,'$.event')='CWD'
+                      AND CAST(json_extract(c.data,'$.tgid') AS INT)=CAST(json_extract(s.data,'$.tgid') AS INT)
+                      AND c.id<=s.id
+                    ORDER BY c.id DESC LIMIT 1),
+                   (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(s.data,'$.tgid') AS INT))
+               )
+           ) AS path,
+           COALESCE(json_extract(s.data,'$.flags[0]'),'O_RDONLY') AS flag0
+    FROM inbox s
+    WHERE s.kind='trace'
+      AND json_extract(s.data,'$.event')='OPEN'
+)
+INSERT INTO events(id,tgid,ts,event)
+    SELECT id,tgid,ts,'OPEN'
+    FROM src
+    WHERE NOT is_sys_path(path, flag0);
+WITH src AS (
+    SELECT s.id,
+           resolve_path(
+               json_extract(s.data,'$.path'),
+               COALESCE(
+                   (SELECT json_extract(c.data,'$.path')
+                    FROM inbox c
+                    WHERE c.kind='trace'
+                      AND json_extract(c.data,'$.event')='CWD'
+                      AND CAST(json_extract(c.data,'$.tgid') AS INT)=CAST(json_extract(s.data,'$.tgid') AS INT)
+                      AND c.id<=s.id
+                    ORDER BY c.id DESC LIMIT 1),
+                   (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(s.data,'$.tgid') AS INT))
+               )
+           ) AS path,
+           COALESCE(json_extract(s.data,'$.flags[0]'),'O_RDONLY') AS flag0,
+           s.data
+    FROM inbox s
+    WHERE s.kind='trace'
+      AND json_extract(s.data,'$.event')='OPEN'
+)
+INSERT INTO open_events(eid,path,flags,fd,err)
+    SELECT id,
+           path,
+           CASE WHEN json_type(data,'$.flags')='array' THEN
+               (SELECT GROUP_CONCAT(value,'|') FROM json_each(json_extract(data,'$.flags')))
+               ELSE NULL END,
+           json_extract(data,'$.fd'),
+           json_extract(data,'$.err')
+    FROM src
+    WHERE EXISTS(SELECT 1 FROM events WHERE id=src.id AND event='OPEN')
+      AND NOT is_sys_path(path, flag0);
+WITH src AS (
+    SELECT id,data
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event')='EXIT'
+)
+INSERT INTO exit_events(eid,status,code,signal,core_dumped,raw)
+    SELECT id,
+           json_extract(data,'$.status'),
+           json_extract(data,'$.code'),
+           json_extract(data,'$.signal'),
+           json_extract(data,'$.core_dumped'),
+           json_extract(data,'$.raw')
+    FROM src;
+WITH src AS (
+    SELECT id,data
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event') IN ('STDOUT','STDERR')
+)
+INSERT INTO io_events(eid,stream,len,data)
+    SELECT id,
+           json_extract(data,'$.event'),
+           json_extract(data,'$.len'),
+           json_extract(data,'$.data')
+    FROM src;
+WITH src AS (
+    SELECT CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
+           MIN(CAST(json_extract(data,'$.ts') AS REAL)) AS min_ts,
+           MAX(CAST(json_extract(data,'$.ts') AS REAL)) AS max_ts
+    FROM inbox
+    WHERE kind='trace'
+      AND json_extract(data,'$.event') IS NOT NULL
+      AND json_extract(data,'$.tgid') IS NOT NULL
+    GROUP BY CAST(json_extract(data,'$.tgid') AS INT)
+)
+UPDATE processes
+SET first_ts=MIN(first_ts, (SELECT min_ts FROM src WHERE tgid=processes.tgid)),
+    last_ts=MAX(last_ts, (SELECT max_ts FROM src WHERE tgid=processes.tgid))
+WHERE tgid IN (SELECT tgid FROM src);
+DELETE FROM inbox WHERE kind='trace';
 
 --%% SETUP
 CREATE INDEX IF NOT EXISTS ix_ev_tg ON events(tgid);
@@ -766,19 +860,40 @@ CREATE TEMP TABLE IF NOT EXISTS _outbox(
 -- ══════════════════════════════════════════════════════════════════════
 -- Input dispatch triggers
 -- ══════════════════════════════════════════════════════════════════════
--- Key events arrive as: INSERT INTO inbox(kind,data) VALUES('key',
---   json_object('key',<int>,'panel',<name>,'cursor',<int>,
---               'row_id',<text>,'focus',<int>,'rows',<int>))
+-- Engine-owned navigation emits:
+--   INSERT INTO inbox(kind,data) VALUES('cursor',
+--     json_object('panel',<name>,'row_id',<text>))
 --
--- The trigger updates state/expanded directly and only emits _outbox
--- rows for operations that need terminal I/O.
+-- Action keys emit:
+--   INSERT INTO inbox(kind,data) VALUES('key',
+--     json_object('key',<int>,'panel',<name>,'row_id',<text>))
+
+-- ══════════════════════════════════════════════════════════════════════
+-- Cursor dispatch trigger
+-- ══════════════════════════════════════════════════════════════════════
+CREATE TEMP TRIGGER _dispatch_cursor AFTER INSERT ON inbox WHEN NEW.kind='cursor'
+BEGIN
+    UPDATE state SET
+        focus = 0,
+        cursor = COALESCE(
+            (SELECT rownum FROM lpane WHERE id = json_extract(NEW.data,'$.row_id')),
+            0),
+        cursor_id = COALESCE(json_extract(NEW.data,'$.row_id'), '')
+        WHERE json_extract(NEW.data,'$.panel') = 'lpane';
+    UPDATE state SET
+        focus = 1,
+        dcursor = COALESCE(
+            (SELECT rownum FROM rpane WHERE id = json_extract(NEW.data,'$.row_id')),
+            0)
+        WHERE json_extract(NEW.data,'$.panel') = 'rpane';
+    DELETE FROM inbox WHERE id = NEW.id;
+END;
 
 -- ══════════════════════════════════════════════════════════════════════
 -- Key dispatch trigger
 -- ══════════════════════════════════════════════════════════════════════
 -- Fires on INSERT INTO inbox(kind,data) VALUES('key', json_object(...)).
--- JSON fields: key (int), panel (text), cursor (int), row_id (text),
---              focus (int: 0=lpane, 1=rpane), rows (int).
+-- JSON fields: key (int), panel (text), row_id (text).
 --
 -- Key code reference (from engine.h TUI_K_* constants):
 --   256=UP  257=DOWN  258=LEFT  259=RIGHT  260=PGUP  261=PGDN
@@ -794,81 +909,14 @@ BEGIN
     INSERT INTO _outbox(cmd) SELECT 'quit'
         WHERE json_extract(NEW.data,'$.key') IN (113, 81);
 
-    -- ── navigation: up/k (lpane) ──
-    UPDATE state SET cursor = MAX(cursor - 1, 0)
-        WHERE json_extract(NEW.data,'$.key') IN (256, 107)
-          AND json_extract(NEW.data,'$.focus') = 0;
-    -- ── navigation: up/k (rpane) ──
-    UPDATE state SET dcursor = MAX(dcursor - 1, 0)
-        WHERE json_extract(NEW.data,'$.key') IN (256, 107)
-          AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: down/j (lpane) ──
-    UPDATE state SET
-        cursor = MIN(cursor + 1,
-            (SELECT MAX(COUNT(*)-1, 0) FROM lpane))
-        WHERE json_extract(NEW.data,'$.key') IN (257, 106)
-          AND json_extract(NEW.data,'$.focus') = 0;
-    -- ── navigation: down/j (rpane) ──
-    UPDATE state SET
-        dcursor = MIN(dcursor + 1,
-            (SELECT MAX(COUNT(*)-1, 0) FROM rpane))
-        WHERE json_extract(NEW.data,'$.key') IN (257, 106)
-          AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: pgup (lpane) ──
-    UPDATE state SET cursor = MAX(cursor - MAX(rows - 3, 1), 0)
-        WHERE json_extract(NEW.data,'$.key') = 260
-          AND json_extract(NEW.data,'$.focus') = 0;
-    -- ── navigation: pgup (rpane) ──
-    UPDATE state SET dcursor = MAX(dcursor - MAX(rows - 3, 1), 0)
-        WHERE json_extract(NEW.data,'$.key') = 260
-          AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: pgdn (lpane) ──
-    UPDATE state SET
-        cursor = MIN(cursor + MAX(rows - 3, 1),
-            (SELECT MAX(COUNT(*)-1, 0) FROM lpane))
-        WHERE json_extract(NEW.data,'$.key') = 261
-          AND json_extract(NEW.data,'$.focus') = 0;
-    -- ── navigation: pgdn (rpane) ──
-    UPDATE state SET
-        dcursor = MIN(dcursor + MAX(rows - 3, 1),
-            (SELECT MAX(COUNT(*)-1, 0) FROM rpane))
-        WHERE json_extract(NEW.data,'$.key') = 261
-          AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: home/g (lpane) ──
-    UPDATE state SET cursor = 0
-        WHERE json_extract(NEW.data,'$.key') IN (262, 103)
-          AND json_extract(NEW.data,'$.focus') = 0;
-    -- ── navigation: home/g (rpane) ──
-    UPDATE state SET dcursor = 0
-        WHERE json_extract(NEW.data,'$.key') IN (262, 103)
-          AND json_extract(NEW.data,'$.focus') = 1;
-    -- ── navigation: end (lpane) ──
-    UPDATE state SET cursor = (SELECT MAX(COUNT(*)-1, 0) FROM lpane)
-        WHERE json_extract(NEW.data,'$.key') = 263
-          AND json_extract(NEW.data,'$.focus') = 0;
-    -- ── navigation: end (rpane) ──
-    UPDATE state SET dcursor = (SELECT MAX(COUNT(*)-1, 0) FROM rpane)
-        WHERE json_extract(NEW.data,'$.key') = 263
-          AND json_extract(NEW.data,'$.focus') = 1;
-
-    -- ── sync cursor_id after navigation ──
-    UPDATE state SET cursor_id = COALESCE(
-        (SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)), '')
-        WHERE json_extract(NEW.data,'$.key') IN
-            (256,257,260,261,262,263,103,106,107);
-
-    -- ── tab: toggle focus ──
-    UPDATE state SET focus = 1 - focus, dcursor = 0
-        WHERE json_extract(NEW.data,'$.key') = 9;
-
-    -- ── enter: focus=0 → switch to rpane; focus=1 → follow link ──
+    -- ── enter: lpane → switch to rpane; rpane → follow link ──
     UPDATE state SET focus = 1, dcursor = 0
         WHERE json_extract(NEW.data,'$.key') IN (13, 10)
-          AND (SELECT focus FROM state) = 0;
+          AND json_extract(NEW.data,'$.panel') = 'lpane';
     INSERT INTO _outbox(cmd,arg) SELECT 'follow_link',
-        CAST((SELECT dcursor FROM state) AS TEXT)
+        COALESCE(json_extract(NEW.data,'$.row_id'), '')
         WHERE json_extract(NEW.data,'$.key') IN (13, 10)
-          AND json_extract(NEW.data,'$.focus') = 1;
+          AND json_extract(NEW.data,'$.panel') = 'rpane';
 
     -- ── G: toggle grouped ──
     UPDATE state SET grouped = 1 - grouped,
@@ -876,54 +924,54 @@ BEGIN
         WHERE json_extract(NEW.data,'$.key') = 71;
 
     -- ── right/l: expand or enter detail ──
-    -- If focus=1 and rpane cursor is on heading, toggle it
+    -- If panel=rpane and cursor is on heading, toggle it
     INSERT OR REPLACE INTO expanded(id, ex)
         SELECT 'rp_' || section,
             CASE WHEN COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)
                  THEN 0 ELSE 1 END
         FROM rpane
         WHERE json_extract(NEW.data,'$.key') IN (259, 108)
-          AND json_extract(NEW.data,'$.focus') = 1
-          AND rpane.rownum = (SELECT dcursor FROM state)
+          AND json_extract(NEW.data,'$.panel') = 'rpane'
+          AND rpane.id = json_extract(NEW.data,'$.row_id')
           AND rpane.style = 'heading';
-    -- If focus=1 and rpane cursor is NOT heading, follow link
+    -- If panel=rpane and cursor is NOT heading, follow link
     INSERT INTO _outbox(cmd,arg) SELECT 'follow_link',
-        CAST((SELECT dcursor FROM state) AS TEXT)
+        COALESCE(json_extract(NEW.data,'$.row_id'), '')
         WHERE json_extract(NEW.data,'$.key') IN (259, 108)
-          AND json_extract(NEW.data,'$.focus') = 1
+          AND json_extract(NEW.data,'$.panel') = 'rpane'
           AND NOT EXISTS(SELECT 1 FROM rpane
-              WHERE rownum=(SELECT dcursor FROM state) AND style='heading');
-    -- If focus=0, expand current node if it has children and is collapsed
+              WHERE id=json_extract(NEW.data,'$.row_id') AND style='heading');
+    -- If panel=lpane, expand current node if it has children and is collapsed
     INSERT OR REPLACE INTO expanded(id, ex)
         SELECT json_extract(NEW.data,'$.row_id'), 1
         WHERE json_extract(NEW.data,'$.key') IN (259, 108)
-          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.panel') = 'lpane'
           AND json_extract(NEW.data,'$.row_id') != ''
           AND (SELECT mode FROM state) IN (0, 1, 2)
           AND COALESCE((SELECT ex FROM expanded
               WHERE id=json_extract(NEW.data,'$.row_id')), 1) = 0;
 
     -- ── left/h: collapse or go to parent ──
-    -- If focus=1, toggle rpane heading
+    -- If panel=rpane, toggle rpane heading
     INSERT OR REPLACE INTO expanded(id, ex)
         SELECT 'rp_' || section,
             CASE WHEN COALESCE((SELECT ex FROM expanded WHERE id='rp_'||section),1)
                  THEN 0 ELSE 1 END
         FROM rpane
         WHERE json_extract(NEW.data,'$.key') IN (258, 104)
-          AND json_extract(NEW.data,'$.focus') = 1
-          AND rpane.rownum = (SELECT dcursor FROM state)
+          AND json_extract(NEW.data,'$.panel') = 'rpane'
+          AND rpane.id = json_extract(NEW.data,'$.row_id')
           AND rpane.style = 'heading';
-    -- If focus=0, mode=0 (procs): collapse if expanded+has children
+    -- If panel=lpane, mode=0 (procs): collapse if expanded+has children
     UPDATE expanded SET ex = 0
         WHERE json_extract(NEW.data,'$.key') IN (258, 104)
-          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.panel') = 'lpane'
           AND (SELECT mode FROM state) = 0
           AND id = json_extract(NEW.data,'$.row_id')
           AND ex = 1
           AND EXISTS(SELECT 1 FROM processes
               WHERE ppid = CAST(json_extract(NEW.data,'$.row_id') AS INT));
-    -- If focus=0, mode=0, not expanded or no children → jump to parent
+    -- If panel=lpane, mode=0, not expanded or no children → jump to parent
     UPDATE state SET cursor = COALESCE(
         (SELECT rownum FROM lpane WHERE id = CAST(
             (SELECT ppid FROM processes
@@ -931,18 +979,18 @@ BEGIN
             AS TEXT)),
         cursor)
         WHERE json_extract(NEW.data,'$.key') IN (258, 104)
-          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.panel') = 'lpane'
           AND (SELECT mode FROM state) = 0
           AND json_extract(NEW.data,'$.row_id') != ''
           AND (NOT EXISTS(SELECT 1 FROM processes
                   WHERE ppid = CAST(json_extract(NEW.data,'$.row_id') AS INT))
                OR COALESCE((SELECT ex FROM expanded
-                   WHERE id = json_extract(NEW.data,'$.row_id')), 1) = 0);
-    -- If focus=0, mode=1 (files): collapse if expanded dir
+                    WHERE id = json_extract(NEW.data,'$.row_id')), 1) = 0);
+    -- If panel=lpane, mode=1 (files): collapse if expanded dir
     INSERT OR REPLACE INTO expanded(id, ex)
         SELECT json_extract(NEW.data,'$.row_id'), 0
         WHERE json_extract(NEW.data,'$.key') IN (258, 104)
-          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.panel') = 'lpane'
           AND (SELECT mode FROM state) = 1
           AND json_extract(NEW.data,'$.row_id') != ''
           AND COALESCE((SELECT ex FROM expanded
@@ -956,18 +1004,18 @@ BEGIN
              WHERE id = json_extract(NEW.data,'$.row_id') LIMIT 1)),
         cursor)
         WHERE json_extract(NEW.data,'$.key') IN (258, 104)
-          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.panel') = 'lpane'
           AND (SELECT mode FROM state) = 1
           AND json_extract(NEW.data,'$.row_id') != ''
           AND (NOT EXISTS(SELECT 1 FROM _ftree
-                   WHERE parent_id=json_extract(NEW.data,'$.row_id'))
-               OR COALESCE((SELECT ex FROM expanded
-                   WHERE id=json_extract(NEW.data,'$.row_id')), 1) = 0);
+                    WHERE parent_id=json_extract(NEW.data,'$.row_id'))
+                OR COALESCE((SELECT ex FROM expanded
+                    WHERE id=json_extract(NEW.data,'$.row_id')), 1) = 0);
     -- mode=2 (output): collapse io_ group or go to parent
     INSERT OR REPLACE INTO expanded(id, ex)
         SELECT json_extract(NEW.data,'$.row_id'), 0
         WHERE json_extract(NEW.data,'$.key') IN (258, 104)
-          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.panel') = 'lpane'
           AND (SELECT mode FROM state) = 2
           AND json_extract(NEW.data,'$.row_id') LIKE 'io_%';
     UPDATE state SET cursor = COALESCE(
@@ -976,7 +1024,7 @@ BEGIN
                      WHERE id = json_extract(NEW.data,'$.row_id'))),
         cursor)
         WHERE json_extract(NEW.data,'$.key') IN (258, 104)
-          AND json_extract(NEW.data,'$.focus') = 0
+          AND json_extract(NEW.data,'$.panel') = 'lpane'
           AND (SELECT mode FROM state) = 2
           AND json_extract(NEW.data,'$.row_id') NOT LIKE 'io_%'
           AND json_extract(NEW.data,'$.row_id') != '';

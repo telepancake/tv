@@ -253,6 +253,11 @@ static void ingest_line(const char *ln) {
     sqlite3_finalize(st);
 }
 
+static void process_trace_batch(void) {
+    if (qint("SELECT COUNT(*) FROM inbox WHERE kind='trace'", 0) == 0) return;
+    xexec(tv_sql_ingest);
+}
+
 static void ingest_file(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "tv: cannot open %s\n", path); exit(1); }
@@ -263,14 +268,14 @@ static void ingest_file(const char *path) {
         if (nl > line && *(nl - 1) == '\r') *(nl - 1) = 0;
         ingest_line(line);
     }
+    process_trace_batch();
     xexec("COMMIT");
     fclose(f);
 }
 
 /* ── Process one JSONL line from the trace ─────────────────────────── */
-/* Trace events are now processed by the _ingest_trace trigger in tv.sql.
- * The trigger fires on INSERT INTO inbox WHERE kind='trace'.
- * No C-side trace processing needed — ingest_line() does the INSERT. */
+/* Trace events are inserted into inbox(kind='trace') and normalized in batches
+ * by process_trace_batch(), which runs the SQL ingest pipeline once per batch. */
 
 static int g_headless;
 
@@ -473,12 +478,13 @@ static void do_search(const char *q) {
 }
 
 /* ── Follow rpane link ─────────────────────────────────────────────── */
-static void follow_link(int rpane_row) {
+static void follow_link(const char *rpane_id) {
+    if (!rpane_id || !rpane_id[0]) return;
     sqlite3_stmt *st;
     sqlite3_prepare_v2(g_db,
-        "SELECT link_mode,link_id FROM rpane WHERE rownum=? AND link_mode>=0",
+        "SELECT link_mode,link_id FROM rpane WHERE id=? AND link_mode>=0",
         -1, &st, 0);
-    sqlite3_bind_int(st, 1, rpane_row);
+    sqlite3_bind_text(st, 1, rpane_id, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st) == SQLITE_ROW) {
         int tm = sqlite3_column_int(st, 0);
         const char *ti = (const char *)sqlite3_column_text(st, 1);
@@ -554,7 +560,7 @@ static int process_outbox(tui_t *tui) {
         if (strcmp(cmd, "quit") == 0) {
             result = TUI_QUIT;
         } else if (strcmp(cmd, "follow_link") == 0) {
-            follow_link(atoi(arg));
+            follow_link(arg);
             sync_engine_from_state();
             tui_dirty(tui, NULL);
         } else if (strcmp(cmd, "build_ftree") == 0) {
@@ -604,32 +610,28 @@ static int process_outbox(tui_t *tui) {
     return result;
 }
 
-/* ── Insert key event into inbox (trigger handles it) ──────────────── */
-static void submit_key(int key) {
-    int focus = qint("SELECT focus FROM state", 0);
-    int cursor = qint("SELECT cursor FROM state", 0);
-    char row_id[4096] = "";
-    { sqlite3_stmt *st;
-      sqlite3_prepare_v2(g_db,
-          "SELECT COALESCE(cursor_id,'') FROM state", -1, &st, 0);
-      if (sqlite3_step(st) == SQLITE_ROW) {
-          const char *v = (const char *)sqlite3_column_text(st, 0);
-          if (v) snprintf(row_id, sizeof row_id, "%s", v);
-      }
-      sqlite3_finalize(st);
-    }
-    int rows = qint("SELECT rows FROM state", 24);
+/* ── Insert semantic events into inbox ─────────────────────────────── */
+static void submit_key(int key, const char *panel, const char *row_id) {
     sqlite3_stmt *st;
     sqlite3_prepare_v2(g_db,
         "INSERT INTO inbox(kind,data) VALUES('key',"
-        "json_object('key',?1,'panel',?2,'cursor',?3,'row_id',?4,'focus',?5,'rows',?6))",
+        "json_object('key',?1,'panel',?2,'row_id',?3))",
         -1, &st, 0);
     sqlite3_bind_int(st, 1, key);
-    sqlite3_bind_text(st, 2, focus ? "rpane" : "lpane", -1, SQLITE_STATIC);
-    sqlite3_bind_int(st, 3, cursor);
-    sqlite3_bind_text(st, 4, row_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 5, focus);
-    sqlite3_bind_int(st, 6, rows);
+    sqlite3_bind_text(st, 2, panel ? panel : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, row_id ? row_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+static void submit_cursor_event(const char *panel, const char *row_id) {
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(g_db,
+        "INSERT INTO inbox(kind,data) VALUES('cursor',"
+        "json_object('panel',?1,'row_id',?2))",
+        -1, &st, 0);
+    sqlite3_bind_text(st, 1, panel ? panel : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, row_id ? row_id : "", -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
@@ -682,12 +684,22 @@ static void process_inbox(tui_t *tui) {
               sqlite3_finalize(st);
             }
             int k = parse_key_name(keyname);
-            if (k != TUI_K_NONE) {
-                submit_key(k);
-                sync_engine_from_state();
-                tui_dirty(tui, NULL);
-                process_outbox(tui);
+            if (k != TUI_K_NONE) tui_input_key(tui, k);
+        } else if (strcmp(inp, "resize") == 0) {
+            int rows = 0, cols = 0;
+            xexecf("DELETE FROM inbox WHERE id=%lld", id);
+            { sqlite3_stmt *st;
+              sqlite3_prepare_v2(g_db,
+                  "SELECT COALESCE(json_extract(?1,'$.rows'),0),"
+                  "COALESCE(json_extract(?1,'$.cols'),0)", -1, &st, 0);
+              sqlite3_bind_text(st, 1, data, -1, SQLITE_TRANSIENT);
+              if (sqlite3_step(st) == SQLITE_ROW) {
+                  rows = sqlite3_column_int(st, 0);
+                  cols = sqlite3_column_int(st, 1);
+              }
+              sqlite3_finalize(st);
             }
+            if (rows > 0 && cols > 0) tui_resize(tui, rows, cols);
         } else {
             /* Delete and re-insert to fire the trigger (row may have been
              * inserted before triggers existed in --trace mode) */
@@ -712,20 +724,16 @@ static void process_inbox(tui_t *tui) {
 /* ── on_key callback ───────────────────────────────────────────────── */
 static int on_key_cb(tui_t *tui, int key, const char *panel,
                      int cursor, const char *row_id, void *ctx) {
-    (void)ctx; (void)panel; (void)cursor; (void)row_id;
+    (void)ctx; (void)cursor;
     if (key == TUI_K_NONE) {
-        /* Post-navigation: engine already moved cursor.
-         * This is only called in interactive mode for default_nav.
-         * We don't use default_nav anymore — trigger handles nav. */
+        submit_cursor_event(panel, row_id);
+        if (panel && strcmp(panel, "lpane") == 0)
+            tui_dirty(tui, "rpane");
+        update_status();
         return TUI_HANDLED;
     }
-    /* Insert into inbox; trigger handles all state updates */
-    submit_key(key);
+    submit_key(key, panel, row_id);
     int result = process_outbox(tui);
-    /* build_ftree after mode changes to file mode */
-    if (qint("SELECT mode FROM state", 0) == 1) {
-        /* ftree may need rebuild */
-    }
     sync_engine_from_state();
     tui_dirty(tui, NULL);
     update_status();
@@ -752,7 +760,7 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
     if (n <= 0) {
         if (t_rbuf_len > 0) {
             t_rbuf[t_rbuf_len] = 0;
-            xexec("BEGIN"); ingest_line(t_rbuf); xexec("COMMIT");
+            xexec("BEGIN"); ingest_line(t_rbuf); process_trace_batch(); xexec("COMMIT");
             t_rbuf_len = 0;
         }
         on_stream_end();
@@ -781,6 +789,7 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
             did++;
             t_rbuf_len = 0;
         }
+        if (did) process_trace_batch();
         xexec("COMMIT");
         if (did) {
             xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
