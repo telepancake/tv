@@ -22,6 +22,9 @@
 #ifndef SA_RESTORER
 #define SA_RESTORER 0x04000000
 #endif
+#ifndef ENAMETOOLONG
+#define ENAMETOOLONG 36
+#endif
 
 #define MINI_MMAP2_SHIFT 12
 
