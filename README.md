@@ -53,7 +53,8 @@ f.close()
 
 `tv --uproctrace -o trace.jsonl.zst -- ...` writes zstd-compressed traces when the
 output filename ends in `.zst`, and `tv --trace trace.jsonl.zst` reads them back
-directly.
+directly. Pass `--no-env` to `tv --uproctrace`, `tv -- ...`, or `sudtrace` to omit
+environment variables from emitted `EXEC` events.
 
 ---
 
@@ -91,7 +92,7 @@ Emitted after a successful `execve()`. A `CWD` event is always emitted immediate
 |--------|----------------|-------------|
 | `exe`  | string ∣ null  | Resolved absolute path to the binary. Symlinks resolved. |
 | `argv` | string[]       | Argument vector. Empty array `[]` if unreadable. |
-| `env`  | object         | Environment as `{"KEY":"VALUE",...}`. Entries without `=` have empty string value. Empty object `{}` if unreadable. |
+| `env`  | object         | Optional. Present unless trace capture was started with `--no-env`. When present, contains the environment as `{"KEY":"VALUE",...}`. Entries without `=` have empty string value. Empty object `{}` if unreadable. |
 | `auxv` | object         | ELF auxiliary vector entries (see below). |
 
 ### `auxv` fields
