@@ -629,6 +629,14 @@ run_test "search: matches process" \
     'assert_line_match t "$OUT" "search=broken"'
 
 OUT=$(drive '{"input":"resize","rows":50,"cols":120}
+{"input":"search","q":"100"}
+{"input":"key","key":"j"}
+{"input":"key","key":"n"}
+{"input":"print","what":"state"}')
+run_test "search: next hit uses latest cursor" \
+    'assert_line_match t "$OUT" "cursor=2 "'
+
+OUT=$(drive '{"input":"resize","rows":50,"cols":120}
 {"input":"key","key":"2"}
 {"input":"search","q":"foo"}
 {"input":"print","what":"lpane"}')
