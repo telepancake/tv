@@ -2056,7 +2056,6 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             return;
         }
 #endif
-
         if (flags != 0) {
             ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
             uc->uc_mcontext.gregs[REG_RAX] = ret;
@@ -2147,9 +2146,9 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
             if (ret == 0) {
-                /* Child created while handling SIGSYS inherits the handler's
-                 * temporary blocked mask; restore delivery for child execs. */
-                unblock_sigsys_raw();
+                /* Child created while handling SIGSYS can inherit blocked
+                 * SIGSYS state and stale SUD task config. Reinstall both. */
+                prepare_child_sud();
             }
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
@@ -2166,14 +2165,33 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
             if (ret == 0) {
-                /* Child created while handling SIGSYS inherits the handler's
-                 * temporary blocked mask; restore delivery for child execs. */
-                unblock_sigsys_raw();
+                /* Child created while handling SIGSYS can inherit blocked
+                 * SIGSYS state and stale SUD task config. Reinstall both. */
+                prepare_child_sud();
             }
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
+
+#ifdef SYS_vfork
+    if (nr == SYS_vfork) {
+        ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+        if (ret == 0)
+            prepare_child_sud();
+        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        return;
+    }
+#endif
+#ifdef SYS_fork
+    if (nr == SYS_fork) {
+        ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+        if (ret == 0)
+            prepare_child_sud();
+        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        return;
+    }
+#endif
 
 #ifdef SYS_rt_sigaction
     if (nr == SYS_rt_sigaction) {
