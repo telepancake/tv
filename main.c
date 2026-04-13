@@ -41,6 +41,9 @@ enum {
     LIVE_TRACE_BATCH_ROWS = 256,
     LIVE_TRACE_BATCH_MS = 50,
     CURSOR_EVENT_DEBOUNCE_MS = 200,
+    /* Panel names are short ("lpane"/"rpane"), while row IDs follow the
+     * engine cursor_id buffer sizing so delayed updates can store any ID
+     * the engine hands back without truncating more aggressively here. */
     CURSOR_EVENT_PANEL_MAX = 32,
     CURSOR_EVENT_ROW_ID_MAX = 4096,
 };
@@ -276,6 +279,7 @@ static char g_pending_cursor_row_id[CURSOR_EVENT_ROW_ID_MAX];
 
 static void flush_pending_cursor_event(tui_t *tui);
 
+/* strlcpy is not portable here; keep truncation explicit and bounded. */
 static void copy_cstr(char *dst, size_t dstsz, const char *src) {
     size_t n;
     if (!dst || dstsz == 0) return;
