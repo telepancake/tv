@@ -129,6 +129,283 @@ static volatile unsigned char *g_sud_selector_ptr = &sud_selector_storage;
 #define sud_selector (*g_sud_selector_ptr)
 
 /* ================================================================
+ * Raw syscall — bypass the C library's errno-mangling wrapper.
+ *
+ * The C library's syscall() returns -1 on error and sets errno.
+ * But when the SIGSYS handler re-executes an intercepted syscall
+ * and puts the result into the traced program's RAX, the program
+ * expects the raw kernel return value (e.g. -ENOSYS, -EPERM).
+ *
+ * If we return -1 for every error, glibc internal code in the
+ * traced program breaks — for example, clone3() returning -1
+ * (=-EPERM) instead of -ENOSYS prevents the clone3→clone fallback
+ * in pthread_create, causing SIGSEGV.
+ *
+ * This inline assembly performs the syscall directly, returning
+ * the raw kernel result without any errno translation.
+ * ================================================================ */
+static inline long raw_syscall6(long nr, long a0, long a1, long a2,
+                                long a3, long a4, long a5)
+{
+    long ret;
+    register long r10 __asm__("r10") = a3;
+    register long r8  __asm__("r8")  = a4;
+    register long r9  __asm__("r9")  = a5;
+    __asm__ volatile(
+        "syscall"
+        : "=a"(ret)
+        : "a"(nr), "D"(a0), "S"(a1), "d"(a2),
+          "r"(r10), "r"(r8), "r"(r9)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+
+/* ================================================================
+ * Raw clone3/clone — special assembly for thread-creating syscalls.
+ *
+ * Problem: when clone3/clone with CLONE_VM|CLONE_THREAD is executed
+ * inside the SIGSYS handler via raw_syscall6(), the NEW child thread
+ * starts executing C code inside the handler — but on a NEW stack
+ * allocated by clone3.  The compiler-generated RSP-relative code
+ * for accessing local variables (including the critical `uc` pointer)
+ * now references wrong addresses on the new stack → SIGSEGV.
+ *
+ * Solution: use dedicated assembly that:
+ *   1. Saves the ucontext pointer in callee-saved r12 before clone3
+ *   2. Executes the raw clone3 syscall
+ *   3. PARENT (ret > 0): restores r12, returns child TID normally
+ *   4. CHILD  (ret == 0): restores the full program register state
+ *      from the ucontext (accessible via CLONE_VM shared memory)
+ *      and jumps directly to the program's next instruction (saved
+ *      RIP) with RAX=0 — bypassing the C handler entirely.
+ *
+ * The child never returns to C code in the handler, so it never
+ * touches the wrong stack.  The program registers are fully restored
+ * from the ucontext, which is the exact state the program had when
+ * it called clone3 via `syscall`.
+ *
+ * Ucontext gregs offsets (x86_64 glibc, verified at compile time):
+ *   R8=40 R9=48 R10=56 R11=64 R12=72 R13=80 R14=88 R15=96
+ *   RDI=104 RSI=112 RBP=120 RBX=128 RDX=136 RAX=144
+ *   RCX=152 RSP=160 RIP=168
+ * ================================================================ */
+
+/*
+ * clone3_raw(clone_args, size, ucontext_ptr)
+ *   rdi = clone_args pointer (arg0)
+ *   rsi = size (arg1)
+ *   rdx = ucontext_t pointer
+ *
+ * Returns (parent only): raw clone3 result (child TID or -errno).
+ * Child: never returns — jumps to program's saved RIP with RAX=0.
+ */
+long clone3_raw(long clone_args, long size, ucontext_t *uc_ptr);
+
+__asm__(
+    "    .text\n"
+    "    .type clone3_raw, @function\n"
+    "clone3_raw:\n"
+    /*
+     * Save callee-saved registers we use as scratch.
+     * r12 = uc pointer, r13 = &sync_flag (both preserved across syscall)
+     */
+    "    push %r12\n"
+    "    push %r13\n"
+    "    mov  %rdx, %r12\n"         /* r12 = uc pointer */
+    "    sub  $8, %rsp\n"           /* allocate sync_flag on stack */
+    "    movq $0, (%rsp)\n"         /* sync_flag = 0 */
+    "    mov  %rsp, %r13\n"         /* r13 = &sync_flag (preserved across syscall) */
+    "    mov  $435, %eax\n"         /* __NR_clone3 = 435 */
+    "    syscall\n"                 /* clone3(rdi=args, rsi=size) */
+    "    test %rax, %rax\n"
+    "    jz   .Lc3_child\n"
+    "    js   .Lc3_done\n"          /* error: skip spin */
+    /*
+     * PARENT: child was created. Spin until child finishes
+     * reading from uc (the signal frame on our stack).
+     */
+    ".Lc3_spin:\n"
+    "    pause\n"
+    "    cmpq $0, (%r13)\n"
+    "    je   .Lc3_spin\n"
+    ".Lc3_done:\n"
+    "    add  $8, %rsp\n"           /* pop sync_flag */
+    "    pop  %r13\n"
+    "    pop  %r12\n"
+    "    ret\n"
+    "\n"
+    ".Lc3_child:\n"
+    /*
+     * CHILD thread.
+     * r12 = uc pointer (on parent's signal frame — still valid because
+     *        parent is spinning on sync_flag).
+     * r13 = &sync_flag (on parent's stack — accessible via CLONE_VM).
+     * RSP = new thread stack (set by kernel from clone_args).
+     *
+     * Strategy: copy ALL register values from uc to our OWN stack,
+     * signal the parent, then pop/restore from our stack and jump.
+     */
+    "    mov  168(%r12), %rax\n"    /* push saved RIP */
+    "    push %rax\n"
+    "    mov  136(%r12), %rax\n"    /* push saved RDX */
+    "    push %rax\n"
+    "    mov  128(%r12), %rax\n"    /* push saved RBX */
+    "    push %rax\n"
+    "    mov  120(%r12), %rax\n"    /* push saved RBP */
+    "    push %rax\n"
+    "    mov  112(%r12), %rax\n"    /* push saved RSI */
+    "    push %rax\n"
+    "    mov  104(%r12), %rax\n"    /* push saved RDI */
+    "    push %rax\n"
+    "    mov  96(%r12),  %rax\n"    /* push saved R15 */
+    "    push %rax\n"
+    "    mov  88(%r12),  %rax\n"    /* push saved R14 */
+    "    push %rax\n"
+    "    mov  80(%r12),  %rax\n"    /* push saved R13 */
+    "    push %rax\n"
+    "    mov  72(%r12),  %rax\n"    /* push saved R12 */
+    "    push %rax\n"
+    "    mov  64(%r12),  %rax\n"    /* push saved R11 */
+    "    push %rax\n"
+    "    mov  56(%r12),  %rax\n"    /* push saved R10 */
+    "    push %rax\n"
+    "    mov  48(%r12),  %rax\n"    /* push saved R9 */
+    "    push %rax\n"
+    "    mov  40(%r12),  %rax\n"    /* push saved R8 */
+    "    push %rax\n"
+    "\n"
+    "    movq $1, (%r13)\n"         /* signal parent: done reading from uc */
+    "\n"
+    "    pop  %r8\n"                /* restore all registers from our stack */
+    "    pop  %r9\n"
+    "    pop  %r10\n"
+    "    pop  %r11\n"
+    "    pop  %r12\n"
+    "    pop  %r13\n"
+    "    pop  %r14\n"
+    "    pop  %r15\n"
+    "    pop  %rdi\n"
+    "    pop  %rsi\n"
+    "    pop  %rbp\n"
+    "    pop  %rbx\n"
+    "    pop  %rdx\n"
+    "    pop  %rcx\n"               /* rcx = saved RIP */
+    "    xor  %eax, %eax\n"        /* RAX = 0 (child clone3 return) */
+    "    jmp  *%rcx\n"             /* jump to program's next instruction */
+    "    .size clone3_raw, .-clone3_raw\n"
+);
+
+/*
+ * clone_raw(flags, stack, parent_tid, child_tid, tls, ucontext_ptr)
+ *   rdi = flags (arg0)
+ *   rsi = stack (arg1)
+ *   rdx = parent_tid (arg2)
+ *   rcx = child_tid (arg3) — NOTE: kernel uses r10, not rcx
+ *   r8  = tls (arg4)
+ *   r9  = ucontext_t pointer (extra arg, not passed to kernel)
+ *
+ * Returns (parent only): raw clone result (child TID or -errno).
+ * Child: never returns — jumps to program's saved RIP with RAX=0.
+ */
+long clone_raw(long flags, long stack, long parent_tid,
+                      long child_tid, long tls, ucontext_t *uc_ptr);
+
+__asm__(
+    "    .text\n"
+    "    .type clone_raw, @function\n"
+    "clone_raw:\n"
+    "    push %r12\n"
+    "    push %r13\n"
+    "    mov  %r9, %r12\n"          /* r12 = uc pointer (from 6th arg) */
+    "    sub  $8, %rsp\n"
+    "    movq $0, (%rsp)\n"         /* sync_flag = 0 */
+    "    mov  %rsp, %r13\n"         /* r13 = &sync_flag */
+    "    mov  %rcx, %r10\n"         /* kernel clone uses r10 for arg3 */
+    "    mov  $56, %eax\n"          /* __NR_clone = 56 */
+    "    syscall\n"                 /* clone(rdi=flags, rsi=stack, rdx=ptid, r10=ctid, r8=tls) */
+    "    test %rax, %rax\n"
+    "    jz   .Lcl_child\n"
+    "    js   .Lcl_done\n"
+    ".Lcl_spin:\n"
+    "    pause\n"
+    "    cmpq $0, (%r13)\n"
+    "    je   .Lcl_spin\n"
+    ".Lcl_done:\n"
+    "    add  $8, %rsp\n"
+    "    pop  %r13\n"
+    "    pop  %r12\n"
+    "    ret\n"
+    "\n"
+    ".Lcl_child:\n"
+    "    mov  168(%r12), %rax\n"
+    "    push %rax\n"
+    "    mov  136(%r12), %rax\n"
+    "    push %rax\n"
+    "    mov  128(%r12), %rax\n"
+    "    push %rax\n"
+    "    mov  120(%r12), %rax\n"
+    "    push %rax\n"
+    "    mov  112(%r12), %rax\n"
+    "    push %rax\n"
+    "    mov  104(%r12), %rax\n"
+    "    push %rax\n"
+    "    mov  96(%r12),  %rax\n"
+    "    push %rax\n"
+    "    mov  88(%r12),  %rax\n"
+    "    push %rax\n"
+    "    mov  80(%r12),  %rax\n"
+    "    push %rax\n"
+    "    mov  72(%r12),  %rax\n"
+    "    push %rax\n"
+    "    mov  64(%r12),  %rax\n"
+    "    push %rax\n"
+    "    mov  56(%r12),  %rax\n"
+    "    push %rax\n"
+    "    mov  48(%r12),  %rax\n"
+    "    push %rax\n"
+    "    mov  40(%r12),  %rax\n"
+    "    push %rax\n"
+    "    movq $1, (%r13)\n"
+    "    pop  %r8\n"
+    "    pop  %r9\n"
+    "    pop  %r10\n"
+    "    pop  %r11\n"
+    "    pop  %r12\n"
+    "    pop  %r13\n"
+    "    pop  %r14\n"
+    "    pop  %r15\n"
+    "    pop  %rdi\n"
+    "    pop  %rsi\n"
+    "    pop  %rbp\n"
+    "    pop  %rbx\n"
+    "    pop  %rdx\n"
+    "    pop  %rcx\n"
+    "    xor  %eax, %eax\n"
+    "    jmp  *%rcx\n"
+    "    .size clone_raw, .-clone_raw\n"
+);
+
+/* Compile-time verification of ucontext_t gregs offsets used in assembly.
+ * If any of these fire, the hardcoded offsets in clone3_raw/clone_raw
+ * assembly above must be updated. */
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R8])  == 40,  "R8 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R9])  == 48,  "R9 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R10]) == 56,  "R10 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R11]) == 64,  "R11 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R12]) == 72,  "R12 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R13]) == 80,  "R13 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R14]) == 88,  "R14 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_R15]) == 96,  "R15 offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RDI]) == 104, "RDI offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RSI]) == 112, "RSI offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RBP]) == 120, "RBP offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RBX]) == 128, "RBX offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RDX]) == 136, "RDX offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RAX]) == 144, "RAX offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RIP]) == 168, "RIP offset");
+
+/* ================================================================
  * Global state
  * ================================================================ */
 
@@ -297,6 +574,41 @@ static int json_header(char *buf, int buflen, const char *event,
  * /proc helpers — all async-signal-safe (use raw open/read/close).
  * ================================================================ */
 
+/*
+ * Simple locale-independent integer parser.
+ *
+ * glibc's atoi/strtol/sscanf use locale data internally.  When called
+ * from the SIGSYS handler in the context of a loaded binary, the
+ * static glibc's locale pointers can be NULL or stale, causing
+ * SIGSEGV in ____strtoll_l_internal (accessing address 0x8 via a
+ * NULL locale struct pointer).
+ *
+ * This helper skips leading whitespace, handles optional sign, and
+ * parses decimal digits directly — no locale lookup needed.
+ */
+static int parse_int(const char *s)
+{
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') { s++; }
+    int val = 0;
+    while (*s >= '0' && *s <= '9')
+        val = val * 10 + (*s++ - '0');
+    return neg ? -val : val;
+}
+
+static long parse_long_octal(const char *s)
+{
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t') s++;
+    long val = 0;
+    while (*s >= '0' && *s <= '7')
+        val = val * 8 + (*s++ - '0');
+    return val;
+}
+
 static ssize_t read_proc_raw(pid_t pid, const char *name,
                               char *buf, size_t bufsz)
 {
@@ -363,9 +675,10 @@ static pid_t get_ppid(pid_t pid)
     if (read_proc_raw(pid, "stat", buf, sizeof(buf) - 1) <= 0) return 0;
     char *cp = strrchr(buf, ')');
     if (!cp) return 0;
-    int ppid = 0;
-    if (sscanf(cp + 2, "%*c %d", &ppid) != 1) return 0;
-    return ppid;
+    /* Format after ')': " S ppid ..." — skip space, state char, space */
+    cp += 2;  /* skip ") " */
+    while (*cp && *cp != ' ') cp++;  /* skip state */
+    return parse_int(cp);
 }
 
 static pid_t get_tgid(pid_t pid)
@@ -374,7 +687,7 @@ static pid_t get_tgid(pid_t pid)
     if (read_proc_raw(pid, "status", buf, sizeof(buf) - 1) <= 0) return pid;
     const char *p = strstr(buf, "\nTgid:");
     if (!p) return pid;
-    return atoi(p + 6);
+    return parse_int(p + 6);
 }
 
 static ssize_t read_proc_mem(pid_t pid, unsigned long addr, void *buf,
@@ -571,7 +884,7 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
         if (r > 0) {
             fdinfo_buf[r] = '\0';
             const char *fp = strstr(fdinfo_buf, "flags:");
-            if (fp) flags = (int)strtol(fp + 6, NULL, 8);
+            if (fp) flags = (int)parse_long_octal(fp + 6);
         }
     }
 
@@ -607,7 +920,7 @@ static void emit_inherited_open_events(pid_t pid)
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
-        int fd_num = atoi(ent->d_name);
+        int fd_num = parse_int(ent->d_name);
         emit_inherited_open_for_fd(pid, tgid, ppid, &ts, fd_num);
     }
     closedir(d);
@@ -1048,8 +1361,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             free_exec_argv(build_argv);
 
             if (new_argv) {
-                ret = syscall(SYS_execve, new_argv[0], new_argv,
-                              (char **)a2);
+                ret = raw_syscall6(SYS_execve, (long)new_argv[0],
+                                   (long)new_argv, a2, 0, 0, 0);
                 free_exec_argv(new_argv);
             } else {
                 ret = -ENOMEM;
@@ -1064,14 +1377,49 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 
 #ifdef SYS_execveat
     if (nr == SYS_execveat) {
-        ret = syscall(SYS_execveat, a0, a1, a2, a3, a4);
+        ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
 #endif
 
-    /* Execute the real syscall */
-    ret = syscall(nr, a0, a1, a2, a3, a4, a5);
+    /*
+     * clone3/clone — thread/process creation needs special handling.
+     *
+     * When clone3 creates a thread (CLONE_VM|CLONE_THREAD), the child
+     * starts executing inside our handler on a NEW stack.  The compiler's
+     * RSP-relative code for local variables (including `uc`) accesses
+     * garbage on the new stack → SIGSEGV.
+     *
+     * We use dedicated assembly functions (clone3_raw / clone_raw) that
+     * save the uc pointer in a callee-saved register (r12), execute the
+     * raw syscall, and — in the child — restore the full program register
+     * state from the ucontext and jump directly to the program's saved
+     * RIP.  The child never returns to C code in this handler.
+     */
+#ifdef SYS_clone3
+    if (nr == SYS_clone3) {
+        ret = clone3_raw(a0, a1, uc);
+        /* Only parent reaches here; child jumped to program's RIP */
+        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        return;
+    }
+#endif
+    if (nr == SYS_clone) {
+        ret = clone_raw(a0, a1, a2, a3, a4, uc);
+        /* Only parent reaches here */
+        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        return;
+    }
+
+    /* Execute the real syscall using raw inline assembly.
+     *
+     * We must NOT use the C library's syscall() wrapper here because it
+     * returns -1 on error (setting errno).  The traced program expects the
+     * raw kernel return value in RAX (e.g. -ENOSYS, -EPERM).  Using the
+     * wrapper would map every error to -1, which breaks glibc internals
+     * in the traced program (e.g. clone3→clone fallback in pthread_create). */
+    ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
 
     /* Post-syscall tracing */
 
