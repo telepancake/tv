@@ -91,6 +91,7 @@ extern char __sud_end[];
 #define ARGV_MAX_READ      32768
 #define ENV_MAX_READ       65536
 #define LINE_MAX_BUF       (PATH_MAX * 8 + 262144 + 1024)
+#define CLONE_ARGS_STACK_OFFSET 40
 
 /* Reserve a high FD for our output so children are unlikely to clobber it */
 #define SUD_OUTPUT_FD      1023
@@ -1942,13 +1943,14 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 #endif
 #ifdef SYS_clone3
     if (nr == SYS_clone3) {
-        /* clone3: flags are at offset 0, stack at offset 40 */
+        /* clone3: flags are at offset 0, stack at CLONE_ARGS_STACK_OFFSET */
         unsigned long long c3_flags = 0;
         unsigned long long c3_stack = 0;
-        if (a0)
+        if (a0) {
             c3_flags = *(unsigned long long *)a0;
-        if (a0)
-            c3_stack = *(unsigned long long *)((char *)a0 + 40);
+            c3_stack =
+                *(unsigned long long *)((char *)a0 + CLONE_ARGS_STACK_OFFSET);
+        }
         if ((c3_flags & (CLONE_VM | CLONE_THREAD)) ==
             (CLONE_VM | CLONE_THREAD) && c3_stack) {
             ret = clone3_raw(a0, a1, uc);
