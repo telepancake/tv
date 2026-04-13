@@ -29,6 +29,16 @@ drive_db() {
     "$TV" --load "$1" --trace "$TMPDIR/input.jsonl" 2>&1
 }
 
+DRIVE_RC=0
+drive_trace() {
+    printf '%s\n' "$2" > "$TMPDIR/input.jsonl"
+    set +e
+    cat "$1" "$TMPDIR/input.jsonl" | timeout 5s "$TV" --trace /dev/stdin > "$TMPDIR/drive.out" 2>&1
+    DRIVE_RC=$?
+    set -e
+    cat "$TMPDIR/drive.out"
+}
+
 assert_contains() {
     if echo "$2" | grep -qF "$3"; then return 0
     else echo "    FAIL assert_contains: missing: $3"; return 1; fi
@@ -43,6 +53,13 @@ assert_not_contains() {
 assert_line_match() {
     if echo "$2" | grep -qE "$3"; then return 0
     else echo "    FAIL assert_line_match: no match: $3"; return 1; fi
+}
+
+assert_occurrences() {
+    local n
+    n=$(printf '%s\n' "$2" | grep -cF "$3" || true)
+    if [ "$n" -eq "$4" ]; then return 0
+    else echo "    FAIL assert_occurrences: expected $4 of $3, got $n"; return 1; fi
 }
 
 run_test() {
@@ -67,6 +84,19 @@ make tv 2>/dev/null || { echo "Build failed"; exit 1; }
 echo "Ingesting trace and saving DB…"
 "$TV" --trace "$TRACE" --save "$TMPDIR/test.db"
 [ -f "$TMPDIR/test.db" ] || { echo "Save failed"; exit 1; }
+
+cat > "$TMPDIR/dep_cycle.jsonl" <<'EOF'
+{"event":"CWD","tgid":2000,"pid":2000,"ppid":1,"nspid":2000,"nstgid":2000,"ts":1.000,"path":"/tmp"}
+{"event":"EXEC","tgid":2000,"pid":2000,"ppid":1,"nspid":2000,"nstgid":2000,"ts":1.001,"exe":"/usr/bin/tool1","argv":["tool1"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}}
+{"event":"OPEN","tgid":2000,"pid":2000,"ppid":1,"nspid":2000,"nstgid":2000,"ts":1.010,"path":"a","flags":["O_RDONLY"],"fd":3}
+{"event":"OPEN","tgid":2000,"pid":2000,"ppid":1,"nspid":2000,"nstgid":2000,"ts":1.011,"path":"b","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4}
+{"event":"EXIT","tgid":2000,"pid":2000,"ppid":1,"nspid":2000,"nstgid":2000,"ts":1.020,"status":"exited","code":0,"raw":0}
+{"event":"CWD","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.000,"path":"/tmp"}
+{"event":"EXEC","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.001,"exe":"/usr/bin/tool2","argv":["tool2"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}}
+{"event":"OPEN","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.010,"path":"b","flags":["O_RDONLY"],"fd":3}
+{"event":"OPEN","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.011,"path":"a","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4}
+{"event":"EXIT","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.020,"status":"exited","code":0,"raw":0}
+EOF
 
 echo ""
 echo "Running tests…"
@@ -389,6 +419,33 @@ run_test "file_detail: error file" \
     'assert_contains t "$OUT" "Errors: 1"' \
     'assert_contains t "$OUT" "PID 1004"' \
     'assert_line_match t "$OUT" "error.*err=2"'
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test: dependency views terminate on cycles
+# ═══════════════════════════════════════════════════════════════════════
+OUT=$(drive_trace "$TMPDIR/dep_cycle.jsonl" '{"input":"resize","rows":30,"cols":100}
+{"input":"key","key":"2"}
+{"input":"select","id":"/tmp/a"}
+{"input":"key","key":"4"}
+{"input":"print","what":"state"}
+{"input":"print","what":"lpane"}')
+run_test "dep_view: cycle terminates and de-dupes" \
+    'test "$DRIVE_RC" -eq 0' \
+    'assert_line_match t "$OUT" "mode=3"' \
+    'assert_occurrences t "$OUT" "|/tmp/a|" 1' \
+    'assert_occurrences t "$OUT" "|/tmp/b|" 1'
+
+OUT=$(drive_trace "$TMPDIR/dep_cycle.jsonl" '{"input":"resize","rows":30,"cols":100}
+{"input":"key","key":"2"}
+{"input":"select","id":"/tmp/a"}
+{"input":"key","key":"5"}
+{"input":"print","what":"state"}
+{"input":"print","what":"lpane"}')
+run_test "rdep_view: cycle terminates and de-dupes" \
+    'test "$DRIVE_RC" -eq 0' \
+    'assert_line_match t "$OUT" "mode=4"' \
+    'assert_occurrences t "$OUT" "|/tmp/a|" 1' \
+    'assert_occurrences t "$OUT" "|/tmp/b|" 1'
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test: output view
