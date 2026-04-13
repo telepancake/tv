@@ -101,6 +101,7 @@ extern char __sud_end[];
 
 /* Reserve a high FD for our output so children are unlikely to clobber it */
 #define SUD_OUTPUT_FD      1023
+#define SUDTRACE_OUTFILE_ENV "SUDTRACE_OUTFILE"
 
 /* ================================================================
  * SUD selector byte.
@@ -298,6 +299,7 @@ __asm__(
     "    push %rax\n"
     "\n"
     "    movq $1, (%r13)\n"         /* signal parent: done reading from uc */
+    "    call prepare_child_sud\n"
     "\n"
     "    pop  %r8\n"                /* restore all registers from our stack */
     "    pop  %r9\n"
@@ -389,6 +391,7 @@ __asm__(
     "    mov  40(%r12),  %rax\n"
     "    push %rax\n"
     "    movq $1, (%r13)\n"
+    "    call prepare_child_sud\n"
     "    pop  %r8\n"
     "    pop  %r9\n"
     "    pop  %r10\n"
@@ -658,6 +661,7 @@ static int g_out_fd = -1;           /* fd for JSONL output */
 static struct stat g_creator_stdout_st;
 static int g_creator_stdout_valid;
 static char g_self_exe[PATH_MAX];   /* path to sudtrace binary itself */
+static char g_path_env[4096];       /* cached before entering SUD handler */
 static int g_trace_exec_env = 1;
 
 /* ================================================================
@@ -752,6 +756,28 @@ static int json_argv_array(char *dst, int dstsize, const char *raw, int rawlen)
     if (di < dstsize) dst[di++] = ']';
     if (di < dstsize) dst[di] = '\0';
     return di;
+}
+
+static int json_argv_array_vec(char *dst, int dstsize, char *const *argv, int argc)
+{
+    int di = 0;
+    dst[di++] = '[';
+    for (int i = 0; i < argc && di + 8 < dstsize; i++) {
+        const char *arg = argv[i] ? argv[i] : "";
+        if (di > 1) dst[di++] = ',';
+        di += json_escape(dst + di, dstsize - di, arg, strlen(arg));
+    }
+    if (di < dstsize) dst[di++] = ']';
+    if (di < dstsize) dst[di] = '\0';
+    return di;
+}
+
+static int is_ld_linux_basename(const char *path)
+{
+    if (!path) return 0;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strncmp(base, "ld-linux", 8) == 0;
 }
 
 static int json_env_object(char *dst, int dstsize, const char *raw, int rawlen)
@@ -1072,7 +1098,8 @@ static void emit_cwd_event(pid_t pid)
     if (pos > 0) emit_raw(line, pos);
 }
 
-static void emit_exec_event(pid_t pid)
+static void emit_exec_event(pid_t pid, const char *fallback_exe,
+                            int fallback_argc, char **fallback_argv)
 {
     pid_t tgid = get_tgid(pid);
     pid_t ppid = get_ppid(pid);
@@ -1080,17 +1107,29 @@ static void emit_exec_event(pid_t pid)
     get_timestamp_raw(&ts);
 
     char exe_buf[PATH_MAX];
-    char *exe = read_proc_exe(pid, exe_buf, sizeof(exe_buf));
+    char *exe = (fallback_exe && fallback_exe[0])
+        ? (char *)fallback_exe
+        : read_proc_exe(pid, exe_buf, sizeof(exe_buf));
     char exe_esc[PATH_MAX * 2];
     if (exe) json_escape(exe_esc, sizeof(exe_esc), exe, strlen(exe));
 
     size_t argv_len = 0;
-    char *argv_raw = read_proc_file(pid, "cmdline", ARGV_MAX_READ, &argv_len);
+    char *argv_raw = NULL;
     char *argv_j = NULL;
-    if (argv_raw && argv_len > 0) {
-        argv_j = malloc(argv_len * 6 + 64);
+    if (fallback_argv && fallback_argc > 0) {
+        size_t alloc = 64;
+        for (int i = 0; i < fallback_argc; i++)
+            alloc += strlen(fallback_argv[i] ? fallback_argv[i] : "") * 6 + 1;
+        argv_j = malloc(alloc);
         if (argv_j)
-            json_argv_array(argv_j, argv_len * 6 + 64, argv_raw, argv_len);
+            json_argv_array_vec(argv_j, (int)alloc, fallback_argv, fallback_argc);
+    } else {
+        argv_raw = read_proc_file(pid, "cmdline", ARGV_MAX_READ, &argv_len);
+        if (argv_raw && argv_len > 0) {
+            argv_j = malloc(argv_len * 6 + 64);
+            if (argv_j)
+                json_argv_array(argv_j, argv_len * 6 + 64, argv_raw, argv_len);
+        }
     }
 
     char *env_j = NULL;
@@ -1595,8 +1634,7 @@ static int resolve_path_raw(const char *cmd, char *out, size_t out_sz)
         return (raw_access(out, X_OK) == 0);
     }
 
-    const char *path_env = getenv("PATH");
-    if (!path_env) path_env = "/usr/bin:/bin";
+    const char *path_env = g_path_env[0] ? g_path_env : "/usr/bin:/bin";
 
     /* Walk PATH directories manually (strtok_r is safe but we avoid
      * snprintf; use manual string concat instead) */
@@ -1618,6 +1656,50 @@ static int resolve_path_raw(const char *cmd, char *out, size_t out_sz)
     }
 
     return 0;
+}
+
+static int resolve_execveat_path_raw(int dirfd, const char *path, long flags,
+                                     char *out, size_t out_sz)
+{
+#ifdef AT_EMPTY_PATH
+    if ((flags & AT_EMPTY_PATH) && path && path[0] == '\0')
+        return 0;
+#endif
+
+    if (!path || !path[0])
+        return 0;
+
+    if (dirfd == AT_FDCWD || path[0] == '/')
+        return resolve_path_raw(path, out, out_sz);
+
+    char proc_path[64];
+    int pos = 0;
+    const char prefix[] = "/proc/self/fd/";
+    memcpy(proc_path, prefix, sizeof(prefix) - 1);
+    pos += sizeof(prefix) - 1;
+    pos += fmt_int(proc_path + pos, (int)(sizeof(proc_path) - pos), dirfd);
+    if (pos <= 0 || pos >= (int)sizeof(proc_path))
+        return 0;
+    proc_path[pos] = '\0';
+
+    char dirbuf[PATH_MAX];
+    ssize_t dlen = raw_readlink(proc_path, dirbuf, sizeof(dirbuf) - 1);
+    if (dlen <= 0 || dlen >= (ssize_t)sizeof(dirbuf))
+        return 0;
+    dirbuf[dlen] = '\0';
+
+    size_t plen = strlen(path);
+    size_t base_len = (size_t)dlen;
+    int need_slash = (base_len > 0 && dirbuf[base_len - 1] != '/');
+    if (base_len + need_slash + plen + 1 > out_sz)
+        return 0;
+
+    memcpy(out, dirbuf, base_len);
+    if (need_slash)
+        out[base_len++] = '/';
+    memcpy(out + base_len, path, plen);
+    out[base_len + plen] = '\0';
+    return (raw_access(out, X_OK) == 0);
 }
 
 /*
@@ -1840,6 +1922,57 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
     return args;
 }
 
+static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw);
+
+struct kernel_sigaction_raw {
+    void (*handler)(int);
+    unsigned long flags;
+    void (*restorer)(void);
+    unsigned long mask;
+};
+
+static void install_sigsys_handler_raw(void)
+{
+#ifdef SYS_rt_sigaction
+    struct kernel_sigaction_raw sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.handler = (void (*)(int))sigsys_handler;
+    sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER;
+    sa.restorer = sud_rt_sigreturn_restorer;
+    sa.mask = 0;
+    raw_syscall6(SYS_rt_sigaction, SIGSYS, (long)&sa, 0,
+                 sizeof(sa.mask), 0, 0);
+#endif
+}
+
+static void unblock_sigsys_raw(void)
+{
+#ifdef SYS_rt_sigprocmask
+    unsigned long mask = 1UL << (SIGSYS - 1);
+    raw_syscall6(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&mask, 0,
+                 sizeof(mask), 0, 0);
+#endif
+}
+
+static void reenable_sud_in_child(void)
+{
+    unsigned long off = (unsigned long)__sud_begin;
+    unsigned long len = (unsigned long)__sud_end - (unsigned long)__sud_begin;
+    raw_syscall6(SYS_prctl, PR_SET_SYSCALL_USER_DISPATCH,
+                 PR_SYS_DISPATCH_ON, off, len,
+                 (long)g_sud_selector_ptr, 0);
+}
+
+void prepare_child_sud(void)
+    __attribute__((noinline));
+
+void prepare_child_sud(void)
+{
+    install_sigsys_handler_raw();
+    unblock_sigsys_raw();
+    reenable_sud_in_child();
+}
+
 /* ================================================================
  * SIGSYS handler — the core of SUD tracing.
  *
@@ -1948,7 +2081,57 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 
 #ifdef SYS_execveat
     if (nr == SYS_execveat) {
-        ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+        const char *fn = (const char *)a1;
+        char **orig_argv = (char **)a2;
+        long flags = a4;
+
+#ifdef AT_EMPTY_PATH
+        if ((flags & AT_EMPTY_PATH) && fn && fn[0] == '\0') {
+            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            return;
+        }
+#endif
+        if (flags != 0) {
+            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            return;
+        }
+
+        char resolved_fn[PATH_MAX];
+        if (!resolve_execveat_path_raw((int)a0, fn, flags,
+                                       resolved_fn, sizeof(resolved_fn))) {
+            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            return;
+        }
+
+        int orig_argc = 0;
+        if (orig_argv)
+            while (orig_argv[orig_argc]) orig_argc++;
+
+        arena_reset();
+
+        int build_argc = orig_argc > 0 ? orig_argc : 1;
+        char **build_argv = arena_alloc((build_argc + 1) * sizeof(char *));
+        if (build_argv) {
+            build_argv[0] = arena_strdup(resolved_fn);
+            for (int i = 1; i < orig_argc; i++)
+                build_argv[i] = arena_strdup(orig_argv[i]);
+            build_argv[build_argc] = NULL;
+
+            char **new_argv = build_exec_argv_raw(build_argc, build_argv);
+            if (new_argv) {
+                ret = raw_syscall6(SYS_execve, (long)new_argv[0],
+                                   (long)new_argv, a3, 0, 0, 0);
+            } else {
+                ret = -ENOMEM;
+            }
+        } else {
+            ret = -ENOMEM;
+        }
+
+        arena_reset();
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
@@ -1992,16 +2175,24 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             c3_stack =
                 *(unsigned long long *)((char *)a0 + CLONE_ARGS_STACK_OFFSET);
         }
-        if ((c3_flags & (CLONE_VM | CLONE_THREAD)) ==
-            (CLONE_VM | CLONE_THREAD) && c3_stack) {
+        if ((c3_flags & CLONE_VFORK) && !(c3_flags & CLONE_THREAD)) {
+            /* glibc uses clone3(CLONE_VM|CLONE_VFORK|...) for posix_spawn-
+             * style exec helpers.  Force its vfork fallback, which returns
+             * through code paths that we already reinitialize correctly. */
+            uc->uc_mcontext.gregs[REG_RAX] = -ENOSYS;
+            return;
+        }
+        if ((c3_flags & CLONE_VM) && c3_stack) {
             ret = clone3_raw(a0, a1, uc);
             /* Only parent reaches here; child jumped to program's RIP */
-        } else if (c3_flags & CLONE_VFORK) {
-            /* glibc falls back to vfork/clone when clone3 reports ENOSYS */
-            ret = -ENOSYS;
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
+            if (ret == 0) {
+                /* Child created while handling SIGSYS can inherit blocked
+                 * SIGSYS state and stale SUD task config. Reinstall both. */
+                prepare_child_sud();
+            }
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
@@ -2016,10 +2207,38 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
+            if (ret == 0) {
+                /* Child created while handling SIGSYS can inherit blocked
+                 * SIGSYS state and stale SUD task config. Reinstall both. */
+                prepare_child_sud();
+            }
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
+
+#ifdef SYS_vfork
+    if (nr == SYS_vfork) {
+        /* Real vfork shares the parent's live stack frame. If the child hits
+         * another SIGSYS before exec, the kernel can overwrite the parent's
+         * suspended signal frame and corrupt its eventual rt_sigreturn state.
+         * Emulate vfork with a plain fork so parent/child stacks diverge. */
+        ret = raw_syscall6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+        if (ret == 0)
+            prepare_child_sud();
+        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        return;
+    }
+#endif
+#ifdef SYS_fork
+    if (nr == SYS_fork) {
+        ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+        if (ret == 0)
+            prepare_child_sud();
+        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        return;
+    }
+#endif
 
 #ifdef SYS_rt_sigaction
     if (nr == SYS_rt_sigaction) {
@@ -2031,6 +2250,10 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         };
         const struct kernel_sigaction *act =
             (const struct kernel_sigaction *)a1;
+        if (a0 == SIGSYS && act) {
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            return;
+        }
         if (act) {
             struct kernel_sigaction patched = *act;
             patched.flags |= SA_RESTORER;
@@ -2241,6 +2464,11 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     *sel = SYSCALL_DISPATCH_FILTER_BLOCK;
     g_sud_selector_ptr = sel;
 
+    /* Wrapper-mode execs can inherit a blocked SIGSYS mask from traced
+     * vfork/clone children.  Unblock it before enabling SUD so the
+     * handler actually runs in this freshly exec'd sudtrace instance. */
+    unblock_sigsys_raw();
+
     /* Enable SUD */
     unsigned long off = (unsigned long)__sud_begin;
     unsigned long len = (unsigned long)__sud_end - (unsigned long)__sud_begin;
@@ -2448,7 +2676,14 @@ static int run_wrapper_mode(int argc, char **argv)
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event(child);
+    char **event_argv = argv + 1;
+    int event_argc = argc - 1;
+    if (event_argc > 1 && is_ld_linux_basename(event_argv[0])) {
+        event_argv++;
+        event_argc--;
+    }
+    emit_exec_event(child, event_argc > 0 ? event_argv[0] : resolved,
+                    event_argc, event_argv);
     emit_inherited_open_events(child);
 
     for (;;) {
@@ -2486,6 +2721,25 @@ static void usage(const char *prog)
     exit(1);
 }
 
+static void make_absolute_path(const char *path, char *out, size_t out_sz)
+{
+    if (!path || !path[0]) {
+        out[0] = '\0';
+        return;
+    }
+    if (path[0] == '/') {
+        snprintf(out, out_sz, "%s", path);
+        return;
+    }
+
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        snprintf(out, out_sz, "%s", path);
+        return;
+    }
+    snprintf(out, out_sz, "%s/%s", cwd, path);
+}
+
 /* ================================================================
  * Main entry point
  * ================================================================ */
@@ -2500,6 +2754,11 @@ int main(int argc, char **argv)
     else
         snprintf(g_self_exe, sizeof(g_self_exe), "%s", argv[0]);
 
+    const char *path_env = getenv("PATH");
+    if (!path_env || !path_env[0])
+        path_env = "/usr/bin:/bin";
+    snprintf(g_path_env, sizeof(g_path_env), "%s", path_env);
+
     /* Wrapper mode? (re-invoked for a static binary) */
     if (is_wrapper_mode(argc, argv)) {
         if (g_out_fd < 0)
@@ -2508,6 +2767,14 @@ int main(int argc, char **argv)
         struct stat st;
         if (fstat(SUD_OUTPUT_FD, &st) == 0)
             g_out_fd = SUD_OUTPUT_FD;
+        else {
+            const char *out_path = getenv(SUDTRACE_OUTFILE_ENV);
+            if (out_path && out_path[0]) {
+                int ofd = open(out_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (ofd >= 0)
+                    g_out_fd = ofd;
+            }
+        }
 
         g_creator_stdout_valid =
             (fstat(STDOUT_FILENO, &g_creator_stdout_st) == 0);
@@ -2541,11 +2808,15 @@ int main(int argc, char **argv)
 
     /* Setup output */
     if (outfile) {
+        char abs_out[PATH_MAX];
+        make_absolute_path(outfile, abs_out, sizeof(abs_out));
         int ofd = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (ofd < 0) { perror("sudtrace: open output"); exit(1); }
         g_out_fd = ofd;
+        setenv(SUDTRACE_OUTFILE_ENV, abs_out, 1);
     } else {
         g_out_fd = STDOUT_FILENO;
+        unsetenv(SUDTRACE_OUTFILE_ENV);
     }
 
     /* Move output to a high fd so children don't clobber it */
@@ -2580,14 +2851,23 @@ int main(int argc, char **argv)
         _exit(127);
     }
 
-    free_exec_argv(exec_argv);
-
     /* Give child time to exec so /proc reflects new image */
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event(child);
+    char **event_argv = exec_argv + 1;
+    int event_argc = 0;
+    while (exec_argv[event_argc])
+        event_argc++;
+    event_argc--;
+    if (event_argc > 1 && is_ld_linux_basename(event_argv[0])) {
+        event_argv++;
+        event_argc--;
+    }
+    emit_exec_event(child, event_argc > 0 ? event_argv[0] : exec_argv[0],
+                    event_argc, event_argv);
     emit_inherited_open_events(child);
+    free_exec_argv(exec_argv);
 
     /* Main wait loop */
     for (;;) {
