@@ -39,7 +39,8 @@ static int g_pending_trace_rows;
 
 enum {
     LIVE_TRACE_BATCH_ROWS = 256,
-    LIVE_TRACE_BATCH_MS = 50
+    LIVE_TRACE_BATCH_MS = 50,
+    CURSOR_EVENT_DEBOUNCE_MS = 200
 };
 
 static void xexec(const char *sql) {
@@ -262,7 +263,35 @@ static void update_status(void) {
     (void)p;
 
     if (g_tui)
-        tui_set_status(g_tui, s);
+    tui_set_status(g_tui, s);
+}
+
+static int g_cursor_event_timer = -1;
+static int g_cursor_event_use_timer = 0;
+static char g_pending_cursor_panel[32];
+static char g_pending_cursor_row_id[4096];
+
+static void flush_pending_cursor_event(tui_t *tui);
+
+static int on_cursor_event_timer(tui_t *tui, void *ctx) {
+    (void)ctx;
+    g_cursor_event_timer = -1;
+    flush_pending_cursor_event(tui);
+    return 0;
+}
+
+static void queue_cursor_event(tui_t *tui, const char *panel, const char *row_id) {
+    if (g_cursor_event_timer >= 0) {
+        tui_remove_timer(tui, g_cursor_event_timer);
+        g_cursor_event_timer = -1;
+    }
+    snprintf(g_pending_cursor_panel, sizeof g_pending_cursor_panel, "%s", panel ? panel : "");
+    snprintf(g_pending_cursor_row_id, sizeof g_pending_cursor_row_id, "%s", row_id ? row_id : "");
+    if (!g_pending_cursor_panel[0]) return;
+    if (g_cursor_event_use_timer) {
+        g_cursor_event_timer = tui_add_timer(tui, CURSOR_EVENT_DEBOUNCE_MS, on_cursor_event_timer, NULL);
+        if (g_cursor_event_timer < 0) flush_pending_cursor_event(tui);
+    }
 }
 
 /* ── FTS setup ─────────────────────────────────────────────────────── */
@@ -795,6 +824,20 @@ static void submit_cursor_event(const char *panel, const char *row_id) {
     sqlite3_finalize(st);
 }
 
+static void flush_pending_cursor_event(tui_t *tui) {
+    if (!g_pending_cursor_panel[0]) return;
+    if (g_cursor_event_timer >= 0) {
+        tui_remove_timer(tui, g_cursor_event_timer);
+        g_cursor_event_timer = -1;
+    }
+    submit_cursor_event(g_pending_cursor_panel, g_pending_cursor_row_id);
+    if (strcmp(g_pending_cursor_panel, "lpane") == 0)
+        tui_dirty(tui, "rpane");
+    update_status();
+    g_pending_cursor_panel[0] = '\0';
+    g_pending_cursor_row_id[0] = '\0';
+}
+
 /* ── Process pending input rows from inbox ─────────────────────────── */
 static void process_inbox(tui_t *tui) {
     /* Input events may have been handled by triggers already (if triggers
@@ -863,12 +906,13 @@ static void process_inbox(tui_t *tui) {
             /* Delete and re-insert to fire the trigger (row may have been
              * inserted before triggers existed in --trace mode) */
             xexecf("DELETE FROM inbox WHERE id=%lld", id);
+            flush_pending_cursor_event(tui);
             { sqlite3_stmt *st;
               sqlite3_prepare_v2(g_db,
                   "INSERT INTO inbox(kind,data) VALUES('input',?)", -1, &st, 0);
               sqlite3_bind_text(st, 1, data, -1, SQLITE_TRANSIENT);
               sqlite3_step(st); sqlite3_finalize(st);
-            }
+             }
             sync_engine_from_state();
             tui_dirty(tui, NULL);
             process_outbox(tui);
@@ -876,6 +920,7 @@ static void process_inbox(tui_t *tui) {
     }
     /* Always drain outbox (triggers may have fired during ingest_file
      * when triggers already existed, e.g. --load + --trace) */
+    flush_pending_cursor_event(tui);
     sync_engine_from_state();
     process_outbox(tui);
 }
@@ -885,12 +930,10 @@ static int on_key_cb(tui_t *tui, int key, const char *panel,
                      int cursor, const char *row_id, void *ctx) {
     (void)ctx; (void)cursor;
     if (key == TUI_K_NONE) {
-        submit_cursor_event(panel, row_id);
-        if (panel && strcmp(panel, "lpane") == 0)
-            tui_dirty(tui, "rpane");
-        update_status();
+        queue_cursor_event(tui, panel, row_id);
         return TUI_HANDLED;
     }
+    flush_pending_cursor_event(tui);
     submit_key(key, panel, row_id);
     int result = process_outbox(tui);
     sync_engine_from_state();
@@ -1138,6 +1181,10 @@ int main(int argc, char **argv) {
         return headless_mode ? 0 : 1;
     }
     g_tui = tui;
+    g_cursor_event_use_timer = !headless_mode;
+    g_cursor_event_timer = -1;
+    g_pending_cursor_panel[0] = '\0';
+    g_pending_cursor_row_id[0] = '\0';
 
     /* Layout from _layout table in DB */
     tui_load_layout(tui);
