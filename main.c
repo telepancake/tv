@@ -86,24 +86,37 @@ static void build_dep_walk_table(const char *table, const char *next_expr,
     char sql[512];
     sqlite3_stmt *clear_st = NULL, *seed_st = NULL, *step_st = NULL;
     int depth = 0;
+    int n;
 
-    snprintf(sql, sizeof sql, "DELETE FROM %s", table);
+    n = snprintf(sql, sizeof sql, "DELETE FROM %s", table);
+    if (n < 0 || (size_t)n >= sizeof sql) {
+        fprintf(stderr, "tv: dependency cache SQL overflow\n");
+        exit(1);
+    }
     if (sqlite3_prepare_v2(g_db, sql, -1, &clear_st, 0) != SQLITE_OK) goto done;
     sqlite3_step(clear_st);
     if (!root || !root[0]) goto done;
 
-    snprintf(sql, sizeof sql, "INSERT OR IGNORE INTO %s(path,depth) VALUES(?1,0)", table);
+    n = snprintf(sql, sizeof sql, "INSERT OR IGNORE INTO %s(path,depth) VALUES(?1,0)", table);
+    if (n < 0 || (size_t)n >= sizeof sql) {
+        fprintf(stderr, "tv: dependency cache SQL overflow\n");
+        exit(1);
+    }
     if (sqlite3_prepare_v2(g_db, sql, -1, &seed_st, 0) != SQLITE_OK) goto done;
     sqlite3_bind_text(seed_st, 1, root, -1, SQLITE_TRANSIENT);
     sqlite3_step(seed_st);
 
-    snprintf(sql, sizeof sql,
-             "INSERT OR IGNORE INTO %s(path,depth)"
-             " SELECT DISTINCT %s, ?2"
-             " FROM _dep_edges de"
-             " JOIN %s w ON %s"
-             " WHERE w.depth=?1",
-             table, next_expr, table, join_cond);
+    n = snprintf(sql, sizeof sql,
+                 "INSERT OR IGNORE INTO %s(path,depth)"
+                 " SELECT DISTINCT %s, ?2"
+                 " FROM _dep_edges de"
+                 " JOIN %s w ON %s"
+                 " WHERE w.depth=?1",
+                 table, next_expr, table, join_cond);
+    if (n < 0 || (size_t)n >= sizeof sql) {
+        fprintf(stderr, "tv: dependency cache SQL overflow\n");
+        exit(1);
+    }
     if (sqlite3_prepare_v2(g_db, sql, -1, &step_st, 0) != SQLITE_OK) goto done;
 
     for (;;) {

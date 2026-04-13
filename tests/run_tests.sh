@@ -112,8 +112,10 @@ EOF
 python - <<'PY' > "$TMPDIR/dep_dense.jsonl"
 import json
 
+INITIAL_TS = 10.0
+
 pid = 3000
-ts = 10.0
+ts = INITIAL_TS
 width = 5
 depth = 7
 
