@@ -108,9 +108,19 @@ cat > "$TMPDIR/dep_cycle.jsonl" <<'EOF'
 {"event":"OPEN","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.011,"path":"a","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4}
 {"event":"EXIT","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.020,"status":"exited","code":0,"raw":0}
 EOF
+echo "Ingesting compressed trace and saving DB…"
+zstd -q -f "$TRACE" -o "$TMPDIR/trace.jsonl.zst"
+"$TV" --trace "$TMPDIR/trace.jsonl.zst" --save "$TMPDIR/test_zstd.db"
+[ -f "$TMPDIR/test_zstd.db" ] || { echo "Compressed save failed"; exit 1; }
 
 echo ""
 echo "Running tests…"
+
+OUT=$(drive_db "$TMPDIR/test_zstd.db" '{"input":"resize","rows":50,"cols":120}
+{"input":"print","what":"lpane"}')
+run_test "zstd trace: compressed input loads" \
+    'assert_contains t "$OUT" "|1000|"' \
+    'assert_contains t "$OUT" "|1008|"'
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test: process tree default view
