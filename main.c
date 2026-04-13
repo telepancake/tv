@@ -389,20 +389,36 @@ static int json_obj_get(const char *json, const char *key, span_t *out) {
     return 0;
 }
 
+static int json_get(const char *json, const char *key, span_t *out) {
+    char pat[128];
+    const char *p, *end;
+    snprintf(pat, sizeof pat, "\"%s\":", key);
+    p = strstr(json, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    end = json + strlen(json);
+    p = skip_ws(p, end);
+    out->s = p;
+    out->e = json_skip_value(p, end);
+    return out->e != NULL;
+}
+
 static int span_to_int(span_t sp, int def) {
     char *tmp = xstrndup(sp.s, (size_t)(sp.e - sp.s));
     char *ep = NULL;
     long v = strtol(tmp, &ep, 10);
+    int ok = (ep && *ep == 0);
     free(tmp);
-    return (ep && *ep == 0) ? (int)v : def;
+    return ok ? (int)v : def;
 }
 
 static double span_to_double(span_t sp, double def) {
     char *tmp = xstrndup(sp.s, (size_t)(sp.e - sp.s));
     char *ep = NULL;
     double v = strtod(tmp, &ep);
+    int ok = (ep && *ep == 0);
     free(tmp);
-    return (ep && *ep == 0) ? v : def;
+    return ok ? v : def;
 }
 
 static int span_to_bool(span_t sp, int def) {
@@ -588,7 +604,6 @@ static trace_event_t *append_event(void) {
     GROW(g_events, g_nevents, g_cap_events);
     trace_event_t *ev = &g_events[g_nevents++];
     memset(ev, 0, sizeof *ev);
-    ev->id = g_next_event_id++;
     ev->fd = -1;
     ev->err = 0;
     return ev;
@@ -641,7 +656,7 @@ static char *join_with_pipe(char **arr, int n) {
 static void ingest_input_line(const char *line) {
     span_t sp;
     char *kind = NULL;
-    if (!json_obj_get(line, "input", &sp)) return;
+    if (!json_get(line, "input", &sp)) return;
     kind = json_decode_string(sp);
     if (!kind) return;
     GROW(g_inputs, g_ninputs, g_cap_inputs);
@@ -650,25 +665,25 @@ static void ingest_input_line(const char *line) {
     if (strcmp(kind, "key") == 0) {
         char *name = NULL;
         cmd->kind = INPUT_KEY;
-        if (json_obj_get(line, "key", &sp)) name = json_decode_string(sp);
+        if (json_get(line, "key", &sp)) name = json_decode_string(sp);
         cmd->key = name ? parse_key_name(name) : TUI_K_NONE;
         free(name);
     } else if (strcmp(kind, "resize") == 0) {
         cmd->kind = INPUT_RESIZE;
-        if (json_obj_get(line, "rows", &sp)) cmd->rows = span_to_int(sp, 0);
-        if (json_obj_get(line, "cols", &sp)) cmd->cols = span_to_int(sp, 0);
+        if (json_get(line, "rows", &sp)) cmd->rows = span_to_int(sp, 0);
+        if (json_get(line, "cols", &sp)) cmd->cols = span_to_int(sp, 0);
     } else if (strcmp(kind, "select") == 0) {
         cmd->kind = INPUT_SELECT;
-        if (json_obj_get(line, "id", &sp)) cmd->text = json_decode_string(sp);
+        if (json_get(line, "id", &sp)) cmd->text = json_decode_string(sp);
     } else if (strcmp(kind, "search") == 0) {
         cmd->kind = INPUT_SEARCH;
-        if (json_obj_get(line, "q", &sp)) cmd->text = json_decode_string(sp);
+        if (json_get(line, "q", &sp)) cmd->text = json_decode_string(sp);
     } else if (strcmp(kind, "evfilt") == 0) {
         cmd->kind = INPUT_EVFILT;
-        if (json_obj_get(line, "q", &sp)) cmd->text = json_decode_string(sp);
+        if (json_get(line, "q", &sp)) cmd->text = json_decode_string(sp);
     } else if (strcmp(kind, "print") == 0) {
         cmd->kind = INPUT_PRINT;
-        if (json_obj_get(line, "what", &sp)) cmd->text = json_decode_string(sp);
+        if (json_get(line, "what", &sp)) cmd->text = json_decode_string(sp);
     } else {
         g_ninputs--;
     }
@@ -681,7 +696,7 @@ static void ingest_trace_line(const char *line) {
     trace_event_t *ev;
     process_t *proc;
 
-    if (!json_obj_get(line, "event", &sp)) return;
+    if (!json_get(line, "event", &sp)) return;
     kind = json_decode_string(sp);
     if (!kind) return;
     append_raw_trace(line);
@@ -692,15 +707,16 @@ static void ingest_trace_line(const char *line) {
     else if (strcmp(kind, "EXIT") == 0) ev->kind = EV_EXIT;
     else if (strcmp(kind, "STDOUT") == 0) ev->kind = EV_STDOUT;
     else if (strcmp(kind, "STDERR") == 0) ev->kind = EV_STDERR;
-    else { free(kind); g_nevents--; g_next_event_id--; free(ev); return; }
+    else { free(kind); g_nevents--; return; }
     free(kind);
+    ev->id = (ev->kind == EV_CWD) ? 0 : g_next_event_id++;
 
-    if (json_obj_get(line, "ts", &sp)) ev->ts = span_to_double(sp, 0.0);
-    if (json_obj_get(line, "pid", &sp)) ev->pid = span_to_int(sp, 0);
-    if (json_obj_get(line, "tgid", &sp)) ev->tgid = span_to_int(sp, 0);
-    if (json_obj_get(line, "ppid", &sp)) ev->ppid = span_to_int(sp, 0);
-    if (json_obj_get(line, "nspid", &sp)) ev->nspid = span_to_int(sp, 0);
-    if (json_obj_get(line, "nstgid", &sp)) ev->nstgid = span_to_int(sp, 0);
+    if (json_get(line, "ts", &sp)) ev->ts = span_to_double(sp, 0.0);
+    if (json_get(line, "pid", &sp)) ev->pid = span_to_int(sp, 0);
+    if (json_get(line, "tgid", &sp)) ev->tgid = span_to_int(sp, 0);
+    if (json_get(line, "ppid", &sp)) ev->ppid = span_to_int(sp, 0);
+    if (json_get(line, "nspid", &sp)) ev->nspid = span_to_int(sp, 0);
+    if (json_get(line, "nstgid", &sp)) ev->nstgid = span_to_int(sp, 0);
     if (g_base_ts == 0.0 || ev->ts < g_base_ts) g_base_ts = ev->ts;
 
     proc = get_process(ev->tgid);
@@ -713,13 +729,13 @@ static void ingest_trace_line(const char *line) {
 
     switch (ev->kind) {
     case EV_CWD:
-        if (json_obj_get(line, "path", &sp)) ev->path = json_decode_string(sp);
+        if (json_get(line, "path", &sp)) ev->path = json_decode_string(sp);
         free(proc->cwd);
         proc->cwd = xstrdup(ev->path ? ev->path : "");
         break;
     case EV_EXEC:
-        if (json_obj_get(line, "exe", &sp)) ev->exe = json_decode_string(sp);
-        if (json_obj_get(line, "argv", &sp)) ev->argv = json_array_of_strings(sp, &ev->argc);
+        if (json_get(line, "exe", &sp)) ev->exe = json_decode_string(sp);
+        if (json_get(line, "argv", &sp)) ev->argv = json_array_of_strings(sp, &ev->argc);
         free(proc->exe);
         proc->exe = xstrdup(ev->exe ? ev->exe : "");
         free_string_array(proc->argv, proc->argc);
@@ -734,12 +750,12 @@ static void ingest_trace_line(const char *line) {
     case EV_OPEN: {
         char **flags = NULL;
         int nfl = 0;
-        if (json_obj_get(line, "path", &sp) && *sp.s != 'n') ev->path = json_decode_string(sp);
-        if (json_obj_get(line, "flags", &sp)) flags = json_array_of_strings(sp, &nfl);
+        if (json_get(line, "path", &sp) && *sp.s != 'n') ev->path = json_decode_string(sp);
+        if (json_get(line, "flags", &sp)) flags = json_array_of_strings(sp, &nfl);
         ev->flags_text = join_with_pipe(flags, nfl);
-        if (json_obj_get(line, "fd", &sp)) ev->fd = span_to_int(sp, -1);
-        if (json_obj_get(line, "err", &sp)) ev->err = span_to_int(sp, 0);
-        if (json_obj_get(line, "inherited", &sp)) ev->inherited = span_to_bool(sp, 0);
+        if (json_get(line, "fd", &sp)) ev->fd = span_to_int(sp, -1);
+        if (json_get(line, "err", &sp)) ev->err = span_to_int(sp, 0);
+        if (json_get(line, "inherited", &sp)) ev->inherited = span_to_bool(sp, 0);
         ev->resolved_path = resolve_path_dup(ev->path, proc->cwd);
         if (is_write_open(ev)) proc->has_write_open = 1;
         if (ev->resolved_path && ev->resolved_path[0]) {
@@ -750,11 +766,11 @@ static void ingest_trace_line(const char *line) {
         break;
     }
     case EV_EXIT:
-        if (json_obj_get(line, "status", &sp)) ev->status = json_decode_string(sp);
-        if (json_obj_get(line, "code", &sp)) ev->code = span_to_int(sp, 0);
-        if (json_obj_get(line, "signal", &sp)) ev->signal = span_to_int(sp, 0);
-        if (json_obj_get(line, "core_dumped", &sp)) ev->core_dumped = span_to_bool(sp, 0);
-        if (json_obj_get(line, "raw", &sp)) ev->raw = span_to_int(sp, 0);
+        if (json_get(line, "status", &sp)) ev->status = json_decode_string(sp);
+        if (json_get(line, "code", &sp)) ev->code = span_to_int(sp, 0);
+        if (json_get(line, "signal", &sp)) ev->signal = span_to_int(sp, 0);
+        if (json_get(line, "core_dumped", &sp)) ev->core_dumped = span_to_bool(sp, 0);
+        if (json_get(line, "raw", &sp)) ev->raw = span_to_int(sp, 0);
         free(proc->exit_status);
         proc->exit_status = xstrdup(ev->status ? ev->status : "");
         proc->exit_code = ev->code;
@@ -766,8 +782,8 @@ static void ingest_trace_line(const char *line) {
         break;
     case EV_STDOUT:
     case EV_STDERR:
-        if (json_obj_get(line, "data", &sp)) ev->data = json_decode_string(sp);
-        if (json_obj_get(line, "len", &sp)) ev->len = span_to_int(sp, 0);
+        if (json_get(line, "data", &sp)) ev->data = json_decode_string(sp);
+        if (json_get(line, "len", &sp)) ev->len = span_to_int(sp, 0);
         if (ev->kind == EV_STDOUT) proc->has_stdout = 1;
         else proc->has_stderr = 1;
         break;
@@ -777,7 +793,7 @@ static void ingest_trace_line(const char *line) {
 static void ingest_line(const char *line) {
     span_t sp;
     if (!line || !line[0] || line[0] != '{') return;
-    if (json_obj_get(line, "input", &sp)) ingest_input_line(line);
+    if (json_get(line, "input", &sp)) ingest_input_line(line);
     else ingest_trace_line(line);
 }
 
@@ -929,8 +945,9 @@ static int proc_should_show(int idx) {
 }
 
 static char *format_duration(double s, double e, int running) {
-    double d = running ? 0.0 : (e - s);
-    if (running) return xstrdup("");
+    double d = e - s;
+    (void)running;
+    if (d < 0.0) d = 0.0;
     if (d >= 1.0) return fmtdup("%.2fs", d);
     return fmtdup("%.1fms", d * 1000.0);
 }
@@ -1671,10 +1688,30 @@ static int on_key_cb(tui_t *tui, int key, const char *panel, int cursor, const c
     case '1': g_state.mode = 0; reset_mode_selection(); break;
     case '2': g_state.mode = 1; reset_mode_selection(); break;
     case '3': g_state.mode = 2; reset_mode_selection(); break;
-    case '4': g_state.mode = 3; reset_mode_selection(); break;
-    case '5': g_state.mode = 4; reset_mode_selection(); break;
-    case '6': g_state.mode = 5; reset_mode_selection(); break;
-    case '7': g_state.mode = 6; reset_mode_selection(); break;
+    case '4': {
+        char keep[4096]; snprintf(keep, sizeof keep, "%s", g_state.cursor_id);
+        g_state.mode = 3; reset_mode_selection();
+        if (keep[0]) snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", keep);
+        break;
+    }
+    case '5': {
+        char keep[4096]; snprintf(keep, sizeof keep, "%s", g_state.cursor_id);
+        g_state.mode = 4; reset_mode_selection();
+        if (keep[0]) snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", keep);
+        break;
+    }
+    case '6': {
+        char keep[4096]; snprintf(keep, sizeof keep, "%s", g_state.cursor_id);
+        g_state.mode = 5; reset_mode_selection();
+        if (keep[0]) snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", keep);
+        break;
+    }
+    case '7': {
+        char keep[4096]; snprintf(keep, sizeof keep, "%s", g_state.cursor_id);
+        g_state.mode = 6; reset_mode_selection();
+        if (keep[0]) snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", keep);
+        break;
+    }
     case 'G': g_state.grouped = !g_state.grouped; reset_mode_selection(); break;
     case 's': g_state.sort_key = (g_state.sort_key + 1) % 3; break;
     case 't': g_state.ts_mode = (g_state.ts_mode + 1) % 3; break;
