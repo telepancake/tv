@@ -101,6 +101,16 @@ exec_basenames() {
     ' "$1" \
         | grep -vE '^(|sudtrace([_-].+)?|sud32([_-].+)?|sud64([_-].+)?|ld-linux[^[:space:]]*)$' \
         | sort -u
+run_both_no_env() {
+    local tag="$1"; shift
+    echo ""
+    echo "═══ Testing: $tag ═══"
+    echo "  Command: $*"
+
+    "$TV" --uproctrace --ptrace --no-env -o "$TMPDIR/${tag}_upt.jsonl" -- "$@" \
+        > "$TMPDIR/${tag}_upt_stdout.txt" 2>&1 || true
+    "$SUDTRACE" --no-env -o "$TMPDIR/${tag}_sud.jsonl" -- "$@" \
+        > "$TMPDIR/${tag}_sud_stdout.txt" 2>&1 || true
 }
 
 # ── Helper: normalise a trace ─────────────────────────────────────────
@@ -144,6 +154,20 @@ validate_schema() {
     fi
 }
 
+check_exec_field_absent() {
+    local desc="$1" field="$2" file="$3"
+    TOTAL=$((TOTAL+1))
+    if jq -e --arg field "$field" 'select(.event=="EXEC") | has($field)' "$file" > /dev/null; then
+        FAIL=$((FAIL+1))
+        echo "  FAIL  $desc ($field present)"
+        return 1
+    else
+        PASS=$((PASS+1))
+        echo "  PASS  $desc"
+        return 0
+    fi
+}
+
 # ═════════════════════════════════════════════════════════════════════
 # Test 1: Dynamic binary (/bin/echo)
 # ═════════════════════════════════════════════════════════════════════
@@ -166,6 +190,17 @@ check "sud exit code 0"     '"code":0'       "$TMPDIR/dynamic_echo_sud.jsonl"
 # Both should reference "echo" somewhere in argv
 check "upt argv has echo"   'echo'           "$TMPDIR/dynamic_echo_upt.jsonl"
 check "sud argv has echo"   'echo'           "$TMPDIR/dynamic_echo_sud.jsonl"
+
+run_both_no_env "dynamic_echo_no_env" /bin/echo "hello from dynamic echo"
+
+echo ""
+echo "=== Test 1b: Dynamic binary without env capture ==="
+validate_schema "uproctrace no-env" "$TMPDIR/dynamic_echo_no_env_upt.jsonl"
+validate_schema "sudtrace no-env"   "$TMPDIR/dynamic_echo_no_env_sud.jsonl"
+check "upt no-env has EXEC"         '"event":"EXEC"' "$TMPDIR/dynamic_echo_no_env_upt.jsonl"
+check "sud no-env has EXEC"         '"event":"EXEC"' "$TMPDIR/dynamic_echo_no_env_sud.jsonl"
+check_exec_field_absent "upt no-env omits env" "env" "$TMPDIR/dynamic_echo_no_env_upt.jsonl"
+check_exec_field_absent "sud no-env omits env" "env" "$TMPDIR/dynamic_echo_no_env_sud.jsonl"
 
 # ═════════════════════════════════════════════════════════════════════
 # Test 2: Shebang script

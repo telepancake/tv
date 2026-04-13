@@ -81,6 +81,7 @@ struct trace_output {
 static struct trace_output g_out;
 static struct stat g_creator_stdout_st; /* stat of the session creator's stdout */
 static int g_creator_stdout_valid;
+static int g_trace_exec_env = 1;
 
 static int path_has_suffix(const char *path, const char *suffix)
 {
@@ -303,9 +304,43 @@ static int trace_output_enqueue(const char *buf, size_t len)
     return 0;
 }
 
+static int trace_output_enqueue_line(const char *line, size_t len)
+{
+    static const char exec_marker[] = "\"event\":\"EXEC\"";
+    static const char env_marker[] = ",\"env\":";
+
+    if (!line || len == 0)
+        return 0;
+    if (g_trace_exec_env)
+        return trace_output_enqueue(line, len);
+
+    const void *exec_hit = memmem(line, len, exec_marker, sizeof(exec_marker) - 1);
+    const void *env_hit = memmem(line, len, env_marker, sizeof(env_marker) - 1);
+    if (!exec_hit || !env_hit)
+        return trace_output_enqueue(line, len);
+
+    char *tmp = malloc(len + 1);
+    if (!tmp)
+        return -1;
+    memcpy(tmp, line, len);
+    tmp[len] = '\0';
+
+    char *env = strstr(tmp, ",\"env\":");
+    char *auxv = env ? strstr(env, ",\"auxv\":") : NULL;
+    size_t out_len = len;
+    if (env && auxv) {
+        size_t remove_len = (size_t)(auxv - env);
+        memmove(env, auxv, (size_t)(tmp + len - auxv) + 1);
+        out_len = len - remove_len;
+    }
+    int rc = trace_output_enqueue(tmp, out_len);
+    free(tmp);
+    return rc;
+}
+
 static void emit_line(const char *line, size_t len)
 {
-    (void)trace_output_enqueue(line, len);
+    (void)trace_output_enqueue_line(line, len);
 }
 
 /* ================================================================
@@ -688,12 +723,15 @@ static void emit_exec_event(pid_t pid)
     }
 
     /* env */
-    size_t env_len = 0;
-    char *env_raw = read_proc_file(pid, "environ", ENV_MAX_READ, &env_len);
+    char *env_raw = NULL;
     char *env_j = NULL;
-    if (env_raw && env_len > 0) {
-        env_j = malloc(env_len * 6 + 64);
-        if (env_j) json_env_object(env_j, env_len * 6 + 64, env_raw, env_len);
+    if (g_trace_exec_env) {
+        size_t env_len = 0;
+        env_raw = read_proc_file(pid, "environ", ENV_MAX_READ, &env_len);
+        if (env_raw && env_len > 0) {
+            env_j = malloc(env_len * 6 + 64);
+            if (env_j) json_env_object(env_j, env_len * 6 + 64, env_raw, env_len);
+        }
     }
 
     /* auxv */
@@ -705,12 +743,20 @@ static void emit_exec_event(pid_t pid)
     char *line = malloc(LINE_MAX_BUF);
     if (line) {
         int pos = json_header(line, LINE_MAX_BUF, "EXEC", pid, tgid, ppid, &ts);
-        pos += snprintf(line + pos, LINE_MAX_BUF - pos,
-            ",\"exe\":%s,\"argv\":%s,\"env\":%s,\"auxv\":{%s}}\n",
-            exe ? exe_esc : "null",
-            argv_j ? argv_j : "[]",
-            env_j ? env_j : "{}",
-            auxv_buf[0] ? auxv_buf : "");
+        if (g_trace_exec_env) {
+            pos += snprintf(line + pos, LINE_MAX_BUF - pos,
+                ",\"exe\":%s,\"argv\":%s,\"env\":%s,\"auxv\":{%s}}\n",
+                exe ? exe_esc : "null",
+                argv_j ? argv_j : "[]",
+                env_j ? env_j : "{}",
+                auxv_buf[0] ? auxv_buf : "");
+        } else {
+            pos += snprintf(line + pos, LINE_MAX_BUF - pos,
+                ",\"exe\":%s,\"argv\":%s,\"auxv\":{%s}}\n",
+                exe ? exe_esc : "null",
+                argv_j ? argv_j : "[]",
+                auxv_buf[0] ? auxv_buf : "");
+        }
         if (pos > 0 && pos < LINE_MAX_BUF)
             emit_line(line, pos);
         free(line);
@@ -1607,7 +1653,7 @@ static int handle_syscall_exit(pid_t pid, struct proc_state *ps)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-o FILE[.zst]] [--backend auto|module|sud|ptrace] [--module|--sud|--ptrace] -- command [args...]\n",
+            "Usage: %s [-o FILE[.zst]] [--no-env] [--backend auto|module|sud|ptrace] [--module|--sud|--ptrace] -- command [args...]\n",
             prog);
     exit(1);
 }
@@ -1794,19 +1840,80 @@ static int close_trace_output(const char *outfile)
 static int copy_fd_to_output(int fd)
 {
     char buf[8192];
+
+    if (g_trace_exec_env) {
+        for (;;) {
+            ssize_t n = read(fd, buf, sizeof(buf));
+            if (n == 0) return 0;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("read");
+                return -1;
+            }
+            if (trace_output_enqueue(buf, (size_t)n) != 0) {
+                fprintf(stderr, "uproctrace: trace output queue failed\n");
+                return -1;
+            }
+        }
+    }
+
+    char *pending = NULL;
+    size_t pending_len = 0;
+    size_t pending_cap = 0;
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
-        if (n == 0) return 0;
+        if (n == 0) break;
         if (n < 0) {
             if (errno == EINTR) continue;
             perror("read");
+            free(pending);
             return -1;
         }
-        if (trace_output_enqueue(buf, (size_t)n) != 0) {
-            fprintf(stderr, "uproctrace: trace output queue failed\n");
-            return -1;
+
+        if (pending_len + (size_t)n + 1 > pending_cap) {
+            size_t new_cap = pending_cap ? pending_cap : 8192;
+            while (new_cap < pending_len + (size_t)n + 1)
+                new_cap *= 2;
+            char *tmp = realloc(pending, new_cap);
+            if (!tmp) {
+                perror("realloc");
+                free(pending);
+                return -1;
+            }
+            pending = tmp;
+            pending_cap = new_cap;
+        }
+        memcpy(pending + pending_len, buf, (size_t)n);
+        pending_len += (size_t)n;
+        pending[pending_len] = '\0';
+
+        size_t start = 0;
+        while (start < pending_len) {
+            char *nl = memchr(pending + start, '\n', pending_len - start);
+            if (!nl) break;
+            size_t line_len = (size_t)(nl - (pending + start)) + 1;
+            if (trace_output_enqueue_line(pending + start, line_len) != 0) {
+                fprintf(stderr, "uproctrace: trace output queue failed\n");
+                free(pending);
+                return -1;
+            }
+            start += line_len;
+        }
+
+        if (start > 0) {
+            memmove(pending, pending + start, pending_len - start);
+            pending_len -= start;
+            pending[pending_len] = '\0';
         }
     }
+
+    if (pending_len > 0 && trace_output_enqueue_line(pending, pending_len) != 0) {
+        fprintf(stderr, "uproctrace: trace output queue failed\n");
+        free(pending);
+        return -1;
+    }
+    free(pending);
+    return 0;
 }
 
 static int wait_for_child(pid_t child)
@@ -1854,12 +1961,12 @@ static int run_module_trace(char **cmd, const char *outfile)
 }
 
 static int build_exec_argv(char ***out_argv, const char *exe,
-                           const char *outfile, char **cmd)
+                           const char *outfile, int no_env, char **cmd)
 {
     size_t cmdc = 0;
     while (cmd[cmdc]) cmdc++;
 
-    size_t argc = 1 + (outfile ? 2 : 0) + 1 + cmdc + 1;
+    size_t argc = 1 + (outfile ? 2 : 0) + (no_env ? 1 : 0) + 1 + cmdc + 1;
     char **sub_argv = calloc(argc, sizeof(*sub_argv));
     if (!sub_argv) {
         perror("calloc");
@@ -1872,6 +1979,8 @@ static int build_exec_argv(char ***out_argv, const char *exe,
         sub_argv[i++] = "-o";
         sub_argv[i++] = (char *)outfile;
     }
+    if (no_env)
+        sub_argv[i++] = "--no-env";
     sub_argv[i++] = "--";
     for (size_t j = 0; j < cmdc; j++)
         sub_argv[i++] = cmd[j];
@@ -1907,7 +2016,7 @@ static int run_sud_trace(char **cmd, const char *outfile, const char *sudtrace_e
             close(pipefd[0]);
             if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
             close(pipefd[1]);
-            if (build_exec_argv(&sub_argv, sudtrace_exe, NULL, cmd) != 0)
+            if (build_exec_argv(&sub_argv, sudtrace_exe, NULL, !g_trace_exec_env, cmd) != 0)
                 _exit(127);
             if (strchr(sudtrace_exe, '/'))
                 execv(sudtrace_exe, sub_argv);
@@ -1933,7 +2042,7 @@ static int run_sud_trace(char **cmd, const char *outfile, const char *sudtrace_e
     }
     if (child == 0) {
         char **sub_argv = NULL;
-        if (build_exec_argv(&sub_argv, sudtrace_exe, outfile, cmd) != 0)
+        if (build_exec_argv(&sub_argv, sudtrace_exe, outfile, !g_trace_exec_env, cmd) != 0)
             _exit(127);
         if (strchr(sudtrace_exe, '/'))
             execv(sudtrace_exe, sub_argv);
@@ -2205,6 +2314,8 @@ int uproctrace_main(int argc, char **argv)
         }
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             outfile = argv[++i];
+        } else if (strcmp(argv[i], "--no-env") == 0) {
+            g_trace_exec_env = 0;
         } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
             if (parse_trace_backend(argv[++i], &requested) != 0)
                 usage(argv[0]);

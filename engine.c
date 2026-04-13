@@ -1,7 +1,3 @@
-/*
- * engine.c — Generic panel-based TUI engine.
- * See engine.h for the API contract.
- */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,72 +18,60 @@
 #define MAX_PANELS  8
 #define MAX_WATCHES 16
 #define MAX_TIMERS  16
+#define PANEL_CACHE_ROWS  256
+#define PANEL_NCOLS_MAX    32
+#define PANEL_CACHE_POOL  (256*1024)
 
-/* ── Row cache ─────────────────────────────────────────────────────── */
-#define PANEL_CACHE_ROWS  256   /* rows cached per panel per window */
-#define PANEL_NCOLS_MAX    32   /* max columns per panel */
-#define PANEL_CACHE_POOL  (256*1024)  /* string pool bytes per panel */
-
-/* One cached row: column values stored as offsets into cache_pool.
- * offset == -1 means SQL NULL. */
 typedef struct {
     int id_off;
     int style_off;
     int col_off[PANEL_NCOLS_MAX];
 } pcache_row_t;
 
-/* ── Panel state ───────────────────────────────────────────────────── */
 typedef struct {
     tui_panel_def def;
-    int x, y, w, h;         /* resolved char positions */
+    int x, y, w, h;
     int cursor, scroll;
     int row_count;
     int dirty;
     char cursor_id[4096];
-
-    /* Row cache — populated on first render after dirty, updated on scroll */
-    pcache_row_t *cache_rows; /* [PANEL_CACHE_ROWS], malloced */
-    char         *cache_pool; /* [PANEL_CACHE_POOL], malloced */
+    pcache_row_t *cache_rows;
+    char         *cache_pool;
     int           cache_pool_pos;
-    int           cache_start;  /* rownum of cache_rows[0] */
-    int           cache_count;  /* 0 = invalid/empty */
+    int           cache_start;
+    int           cache_count;
 } panel_st;
 
 typedef struct { int fd; tui_fd_cb cb; void *ctx; int active; } fd_watch;
 typedef struct {
     int id, ms, active;
     struct timeval fire;
-    tui_timer_cb cb; void *ctx;
+    tui_timer_cb cb;
+    void *ctx;
 } timer_ent;
 
 struct tui {
-    sqlite3       *db;
-    int            tty_fd;
+    tui_data_source source;
+    void *source_ctx;
+    int tty_fd;
     struct termios orig_tios;
-    int            tty_raw, rows, cols;
-
-    panel_st       panels[MAX_PANELS];
-    int            npanels, focus;
-
-    tui_box_t     *layout_root;  /* root of layout tree */
-
-    char           status[1024];
-
-    tui_key_cb     key_cb;
-    void          *key_ctx;
-    fd_watch       watches[MAX_WATCHES];
-    timer_ent      timers[MAX_TIMERS];
-    int            next_timer_id, quit_flag;
-
-    char          *scr;
-    int            scr_len, scr_cap;
+    int tty_raw, rows, cols;
+    panel_st panels[MAX_PANELS];
+    int npanels, focus;
+    tui_box_t *layout_root;
+    char status[1024];
+    tui_key_cb key_cb;
+    void *key_ctx;
+    fd_watch watches[MAX_WATCHES];
+    timer_ent timers[MAX_TIMERS];
+    int next_timer_id, quit_flag;
+    char *scr;
+    int scr_len, scr_cap;
 };
 
-/* ── Globals ───────────────────────────────────────────────────────── */
 static volatile int g_resized = 0;
 static tui_t *g_atexit_tui = NULL;
 
-/* ── Screen buffer ─────────────────────────────────────────────────── */
 static void sa(tui_t *t, const char *s, int n) {
     if (t->scr_len + n + 1 > t->scr_cap) {
         t->scr_cap = (t->scr_len + n + 1) * 2;
@@ -97,24 +81,31 @@ static void sa(tui_t *t, const char *s, int n) {
     memcpy(t->scr + t->scr_len, s, n);
     t->scr_len += n;
 }
-static void sp(tui_t *t, const char *s) { sa(t, s, strlen(s)); }
+static void sp(tui_t *t, const char *s) { sa(t, s, (int)strlen(s)); }
 static void sf(tui_t *t, const char *fmt, ...) {
-    char buf[4096]; va_list a; va_start(a, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, a); va_end(a);
+    char buf[4096];
+    va_list a;
+    va_start(a, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, a);
+    va_end(a);
     if (n > 0) sa(t, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1);
 }
 static void sflush(tui_t *t) {
     if (t->scr_len > 0 && t->tty_fd >= 0) {
-        int r = write(t->tty_fd, t->scr, t->scr_len); (void)r;
+        int r = (int)write(t->tty_fd, t->scr, t->scr_len);
+        (void)r;
     }
     t->scr_len = 0;
 }
 
-/* ── Visible-width text output ─────────────────────────────────────── */
 static int visible_len(const char *s) {
     int n = 0;
     while (*s) {
-        if (*s == '\x1b') { while (*s && *s != 'm') s++; if (*s) s++; continue; }
+        if (*s == '\x1b') {
+            while (*s && *s != 'm') s++;
+            if (*s) s++;
+            continue;
+        }
         if ((*s & 0xC0) != 0x80) n++;
         s++;
     }
@@ -127,28 +118,41 @@ static void sput_field(tui_t *t, const char *s, int w, int align, int ovf) {
     int vl = visible_len(s);
     if (vl <= w) {
         int pad = w - vl, lp = 0, rp = 0;
-        if (align == TUI_ALIGN_RIGHT) { lp = pad; rp = 0; }
+        if (align == TUI_ALIGN_RIGHT) lp = pad;
         else if (align == TUI_ALIGN_CENTER) { lp = pad / 2; rp = pad - lp; }
-        else { lp = 0; rp = pad; }
+        else rp = pad;
         for (int i = 0; i < lp; i++) sp(t, " ");
         while (*s) {
-            if (*s == '\x1b') { while (*s && *s != 'm') { sa(t, s, 1); s++; } if (*s) { sa(t, s, 1); s++; } continue; }
-            sa(t, s, 1); s++;
+            if (*s == '\x1b') {
+                while (*s && *s != 'm') { sa(t, s, 1); s++; }
+                if (*s) { sa(t, s, 1); s++; }
+                continue;
+            }
+            sa(t, s, 1);
+            s++;
         }
         for (int i = 0; i < rp; i++) sp(t, " ");
     } else {
         int lim = (ovf == TUI_OVERFLOW_ELLIPSIS && w >= 3) ? w - 1 : w;
         int p = 0;
         while (*s && p < lim) {
-            if (*s == '\x1b') { while (*s && *s != 'm') { sa(t, s, 1); s++; } if (*s) { sa(t, s, 1); s++; } continue; }
-            sa(t, s, 1); if ((*s & 0xC0) != 0x80) p++; s++;
+            if (*s == '\x1b') {
+                while (*s && *s != 'm') { sa(t, s, 1); s++; }
+                if (*s) { sa(t, s, 1); s++; }
+                continue;
+            }
+            sa(t, s, 1);
+            if ((*s & 0xC0) != 0x80) p++;
+            s++;
         }
-        if (ovf == TUI_OVERFLOW_ELLIPSIS && w >= 3 && p < vl) { sp(t, "\xe2\x80\xa6"); p++; }
+        if (ovf == TUI_OVERFLOW_ELLIPSIS && w >= 3 && p < vl) {
+            sp(t, "\xe2\x80\xa6");
+            p++;
+        }
         while (p < w) { sp(t, " "); p++; }
     }
 }
 
-/* ── Style map ─────────────────────────────────────────────────────── */
 static const char *style_ansi(const char *s) {
     if (!s || !s[0]) return "\x1b[0m";
     switch (s[0]) {
@@ -161,41 +165,34 @@ static const char *style_ansi(const char *s) {
     case 'n': return "\x1b[0m";
     case 's': return "\x1b[1;35m";
     case 'y': return "\x1b[33m";
+    default: return "\x1b[0m";
     }
-    return "\x1b[0m";
 }
 
-/* ── Terminal ──────────────────────────────────────────────────────── */
+static void notify_size_changed(tui_t *t) {
+    if (t && t->source.size_changed) t->source.size_changed(t->rows, t->cols, t->source_ctx);
+}
+
 static void tty_restore(tui_t *t) {
     if (t->tty_raw && t->tty_fd >= 0) {
         tcsetattr(t->tty_fd, TCSAFLUSH, &t->orig_tios);
-        int r = write(t->tty_fd, "\x1b[?25h\x1b[?1049l", 14); (void)r;
+        int r = (int)write(t->tty_fd, "\x1b[?25h\x1b[?1049l", 14);
+        (void)r;
         t->tty_raw = 0;
     }
     if (t->tty_fd >= 0) { close(t->tty_fd); t->tty_fd = -1; }
 }
 static void atexit_restore(void) { if (g_atexit_tui) tty_restore(g_atexit_tui); }
 static void sigwinch(int sig) { (void)sig; g_resized = 1; }
-static void sync_state_size(tui_t *t) {
-    if (!t || !t->db) return;
-    sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(t->db,
-            "UPDATE state SET rows=?, cols=?", -1, &st, 0) == SQLITE_OK) {
-        sqlite3_bind_int(st, 1, t->rows);
-        sqlite3_bind_int(st, 2, t->cols);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
-    }
-}
 static void tty_size(tui_t *t) {
     struct winsize ws;
     if (t->tty_fd >= 0 && ioctl(t->tty_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
-        t->rows = ws.ws_row; t->cols = ws.ws_col;
-        sync_state_size(t);
+        t->rows = ws.ws_row;
+        t->cols = ws.ws_col;
+        notify_size_changed(t);
     }
 }
 
-/* ── Panel helpers ─────────────────────────────────────────────────── */
 static panel_st *pfind(tui_t *t, const char *nm) {
     if (!nm) return NULL;
     for (int i = 0; i < t->npanels; i++)
@@ -210,13 +207,10 @@ static int pfind_idx(tui_t *t, const char *nm) {
 }
 
 static void p_update_count(tui_t *t, panel_st *p) {
-    char sql[256];
-    snprintf(sql, sizeof sql, "SELECT COUNT(*) FROM \"%s\"", p->def.name);
-    sqlite3_stmt *st; p->row_count = 0;
-    if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) == SQLITE_OK) {
-        if (sqlite3_step(st) == SQLITE_ROW) p->row_count = sqlite3_column_int(st, 0);
-        sqlite3_finalize(st);
-    }
+    p->row_count = 0;
+    if (t->source.row_count)
+        p->row_count = t->source.row_count(p->def.name, t->source_ctx);
+    if (p->row_count < 0) p->row_count = 0;
 }
 
 static void p_clamp(panel_st *p) {
@@ -232,46 +226,41 @@ static void p_clamp(panel_st *p) {
 
 static void p_sync_id(tui_t *t, panel_st *p) {
     p->cursor_id[0] = '\0';
-    if (p->row_count == 0) return;
-    /* Use cache if cursor row is within it — avoids a DB round-trip */
+    if (p->row_count == 0 || !t->source.row_get) return;
     int ci = p->cursor - p->cache_start;
     if (p->cache_count > 0 && p->cache_rows && p->cache_pool &&
-        ci >= 0 && ci < p->cache_count &&
-        p->cache_rows[ci].id_off >= 0) {
+        ci >= 0 && ci < p->cache_count && p->cache_rows[ci].id_off >= 0) {
         snprintf(p->cursor_id, sizeof p->cursor_id, "%s",
                  p->cache_pool + p->cache_rows[ci].id_off);
         return;
     }
-    /* Fall back to DB */
-    char sql[256];
-    snprintf(sql, sizeof sql, "SELECT id FROM \"%s\" WHERE rownum=?", p->def.name);
-    sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) == SQLITE_OK) {
-        sqlite3_bind_int(st, 1, p->cursor);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            const char *v = (const char *)sqlite3_column_text(st, 0);
-            if (v) snprintf(p->cursor_id, sizeof p->cursor_id, "%s", v);
-        }
-        sqlite3_finalize(st);
-    }
+    tui_row_ref row;
+    memset(&row, 0, sizeof row);
+    if (t->source.row_get(p->def.name, p->cursor, &row, t->source_ctx) && row.id)
+        snprintf(p->cursor_id, sizeof p->cursor_id, "%s", row.id);
 }
 
 static void p_resolve_id(tui_t *t, panel_st *p) {
     if (!p->cursor_id[0]) { p->cursor = 0; return; }
-    char sql[256];
-    snprintf(sql, sizeof sql, "SELECT rownum FROM \"%s\" WHERE id=? LIMIT 1", p->def.name);
-    sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, p->cursor_id, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(st) == SQLITE_ROW) p->cursor = sqlite3_column_int(st, 0);
-        sqlite3_finalize(st);
+    if (t->source.row_find) {
+        int idx = t->source.row_find(p->def.name, p->cursor_id, t->source_ctx);
+        if (idx >= 0) p->cursor = idx;
+        return;
+    }
+    if (!t->source.row_get) return;
+    tui_row_ref row;
+    for (int i = 0; i < p->row_count; i++) {
+        memset(&row, 0, sizeof row);
+        if (t->source.row_get(p->def.name, i, &row, t->source_ctx) && row.id && strcmp(row.id, p->cursor_id) == 0) {
+            p->cursor = i;
+            return;
+        }
     }
 }
 
-/* ── Row cache helpers ─────────────────────────────────────────────── */
-static int pool_add(panel_st *p, const unsigned char *s) {
+static int pool_add(panel_st *p, const char *s) {
     if (!s) return -1;
-    int len = (int)strlen((const char *)s) + 1;
+    int len = (int)strlen(s) + 1;
     if (p->cache_pool_pos + len > PANEL_CACHE_POOL) return -1;
     int off = p->cache_pool_pos;
     memcpy(p->cache_pool + off, s, len);
@@ -279,53 +268,32 @@ static int pool_add(panel_st *p, const unsigned char *s) {
     return off;
 }
 
-/* Load (or reload) PANEL_CACHE_ROWS rows starting at `from_row` from the DB. */
 static void p_load_cache(tui_t *t, panel_st *p, int from_row) {
-    if (!p->cache_rows || !p->cache_pool) return;
+    if (!p->cache_rows || !p->cache_pool || !t->source.row_get) return;
     if (from_row < 0) from_row = 0;
     p->cache_pool_pos = 0;
-    p->cache_count    = 0;
-    p->cache_start    = from_row;
-
-    char sql[4096]; int pos = 0;
-    pos += snprintf(sql + pos, sizeof sql - pos, "SELECT id,style");
+    p->cache_count = 0;
+    p->cache_start = from_row;
     int nc = p->def.ncols < PANEL_NCOLS_MAX ? p->def.ncols : PANEL_NCOLS_MAX;
-    for (int c = 0; c < nc; c++)
-        pos += snprintf(sql + pos, sizeof sql - pos, ",\"%s\"", p->def.cols[c].name);
-    pos += snprintf(sql + pos, sizeof sql - pos,
-        " FROM \"%s\" WHERE rownum>=? AND rownum<? ORDER BY rownum",
-        p->def.name);
-
-    sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(t->db, sql, -1, &st, 0) != SQLITE_OK) return;
-    sqlite3_bind_int(st, 1, from_row);
-    sqlite3_bind_int(st, 2, from_row + PANEL_CACHE_ROWS);
-    while (sqlite3_step(st) == SQLITE_ROW && p->cache_count < PANEL_CACHE_ROWS) {
-        pcache_row_t *r = &p->cache_rows[p->cache_count];
-        r->id_off    = pool_add(p, sqlite3_column_text(st, 0));
-        r->style_off = pool_add(p, sqlite3_column_text(st, 1));
-        for (int c = 0; c < nc; c++)
-            r->col_off[c] = pool_add(p, sqlite3_column_text(st, 2 + c));
-        for (int c = nc; c < PANEL_NCOLS_MAX; c++)
-            r->col_off[c] = -1;
-        p->cache_count++;
+    tui_row_ref row;
+    for (int i = from_row; i < p->row_count && p->cache_count < PANEL_CACHE_ROWS; i++) {
+        memset(&row, 0, sizeof row);
+        if (!t->source.row_get(p->def.name, i, &row, t->source_ctx)) break;
+        pcache_row_t *r = &p->cache_rows[p->cache_count++];
+        r->id_off = pool_add(p, row.id);
+        r->style_off = pool_add(p, row.style);
+        for (int c = 0; c < nc; c++) r->col_off[c] = pool_add(p, row.cols[c]);
+        for (int c = nc; c < PANEL_NCOLS_MAX; c++) r->col_off[c] = -1;
     }
-    sqlite3_finalize(st);
 }
 
-/* Ensure cache covers row `rn`. Loads if not covered. */
 static void p_ensure_cached(tui_t *t, panel_st *p, int rn) {
-    if (p->cache_count > 0 &&
-        rn >= p->cache_start &&
-        rn < p->cache_start + p->cache_count) return;
-    /* Load a window that covers rn, biased slightly before it for upward scrolling */
+    if (p->cache_count > 0 && rn >= p->cache_start && rn < p->cache_start + p->cache_count) return;
     int ahead = PANEL_CACHE_ROWS / 4;
-    int from  = rn > ahead ? rn - ahead : 0;
+    int from = rn > ahead ? rn - ahead : 0;
     p_load_cache(t, p, from);
 }
 
-/* ── Layout resolution ─────────────────────────────────────────────── */
-/* Recursively assign x,y,w,h to each panel in the layout tree. */
 static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
     if (!b) return;
     if (b->type == TUI_BOX_PANEL) {
@@ -333,7 +301,6 @@ static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
         if (p) { p->x = x; p->y = y; p->w = w < 1 ? 1 : w; p->h = h < 1 ? 1 : h; }
         return;
     }
-    /* Split: TUI_BOX_HBOX divides width, TUI_BOX_VBOX divides height */
     int axis = (b->type == TUI_BOX_HBOX) ? w : h;
     int total_weight = 0, fixed_sum = 0;
     for (int i = 0; i < b->nchildren; i++) {
@@ -348,16 +315,13 @@ static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
     for (int i = 0; i < b->nchildren; i++) {
         tui_box_t *c = b->children[i];
         int sz;
-        if (c->weight == 0) {
-            sz = c->min_size;
-        } else {
+        if (c->weight == 0) sz = c->min_size;
+        else {
             sz = c->min_size + (total_weight > 0 ? flex * c->weight / total_weight : 0);
-            /* Give last flex child any leftover from integer division */
             int is_last_flex = 1;
             for (int j = i + 1; j < b->nchildren; j++)
                 if (b->children[j]->weight > 0) { is_last_flex = 0; break; }
             if (is_last_flex) {
-                /* remaining space minus any fixed-size children that follow */
                 int tail_fixed = 0;
                 for (int j = i + 1; j < b->nchildren; j++)
                     if (b->children[j]->weight == 0) tail_fixed += b->children[j]->min_size;
@@ -365,36 +329,39 @@ static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
             }
         }
         if (sz < 1) sz = 1;
-        if (b->type == TUI_BOX_HBOX)
-            resolve_box(t, c, pos, y, sz, h);
-        else
-            resolve_box(t, c, x, pos, w, sz);
+        if (b->type == TUI_BOX_HBOX) resolve_box(t, c, pos, y, sz, h);
+        else resolve_box(t, c, x, pos, w, sz);
         pos += sz;
         remaining -= sz;
     }
 }
 
 static void resolve_layout(tui_t *t) {
-    int ah = t->rows - 1, aw = t->cols;  /* -1 for status bar */
-    if (t->layout_root)
-        resolve_box(t, t->layout_root, 0, 0, aw, ah);
+    int ah = t->rows - 1;
+    int aw = t->cols;
+    if (t->layout_root) resolve_box(t, t->layout_root, 0, 0, aw, ah);
 }
 
 static void resolve_col_widths(const tui_panel_def *d, int tw, int *out) {
     int fx = 0, fl = 0;
     for (int i = 0; i < d->ncols; i++) {
-        if (d->cols[i].width > 0) fx += d->cols[i].width; else fl += -(d->cols[i].width);
+        if (d->cols[i].width > 0) fx += d->cols[i].width;
+        else fl += -d->cols[i].width;
     }
-    int rem = tw - fx; if (rem < 0) rem = 0;
+    int rem = tw - fx;
+    if (rem < 0) rem = 0;
     int sum = 0;
     for (int i = 0; i < d->ncols; i++) {
-        out[i] = d->cols[i].width > 0 ? d->cols[i].width : (fl > 0 ? rem * (-(d->cols[i].width)) / fl : 0);
+        out[i] = d->cols[i].width > 0 ? d->cols[i].width : (fl > 0 ? rem * (-d->cols[i].width) / fl : 0);
         sum += out[i];
     }
-    if (sum < tw) for (int i = d->ncols - 1; i >= 0; i--) if (d->cols[i].width < 0) { out[i] += tw - sum; break; }
+    if (sum < tw) {
+        for (int i = d->ncols - 1; i >= 0; i--) {
+            if (d->cols[i].width < 0) { out[i] += tw - sum; break; }
+        }
+    }
 }
 
-/* ── Read key ──────────────────────────────────────────────────────── */
 static int read_key(tui_t *t) {
     if (t->tty_fd < 0) return TUI_K_NONE;
     char c;
@@ -407,66 +374,61 @@ static int read_key(tui_t *t) {
             if (s[1] >= '0' && s[1] <= '9') {
                 if (read(t->tty_fd, &s[2], 1) != 1) return TUI_K_ESC;
                 if (s[2] == '~') switch (s[1]) {
-                    case '1': case '7': return TUI_K_HOME; case '4': case '8': return TUI_K_END;
-                    case '5': return TUI_K_PGUP; case '6': return TUI_K_PGDN;
+                    case '1': case '7': return TUI_K_HOME;
+                    case '4': case '8': return TUI_K_END;
+                    case '5': return TUI_K_PGUP;
+                    case '6': return TUI_K_PGDN;
                 }
             } else switch (s[1]) {
-                case 'A': return TUI_K_UP;  case 'B': return TUI_K_DOWN;
-                case 'C': return TUI_K_RIGHT; case 'D': return TUI_K_LEFT;
-                case 'H': return TUI_K_HOME; case 'F': return TUI_K_END;
+                case 'A': return TUI_K_UP;
+                case 'B': return TUI_K_DOWN;
+                case 'C': return TUI_K_RIGHT;
+                case 'D': return TUI_K_LEFT;
+                case 'H': return TUI_K_HOME;
+                case 'F': return TUI_K_END;
             }
         } else if (s[0] == 'O') switch (s[1]) {
-            case 'H': return TUI_K_HOME; case 'F': return TUI_K_END;
+            case 'H': return TUI_K_HOME;
+            case 'F': return TUI_K_END;
         }
         return TUI_K_ESC;
     }
     return (unsigned char)c;
 }
 
-/* ── Render one panel ──────────────────────────────────────────────── */
 static void render_panel(tui_t *t, panel_st *p) {
     const tui_panel_def *d = &p->def;
     int focused = (t->focus >= 0 && &t->panels[t->focus] == p);
     int cy = p->y, ch = p->h;
-
     if (d->title) {
         sf(t, "\x1b[%d;%dH", cy + 1, p->x + 1);
         sp(t, focused ? "\x1b[1;45;37m" : "\x1b[7m");
-        char hdr[512]; snprintf(hdr, sizeof hdr, " %s ", d->title);
+        char hdr[512];
+        snprintf(hdr, sizeof hdr, " %s ", d->title);
         sput_field(t, hdr, p->w, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE);
         sp(t, "\x1b[0m");
-        cy++; ch--;
+        cy++;
+        ch--;
     }
     if (ch <= 0) return;
-
     int cw[32], pw = p->w;
     if (d->flags & TUI_PANEL_BORDER) pw--;
     resolve_col_widths(d, pw, cw);
-
-    /* Ensure the cache covers the visible viewport [scroll, scroll+ch).
-     * If the viewport extends beyond the current cache window, load on demand. */
     if (p->cache_rows && p->cache_pool && p->row_count > 0) {
         p_ensure_cached(t, p, p->scroll);
-        /* Also ensure the last visible row is covered (load again if needed) */
         int last_vis = p->scroll + ch - 1;
         if (last_vis >= p->row_count) last_vis = p->row_count - 1;
-        if (last_vis >= p->cache_start + p->cache_count)
-            p_ensure_cached(t, p, last_vis);
+        if (last_vis >= p->cache_start + p->cache_count) p_ensure_cached(t, p, last_vis);
     }
-
     int row = 0;
     int nc = d->ncols < PANEL_NCOLS_MAX ? d->ncols : PANEL_NCOLS_MAX;
     for (int rn = p->scroll; row < ch; rn++, row++) {
         int sr = cy + row + 1, sc = p->x + 1;
         if (d->flags & TUI_PANEL_BORDER) sc++;
         sf(t, "\x1b[%d;%dH", sr, sc);
-
         int ci = rn - p->cache_start;
-        int has_row = (p->cache_rows && p->cache_pool &&
-                       p->cache_count > 0 &&
-                       ci >= 0 && ci < p->cache_count);
+        int has_row = (p->cache_rows && p->cache_pool && p->cache_count > 0 && ci >= 0 && ci < p->cache_count);
         if (!has_row) {
-            /* Past end of data — blank line */
             sp(t, "\x1b[0m");
             for (int c = 0; c < pw; c++) sp(t, " ");
             continue;
@@ -485,9 +447,10 @@ static void render_panel(tui_t *t, panel_st *p) {
         }
         sp(t, "\x1b[0m");
     }
-    if (d->flags & TUI_PANEL_BORDER)
+    if (d->flags & TUI_PANEL_BORDER) {
         for (int r = 0; r < p->h; r++)
             sf(t, "\x1b[%d;%dH\x1b[0m\xe2\x94\x82", p->y + r + 1, p->x + 1);
+    }
 }
 
 static void render_status(tui_t *t) {
@@ -498,14 +461,14 @@ static void render_status(tui_t *t) {
 
 static void render_all(tui_t *t) {
     resolve_layout(t);
-    t->scr_len = 0; sp(t, "\x1b[H");
+    t->scr_len = 0;
+    sp(t, "\x1b[H");
     for (int i = 0; i < t->npanels; i++) {
         panel_st *p = &t->panels[i];
         if (p->dirty) {
             p_update_count(t, p);
             p_resolve_id(t, p);
             p_clamp(p);
-            /* Invalidate cache so render_panel re-fetches from DB */
             p->cache_count = 0;
             p_sync_id(t, p);
             p->dirty = 0;
@@ -516,7 +479,6 @@ static void render_all(tui_t *t) {
     sflush(t);
 }
 
-/* ── Default navigation ────────────────────────────────────────────── */
 static int is_engine_nav_key(int k) {
     switch (k) {
     case TUI_K_UP: case TUI_K_DOWN:
@@ -533,8 +495,7 @@ static int is_engine_nav_key(int k) {
 static void default_nav(tui_t *t, int k) {
     if (k == TUI_K_TAB) {
         if (t->npanels <= 0) return;
-        int start = t->focus;
-        if (start < 0) start = 0;
+        int start = t->focus < 0 ? 0 : t->focus;
         for (int off = 1; off <= t->npanels; off++) {
             int idx = (start + off) % t->npanels;
             if (t->panels[idx].def.flags & TUI_PANEL_CURSOR) {
@@ -553,71 +514,63 @@ static void default_nav(tui_t *t, int k) {
     int vh = p->h - (p->def.title ? 1 : 0);
     int pg = vh > 2 ? vh - 1 : 1;
     switch (k) {
-    case TUI_K_UP:   case 'k': p->cursor--; break;
+    case TUI_K_UP: case 'k': p->cursor--; break;
     case TUI_K_DOWN: case 'j': p->cursor++; break;
-    case TUI_K_PGUP:           p->cursor -= pg; break;
-    case TUI_K_PGDN:           p->cursor += pg; break;
+    case TUI_K_PGUP: p->cursor -= pg; break;
+    case TUI_K_PGDN: p->cursor += pg; break;
     case TUI_K_HOME: case 'g': p->cursor = 0; break;
-    case TUI_K_END:            p->cursor = p->row_count > 0 ? p->row_count - 1 : 0; break;
+    case TUI_K_END: p->cursor = p->row_count > 0 ? p->row_count - 1 : 0; break;
     default: return;
     }
     p_clamp(p);
     p_sync_id(t, p);
 }
 
-/* ═══════════════════════════════════════════════════════════════════ */
-/*  PUBLIC API                                                        */
-/* ═══════════════════════════════════════════════════════════════════ */
-
-tui_t *tui_open(sqlite3 *db) {
+tui_t *tui_open(const tui_data_source *source, void *source_ctx) {
     tui_t *t = calloc(1, sizeof *t);
     if (!t) return NULL;
-    t->db = db; t->tty_fd = -1; t->focus = -1;
-    t->next_timer_id = 1; t->rows = 24; t->cols = 80;
-
+    if (source) t->source = *source;
+    t->source_ctx = source_ctx;
+    t->tty_fd = -1;
+    t->focus = -1;
+    t->next_timer_id = 1;
+    t->rows = 24;
+    t->cols = 80;
     t->tty_fd = open("/dev/tty", O_RDWR);
     if (t->tty_fd < 0) { free(t); return NULL; }
     tcgetattr(t->tty_fd, &t->orig_tios);
     g_atexit_tui = t;
     atexit(atexit_restore);
-
     struct termios r = t->orig_tios;
     r.c_iflag &= ~(unsigned)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     r.c_oflag &= ~(unsigned)(OPOST);
     r.c_cflag |= CS8;
     r.c_lflag &= ~(unsigned)(ECHO | ICANON | IEXTEN | ISIG);
-    r.c_cc[VMIN] = 0; r.c_cc[VTIME] = 1;
+    r.c_cc[VMIN] = 0;
+    r.c_cc[VTIME] = 1;
     tcsetattr(t->tty_fd, TCSAFLUSH, &r);
     t->tty_raw = 1;
-
-    int wr = write(t->tty_fd, "\x1b[?1049h\x1b[?25l", 14); (void)wr;
+    int wr = (int)write(t->tty_fd, "\x1b[?1049h\x1b[?25l", 14);
+    (void)wr;
     tty_size(t);
-    sync_state_size(t);
-
+    notify_size_changed(t);
     struct sigaction sa = {{0}};
     sa.sa_handler = sigwinch;
     sigaction(SIGWINCH, &sa, 0);
     return t;
 }
 
-tui_t *tui_open_headless(sqlite3 *db) {
+tui_t *tui_open_headless(const tui_data_source *source, void *source_ctx, int rows, int cols) {
     tui_t *t = calloc(1, sizeof *t);
     if (!t) return NULL;
-    t->db = db; t->tty_fd = -1; t->focus = -1;
+    if (source) t->source = *source;
+    t->source_ctx = source_ctx;
+    t->tty_fd = -1;
+    t->focus = -1;
     t->next_timer_id = 1;
-    /* Read rows/cols from state table if present */
-    {   sqlite3_stmt *st;
-        if (sqlite3_prepare_v2(db, "SELECT rows,cols FROM state", -1, &st, 0) == SQLITE_OK) {
-            if (sqlite3_step(st) == SQLITE_ROW) {
-                int r = sqlite3_column_int(st, 0);
-                int c = sqlite3_column_int(st, 1);
-                t->rows = r > 0 ? r : 24;
-                t->cols = c > 0 ? c : 80;
-            }
-            sqlite3_finalize(st);
-        } else { t->rows = 24; t->cols = 80; }
-    }
-    sync_state_size(t);
+    t->rows = rows > 0 ? rows : 24;
+    t->cols = cols > 0 ? cols : 80;
+    notify_size_changed(t);
     return t;
 }
 
@@ -629,15 +582,16 @@ void tui_close(tui_t *t) {
     }
     tty_restore(t);
     if (t == g_atexit_tui) g_atexit_tui = NULL;
-    free(t->scr); free(t);
+    free(t->scr);
+    free(t);
 }
 
 void tui_set_layout(tui_t *tui, tui_box_t *root) {
     if (!tui) return;
     tui->layout_root = root;
-    /* Walk tree, register panels not yet registered */
     struct { tui_box_t *b; } stack[128];
-    int top = 0; stack[top++].b = root;
+    int top = 0;
+    stack[top++].b = root;
     while (top > 0) {
         tui_box_t *b = stack[--top].b;
         if (!b) continue;
@@ -647,178 +601,22 @@ void tui_set_layout(tui_t *tui, tui_box_t *root) {
                 memset(p, 0, sizeof *p);
                 p->def = *b->def;
                 p->dirty = 1;
-                /* Allocate row cache */
                 p->cache_rows = malloc(PANEL_CACHE_ROWS * sizeof(pcache_row_t));
                 p->cache_pool = malloc(PANEL_CACHE_POOL);
                 if (!p->cache_rows || !p->cache_pool) {
                     free(p->cache_rows); p->cache_rows = NULL;
                     free(p->cache_pool); p->cache_pool = NULL;
                 }
-                if (tui->focus < 0 && (b->def->flags & TUI_PANEL_CURSOR))
-                    tui->focus = tui->npanels;
+                if (tui->focus < 0 && (b->def->flags & TUI_PANEL_CURSOR)) tui->focus = tui->npanels;
                 tui->npanels++;
             }
         } else {
-            for (int i = 0; i < b->nchildren && top < 128; i++)
-                stack[top++].b = b->children[i];
+            for (int i = 0; i < b->nchildren && top < 128; i++) stack[top++].b = b->children[i];
         }
     }
-}
-
-/* ── Load layout from _layout table ────────────────────────────────── */
-/*
- * Table schema:
- *   CREATE TABLE _layout(
- *       id INTEGER PRIMARY KEY,          -- node id
- *       parent_id INT,                   -- parent node id (NULL=root)
- *       type TEXT NOT NULL,              -- 'hbox','vbox','panel'
- *       name TEXT,                       -- panel name (= SQL view name) for type='panel'
- *       weight INT DEFAULT 1,           -- flex weight
- *       min_size INT DEFAULT 0,         -- minimum size
- *       flags INT DEFAULT 0,            -- TUI_PANEL_* flags for panels
- *       col_name TEXT,                  -- column name (for panel)
- *       col_width INT DEFAULT -1,       -- column width
- *       col_align INT DEFAULT 0,        -- column alignment
- *       col_overflow INT DEFAULT 1      -- column overflow
- *   );
- */
-
-/* Static storage for layout loaded from DB */
-#define MAX_LAYOUT_NODES 64
-#define MAX_LAYOUT_PDEFS 16
-#define MAX_LAYOUT_CDEFS 32
-static tui_box_t      ll_boxes[MAX_LAYOUT_NODES];
-static tui_box_t     *ll_child_ptrs[MAX_LAYOUT_NODES * 4]; /* child pointer arrays */
-static tui_panel_def  ll_pdefs[MAX_LAYOUT_PDEFS];
-static tui_col_def    ll_cdefs[MAX_LAYOUT_CDEFS];
-static char           ll_strings[MAX_LAYOUT_PDEFS * 64]; /* name storage */
-static int            ll_nbox, ll_nchild, ll_npdef, ll_ncdef, ll_nstr;
-
-static char *ll_strdup(const char *s) {
-    if (!s) return NULL;
-    int len = (int)strlen(s) + 1;
-    if (ll_nstr + len > (int)sizeof(ll_strings)) return NULL;
-    char *p = ll_strings + ll_nstr;
-    memcpy(p, s, len);
-    ll_nstr += len;
-    return p;
-}
-
-void tui_load_layout(tui_t *tui) {
-    if (!tui) return;
-    sqlite3 *db = tui->db;
-
-    /* Reset static pools */
-    ll_nbox = ll_nchild = ll_npdef = ll_ncdef = ll_nstr = 0;
-
-    /* Check if _layout table exists */
-    { sqlite3_stmt *st;
-      if (sqlite3_prepare_v2(db,
-          "SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='_layout'",
-          -1, &st, 0) != SQLITE_OK) return;
-      int found = (sqlite3_step(st) == SQLITE_ROW);
-      sqlite3_finalize(st);
-      if (!found) return;
-    }
-
-    /* Read all rows ordered by id */
-    sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(db,
-        "SELECT id, parent_id, type, name, weight, min_size, flags,"
-        " col_name, col_width, col_align, col_overflow"
-        " FROM _layout ORDER BY id", -1, &st, 0) != SQLITE_OK) return;
-
-    /* Temporary storage: id→box index mapping */
-    struct { int id; int box_idx; } id_map[MAX_LAYOUT_NODES];
-    int id_parent[MAX_LAYOUT_NODES]; /* parent_id for each node */
-    int nmap = 0;
-
-    while (sqlite3_step(st) == SQLITE_ROW && nmap < MAX_LAYOUT_NODES && ll_nbox < MAX_LAYOUT_NODES) {
-        int id = sqlite3_column_int(st, 0);
-        int parent_id = sqlite3_column_type(st, 1) == SQLITE_NULL ? -1 : sqlite3_column_int(st, 1);
-        const char *type = (const char *)sqlite3_column_text(st, 2);
-        const char *name = (const char *)sqlite3_column_text(st, 3);
-        int weight = sqlite3_column_int(st, 4);
-        int min_size = sqlite3_column_int(st, 5);
-        int flags = sqlite3_column_int(st, 6);
-        const char *col_name = (const char *)sqlite3_column_text(st, 7);
-        int col_width = sqlite3_column_int(st, 8);
-        int col_align = sqlite3_column_int(st, 9);
-        int col_overflow = sqlite3_column_int(st, 10);
-
-        tui_box_t *b = &ll_boxes[ll_nbox];
-        memset(b, 0, sizeof *b);
-        b->weight = weight > 0 ? weight : 1;
-        b->min_size = min_size;
-
-        if (type && strcmp(type, "panel") == 0 && name && ll_npdef < MAX_LAYOUT_PDEFS) {
-            b->type = TUI_BOX_PANEL;
-            tui_panel_def *pd = &ll_pdefs[ll_npdef];
-            memset(pd, 0, sizeof *pd);
-            pd->name = ll_strdup(name);
-            pd->title = NULL;
-            pd->flags = flags;
-            /* Add column definition */
-            if (col_name && ll_ncdef < MAX_LAYOUT_CDEFS) {
-                tui_col_def *cd = &ll_cdefs[ll_ncdef];
-                cd->name = ll_strdup(col_name);
-                cd->width = col_width;
-                cd->align = col_align;
-                cd->overflow = col_overflow;
-                pd->cols = cd;
-                pd->ncols = 1;
-                ll_ncdef++;
-            }
-            b->def = pd;
-            ll_npdef++;
-        } else if (type && strcmp(type, "hbox") == 0) {
-            b->type = TUI_BOX_HBOX;
-        } else if (type && strcmp(type, "vbox") == 0) {
-            b->type = TUI_BOX_VBOX;
-        } else {
-            continue; /* skip unknown types */
-        }
-
-        id_map[nmap].id = id;
-        id_map[nmap].box_idx = ll_nbox;
-        id_parent[nmap] = parent_id;
-        nmap++;
-        ll_nbox++;
-    }
-    sqlite3_finalize(st);
-
-    if (nmap == 0) return;
-
-    /* Resolve parent→children relationships */
-    for (int i = 0; i < nmap; i++) {
-        tui_box_t *b = &ll_boxes[id_map[i].box_idx];
-        if (b->type == TUI_BOX_PANEL) continue;
-        /* Count children */
-        int nc = 0;
-        for (int j = 0; j < nmap; j++)
-            if (id_parent[j] == id_map[i].id) nc++;
-        if (nc == 0) continue;
-        if (ll_nchild + nc > MAX_LAYOUT_NODES * 4) continue;
-        b->children = &ll_child_ptrs[ll_nchild];
-        b->nchildren = nc;
-        int ci = 0;
-        for (int j = 0; j < nmap; j++)
-            if (id_parent[j] == id_map[i].id)
-                ll_child_ptrs[ll_nchild + ci++] = &ll_boxes[id_map[j].box_idx];
-        ll_nchild += nc;
-    }
-
-    /* Find root (parent_id == -1) */
-    tui_box_t *root = NULL;
-    for (int i = 0; i < nmap; i++)
-        if (id_parent[i] < 0) { root = &ll_boxes[id_map[i].box_idx]; break; }
-
-    if (root) tui_set_layout(tui, root);
 }
 
 tui_box_t *tui_panel_box(const tui_panel_def *def, int weight, int min_size) {
-    /* boxes are allocated from a static pool inside tui_t; but tui_panel_box
-     * is called before tui_set_layout, so we use a simple static allocator */
     static tui_box_t pool[256];
     static int pool_n = 0;
     if (pool_n >= 256) return NULL;
@@ -896,6 +694,11 @@ int tui_get_cursor(tui_t *tui, const char *panel) {
     return p ? p->cursor : -1;
 }
 
+int tui_get_scroll(tui_t *tui, const char *panel) {
+    panel_st *p = tui ? pfind(tui, panel) : NULL;
+    return p ? p->scroll : 0;
+}
+
 const char *tui_get_cursor_id(tui_t *tui, const char *panel) {
     panel_st *p = tui ? pfind(tui, panel) : NULL;
     return (p && p->cursor_id[0]) ? p->cursor_id : "";
@@ -909,7 +712,9 @@ int tui_row_count(tui_t *tui, const char *panel) {
 }
 
 void tui_on_key(tui_t *tui, tui_key_cb cb, void *ctx) {
-    if (!tui) return; tui->key_cb = cb; tui->key_ctx = ctx;
+    if (!tui) return;
+    tui->key_cb = cb;
+    tui->key_ctx = ctx;
 }
 
 void tui_watch_fd(tui_t *tui, int fd, tui_fd_cb cb, void *ctx) {
@@ -930,11 +735,14 @@ int tui_add_timer(tui_t *tui, int ms, tui_timer_cb cb, void *ctx) {
         if (!tui->timers[i].active) {
             int id = tui->next_timer_id++;
             struct timeval now; gettimeofday(&now, NULL);
-            tui->timers[i].id = id; tui->timers[i].ms = ms;
+            tui->timers[i].id = id;
+            tui->timers[i].ms = ms;
             tui->timers[i].fire.tv_sec = now.tv_sec + ms / 1000;
             tui->timers[i].fire.tv_usec = now.tv_usec + (ms % 1000) * 1000;
             if (tui->timers[i].fire.tv_usec >= 1000000) { tui->timers[i].fire.tv_sec++; tui->timers[i].fire.tv_usec -= 1000000; }
-            tui->timers[i].cb = cb; tui->timers[i].ctx = ctx; tui->timers[i].active = 1;
+            tui->timers[i].cb = cb;
+            tui->timers[i].ctx = ctx;
+            tui->timers[i].active = 1;
             return id;
         }
     }
@@ -954,16 +762,15 @@ void tui_run(tui_t *tui) {
     tui->quit_flag = 0;
     while (!tui->quit_flag) {
         if (g_resized) {
-            g_resized = 0; tty_size(tui);
+            g_resized = 0;
+            tty_size(tui);
             for (int i = 0; i < tui->npanels; i++) tui->panels[i].dirty = 1;
         }
         render_all(tui);
-
         fd_set rfds; FD_ZERO(&rfds); int mfd = -1;
         if (tui->tty_fd >= 0) { FD_SET(tui->tty_fd, &rfds); mfd = tui->tty_fd; }
         for (int i = 0; i < MAX_WATCHES; i++)
             if (tui->watches[i].active) { FD_SET(tui->watches[i].fd, &rfds); if (tui->watches[i].fd > mfd) mfd = tui->watches[i].fd; }
-
         struct timeval tv, *tvp = NULL;
         { struct timeval now; gettimeofday(&now, NULL); long min_ms = -1;
           for (int i = 0; i < MAX_TIMERS; i++) {
@@ -972,13 +779,9 @@ void tui_run(tui_t *tui) {
             if (ms < 0) ms = 0;
             if (min_ms < 0 || ms < min_ms) min_ms = ms;
           }
-          if (min_ms >= 0) { tv.tv_sec = min_ms / 1000; tv.tv_usec = (min_ms % 1000) * 1000; tvp = &tv; }
-        }
-
+          if (min_ms >= 0) { tv.tv_sec = min_ms / 1000; tv.tv_usec = (min_ms % 1000) * 1000; tvp = &tv; } }
         int sel = select(mfd + 1, &rfds, NULL, NULL, tvp);
         if (sel < 0 && errno == EINTR) continue;
-
-        /* Timers */
         { struct timeval now; gettimeofday(&now, NULL);
           for (int i = 0; i < MAX_TIMERS; i++) {
             if (!tui->timers[i].active) continue;
@@ -991,18 +794,13 @@ void tui_run(tui_t *tui) {
                     if (tui->timers[i].fire.tv_usec >= 1000000) { tui->timers[i].fire.tv_sec++; tui->timers[i].fire.tv_usec -= 1000000; }
                 } else tui->timers[i].active = 0;
             }
-          }
-        }
+          } }
         if (tui->quit_flag) break;
-
-        /* FD callbacks */
         if (sel > 0)
             for (int i = 0; i < MAX_WATCHES; i++)
                 if (tui->watches[i].active && FD_ISSET(tui->watches[i].fd, &rfds))
                     tui->watches[i].cb(tui, tui->watches[i].fd, tui->watches[i].ctx);
         if (tui->quit_flag) break;
-
-        /* Keyboard */
         if (sel > 0 && tui->tty_fd >= 0 && FD_ISSET(tui->tty_fd, &rfds)) {
             int k = read_key(tui);
             if (k != TUI_K_NONE) {
@@ -1029,7 +827,6 @@ void tui_run(tui_t *tui) {
                 if (res == TUI_QUIT) break;
                 if (res == TUI_DEFAULT) {
                     default_nav(tui, k);
-                    /* Notify app of updated cursor position (TUI_K_NONE = post-nav). */
                     if (tui->key_cb) {
                         const char *fp2 = "", *fid2 = ""; int fc2 = 0;
                         if (tui->focus >= 0 && tui->focus < tui->npanels) {
@@ -1053,10 +850,9 @@ void tui_set_status(tui_t *tui, const char *text) {
 int tui_rows(tui_t *tui) { return tui ? tui->rows : 24; }
 int tui_cols(tui_t *tui) { return tui ? tui->cols : 80; }
 
-/* ── Line editor ───────────────────────────────────────────────────── */
 int tui_line_edit(tui_t *tui, const char *prompt, char *buf, int bsz) {
     if (!tui || tui->tty_fd < 0) return 0;
-    int len = strlen(buf), pos = len;
+    int len = (int)strlen(buf), pos = len;
     for (;;) {
         tui->scr_len = 0;
         sf(tui, "\x1b[%d;1H\x1b[7m%s%s", tui->rows, prompt, buf);
@@ -1067,62 +863,25 @@ int tui_line_edit(tui_t *tui, const char *prompt, char *buf, int bsz) {
         if (k == TUI_K_NONE) continue;
         if (k == TUI_K_ENTER || k == '\n') { sp(tui, "\x1b[?25l"); sflush(tui); return 1; }
         if (k == TUI_K_ESC) { sp(tui, "\x1b[?25l"); sflush(tui); return 0; }
-        if ((k == TUI_K_BS || k == 8) && pos > 0) { memmove(buf+pos-1, buf+pos, len-pos+1); pos--; len--; }
-        else if (k >= 32 && k < 127 && len < bsz - 1) { memmove(buf+pos+1, buf+pos, len-pos+1); buf[pos++] = k; len++; }
+        if ((k == TUI_K_BS || k == 8) && pos > 0) { memmove(buf + pos - 1, buf + pos, len - pos + 1); pos--; len--; }
+        else if (k >= 32 && k < 127 && len < bsz - 1) { memmove(buf + pos + 1, buf + pos, len - pos + 1); buf[pos++] = (char)k; len++; }
     }
 }
 
-/* ── Help screen ───────────────────────────────────────────────────── */
 void tui_show_help(tui_t *tui, const char **lines) {
     if (!tui || tui->tty_fd < 0) return;
-    tui->scr_len = 0; sp(tui, "\x1b[H\x1b[2J");
-    for (int i = 0; lines[i]; i++) sf(tui, "\x1b[%d;1H\x1b[36m%s\x1b[0m", i+1, lines[i]);
+    tui->scr_len = 0;
+    sp(tui, "\x1b[H\x1b[2J");
+    for (int i = 0; lines[i]; i++) sf(tui, "\x1b[%d;1H\x1b[36m%s\x1b[0m", i + 1, lines[i]);
     sflush(tui);
     while (read_key(tui) == TUI_K_NONE) ;
 }
 
-/* ── SQL prompt ────────────────────────────────────────────────────── */
-void tui_sql_prompt(tui_t *tui) {
-    if (!tui || tui->tty_fd < 0) return;
-    sqlite3 *db = tui->db;
-    char sql[1024] = "";
-    if (!tui_line_edit(tui, "SQL> ", sql, sizeof sql) || !sql[0]) return;
-    tui->scr_len = 0; sp(tui, "\x1b[H\x1b[2J");
-    sf(tui, "\x1b[1;1H\x1b[33;1mSQL: %s\x1b[0m", sql);
-    sqlite3_stmt *st;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, 0) != SQLITE_OK) {
-        sf(tui, "\x1b[3;1H\x1b[31m%s\x1b[0m", sqlite3_errmsg(db));
-        sflush(tui); while (read_key(tui) == TUI_K_NONE) ; return;
-    }
-    int nc = sqlite3_column_count(st), row = 3;
-    sf(tui, "\x1b[%d;1H\x1b[36;1m", row++);
-    for (int c = 0; c < nc && c < 10; c++) sf(tui, "%-20s", sqlite3_column_name(st, c));
-    sp(tui, "\x1b[0m");
-    sf(tui, "\x1b[%d;1H", row++);
-    for (int c = 0; c < nc && c < 10; c++) sp(tui, "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 ");
-    int nr = 0;
-    while (sqlite3_step(st) == SQLITE_ROW && row < tui->rows - 2) {
-        sf(tui, "\x1b[%d;1H", row++);
-        for (int c = 0; c < nc && c < 10; c++) {
-            const char *v = (const char *)sqlite3_column_text(st, c);
-            char tmp[21]; snprintf(tmp, sizeof tmp, "%.20s", v ? v : "NULL");
-            sf(tui, "%-20s", tmp);
-        }
-        nr++;
-    }
-    sqlite3_finalize(st);
-    sf(tui, "\x1b[%d;1H\x1b[2m%d rows.\x1b[0m", row + 1, nr);
-    sflush(tui); while (read_key(tui) == TUI_K_NONE) ;
-}
-
-/* ── Headless input dispatch ───────────────────────────────────────── */
 void tui_input_key(tui_t *tui, int key) {
     if (!tui) return;
-    /* Ensure panel counts are up-to-date */
     for (int i = 0; i < tui->npanels; i++) {
         panel_st *p = &tui->panels[i];
         p_update_count(tui, p);
-        /* Resolve cursor_id → position if dirty */
         if (p->dirty) { p_resolve_id(tui, p); p_clamp(p); p->dirty = 0; }
     }
     if (is_engine_nav_key(key)) {
@@ -1137,7 +896,6 @@ void tui_input_key(tui_t *tui, int key) {
         }
         return;
     }
-    /* Call key callback first, just like the event loop */
     int res = TUI_DEFAULT;
     const char *fp = "", *fid = ""; int fc = 0;
     if (tui->focus >= 0 && tui->focus < tui->npanels) {
@@ -1147,7 +905,6 @@ void tui_input_key(tui_t *tui, int key) {
     if (tui->key_cb) res = tui->key_cb(tui, key, fp, fc, fid, tui->key_ctx);
     if (res == TUI_DEFAULT) {
         default_nav(tui, key);
-        /* Post-nav notification */
         if (tui->key_cb) {
             const char *fp2 = "", *fid2 = ""; int fc2 = 0;
             if (tui->focus >= 0 && tui->focus < tui->npanels) {
@@ -1163,76 +920,6 @@ void tui_resize(tui_t *tui, int rows, int cols) {
     if (!tui) return;
     if (rows > 0) tui->rows = rows;
     if (cols > 0) tui->cols = cols;
-    sync_state_size(tui);
+    notify_size_changed(tui);
     for (int i = 0; i < tui->npanels; i++) tui->panels[i].dirty = 1;
-}
-
-/* ── Dump panel or state for test mode ─────────────────────────────── */
-void tui_dump(tui_t *tui, const char *what, FILE *out) {
-    if (!tui || !what || !out) return;
-    sqlite3 *db = tui->db;
-
-    if (strcmp(what, "lpane") == 0) {
-        /* Ensure fresh counts */
-        panel_st *p = pfind(tui, "lpane");
-        if (p) { p_update_count(tui, p); p_clamp(p); }
-        fprintf(out, "=== LPANE ===\n");
-        sqlite3_stmt *st;
-        sqlite3_prepare_v2(db,
-            "SELECT rownum,style,id,COALESCE(parent_id,''),text FROM lpane ORDER BY rownum",
-            -1, &st, 0);
-        while (sqlite3_step(st) == SQLITE_ROW)
-            fprintf(out, "%d|%s|%s|%s|%s\n",
-                sqlite3_column_int(st, 0),
-                (const char *)sqlite3_column_text(st, 1),
-                (const char *)sqlite3_column_text(st, 2),
-                (const char *)sqlite3_column_text(st, 3),
-                (const char *)sqlite3_column_text(st, 4));
-        sqlite3_finalize(st);
-        fprintf(out, "=== END LPANE ===\n");
-    } else if (strcmp(what, "rpane") == 0) {
-        panel_st *p = pfind(tui, "rpane");
-        if (p) { p_update_count(tui, p); p_clamp(p); }
-        fprintf(out, "=== RPANE ===\n");
-        sqlite3_stmt *st;
-        int rc = sqlite3_prepare_v2(db,
-            "SELECT rownum,style,text,link_mode,COALESCE(link_id,'') FROM rpane ORDER BY rownum",
-            -1, &st, 0);
-        if (rc != SQLITE_OK) {
-            fprintf(stderr, "dump_rpane prepare error: %s\n", sqlite3_errmsg(db));
-            fprintf(out, "=== END RPANE ===\n");
-            return;
-        }
-        while ((rc = sqlite3_step(st)) == SQLITE_ROW)
-            fprintf(out, "%d|%s|%s|%d|%s\n",
-                sqlite3_column_int(st, 0),
-                (const char *)sqlite3_column_text(st, 1),
-                (const char *)sqlite3_column_text(st, 2),
-                sqlite3_column_int(st, 3),
-                (const char *)sqlite3_column_text(st, 4));
-        if (rc != SQLITE_DONE)
-            fprintf(stderr, "dump_rpane step error: %s\n", sqlite3_errmsg(db));
-        sqlite3_finalize(st);
-        fprintf(out, "=== END RPANE ===\n");
-    } else if (strcmp(what, "state") == 0) {
-        fprintf(out, "=== STATE ===\n");
-        sqlite3_stmt *st;
-        sqlite3_prepare_v2(db,
-            "SELECT cursor,scroll,focus,dcursor,dscroll,ts_mode,sort_key,grouped,mode,lp_filter,"
-            "COALESCE(search,''),COALESCE(evfilt,''),rows,cols,dep_filter FROM state",
-            -1, &st, 0);
-        if (sqlite3_step(st) == SQLITE_ROW)
-            fprintf(out, "cursor=%d scroll=%d focus=%d dcursor=%d dscroll=%d ts_mode=%d sort_key=%d"
-                " grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d dep_filter=%d\n",
-                sqlite3_column_int(st, 0), sqlite3_column_int(st, 1), sqlite3_column_int(st, 2),
-                sqlite3_column_int(st, 3), sqlite3_column_int(st, 4), sqlite3_column_int(st, 5),
-                sqlite3_column_int(st, 6), sqlite3_column_int(st, 7), sqlite3_column_int(st, 8),
-                sqlite3_column_int(st, 9),
-                (const char *)sqlite3_column_text(st, 10),
-                (const char *)sqlite3_column_text(st, 11),
-                sqlite3_column_int(st, 12), sqlite3_column_int(st, 13),
-                sqlite3_column_int(st, 14));
-        sqlite3_finalize(st);
-        fprintf(out, "=== END STATE ===\n");
-    }
 }

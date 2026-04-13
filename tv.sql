@@ -318,37 +318,13 @@ CREATE TEMP VIEW _dep_root AS
     SELECT dep_root AS path FROM state
     WHERE dep_root!='';
 
-CREATE TEMP VIEW _dep_walk_rev AS
-    WITH RECURSIVE walk(path, depth, trail) AS (
-        -- char(31) keeps path membership checks unambiguous without colliding
-        -- with normal filesystem path characters.
-        SELECT path, 0, char(31) || path || char(31)
-        FROM _dep_root
-        UNION ALL
-        SELECT de.src, walk.depth+1, walk.trail || de.src || char(31)
-        FROM _dep_edges de
-        JOIN walk ON walk.path=de.dst
-        WHERE instr(walk.trail, char(31) || de.src || char(31))=0
-    )
-    SELECT path, MIN(depth) AS depth
-    FROM walk
-    GROUP BY path;
+CREATE TEMP TABLE IF NOT EXISTS _dep_walk_rev(
+    path TEXT PRIMARY KEY,
+    depth INT NOT NULL);
 
-CREATE TEMP VIEW _dep_walk_fwd AS
-    WITH RECURSIVE walk(path, depth, trail) AS (
-        -- char(31) keeps path membership checks unambiguous without colliding
-        -- with normal filesystem path characters.
-        SELECT path, 0, char(31) || path || char(31)
-        FROM _dep_root
-        UNION ALL
-        SELECT de.dst, walk.depth+1, walk.trail || de.dst || char(31)
-        FROM _dep_edges de
-        JOIN walk ON walk.path=de.src
-        WHERE instr(walk.trail, char(31) || de.dst || char(31))=0
-    )
-    SELECT path, MIN(depth) AS depth
-    FROM walk
-    GROUP BY path;
+CREATE TEMP TABLE IF NOT EXISTS _dep_walk_fwd(
+    path TEXT PRIMARY KEY,
+    depth INT NOT NULL);
 
 -- ── lpane VIEW for mode=0: process tree (grouped) ────────────────────
 CREATE TEMP VIEW _lp_procs_tree AS
