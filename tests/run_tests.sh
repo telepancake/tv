@@ -64,6 +64,15 @@ assert_occurrences() {
     else echo "    FAIL assert_occurrences: expected $4 of $3, got $n"; return 1; fi
 }
 
+assert_ok_or_timeout() {
+    if [ "$2" -eq 0 ]; then return 0
+    elif [ "$2" -eq 124 ]; then
+        echo "    FAIL assert_ok_or_timeout: command timed out"; return 1
+    else
+        echo "    FAIL assert_ok_or_timeout: exit code $2"; return 1
+    fi
+}
+
 run_test() {
     TOTAL=$((TOTAL+1))
     local name="$1"; shift
@@ -432,7 +441,7 @@ OUT=$(drive_trace "$TMPDIR/dep_cycle.jsonl" '{"input":"resize","rows":30,"cols":
 {"input":"print","what":"state"}
 {"input":"print","what":"lpane"}')
 run_test "dep_view: cycle terminates and de-dupes" \
-    'test "$DRIVE_RC" -eq 0' \
+    'assert_ok_or_timeout t "$DRIVE_RC"' \
     'assert_line_match t "$OUT" "mode=3"' \
     'assert_occurrences t "$OUT" "|/tmp/a|" 1' \
     'assert_occurrences t "$OUT" "|/tmp/b|" 1'
@@ -444,7 +453,7 @@ OUT=$(drive_trace "$TMPDIR/dep_cycle.jsonl" '{"input":"resize","rows":30,"cols":
 {"input":"print","what":"state"}
 {"input":"print","what":"lpane"}')
 run_test "rdep_view: cycle terminates and de-dupes" \
-    'test "$DRIVE_RC" -eq 0' \
+    'assert_ok_or_timeout t "$DRIVE_RC"' \
     'assert_line_match t "$OUT" "mode=4"' \
     'assert_occurrences t "$OUT" "|/tmp/a|" 1' \
     'assert_occurrences t "$OUT" "|/tmp/b|" 1'
