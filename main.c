@@ -70,7 +70,10 @@ static int qint(const char *sql, int def) {
 
 static long long monotonic_millis(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        fprintf(stderr, "tv: clock_gettime(CLOCK_MONOTONIC): %s\n", strerror(errno));
+        return -1;
+    }
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
@@ -839,11 +842,12 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
         }
         if (did) {
             long long now = monotonic_millis();
+            int timing_failed = now < 0;
             if (t_pending_live_trace_rows == 0 && now >= 0)
                 t_live_trace_batch_start_ms = now;
             t_pending_live_trace_rows += did;
             if (t_pending_live_trace_rows >= LIVE_TRACE_BATCH_ROWS
-                || now < 0
+                || timing_failed
                 || (t_live_trace_batch_start_ms > 0
                     && (now - t_live_trace_batch_start_ms) >= LIVE_TRACE_BATCH_MS)) {
                 process_trace_batch();
