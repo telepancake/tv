@@ -2146,6 +2146,11 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
+            if (ret == 0) {
+                /* Child created while handling SIGSYS inherits the handler's
+                 * temporary blocked mask; restore delivery for child execs. */
+                unblock_sigsys_raw();
+            }
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
@@ -2160,6 +2165,11 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
+            if (ret == 0) {
+                /* Child created while handling SIGSYS inherits the handler's
+                 * temporary blocked mask; restore delivery for child execs. */
+                unblock_sigsys_raw();
+            }
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
