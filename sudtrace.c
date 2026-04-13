@@ -1900,6 +1900,7 @@ static void install_sigsys_handler_raw(void)
 {
 #ifdef SYS_rt_sigaction
     struct kernel_sigaction_raw sa;
+    memset(&sa, 0, sizeof(sa));
     sa.handler = (void (*)(int))sigsys_handler;
     sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER;
     sa.restorer = sud_rt_sigreturn_restorer;
