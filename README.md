@@ -51,6 +51,10 @@ for line in f:
 f.close()
 ```
 
+`tv --uproctrace -o trace.jsonl.zst -- ...` writes zstd-compressed traces when the
+output filename ends in `.zst`, and `tv --trace trace.jsonl.zst` reads them back
+directly.
+
 ---
 
 ## Output Format
