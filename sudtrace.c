@@ -406,6 +406,229 @@ _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RAX]) == 144
 _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RIP]) == 168, "RIP offset");
 
 /* ================================================================
+ * Raw syscall convenience wrappers.
+ *
+ * The SIGSYS handler MUST NOT call glibc syscall wrappers (open, read,
+ * write, etc.) because they access thread-local storage via %fs for
+ * errno, stack canaries, and internal state.  When the traced binary's
+ * runtime (glibc, Go, etc.) sets its own FS base via arch_prctl, the
+ * %fs register points to the traced binary's TLS, not sudtrace's.
+ * Any %fs access from sudtrace's glibc then reads/writes the wrong
+ * memory — causing silent corruption, wrong errno, or SIGSEGV.
+ *
+ * These thin wrappers use raw_syscall6() to bypass glibc entirely.
+ * They return raw kernel results (negative errno on error).
+ * ================================================================ */
+
+static inline int raw_open(const char *path, int flags)
+{
+    return (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path, flags, 0, 0, 0);
+}
+
+static inline int raw_open3(const char *path, int flags, int mode)
+{
+    return (int)raw_syscall6(SYS_openat, AT_FDCWD, (long)path, flags, mode, 0, 0);
+}
+
+static inline ssize_t raw_read(int fd, void *buf, size_t count)
+{
+    return (ssize_t)raw_syscall6(SYS_read, fd, (long)buf, count, 0, 0, 0);
+}
+
+static inline ssize_t raw_write(int fd, const void *buf, size_t count)
+{
+    return (ssize_t)raw_syscall6(SYS_write, fd, (long)buf, count, 0, 0, 0);
+}
+
+static inline int raw_close(int fd)
+{
+    return (int)raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);
+}
+
+static inline ssize_t raw_readlink(const char *path, char *buf, size_t bufsz)
+{
+    return (ssize_t)raw_syscall6(SYS_readlinkat, AT_FDCWD, (long)path,
+                                  (long)buf, bufsz, 0, 0);
+}
+
+static inline int raw_fstatat(int dirfd, const char *path, struct stat *st,
+                              int flags)
+{
+    return (int)raw_syscall6(SYS_newfstatat, dirfd, (long)path, (long)st,
+                              flags, 0, 0);
+}
+
+static inline ssize_t raw_pread(int fd, void *buf, size_t count, off_t offset)
+{
+    return (ssize_t)raw_syscall6(SYS_pread64, fd, (long)buf, count,
+                                  offset, 0, 0);
+}
+
+static inline pid_t raw_gettid(void)
+{
+    return (pid_t)raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+}
+
+static inline int raw_clock_gettime(clockid_t clk, struct timespec *ts)
+{
+    return (int)raw_syscall6(SYS_clock_gettime, clk, (long)ts, 0, 0, 0, 0);
+}
+
+static inline int raw_sched_yield(void)
+{
+    return (int)raw_syscall6(SYS_sched_yield, 0, 0, 0, 0, 0, 0);
+}
+
+static inline int raw_access(const char *path, int mode)
+{
+    return (int)raw_syscall6(SYS_faccessat, AT_FDCWD, (long)path, mode,
+                              0, 0, 0);
+}
+
+static inline long raw_getdents64(int fd, void *buf, size_t count)
+{
+    return raw_syscall6(SYS_getdents64, fd, (long)buf, count, 0, 0, 0);
+}
+
+/* ================================================================
+ * Signal-safe bump allocator for the execve path.
+ *
+ * malloc/calloc/realloc/free use TLS (thread-local arenas, tcache)
+ * and internal locks that may be held by the interrupted code.
+ * We use a simple bump allocator backed by a pre-allocated mmap page.
+ * The arena is reset after each execve attempt (either exec succeeded
+ * and the address space is replaced, or it failed and we reset).
+ * ================================================================ */
+
+#define ARENA_SIZE (256 * 1024)
+
+static char  g_arena_buf[ARENA_SIZE]
+    __attribute__((aligned(16)));
+static size_t g_arena_pos = 0;
+
+static void arena_reset(void)
+{
+    g_arena_pos = 0;
+}
+
+static void *arena_alloc(size_t size)
+{
+    size = (size + 15) & ~(size_t)15;  /* align to 16 bytes */
+    if (g_arena_pos + size > ARENA_SIZE) return NULL;
+    void *p = g_arena_buf + g_arena_pos;
+    g_arena_pos += size;
+    memset(p, 0, size);
+    return p;
+}
+
+static char *arena_strdup(const char *s)
+{
+    if (!s) return NULL;
+    size_t len = strlen(s) + 1;
+    char *p = arena_alloc(len);
+    if (p) memcpy(p, s, len);
+    return p;
+}
+
+static void arena_free(void *p)
+{
+    (void)p;  /* bump allocator: nothing to free */
+}
+
+/* ================================================================
+ * TLS-free integer-to-string formatting.
+ *
+ * snprintf uses glibc internals that access %fs (stack canary,
+ * locale data, errno).  These helpers format numbers directly
+ * into a caller-supplied buffer without any TLS access.
+ * ================================================================ */
+
+/* Format a signed int. Returns number of chars written (not including NUL). */
+static int fmt_int(char *buf, int buflen, int val)
+{
+    if (buflen < 2) return 0;
+    char tmp[24];
+    int neg = 0, pos = 0;
+    unsigned int uv;
+    if (val < 0) { neg = 1; uv = (unsigned int)(-(val + 1)) + 1u; }
+    else uv = (unsigned int)val;
+    do { tmp[pos++] = '0' + (uv % 10); uv /= 10; } while (uv);
+    if (neg) tmp[pos++] = '-';
+    int len = pos;
+    if (len >= buflen) len = buflen - 1;
+    for (int i = 0; i < len; i++) buf[i] = tmp[pos - 1 - i];
+    buf[len] = '\0';
+    return len;
+}
+
+/* Format a signed long. */
+static int fmt_long(char *buf, int buflen, long val)
+{
+    if (buflen < 2) return 0;
+    char tmp[24];
+    int neg = 0, pos = 0;
+    unsigned long uv;
+    if (val < 0) { neg = 1; uv = (unsigned long)(-(val + 1)) + 1UL; }
+    else uv = (unsigned long)val;
+    do { tmp[pos++] = '0' + (uv % 10); uv /= 10; } while (uv);
+    if (neg) tmp[pos++] = '-';
+    int len = pos;
+    if (len >= buflen) len = buflen - 1;
+    for (int i = 0; i < len; i++) buf[i] = tmp[pos - 1 - i];
+    buf[len] = '\0';
+    return len;
+}
+
+/* Format an unsigned long. */
+static int fmt_ulong(char *buf, int buflen, unsigned long val)
+{
+    if (buflen < 2) return 0;
+    char tmp[24];
+    int pos = 0;
+    do { tmp[pos++] = '0' + (val % 10); val /= 10; } while (val);
+    int len = pos;
+    if (len >= buflen) len = buflen - 1;
+    for (int i = 0; i < len; i++) buf[i] = tmp[pos - 1 - i];
+    buf[len] = '\0';
+    return len;
+}
+
+/* Format a size_t as unsigned. */
+static int fmt_size(char *buf, int buflen, size_t val)
+{
+    return fmt_ulong(buf, buflen, (unsigned long)val);
+}
+
+/* Append a string, returning chars written. */
+static int fmt_str(char *buf, int buflen, const char *s)
+{
+    int i = 0;
+    while (s[i] && i < buflen - 1) { buf[i] = s[i]; i++; }
+    buf[i] = '\0';
+    return i;
+}
+
+/* Append char, returning 1 if written, 0 if full. */
+static int fmt_ch(char *buf, int buflen, char c)
+{
+    if (buflen < 2) return 0;
+    buf[0] = c;
+    buf[1] = '\0';
+    return 1;
+}
+
+/* Format "/proc/<pid>/<name>" into buf. */
+static int fmt_proc_path(char *buf, int buflen, int pid, const char *name)
+{
+    int pos = 0;
+    pos += fmt_str(buf + pos, buflen - pos, "/proc/");
+    pos += fmt_int(buf + pos, buflen - pos, pid);
+    pos += fmt_ch(buf + pos, buflen - pos, '/');
+    pos += fmt_str(buf + pos, buflen - pos, name);
+    return pos;
+}
+
+/* ================================================================
  * Global state
  * ================================================================ */
 
@@ -427,7 +650,7 @@ static volatile int g_write_lock = 0;
 static void emit_lock(void)
 {
     while (__sync_lock_test_and_set(&g_write_lock, 1))
-        sched_yield();
+        raw_sched_yield();
 }
 static void emit_unlock(void)
 {
@@ -439,7 +662,7 @@ static void emit_raw(const char *buf, size_t len)
     emit_lock();
     size_t off = 0;
     while (off < len) {
-        ssize_t n = write(g_out_fd, buf + off, len - off);
+        ssize_t n = raw_write(g_out_fd, buf + off, len - off);
         if (n <= 0) break;
         off += n;
     }
@@ -452,7 +675,7 @@ static void emit_raw(const char *buf, size_t len)
 
 static void get_timestamp_raw(struct timespec *ts)
 {
-    clock_gettime(CLOCK_REALTIME, ts);
+    raw_clock_gettime(CLOCK_REALTIME, ts);
 }
 
 /* ================================================================
@@ -475,9 +698,13 @@ static int json_escape(char *dst, int dstsize, const char *src, int srclen)
         case '\b': dst[di++] = '\\'; dst[di++] = 'b'; break;
         case '\f': dst[di++] = '\\'; dst[di++] = 'f'; break;
         default:
-            if (c < 0x20)
-                di += snprintf(dst + di, dstsize - di, "\\u%04x", c);
-            else
+            if (c < 0x20) {
+                static const char hex[] = "0123456789abcdef";
+                dst[di++] = '\\'; dst[di++] = 'u';
+                dst[di++] = '0'; dst[di++] = '0';
+                dst[di++] = hex[(c >> 4) & 0xf];
+                dst[di++] = hex[c & 0xf];
+            } else
                 dst[di++] = c;
         }
     }
@@ -534,13 +761,13 @@ static int json_open_flags(int flags, char *buf, int buflen)
     int pos = 0, acc = flags & O_ACCMODE;
     buf[pos++] = '[';
     switch (acc) {
-    case O_RDONLY: pos += snprintf(buf + pos, buflen - pos, "\"O_RDONLY\""); break;
-    case O_WRONLY: pos += snprintf(buf + pos, buflen - pos, "\"O_WRONLY\""); break;
-    case O_RDWR:  pos += snprintf(buf + pos, buflen - pos, "\"O_RDWR\""); break;
-    default:      pos += snprintf(buf + pos, buflen - pos, "\"0x%x\"", acc); break;
+    case O_RDONLY: pos += fmt_str(buf + pos, buflen - pos, "\"O_RDONLY\""); break;
+    case O_WRONLY: pos += fmt_str(buf + pos, buflen - pos, "\"O_WRONLY\""); break;
+    case O_RDWR:  pos += fmt_str(buf + pos, buflen - pos, "\"O_RDWR\""); break;
+    default:      pos += fmt_str(buf + pos, buflen - pos, "\"O_OTHER\""); break;
     }
 #define F(f) if ((flags & (f)) && pos < buflen - 2) \
-    pos += snprintf(buf + pos, buflen - pos, ",\"" #f "\"")
+    pos += fmt_str(buf + pos, buflen - pos, ",\"" #f "\"")
     F(O_CREAT); F(O_EXCL); F(O_TRUNC); F(O_APPEND); F(O_NONBLOCK);
     F(O_DIRECTORY); F(O_NOFOLLOW); F(O_CLOEXEC);
 #ifdef O_TMPFILE
@@ -560,14 +787,31 @@ static int json_header(char *buf, int buflen, const char *event,
                        pid_t pid, pid_t tgid, pid_t ppid,
                        struct timespec *ts)
 {
-    return snprintf(buf, buflen,
-        "{\"event\":\"%s\",\"ts\":%lld.%09ld,"
-        "\"pid\":%d,\"tgid\":%d,\"ppid\":%d,"
-        "\"nspid\":%d,\"nstgid\":%d",
-        event,
-        (long long)ts->tv_sec, ts->tv_nsec,
-        (int)pid, (int)tgid, (int)ppid,
-        (int)pid, (int)tgid);
+    int pos = 0;
+    pos += fmt_str(buf + pos, buflen - pos, "{\"event\":\"");
+    pos += fmt_str(buf + pos, buflen - pos, event);
+    pos += fmt_str(buf + pos, buflen - pos, "\",\"ts\":");
+    pos += fmt_long(buf + pos, buflen - pos, (long)ts->tv_sec);
+    pos += fmt_ch(buf + pos, buflen - pos, '.');
+    /* Zero-pad nanoseconds to 9 digits */
+    {
+        char ns[16];
+        int nlen = fmt_long(ns, sizeof(ns), ts->tv_nsec);
+        for (int i = nlen; i < 9; i++)
+            pos += fmt_ch(buf + pos, buflen - pos, '0');
+        pos += fmt_str(buf + pos, buflen - pos, ns);
+    }
+    pos += fmt_str(buf + pos, buflen - pos, ",\"pid\":");
+    pos += fmt_int(buf + pos, buflen - pos, (int)pid);
+    pos += fmt_str(buf + pos, buflen - pos, ",\"tgid\":");
+    pos += fmt_int(buf + pos, buflen - pos, (int)tgid);
+    pos += fmt_str(buf + pos, buflen - pos, ",\"ppid\":");
+    pos += fmt_int(buf + pos, buflen - pos, (int)ppid);
+    pos += fmt_str(buf + pos, buflen - pos, ",\"nspid\":");
+    pos += fmt_int(buf + pos, buflen - pos, (int)pid);
+    pos += fmt_str(buf + pos, buflen - pos, ",\"nstgid\":");
+    pos += fmt_int(buf + pos, buflen - pos, (int)tgid);
+    return pos;
 }
 
 /* ================================================================
@@ -613,14 +857,14 @@ static ssize_t read_proc_raw(pid_t pid, const char *name,
                               char *buf, size_t bufsz)
 {
     char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, name);
-    int fd = open(path, O_RDONLY);
+    fmt_proc_path(path, sizeof(path), (int)pid, name);
+    int fd = raw_open(path, O_RDONLY);
     if (fd < 0) return -1;
     ssize_t total = 0, n;
     while ((size_t)total < bufsz &&
-           (n = read(fd, buf + total, bufsz - total)) > 0)
+           (n = raw_read(fd, buf + total, bufsz - total)) > 0)
         total += n;
-    close(fd);
+    raw_close(fd);
     if (total > 0 && (size_t)total < bufsz) buf[total] = '\0';
     return total;
 }
@@ -629,7 +873,7 @@ static char *read_proc_file(pid_t pid, const char *name, size_t max,
                             size_t *out_len)
 {
     char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, name);
+    fmt_proc_path(path, sizeof(path), (int)pid, name);
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
     char *buf = malloc(max + 1);
@@ -648,8 +892,8 @@ static char *read_proc_file(pid_t pid, const char *name, size_t max,
 static char *read_proc_exe(pid_t pid, char *buf, size_t bufsz)
 {
     char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/exe", (int)pid);
-    ssize_t n = readlink(path, buf, bufsz - 1);
+    fmt_proc_path(path, sizeof(path), (int)pid, "exe");
+    ssize_t n = raw_readlink(path, buf, bufsz - 1);
     if (n <= 0) return NULL;
     buf[n] = '\0';
     const char *del = " (deleted)";
@@ -662,8 +906,8 @@ static char *read_proc_exe(pid_t pid, char *buf, size_t bufsz)
 static char *read_proc_cwd(pid_t pid, char *buf, size_t bufsz)
 {
     char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/cwd", (int)pid);
-    ssize_t n = readlink(path, buf, bufsz - 1);
+    fmt_proc_path(path, sizeof(path), (int)pid, "cwd");
+    ssize_t n = raw_readlink(path, buf, bufsz - 1);
     if (n <= 0) return NULL;
     buf[n] = '\0';
     return buf;
@@ -799,8 +1043,9 @@ static void emit_cwd_event(pid_t pid)
 
     char line[PATH_MAX * 2 + 256];
     int pos = json_header(line, sizeof(line), "CWD", pid, tgid, ppid, &ts);
-    pos += snprintf(line + pos, sizeof(line) - pos, ",\"path\":%s}\n",
-                    cwd_esc);
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"path\":");
+    pos += fmt_str(line + pos, sizeof(line) - pos, cwd_esc);
+    pos += fmt_str(line + pos, sizeof(line) - pos, "}\n");
     if (pos > 0) emit_raw(line, pos);
 }
 
@@ -863,8 +1108,13 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
     if (fd_num == g_out_fd) return;
 
     char link_path[256], link_target[PATH_MAX];
-    snprintf(link_path, sizeof(link_path), "/proc/%d/fd/%d",
-             (int)pid, fd_num);
+    {
+        int lp = 0;
+        lp += fmt_str(link_path + lp, sizeof(link_path) - lp, "/proc/");
+        lp += fmt_int(link_path + lp, sizeof(link_path) - lp, (int)pid);
+        lp += fmt_str(link_path + lp, sizeof(link_path) - lp, "/fd/");
+        lp += fmt_int(link_path + lp, sizeof(link_path) - lp, fd_num);
+    }
     ssize_t n = readlink(link_path, link_target, sizeof(link_target) - 1);
     if (n <= 0) return;
     link_target[n] = '\0';
@@ -874,8 +1124,13 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
         memset(&st, 0, sizeof(st));
 
     char fdinfo_path[256], fdinfo_buf[512];
-    snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo/%d",
-             (int)pid, fd_num);
+    {
+        int fp = 0;
+        fp += fmt_str(fdinfo_path + fp, sizeof(fdinfo_path) - fp, "/proc/");
+        fp += fmt_int(fdinfo_path + fp, sizeof(fdinfo_path) - fp, (int)pid);
+        fp += fmt_str(fdinfo_path + fp, sizeof(fdinfo_path) - fp, "/fdinfo/");
+        fp += fmt_int(fdinfo_path + fp, sizeof(fdinfo_path) - fp, fd_num);
+    }
     int flags = O_RDONLY;
     int fi = open(fdinfo_path, O_RDONLY);
     if (fi >= 0) {
@@ -883,8 +1138,8 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
         close(fi);
         if (r > 0) {
             fdinfo_buf[r] = '\0';
-            const char *fp = strstr(fdinfo_buf, "flags:");
-            if (fp) flags = (int)parse_long_octal(fp + 6);
+            const char *fptr = strstr(fdinfo_buf, "flags:");
+            if (fptr) flags = (int)parse_long_octal(fptr + 6);
         }
     }
 
@@ -896,12 +1151,19 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
 
     char line[PATH_MAX * 2 + 512];
     int pos = json_header(line, sizeof(line), "OPEN", pid, tgid, ppid, ts);
-    pos += snprintf(line + pos, sizeof(line) - pos,
-        ",\"path\":%s,\"flags\":%s,\"fd\":%d,\"ino\":%lu,\"dev\":\"%u:%u\","
-        "\"inherited\":true}\n",
-        path_esc, flags_j, fd_num,
-        (unsigned long)st.st_ino,
-        major(st.st_dev), minor(st.st_dev));
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"path\":");
+    pos += fmt_str(line + pos, sizeof(line) - pos, path_esc);
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"flags\":");
+    pos += fmt_str(line + pos, sizeof(line) - pos, flags_j);
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"fd\":");
+    pos += fmt_int(line + pos, sizeof(line) - pos, fd_num);
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"ino\":");
+    pos += fmt_ulong(line + pos, sizeof(line) - pos, (unsigned long)st.st_ino);
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"dev\":\"");
+    pos += fmt_ulong(line + pos, sizeof(line) - pos, major(st.st_dev));
+    pos += fmt_ch(line + pos, sizeof(line) - pos, ':');
+    pos += fmt_ulong(line + pos, sizeof(line) - pos, minor(st.st_dev));
+    pos += fmt_str(line + pos, sizeof(line) - pos, "\",\"inherited\":true}\n");
     if (pos > 0) emit_raw(line, pos);
 }
 
@@ -913,7 +1175,7 @@ static void emit_inherited_open_events(pid_t pid)
     get_timestamp_raw(&ts);
 
     char dir_path[256];
-    snprintf(dir_path, sizeof(dir_path), "/proc/%d/fd", (int)pid);
+    fmt_proc_path(dir_path, sizeof(dir_path), (int)pid, "fd");
     DIR *d = opendir(dir_path);
     if (!d) return;
 
@@ -946,9 +1208,12 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
     if (fd_or_err >= 0) {
         char fd_path[256];
         struct stat st;
-        snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%ld", (int)pid,
-                 fd_or_err);
-        if (fstatat(AT_FDCWD, fd_path, &st, 0) == 0) {
+        int fp = 0;
+        fp += fmt_str(fd_path + fp, sizeof(fd_path) - fp, "/proc/");
+        fp += fmt_int(fd_path + fp, sizeof(fd_path) - fp, (int)pid);
+        fp += fmt_str(fd_path + fp, sizeof(fd_path) - fp, "/fd/");
+        fp += fmt_long(fd_path + fp, sizeof(fd_path) - fp, fd_or_err);
+        if (raw_fstatat(AT_FDCWD, fd_path, &st, 0) == 0) {
             ino_nr = st.st_ino;
             dev_major = major(st.st_dev);
             dev_minor = minor(st.st_dev);
@@ -958,16 +1223,26 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
     char line[PATH_MAX * 2 + 512];
     int pos = json_header(line, sizeof(line), "OPEN", pid, tgid, ppid, &ts);
 
-    if (fd_or_err >= 0)
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"path\":%s,\"flags\":%s,\"fd\":%ld,\"ino\":%lu,"
-            "\"dev\":\"%u:%u\"}\n",
-            path ? path_esc : "null", flags_j,
-            fd_or_err, ino_nr, dev_major, dev_minor);
-    else
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"path\":%s,\"flags\":%s,\"err\":%ld}\n",
-            path ? path_esc : "null", flags_j, fd_or_err);
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"path\":");
+    pos += fmt_str(line + pos, sizeof(line) - pos, path ? path_esc : "null");
+    pos += fmt_str(line + pos, sizeof(line) - pos, ",\"flags\":");
+    pos += fmt_str(line + pos, sizeof(line) - pos, flags_j);
+
+    if (fd_or_err >= 0) {
+        pos += fmt_str(line + pos, sizeof(line) - pos, ",\"fd\":");
+        pos += fmt_long(line + pos, sizeof(line) - pos, fd_or_err);
+        pos += fmt_str(line + pos, sizeof(line) - pos, ",\"ino\":");
+        pos += fmt_ulong(line + pos, sizeof(line) - pos, ino_nr);
+        pos += fmt_str(line + pos, sizeof(line) - pos, ",\"dev\":\"");
+        pos += fmt_ulong(line + pos, sizeof(line) - pos, dev_major);
+        pos += fmt_ch(line + pos, sizeof(line) - pos, ':');
+        pos += fmt_ulong(line + pos, sizeof(line) - pos, dev_minor);
+        pos += fmt_str(line + pos, sizeof(line) - pos, "\"}\n");
+    } else {
+        pos += fmt_str(line + pos, sizeof(line) - pos, ",\"err\":");
+        pos += fmt_long(line + pos, sizeof(line) - pos, fd_or_err);
+        pos += fmt_str(line + pos, sizeof(line) - pos, "}\n");
+    }
 
     if (pos > 0) emit_raw(line, pos);
 }
@@ -1001,13 +1276,17 @@ static void emit_write_event(pid_t pid, const char *stream,
 
     int pos = json_header(g_write_line_buf, WRITE_LINE_MAX, stream,
                           pid, tgid, ppid, &ts);
-    pos += snprintf(g_write_line_buf + pos, WRITE_LINE_MAX - pos,
-        ",\"len\":%zu,\"data\":%s}\n", to_read, g_write_escaped_buf);
+    pos += fmt_str(g_write_line_buf + pos, WRITE_LINE_MAX - pos, ",\"len\":");
+    pos += fmt_size(g_write_line_buf + pos, WRITE_LINE_MAX - pos, to_read);
+    pos += fmt_str(g_write_line_buf + pos, WRITE_LINE_MAX - pos, ",\"data\":");
+    pos += fmt_str(g_write_line_buf + pos, WRITE_LINE_MAX - pos,
+                   g_write_escaped_buf);
+    pos += fmt_str(g_write_line_buf + pos, WRITE_LINE_MAX - pos, "}\n");
 
     if (pos > 0) {
         size_t off = 0;
         while (off < (size_t)pos) {
-            ssize_t n = write(g_out_fd, g_write_line_buf + off, pos - off);
+            ssize_t n = raw_write(g_out_fd, g_write_line_buf + off, pos - off);
             if (n <= 0) break;
             off += n;
         }
@@ -1028,22 +1307,32 @@ static void emit_exit_event(pid_t pid, int status)
 
     if (WIFEXITED(status)) {
         int code = WEXITSTATUS(status);
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"exited\",\"code\":%d,\"raw\":%d}\n",
-            code, status);
+        pos += fmt_str(line + pos, sizeof(line) - pos,
+            ",\"status\":\"exited\",\"code\":");
+        pos += fmt_int(line + pos, sizeof(line) - pos, code);
+        pos += fmt_str(line + pos, sizeof(line) - pos, ",\"raw\":");
+        pos += fmt_int(line + pos, sizeof(line) - pos, status);
+        pos += fmt_str(line + pos, sizeof(line) - pos, "}\n");
     } else if (WIFSIGNALED(status)) {
         int sig = WTERMSIG(status);
         int core = 0;
 #ifdef WCOREDUMP
         core = WCOREDUMP(status) ? 1 : 0;
 #endif
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"signaled\",\"signal\":%d,\"core_dumped\":%s,"
-            "\"raw\":%d}\n",
-            sig, core ? "true" : "false", status);
+        pos += fmt_str(line + pos, sizeof(line) - pos,
+            ",\"status\":\"signaled\",\"signal\":");
+        pos += fmt_int(line + pos, sizeof(line) - pos, sig);
+        pos += fmt_str(line + pos, sizeof(line) - pos, ",\"core_dumped\":");
+        pos += fmt_str(line + pos, sizeof(line) - pos,
+            core ? "true" : "false");
+        pos += fmt_str(line + pos, sizeof(line) - pos, ",\"raw\":");
+        pos += fmt_int(line + pos, sizeof(line) - pos, status);
+        pos += fmt_str(line + pos, sizeof(line) - pos, "}\n");
     } else {
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"unknown\",\"raw\":%d}\n", status);
+        pos += fmt_str(line + pos, sizeof(line) - pos,
+            ",\"status\":\"unknown\",\"raw\":");
+        pos += fmt_int(line + pos, sizeof(line) - pos, status);
+        pos += fmt_str(line + pos, sizeof(line) - pos, "}\n");
     }
 
     if (pos > 0) emit_raw(line, pos);
@@ -1058,8 +1347,11 @@ static int fd1_is_creator_stdout(pid_t pid)
     if (!g_creator_stdout_valid) return 0;
     char link_path[256];
     struct stat st;
-    snprintf(link_path, sizeof(link_path), "/proc/%d/fd/1", (int)pid);
-    int r = stat(link_path, &st);
+    int pos = 0;
+    pos += fmt_str(link_path + pos, sizeof(link_path) - pos, "/proc/");
+    pos += fmt_int(link_path + pos, sizeof(link_path) - pos, (int)pid);
+    pos += fmt_str(link_path + pos, sizeof(link_path) - pos, "/fd/1");
+    int r = raw_fstatat(AT_FDCWD, link_path, &st, 0);
     if (r < 0) return 0;
     return (st.st_dev == g_creator_stdout_st.st_dev &&
             st.st_ino == g_creator_stdout_st.st_ino);
@@ -1161,6 +1453,143 @@ static int check_elf_dynamic(const char *path, char *interp, size_t interp_sz)
     return 0;
 }
 
+/*
+ * Signal-safe versions of check_shebang and check_elf_dynamic
+ * using raw syscalls (no TLS access).
+ */
+
+static int check_shebang_raw(const char *path, char *interp, size_t interp_sz,
+                              char *interp_arg, size_t arg_sz)
+{
+    int fd = raw_open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    char buf[256];
+    ssize_t n = raw_read(fd, buf, sizeof(buf) - 1);
+    raw_close(fd);
+    if (n < 3) return 0;
+    buf[n] = '\0';
+
+    if (buf[0] != '#' || buf[1] != '!') return 0;
+
+    char *nl = strchr(buf + 2, '\n');
+    if (nl) *nl = '\0';
+
+    char *p = buf + 2;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) return 0;
+
+    char *end = p;
+    while (*end && *end != ' ' && *end != '\t') end++;
+
+    size_t ilen = end - p;
+    if (ilen >= interp_sz) ilen = interp_sz - 1;
+    memcpy(interp, p, ilen);
+    interp[ilen] = '\0';
+
+    if (interp_arg) {
+        interp_arg[0] = '\0';
+        while (*end == ' ' || *end == '\t') end++;
+        if (*end) {
+            size_t alen = strlen(end);
+            if (alen >= arg_sz) alen = arg_sz - 1;
+            memcpy(interp_arg, end, alen);
+            interp_arg[alen] = '\0';
+        }
+    }
+
+    return 1;
+}
+
+static int check_elf_dynamic_raw(const char *path, char *interp,
+                                  size_t interp_sz)
+{
+    int fd = raw_open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    Elf64_Ehdr ehdr;
+    if (raw_read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+        raw_close(fd);
+        return -1;
+    }
+
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+        raw_close(fd);
+        return -1;
+    }
+
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        raw_close(fd);
+        return -1;
+    }
+
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+        if (raw_pread(fd, &phdr, sizeof(phdr),
+                      ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+            continue;
+
+        if (phdr.p_type == PT_INTERP) {
+            size_t sz = phdr.p_filesz;
+            if (sz >= interp_sz) sz = interp_sz - 1;
+            if (raw_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz) {
+                raw_close(fd);
+                return -1;
+            }
+            interp[sz] = '\0';
+            size_t len = strlen(interp);
+            while (len > 0 &&
+                   (interp[len-1] == '\n' || interp[len-1] == '\0'))
+                len--;
+            interp[len] = '\0';
+            raw_close(fd);
+            return 1;
+        }
+    }
+
+    raw_close(fd);
+    return 0;
+}
+static int resolve_path_raw(const char *cmd, char *out, size_t out_sz)
+{
+    if (cmd[0] == '/' || cmd[0] == '.') {
+        /* Copy the path directly — no realpath resolution */
+        size_t clen = strlen(cmd);
+        if (clen >= out_sz) clen = out_sz - 1;
+        memcpy(out, cmd, clen);
+        out[clen] = '\0';
+        return (raw_access(out, X_OK) == 0);
+    }
+
+    const char *path_env = getenv("PATH");
+    if (!path_env) path_env = "/usr/bin:/bin";
+
+    /* Walk PATH directories manually (strtok_r is safe but we avoid
+     * snprintf; use manual string concat instead) */
+    const char *p = path_env;
+    while (*p) {
+        const char *colon = p;
+        while (*colon && *colon != ':') colon++;
+        size_t dlen = colon - p;
+        size_t clen = strlen(cmd);
+        if (dlen + 1 + clen + 1 <= out_sz) {
+            memcpy(out, p, dlen);
+            out[dlen] = '/';
+            memcpy(out + dlen + 1, cmd, clen);
+            out[dlen + 1 + clen] = '\0';
+            if (raw_access(out, X_OK) == 0)
+                return 1;
+        }
+        p = *colon ? colon + 1 : colon;
+    }
+
+    return 0;
+}
+
+/*
+ * Original resolve_path using glibc — for use in the parent process
+ * (normal mode startup) where TLS is valid.
+ */
 static int resolve_path(const char *cmd, char *out, size_t out_sz)
 {
     if (cmd[0] == '/' || cmd[0] == '.') {
@@ -1273,6 +1702,87 @@ static void free_exec_argv(char **args)
     free(args);
 }
 
+/*
+ * Signal-safe version of build_exec_argv using the arena allocator
+ * and raw syscalls.  Called from the SIGSYS handler's execve path.
+ * All allocations go to the arena; call arena_reset() when done.
+ */
+static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
+{
+    int max_args = orig_argc + 16;
+    char **args = arena_alloc((max_args + 1) * sizeof(char *));
+    if (!args) return NULL;
+
+    int nargs = 0;
+    for (int i = 0; i < orig_argc; i++)
+        args[nargs++] = arena_strdup(orig_argv[i]);
+    args[nargs] = NULL;
+
+    for (int depth = 0; depth < 16; depth++) {
+        char resolved[PATH_MAX];
+        if (!resolve_path_raw(args[0], resolved, sizeof(resolved)))
+            return args;
+
+        args[0] = arena_strdup(resolved);
+
+        char interp[PATH_MAX], interp_arg[256];
+        if (check_shebang_raw(resolved, interp, sizeof(interp),
+                               interp_arg, sizeof(interp_arg))) {
+            int extra = interp_arg[0] ? 2 : 1;
+            if (nargs + extra >= max_args) {
+                /* Need more space: allocate new array in arena */
+                max_args = nargs + extra + 8;
+                char **new_args = arena_alloc((max_args + 1) * sizeof(char *));
+                if (!new_args) return args;
+                memcpy(new_args, args, (nargs + 1) * sizeof(char *));
+                args = new_args;
+            }
+            memmove(args + extra, args, (nargs + 1) * sizeof(char *));
+            args[0] = arena_strdup(interp);
+            if (interp_arg[0])
+                args[1] = arena_strdup(interp_arg);
+            nargs += extra;
+            continue;
+        }
+
+        char elf_interp[PATH_MAX];
+        int dyn = check_elf_dynamic_raw(resolved, elf_interp,
+                                         sizeof(elf_interp));
+
+        if (dyn == 1) {
+            if (nargs + 1 >= max_args) {
+                max_args = nargs + 8;
+                char **new_args = arena_alloc((max_args + 1) * sizeof(char *));
+                if (!new_args) return args;
+                memcpy(new_args, args, (nargs + 1) * sizeof(char *));
+                args = new_args;
+            }
+            memmove(args + 1, args, (nargs + 1) * sizeof(char *));
+            args[0] = arena_strdup(elf_interp);
+            nargs++;
+            continue;
+        }
+
+        if (dyn == 0) {
+            if (nargs + 1 >= max_args) {
+                max_args = nargs + 8;
+                char **new_args = arena_alloc((max_args + 1) * sizeof(char *));
+                if (!new_args) return args;
+                memcpy(new_args, args, (nargs + 1) * sizeof(char *));
+                args = new_args;
+            }
+            memmove(args + 1, args, (nargs + 1) * sizeof(char *));
+            args[0] = arena_strdup(g_self_exe);
+            nargs++;
+            break;
+        }
+
+        break;
+    }
+
+    return args;
+}
+
 /* ================================================================
  * SIGSYS handler — the core of SUD tracing.
  *
@@ -1301,7 +1811,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * programs — a shared selector byte with toggling would race
      * between concurrent SIGSYS handlers on different threads. */
 
-    pid_t tid = (pid_t)syscall(SYS_gettid);
+    pid_t tid = raw_gettid();
 
     /* x86_64 ABI: nr=rax, args=rdi,rsi,rdx,r10,r8,r9, ret→rax */
     long nr  = (long)uc->uc_mcontext.gregs[REG_RAX];
@@ -1327,15 +1837,16 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * for EXEC/EXIT events.
      */
     if (nr == SYS_ptrace && a0 == 0 /* PTRACE_TRACEME */) {
-        long r = syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, NULL, NULL);
+        long r = raw_syscall6(SYS_ptrace, 0 /* PTRACE_TRACEME */,
+                              0, 0, 0, 0, 0);
         if (r == 0) {
             /* Disable SUD: the sub-tracer now manages this process. */
-            prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF,
-                  0, 0, 0);
+            raw_syscall6(SYS_prctl, PR_SET_SYSCALL_USER_DISPATCH,
+                         PR_SYS_DISPATCH_OFF, 0, 0, 0, 0);
             uc->uc_mcontext.gregs[REG_RAX] = 0;
             return;
         }
-        uc->uc_mcontext.gregs[REG_RAX] = -errno;
+        uc->uc_mcontext.gregs[REG_RAX] = r;  /* raw kernel negative errno */
         return;
     }
 
@@ -1349,21 +1860,23 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         if (orig_argv)
             while (orig_argv[orig_argc]) orig_argc++;
 
+        arena_reset();
+
         int build_argc = orig_argc > 0 ? orig_argc : 1;
-        char **build_argv = calloc(build_argc + 1, sizeof(char *));
+        char **build_argv = arena_alloc((build_argc + 1) * sizeof(char *));
         if (build_argv) {
-            build_argv[0] = strdup(fn);
+            build_argv[0] = arena_strdup(fn);
             for (int i = 1; i < orig_argc; i++)
-                build_argv[i] = strdup(orig_argv[i]);
+                build_argv[i] = arena_strdup(orig_argv[i]);
             build_argv[build_argc] = NULL;
 
-            char **new_argv = build_exec_argv(build_argc, build_argv);
-            free_exec_argv(build_argv);
+            char **new_argv = build_exec_argv_raw(build_argc, build_argv);
 
             if (new_argv) {
                 ret = raw_syscall6(SYS_execve, (long)new_argv[0],
                                    (long)new_argv, a2, 0, 0, 0);
-                free_exec_argv(new_argv);
+                /* If exec succeeded, we never reach here.
+                 * If it failed, arena will be reset on next execve. */
             } else {
                 ret = -ENOMEM;
             }
@@ -1371,6 +1884,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             ret = -ENOMEM;
         }
 
+        arena_reset();
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
@@ -1386,28 +1900,55 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     /*
      * clone3/clone — thread/process creation needs special handling.
      *
-     * When clone3 creates a thread (CLONE_VM|CLONE_THREAD), the child
-     * starts executing inside our handler on a NEW stack.  The compiler's
-     * RSP-relative code for local variables (including `uc`) accesses
-     * garbage on the new stack → SIGSEGV.
+     * Two cases:
      *
-     * We use dedicated assembly functions (clone3_raw / clone_raw) that
-     * save the uc pointer in a callee-saved register (r12), execute the
-     * raw syscall, and — in the child — restore the full program register
-     * state from the ucontext and jump directly to the program's saved
-     * RIP.  The child never returns to C code in this handler.
+     * A) CLONE_VM set (thread creation, e.g. pthread_create):
+     *    The child starts executing inside this handler on a NEW stack.
+     *    The compiler's RSP-relative code for local variables (including
+     *    `uc`) references wrong addresses on the new stack → SIGSEGV.
+     *    Use dedicated assembly (clone3_raw/clone_raw) that saves the uc
+     *    pointer in r12, and in the child restores the full program
+     *    register state from the ucontext and jumps directly to the
+     *    program's saved RIP.  The child never returns to C code here.
+     *
+     * B) CLONE_VM not set (fork, e.g. fork()/vfork()):
+     *    The child gets its own address space (COW).  It continues
+     *    executing inside the handler on its own copy of the stack, with
+     *    all local variables intact.  The clone_raw assembly would break
+     *    because its sync_flag write goes to the child's COW page (the
+     *    parent never sees it and spins forever).  Use raw_syscall6
+     *    instead — the child returns normally through the handler and
+     *    the signal frame is cleaned up by rt_sigreturn as usual.
      */
+#ifndef CLONE_VM
+#define CLONE_VM 0x00000100
+#endif
 #ifdef SYS_clone3
     if (nr == SYS_clone3) {
-        ret = clone3_raw(a0, a1, uc);
-        /* Only parent reaches here; child jumped to program's RIP */
+        /* clone3: flags are at offset 0 of the clone_args struct */
+        unsigned long long c3_flags = 0;
+        if (a0)
+            c3_flags = *(unsigned long long *)a0;
+        if (c3_flags & CLONE_VM) {
+            ret = clone3_raw(a0, a1, uc);
+            /* Only parent reaches here; child jumped to program's RIP */
+        } else {
+            ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+            /* Both parent and child reach here */
+        }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
 #endif
     if (nr == SYS_clone) {
-        ret = clone_raw(a0, a1, a2, a3, a4, uc);
-        /* Only parent reaches here */
+        /* clone: flags are in a0 (rdi) */
+        if ((unsigned long)a0 & CLONE_VM) {
+            ret = clone_raw(a0, a1, a2, a3, a4, uc);
+            /* Only parent reaches here */
+        } else {
+            ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+            /* Both parent and child reach here */
+        }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }

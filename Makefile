@@ -52,7 +52,7 @@ tv: main.c engine.c engine.h tv_sql.h uproctrace.c
 cc $(CFLAGS) -o tv main.c engine.c uproctrace.c sqlite3.c -static -lm
 
 sudtrace: sudtrace.c sudtrace.lds
-cc -O2 -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm
+cc -O2 -fno-stack-protector -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm
 
 .PHONY: all keygen sign load unload clean install test
 test: tv
