@@ -306,11 +306,17 @@ static int trace_output_enqueue(const char *buf, size_t len)
 
 static int trace_output_enqueue_line(const char *line, size_t len)
 {
-    if (g_trace_exec_env || !line || len == 0)
+    static const char exec_marker[] = "\"event\":\"EXEC\"";
+    static const char env_marker[] = ",\"env\":";
+
+    if (!line || len == 0)
+        return 0;
+    if (g_trace_exec_env)
         return trace_output_enqueue(line, len);
 
-    if (!memmem(line, len, "\"event\":\"EXEC\"", strlen("\"event\":\"EXEC\""))
-        || !memmem(line, len, ",\"env\":", strlen(",\"env\":")))
+    const void *exec_hit = memmem(line, len, exec_marker, sizeof(exec_marker) - 1);
+    const void *env_hit = memmem(line, len, env_marker, sizeof(env_marker) - 1);
+    if (!exec_hit || !env_hit)
         return trace_output_enqueue(line, len);
 
     char *tmp = malloc(len + 1);
@@ -323,8 +329,9 @@ static int trace_output_enqueue_line(const char *line, size_t len)
     char *auxv = env ? strstr(env, ",\"auxv\":") : NULL;
     size_t out_len = len;
     if (env && auxv) {
-        memmove(env, auxv, out_len - (size_t)(auxv - tmp) + 1);
-        out_len -= (size_t)(auxv - env);
+        size_t remove_len = (size_t)(auxv - env);
+        memmove(env, auxv, (size_t)(tmp + len - auxv) + 1);
+        out_len = len - remove_len;
     }
     int rc = trace_output_enqueue(tmp, out_len);
     free(tmp);

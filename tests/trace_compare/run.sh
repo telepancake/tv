@@ -137,7 +137,7 @@ validate_schema() {
 check_exec_field_absent() {
     local desc="$1" field="$2" file="$3"
     TOTAL=$((TOTAL+1))
-    if jq -e --arg field "$field" 'select(.event=="EXEC") | has($field)' "$file" | grep -q true; then
+    if jq -e --arg field "$field" 'select(.event=="EXEC") | has($field)' "$file" > /dev/null; then
         FAIL=$((FAIL+1))
         echo "  FAIL  $desc ($field present)"
         return 1
