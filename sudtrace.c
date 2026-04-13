@@ -156,7 +156,7 @@ static inline long raw_syscall6(long nr, long a0, long a1, long a2,
         : "=a"(ret)
         : "a"(nr), "D"(a0), "S"(a1), "d"(a2),
           "r"(r10), "r"(r8), "r"(r9)
-        : "rcx", "r11", "memory"
+        : "rcx", "r11", "memory"  /* syscall clobbers rcx (saves RIP) and r11 (saves RFLAGS) */
     );
     return ret;
 }

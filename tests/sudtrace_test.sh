@@ -85,6 +85,8 @@ run_test "basic: stderr captured" \
 
 # ── Test: multithreaded tracing ────────────────────────────────────────
 
+# Run 3 times to detect race conditions — the clone3 child/parent
+# synchronization and signal handler re-entrancy are timing-sensitive.
 for attempt in 1 2 3; do
     OUT=$("$SUDTRACE" -o "$TMPDIR/threads_${attempt}.jsonl" -- "$TMPDIR/threads" 2>&1)
     run_test "threads attempt $attempt: no crash" \
