@@ -771,6 +771,14 @@ static int json_argv_array_vec(char *dst, int dstsize, char *const *argv, int ar
     return di;
 }
 
+static int is_ld_linux_basename(const char *path)
+{
+    if (!path) return 0;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return strncmp(base, "ld-linux", 8) == 0;
+}
+
 static int json_env_object(char *dst, int dstsize, const char *raw, int rawlen)
 {
     int di = 0, si = 0;
@@ -1098,26 +1106,29 @@ static void emit_exec_event(pid_t pid, const char *fallback_exe,
     get_timestamp_raw(&ts);
 
     char exe_buf[PATH_MAX];
-    char *exe = read_proc_exe(pid, exe_buf, sizeof(exe_buf));
-    if (!exe && fallback_exe && fallback_exe[0])
-        exe = (char *)fallback_exe;
+    char *exe = (fallback_exe && fallback_exe[0])
+        ? (char *)fallback_exe
+        : read_proc_exe(pid, exe_buf, sizeof(exe_buf));
     char exe_esc[PATH_MAX * 2];
     if (exe) json_escape(exe_esc, sizeof(exe_esc), exe, strlen(exe));
 
     size_t argv_len = 0;
-    char *argv_raw = read_proc_file(pid, "cmdline", ARGV_MAX_READ, &argv_len);
+    char *argv_raw = NULL;
     char *argv_j = NULL;
-    if (argv_raw && argv_len > 0) {
-        argv_j = malloc(argv_len * 6 + 64);
-        if (argv_j)
-            json_argv_array(argv_j, argv_len * 6 + 64, argv_raw, argv_len);
-    } else if (fallback_argv && fallback_argc > 0) {
+    if (fallback_argv && fallback_argc > 0) {
         size_t alloc = 64;
         for (int i = 0; i < fallback_argc; i++)
             alloc += strlen(fallback_argv[i] ? fallback_argv[i] : "") * 6 + 1;
         argv_j = malloc(alloc);
         if (argv_j)
             json_argv_array_vec(argv_j, (int)alloc, fallback_argv, fallback_argc);
+    } else {
+        argv_raw = read_proc_file(pid, "cmdline", ARGV_MAX_READ, &argv_len);
+        if (argv_raw && argv_len > 0) {
+            argv_j = malloc(argv_len * 6 + 64);
+            if (argv_j)
+                json_argv_array(argv_j, argv_len * 6 + 64, argv_raw, argv_len);
+        }
     }
 
     size_t env_len = 0;
@@ -2582,7 +2593,14 @@ static int run_wrapper_mode(int argc, char **argv)
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event(child, argv[0], argc, argv);
+    char **event_argv = argv + 1;
+    int event_argc = argc - 1;
+    if (event_argc > 1 && is_ld_linux_basename(event_argv[0])) {
+        event_argv++;
+        event_argc--;
+    }
+    emit_exec_event(child, event_argc > 0 ? event_argv[0] : resolved,
+                    event_argc, event_argv);
     emit_inherited_open_events(child);
 
     for (;;) {
@@ -2754,7 +2772,17 @@ int main(int argc, char **argv)
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event(child, exec_argv[0], cmd_argc, exec_argv);
+    char **event_argv = exec_argv + 1;
+    int event_argc = 0;
+    while (exec_argv[event_argc])
+        event_argc++;
+    event_argc--;
+    if (event_argc > 1 && is_ld_linux_basename(event_argv[0])) {
+        event_argv++;
+        event_argc--;
+    }
+    emit_exec_event(child, event_argc > 0 ? event_argv[0] : exec_argv[0],
+                    event_argc, event_argv);
     emit_inherited_open_events(child);
 
     /* Main wait loop */
