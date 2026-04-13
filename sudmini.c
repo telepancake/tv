@@ -23,6 +23,14 @@
 #define SA_RESTORER 0x04000000
 #endif
 
+#define MINI_MMAP2_SHIFT 12
+
+#if defined(__i386__)
+typedef unsigned long long mini_sigset_word_t;
+#else
+typedef unsigned long mini_sigset_word_t;
+#endif
+
 char **environ;
 static int g_errno_value;
 
@@ -511,7 +519,7 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset)
 #if defined(__x86_64__)
     return mini_ret_errno(mini_syscall4(SYS_pread64, fd, (long)buf, count, (long)offset));
 #else
-    uint64_t off = (uint64_t)(uint32_t)offset;
+    uint64_t off = (uint64_t)offset;
     return mini_ret_errno(mini_syscall5(SYS_pread64, fd, (long)buf, count,
                                         (uint32_t)off, (uint32_t)(off >> 32)));
 #endif
@@ -572,8 +580,9 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
 #if defined(__x86_64__)
     long ret = mini_syscall6(SYS_mmap, (long)addr, len, prot, flags, fd, offset);
 #else
+    /* SYS_mmap2 uses offsets in 4096-byte units. */
     long ret = mini_syscall6(SYS_mmap2, (long)addr, len, prot, flags, fd,
-                             (long)((uint64_t)(uint32_t)offset >> 12));
+                             (long)((uint64_t)offset >> MINI_MMAP2_SHIFT));
 #endif
     if ((unsigned long)ret >= (unsigned long)-4095) {
         g_errno_value = (int)-ret;
@@ -612,7 +621,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
         void (*handler)(int);
         unsigned long flags;
         void (*restorer)(void);
-        unsigned long mask;
+        mini_sigset_word_t mask;
     } kact, kold;
 
     struct kernel_sigaction *pact = NULL;
@@ -628,7 +637,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
     if (oldact)
         pold = &kold;
     long ret = mini_syscall4(SYS_rt_sigaction, signum, (long)pact, (long)pold,
-                             sizeof(unsigned long));
+                             sizeof(kact.mask));
     if ((unsigned long)ret >= (unsigned long)-4095) {
         g_errno_value = (int)-ret;
         return -1;

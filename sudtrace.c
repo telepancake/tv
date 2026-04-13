@@ -639,7 +639,7 @@ static inline ssize_t raw_pread(int fd, void *buf, size_t count, off_t offset)
     return (ssize_t)raw_syscall6(SYS_pread64, fd, (long)buf, count,
                                   offset, 0, 0);
 #else
-    unsigned long long off = (unsigned long long)(uint32_t)offset;
+    unsigned long long off = (unsigned long long)offset;
     return (ssize_t)raw_syscall6(SYS_pread64, fd, (long)buf, count,
                                   (uint32_t)off, (uint32_t)(off >> 32), 0);
 #endif
@@ -1639,14 +1639,12 @@ static int check_shebang(const char *path, char *interp, size_t interp_sz,
     return 1;
 }
 
-static int trim_interp(char *interp)
+static void trim_interp(char *interp)
 {
     size_t len = strlen(interp);
-    while (len > 0 &&
-           (interp[len - 1] == '\n' || interp[len - 1] == '\0'))
+    while (len > 0 && interp[len - 1] == '\n')
         len--;
     interp[len] = '\0';
-    return 0;
 }
 
 static int inspect_elf_dynamic_fd(int fd, char *interp, size_t interp_sz,
