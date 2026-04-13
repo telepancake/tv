@@ -288,18 +288,26 @@ INSERT INTO _layout VALUES(3, 1,    'panel','rpane',1, 0, 3, 'text', -1, 0, 1);
 -- ── Dependency edge VIEW (used by modes 3-6) ─────────────────────────
 -- Each row: (src=reader, dst=writer) for the same process group.
 CREATE TEMP VIEW _dep_reads AS
-    SELECT DISTINCT e.tgid, o.path
-    FROM open_events o JOIN events e ON e.id=o.eid
-    WHERE o.path IS NOT NULL
-        AND (instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_RDONLY|')>0
-             OR instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_RDWR|')>0);
+    SELECT DISTINCT tgid, path
+    FROM (
+        SELECT e.tgid, o.path,
+            '|' || replace(COALESCE(o.flags,''), ',', '|') || '|' AS norm_flags
+        FROM open_events o JOIN events e ON e.id=o.eid
+        WHERE o.path IS NOT NULL
+    )
+    WHERE instr(norm_flags, '|O_RDONLY|')>0
+       OR instr(norm_flags, '|O_RDWR|')>0;
 
 CREATE TEMP VIEW _dep_writes AS
-    SELECT DISTINCT e.tgid, o.path
-    FROM open_events o JOIN events e ON e.id=o.eid
-    WHERE o.path IS NOT NULL
-        AND (instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_WRONLY|')>0
-             OR instr('|' || replace(COALESCE(o.flags,''), ',', '|') || '|', '|O_RDWR|')>0);
+    SELECT DISTINCT tgid, path
+    FROM (
+        SELECT e.tgid, o.path,
+            '|' || replace(COALESCE(o.flags,''), ',', '|') || '|' AS norm_flags
+        FROM open_events o JOIN events e ON e.id=o.eid
+        WHERE o.path IS NOT NULL
+    )
+    WHERE instr(norm_flags, '|O_WRONLY|')>0
+       OR instr(norm_flags, '|O_RDWR|')>0;
 
 CREATE TEMP VIEW _dep_written_paths AS
     SELECT DISTINCT path FROM _dep_writes;
