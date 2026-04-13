@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <time.h>
 
@@ -47,6 +48,12 @@ enum {
     CURSOR_EVENT_PANEL_MAX = 32,
     CURSOR_EVENT_ROW_ID_MAX = 4096,
 };
+
+static bool g_dep_walk_cache_needs_rebuild = true;
+static char g_dep_walk_root[CURSOR_EVENT_ROW_ID_MAX];
+
+/* Keep string truncation explicit for cached row IDs and roots. */
+static void copy_cstr(char *dst, size_t dstsz, const char *src);
 
 static void xexec(const char *sql) {
     char *e;
@@ -74,6 +81,92 @@ static int qint(const char *sql, int def) {
         sqlite3_finalize(s);
     }
     return r;
+}
+
+static void build_dep_walk_table(const char *table, const char *next_expr,
+                                 const char *join_cond, const char *root) {
+    char sql[512];
+    sqlite3_stmt *clear_st = NULL, *seed_st = NULL, *step_st = NULL;
+    int depth = 0;
+    int n;
+
+    n = snprintf(sql, sizeof sql, "DELETE FROM %s", table);
+    if (n < 0 || (size_t)n >= sizeof sql) {
+        fprintf(stderr, "tv: dependency cache SQL overflow (%s delete)\n", table);
+        exit(1);
+    }
+    if (sqlite3_prepare_v2(g_db, sql, -1, &clear_st, 0) != SQLITE_OK) goto done;
+    sqlite3_step(clear_st);
+    if (!root || !root[0]) goto done;
+
+    n = snprintf(sql, sizeof sql, "INSERT OR IGNORE INTO %s(path,depth) VALUES(?1,0)", table);
+    if (n < 0 || (size_t)n >= sizeof sql) {
+        fprintf(stderr, "tv: dependency cache SQL overflow (%s seed)\n", table);
+        exit(1);
+    }
+    if (sqlite3_prepare_v2(g_db, sql, -1, &seed_st, 0) != SQLITE_OK) goto done;
+    sqlite3_bind_text(seed_st, 1, root, -1, SQLITE_TRANSIENT);
+    sqlite3_step(seed_st);
+
+    n = snprintf(sql, sizeof sql,
+                 "INSERT OR IGNORE INTO %s(path,depth)"
+                 " SELECT DISTINCT %s, ?2"
+                 " FROM _dep_edges de"
+                 " JOIN %s w ON %s"
+                 " WHERE w.depth=?1",
+                 table, next_expr, table, join_cond);
+    if (n < 0 || (size_t)n >= sizeof sql) {
+        fprintf(stderr, "tv: dependency cache SQL overflow (%s step)\n", table);
+        exit(1);
+    }
+    if (sqlite3_prepare_v2(g_db, sql, -1, &step_st, 0) != SQLITE_OK) goto done;
+
+    for (;;) {
+        sqlite3_reset(step_st);
+        sqlite3_clear_bindings(step_st);
+        sqlite3_bind_int(step_st, 1, depth);
+        sqlite3_bind_int(step_st, 2, depth + 1);
+        sqlite3_step(step_st);
+        if (sqlite3_changes(g_db) == 0) break; /* frontier exhausted */
+        depth++;
+    }
+
+done:
+    sqlite3_finalize(clear_st);
+    sqlite3_finalize(seed_st);
+    sqlite3_finalize(step_st);
+}
+
+static void ensure_dep_walk_cache(void) {
+    sqlite3_stmt *st = NULL;
+    char state_dep_root[CURSOR_EVENT_ROW_ID_MAX] = "";
+    int mode = 0;
+
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT mode, COALESCE(dep_root,'') FROM state", -1, &st, 0) != SQLITE_OK)
+        return;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        mode = sqlite3_column_int(st, 0);
+        copy_cstr(state_dep_root, sizeof state_dep_root,
+                  (const char *)sqlite3_column_text(st, 1));
+    }
+    sqlite3_finalize(st);
+
+    if (!g_dep_walk_cache_needs_rebuild && strcmp(g_dep_walk_root, state_dep_root) == 0) return;
+    if (mode < 3 || mode > 6) {
+        copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, state_dep_root);
+        g_dep_walk_cache_needs_rebuild = false;
+        return;
+    }
+
+    xexec("SAVEPOINT dep_walk_cache");
+    /* Empty roots are valid and intentionally yield empty dependency caches. */
+    build_dep_walk_table("_dep_walk_rev", "de.src", "w.path=de.dst", state_dep_root);
+    build_dep_walk_table("_dep_walk_fwd", "de.dst", "w.path=de.src", state_dep_root);
+    xexec("RELEASE dep_walk_cache");
+
+    copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, state_dep_root);
+    g_dep_walk_cache_needs_rebuild = false;
 }
 
 static long long monotonic_millis(void) {
@@ -213,6 +306,7 @@ static tui_t *g_tui;
 
 /* ── Sync engine cursor from state table ───────────────────────────── */
 static void sync_engine_from_state(void) {
+    ensure_dep_walk_cache();
     if (!g_tui) return;
     sqlite3_stmt *st;
     sqlite3_prepare_v2(g_db,
@@ -232,6 +326,7 @@ static void sync_engine_from_state(void) {
 
 /* ── Status bar update ─────────────────────────────────────────────── */
 static void update_status(void) {
+    ensure_dep_walk_cache();
     static const char *mn[] = {"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};
     static const char *tsl[] = {"abs","rel","Δ"};
     int mode = qint("SELECT mode FROM state", 0);
@@ -340,6 +435,7 @@ static void process_trace_batch(void) {
     if (g_pending_trace_rows == 0) return;
     xexec(tv_sql_ingest);
     g_pending_trace_rows = 0;
+    g_dep_walk_cache_needs_rebuild = true;
 }
 
 static int path_has_suffix(const char *path, const char *suffix) {
@@ -1175,6 +1271,7 @@ int main(int argc, char **argv) {
 
     /* Initial setup: populate _ftree if starting in file mode */
     if (qint("SELECT mode FROM state", 0) == 1) xexec("SELECT build_ftree()");
+    ensure_dep_walk_cache();
     xexec("UPDATE state SET cursor_id=COALESCE("
           "(SELECT id FROM lpane WHERE rownum=(SELECT cursor FROM state)),'')");
 
