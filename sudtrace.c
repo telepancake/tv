@@ -494,6 +494,16 @@ static inline pid_t raw_gettid(void)
     return (pid_t)raw_syscall6(SYS_gettid, 0, 0, 0, 0, 0, 0);
 }
 
+static inline pid_t raw_getpid(void)
+{
+    return (pid_t)raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+}
+
+static inline pid_t raw_getppid(void)
+{
+    return (pid_t)raw_syscall6(SYS_getppid, 0, 0, 0, 0, 0, 0);
+}
+
 static inline int raw_clock_gettime(clockid_t clk, struct timespec *ts)
 {
     return (int)raw_syscall6(SYS_clock_gettime, clk, (long)ts, 0, 0, 0, 0);
@@ -1161,6 +1171,44 @@ static void emit_exec_event(pid_t pid, const char *fallback_exe,
 
     free(env_j); free(env_raw);
     free(argv_j); free(argv_raw);
+}
+
+static void emit_exec_event_raw(pid_t pid, const char *fallback_exe,
+                                int fallback_argc, char **fallback_argv)
+{
+    struct timespec ts;
+    raw_clock_gettime(CLOCK_REALTIME, &ts);
+
+    char exe_esc[PATH_MAX * 2];
+    const char *exe_j = "null";
+    if (fallback_exe && fallback_exe[0]) {
+        json_escape(exe_esc, sizeof(exe_esc), fallback_exe, strlen(fallback_exe));
+        exe_j = exe_esc;
+    }
+
+    char *argv_j = NULL;
+    if (fallback_argv && fallback_argc > 0) {
+        size_t alloc = 64;
+        for (int i = 0; i < fallback_argc; i++)
+            alloc += strlen(fallback_argv[i] ? fallback_argv[i] : "") * 6 + 1;
+        argv_j = arena_alloc(alloc);
+        if (argv_j)
+            json_argv_array_vec(argv_j, (int)alloc, fallback_argv, fallback_argc);
+    }
+
+    char *line = arena_alloc(LINE_MAX_BUF);
+    if (!line)
+        return;
+
+    int pos = json_header(line, LINE_MAX_BUF, "EXEC",
+                          pid, raw_getpid(), raw_getppid(), &ts);
+    pos += fmt_str(line + pos, LINE_MAX_BUF - pos, ",\"exe\":");
+    pos += fmt_str(line + pos, LINE_MAX_BUF - pos, exe_j);
+    pos += fmt_str(line + pos, LINE_MAX_BUF - pos, ",\"argv\":");
+    pos += fmt_str(line + pos, LINE_MAX_BUF - pos, argv_j ? argv_j : "[]");
+    pos += fmt_str(line + pos, LINE_MAX_BUF - pos, ",\"env\":{},\"auxv\":{}}\n");
+    if (pos > 0 && pos < LINE_MAX_BUF)
+        emit_raw(line, pos);
 }
 
 static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
@@ -2028,6 +2076,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             char **new_argv = build_exec_argv_raw(build_argc, build_argv);
 
             if (new_argv) {
+                emit_exec_event_raw(raw_gettid(), build_argv[0], build_argc,
+                                    build_argv);
                 ret = raw_syscall6(SYS_execve, (long)new_argv[0],
                                    (long)new_argv, a2, 0, 0, 0);
                 /* If exec succeeded, we never reach here.
@@ -2087,6 +2137,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 
             char **new_argv = build_exec_argv_raw(build_argc, build_argv);
             if (new_argv) {
+                emit_exec_event_raw(raw_gettid(), build_argv[0], build_argc,
+                                    build_argv);
                 ret = raw_syscall6(SYS_execve, (long)new_argv[0],
                                    (long)new_argv, a3, 0, 0, 0);
             } else {
