@@ -1722,7 +1722,9 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
             if (!g_trace_exec_env) {
                 if (nargs + 1 >= max_args) {
                     max_args = nargs + 8;
-                    args = realloc(args, (max_args + 1) * sizeof(char *));
+                    char **new_args = realloc(args, (max_args + 1) * sizeof(char *));
+                    if (!new_args) return NULL;
+                    args = new_args;
                 }
                 memmove(args + 2, args + 1, nargs * sizeof(char *));
                 args[1] = strdup("--no-env");
@@ -1821,7 +1823,7 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
                 if (nargs + 1 >= max_args) {
                     max_args = nargs + 8;
                     char **new_args = arena_alloc((max_args + 1) * sizeof(char *));
-                    if (!new_args) return args;
+                    if (!new_args) return NULL;
                     memcpy(new_args, args, (nargs + 1) * sizeof(char *));
                     args = new_args;
                 }
@@ -2416,7 +2418,7 @@ static int is_wrapper_mode(int argc, char **argv)
      *   sudtrace tv --uproctrace -o x -- /bin/echo hello
      * where "--" separates uproctrace's options from its command). */
     int i = 1;
-    while (i < argc && argv[i] && strcmp(argv[i], "--no-env") == 0)
+    if (i < argc && argv[i] && strcmp(argv[i], "--no-env") == 0)
         i++;
     if (i >= argc || !argv[i] || argv[i][0] == '-') return 0;
     return 1;
@@ -2425,9 +2427,9 @@ static int is_wrapper_mode(int argc, char **argv)
 static int run_wrapper_mode(int argc, char **argv)
 {
     int argi = 1;
-    while (argi < argc && argv[argi] && strcmp(argv[argi], "--no-env") == 0) {
-        g_trace_exec_env = 0;
+    if (argi < argc && argv[argi] && strcmp(argv[argi], "--no-env") == 0) {
         argi++;
+        g_trace_exec_env = 0;
     }
     char resolved[PATH_MAX];
     if (!resolve_path(argv[argi], resolved, sizeof(resolved))) {
