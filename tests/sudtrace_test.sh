@@ -85,6 +85,8 @@ EOF
 HAVE_STATIC32=0
 if gcc -m32 -static -o "$TMPDIR/static32" "$TMPDIR/static32.c" 2>/dev/null; then
     HAVE_STATIC32=1
+else
+    echo "  SKIP  static32 toolchain unavailable"
 fi
 
 # ── Test: basic single-threaded tracing ────────────────────────────────

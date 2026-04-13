@@ -1714,7 +1714,7 @@ static int resolve_exec_path(const char *cmd, char *out, size_t out_sz)
 {
     if (!cmd || !cmd[0] || out_sz == 0)
         return -1;
-    if (cmd[0] == '/' || cmd[0] == '.') {
+    if (cmd[0] == '/' || strchr(cmd, '/')) {
         if (realpath(cmd, out) != NULL)
             return 0;
         if (snprintf(out, out_sz, "%s", cmd) >= (int)out_sz)
@@ -1831,6 +1831,11 @@ static int resolve_sud_launcher_exe(char *buf, size_t bufsz,
 {
     int elf_class = 0;
     if (resolve_command_elf_class(cmd[0], &elf_class) != 0) {
+        if (snprintf(buf, bufsz, "%s", sudtrace_exe) >= (int)bufsz)
+            return -1;
+        return 0;
+    }
+    if (elf_class != ELFCLASS32 && elf_class != ELFCLASS64) {
         if (snprintf(buf, bufsz, "%s", sudtrace_exe) >= (int)bufsz)
             return -1;
         return 0;
