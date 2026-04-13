@@ -87,7 +87,7 @@ exec_basenames() {
         | (
             (.argv // []) as $argv
             | if ($argv | length) == 0 then (.exe // "")
-              elif (($argv[0] // "") | split("/") | last | test("^sud(32|64)?trace$")) then
+              elif (($argv[0] // "") | split("/") | last | test("^sud(32|64)?trace([_-].+)?$")) then
                   if ($argv | length) >= 3 and (($argv[1] // "") | split("/") | last | test("^ld-linux")) then
                       ($argv[2] // "")
                   else
@@ -99,7 +99,7 @@ exec_basenames() {
           )
         | split("/") | last
     ' "$1" \
-        | grep -vE '^(|sudtrace|sud32|sud64|ld-linux[^[:space:]]*)$' \
+        | grep -vE '^(|sudtrace([_-].+)?|sud32([_-].+)?|sud64([_-].+)?|ld-linux[^[:space:]]*)$' \
         | sort -u
 }
 
