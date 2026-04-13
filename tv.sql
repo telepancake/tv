@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS expanded(id TEXT PRIMARY KEY, ex INT DEFAULT 1);
 
 --%% INGEST
 CREATE TEMP TABLE IF NOT EXISTS _trace_src(
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY, -- inbox.id
     event TEXT,
     tgid INT,
     pid INT,
