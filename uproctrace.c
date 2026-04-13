@@ -39,8 +39,6 @@
 #include <elf.h>          /* AT_* constants, ElfW, NT_PRSTATUS */
 #include <pthread.h>
 
-#include <zstd.h>
-
 #ifndef PR_SET_SYSCALL_USER_DISPATCH
 #define PR_SET_SYSCALL_USER_DISPATCH 59
 #endif
@@ -66,7 +64,6 @@
 struct trace_output {
     FILE *stream;
     int owns_stream;
-    int use_zstd;
     int error;
     int closing;
     pid_t compressor_pid;
@@ -79,9 +76,6 @@ struct trace_output {
     pthread_mutex_t lock;
     pthread_cond_t can_read;
     pthread_cond_t can_write;
-    ZSTD_CCtx *zstd_cctx;
-    void *zstd_out_buf;
-    size_t zstd_out_cap;
 };
 
 static struct trace_output g_out;
@@ -229,26 +223,6 @@ static int trace_output_write_plain(struct trace_output *out, const char *buf, s
     return fwrite(buf, 1, len, out->stream) == len ? 0 : -1;
 }
 
-static int trace_output_write_zstd(struct trace_output *out, const char *buf,
-                                   size_t len, ZSTD_EndDirective mode)
-{
-    ZSTD_inBuffer input = { buf, len, 0 };
-    while (input.pos < input.size || mode != ZSTD_e_continue) {
-        ZSTD_outBuffer output = { out->zstd_out_buf, out->zstd_out_cap, 0 };
-        size_t rc = ZSTD_compressStream2(out->zstd_cctx, &output, &input, mode);
-        if (ZSTD_isError(rc))
-            return -1;
-        if (output.pos > 0 && fwrite(out->zstd_out_buf, 1, output.pos, out->stream) != output.pos)
-            return -1;
-        if (mode == ZSTD_e_continue) {
-            if (input.pos >= input.size) break;
-        } else if (rc == 0) {
-            break;
-        }
-    }
-    return 0;
-}
-
 static void *trace_output_writer_main(void *arg)
 {
     struct trace_output *out = arg;
@@ -286,9 +260,7 @@ static void *trace_output_writer_main(void *arg)
         pthread_cond_signal(&out->can_write);
         pthread_mutex_unlock(&out->lock);
 
-        if ((out->use_zstd
-                ? trace_output_write_zstd(out, chunk, n, ZSTD_e_continue)
-                : trace_output_write_plain(out, chunk, n)) != 0) {
+        if (trace_output_write_plain(out, chunk, n) != 0) {
             pthread_mutex_lock(&out->lock);
             out->error = 1;
             pthread_cond_broadcast(&out->can_read);
@@ -298,8 +270,6 @@ static void *trace_output_writer_main(void *arg)
         }
     }
 
-    if (!out->error && out->use_zstd)
-        (void)trace_output_write_zstd(out, NULL, 0, ZSTD_e_end);
     if (!out->error)
         fflush(out->stream);
     free(chunk);
@@ -1777,13 +1747,10 @@ static int open_trace_output(const char *outfile)
         g_out.owns_stream = 0;
     }
     setvbuf(g_out.stream, NULL, _IOFBF, TRACE_OUT_RING_SIZE);
-    g_out.use_zstd = 0;
     if (pthread_create(&g_out.writer, NULL, trace_output_writer_main, &g_out) != 0) {
         perror("pthread_create");
         if (g_out.owns_stream) fclose(g_out.stream);
         if (g_out.compressor_pid > 0) waitpid(g_out.compressor_pid, NULL, 0);
-        free(g_out.zstd_out_buf);
-        if (g_out.zstd_cctx) ZSTD_freeCCtx(g_out.zstd_cctx);
         free(g_out.ring);
         g_out.ring = NULL;
         return -1;
@@ -1820,8 +1787,6 @@ static int close_trace_output(const char *outfile)
     pthread_cond_destroy(&g_out.can_write);
     pthread_mutex_destroy(&g_out.lock);
     free(g_out.ring);
-    free(g_out.zstd_out_buf);
-    if (g_out.zstd_cctx) ZSTD_freeCCtx(g_out.zstd_cctx);
     memset(&g_out, 0, sizeof(g_out));
     return rc;
 }
