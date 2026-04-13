@@ -108,6 +108,11 @@ cat > "$TMPDIR/dep_cycle.jsonl" <<'EOF'
 {"event":"OPEN","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.011,"path":"a","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4}
 {"event":"EXIT","tgid":2001,"pid":2001,"ppid":1,"nspid":2001,"nstgid":2001,"ts":2.020,"status":"exited","code":0,"raw":0}
 EOF
+cat > "$TMPDIR/no_env_trace.jsonl" <<'EOF'
+{"event":"CWD","tgid":3000,"pid":3000,"ppid":1,"nspid":3000,"nstgid":3000,"ts":3.000,"path":"/tmp"}
+{"event":"EXEC","tgid":3000,"pid":3000,"ppid":1,"nspid":3000,"nstgid":3000,"ts":3.001,"exe":"/usr/bin/tool3","argv":["tool3","--flag"],"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}}
+{"event":"EXIT","tgid":3000,"pid":3000,"ppid":1,"nspid":3000,"nstgid":3000,"ts":3.020,"status":"exited","code":0,"raw":0}
+EOF
 echo "Ingesting compressed trace and saving DB…"
 zstd -q -f "$TRACE" -o "$TMPDIR/trace.jsonl.zst"
 "$TV" --trace "$TMPDIR/trace.jsonl.zst" --save "$TMPDIR/test_zstd.db"
@@ -121,6 +126,16 @@ OUT=$(drive_db "$TMPDIR/test_zstd.db" '{"input":"resize","rows":50,"cols":120}
 run_test "zstd trace: compressed input loads" \
     'assert_contains t "$OUT" "|1000|"' \
     'assert_contains t "$OUT" "|1008|"'
+
+OUT=$(drive_trace "$TMPDIR/no_env_trace.jsonl" '{"input":"resize","rows":40,"cols":100}
+{"input":"select","id":"3000"}
+{"input":"print","what":"rpane"}')
+run_test "trace ingest: exec without env" \
+    'assert_ok_or_timeout t "$DRIVE_RC"' \
+    'assert_contains t "$OUT" "TGID:  3000"' \
+    'assert_contains t "$OUT" "EXE:   /usr/bin/tool3"' \
+    'assert_contains t "$OUT" "[0] tool3"' \
+    'assert_contains t "$OUT" "[1] --flag"'
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test: process tree default view
