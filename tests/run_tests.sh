@@ -68,8 +68,19 @@ echo "Ingesting trace and saving DB…"
 "$TV" --trace "$TRACE" --save "$TMPDIR/test.db"
 [ -f "$TMPDIR/test.db" ] || { echo "Save failed"; exit 1; }
 
+echo "Ingesting compressed trace and saving DB…"
+zstd -q -f "$TRACE" -o "$TMPDIR/trace.jsonl.zst"
+"$TV" --trace "$TMPDIR/trace.jsonl.zst" --save "$TMPDIR/test_zstd.db"
+[ -f "$TMPDIR/test_zstd.db" ] || { echo "Compressed save failed"; exit 1; }
+
 echo ""
 echo "Running tests…"
+
+OUT=$(drive_db "$TMPDIR/test_zstd.db" '{"input":"resize","rows":50,"cols":120}
+{"input":"print","what":"lpane"}')
+run_test "zstd trace: compressed input loads" \
+    'assert_contains t "$OUT" "|1000|"' \
+    'assert_contains t "$OUT" "|1008|"'
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test: process tree default view

@@ -37,6 +37,9 @@
 #include <sys/prctl.h>
 #include <linux/ptrace.h>
 #include <elf.h>          /* AT_* constants, ElfW, NT_PRSTATUS */
+#include <pthread.h>
+
+#include <zstd.h>
 
 #ifndef PR_SET_SYSCALL_USER_DISPATCH
 #define PR_SET_SYSCALL_USER_DISPATCH 59
@@ -53,14 +56,45 @@
 #define ARGV_MAX_READ       32768
 #define ENV_MAX_READ        65536
 #define LINE_MAX_BUF        (PATH_MAX * 8 + 262144 + 1024)
+#define TRACE_OUT_RING_SIZE (1 << 20)
+#define TRACE_OUT_CHUNK_SIZE (1 << 16)
 
 /* ================================================================
  * Output stream
  * ================================================================ */
 
-static FILE *g_out;
+struct trace_output {
+    FILE *stream;
+    int owns_stream;
+    int use_zstd;
+    int error;
+    int closing;
+    char *ring;
+    size_t ring_size;
+    size_t head;
+    size_t tail;
+    size_t used;
+    pthread_t writer;
+    pthread_mutex_t lock;
+    pthread_cond_t can_read;
+    pthread_cond_t can_write;
+    ZSTD_CCtx *zstd_cctx;
+    void *zstd_out_buf;
+    size_t zstd_out_cap;
+};
+
+static struct trace_output g_out;
 static struct stat g_creator_stdout_st; /* stat of the session creator's stdout */
 static int g_creator_stdout_valid;
+
+static int path_has_suffix(const char *path, const char *suffix)
+{
+    size_t path_len, suffix_len;
+    if (!path || !suffix) return 0;
+    path_len = strlen(path);
+    suffix_len = strlen(suffix);
+    return path_len >= suffix_len && strcmp(path + path_len - suffix_len, suffix) == 0;
+}
 
 /* ================================================================
  * Timestamp
@@ -189,10 +223,118 @@ static int json_header(char *buf, int buflen, const char *event,
         (int)pid, (int)tgid);
 }
 
+static int trace_output_write_plain(struct trace_output *out, const char *buf, size_t len)
+{
+    return fwrite(buf, 1, len, out->stream) == len ? 0 : -1;
+}
+
+static int trace_output_write_zstd(struct trace_output *out, const char *buf,
+                                   size_t len, ZSTD_EndDirective mode)
+{
+    ZSTD_inBuffer input = { buf, len, 0 };
+    while (input.pos < input.size || mode != ZSTD_e_continue) {
+        ZSTD_outBuffer output = { out->zstd_out_buf, out->zstd_out_cap, 0 };
+        size_t rc = ZSTD_compressStream2(out->zstd_cctx, &output, &input, mode);
+        if (ZSTD_isError(rc))
+            return -1;
+        if (output.pos > 0 && fwrite(out->zstd_out_buf, 1, output.pos, out->stream) != output.pos)
+            return -1;
+        if (mode == ZSTD_e_continue) {
+            if (input.pos >= input.size) break;
+        } else if (rc == 0) {
+            break;
+        }
+    }
+    return 0;
+}
+
+static void *trace_output_writer_main(void *arg)
+{
+    struct trace_output *out = arg;
+    char *chunk = malloc(TRACE_OUT_CHUNK_SIZE);
+    if (!chunk) {
+        pthread_mutex_lock(&out->lock);
+        out->error = 1;
+        pthread_cond_broadcast(&out->can_read);
+        pthread_cond_broadcast(&out->can_write);
+        pthread_mutex_unlock(&out->lock);
+        return NULL;
+    }
+
+    for (;;) {
+        size_t n = 0;
+
+        pthread_mutex_lock(&out->lock);
+        while (out->used == 0 && !out->closing && !out->error)
+            pthread_cond_wait(&out->can_read, &out->lock);
+        if (out->error) {
+            pthread_mutex_unlock(&out->lock);
+            break;
+        }
+        if (out->used == 0 && out->closing) {
+            pthread_mutex_unlock(&out->lock);
+            break;
+        }
+
+        n = out->ring_size - out->tail;
+        if (n > out->used) n = out->used;
+        if (n > TRACE_OUT_CHUNK_SIZE) n = TRACE_OUT_CHUNK_SIZE;
+        memcpy(chunk, out->ring + out->tail, n);
+        out->tail = (out->tail + n) % out->ring_size;
+        out->used -= n;
+        pthread_cond_signal(&out->can_write);
+        pthread_mutex_unlock(&out->lock);
+
+        if ((out->use_zstd
+                ? trace_output_write_zstd(out, chunk, n, ZSTD_e_continue)
+                : trace_output_write_plain(out, chunk, n)) != 0) {
+            pthread_mutex_lock(&out->lock);
+            out->error = 1;
+            pthread_cond_broadcast(&out->can_read);
+            pthread_cond_broadcast(&out->can_write);
+            pthread_mutex_unlock(&out->lock);
+            break;
+        }
+    }
+
+    if (!out->error && out->use_zstd)
+        (void)trace_output_write_zstd(out, NULL, 0, ZSTD_e_end);
+    if (!out->error)
+        fflush(out->stream);
+    free(chunk);
+    return NULL;
+}
+
+static int trace_output_enqueue(const char *buf, size_t len)
+{
+    struct trace_output *out = &g_out;
+
+    if (!out->ring || len == 0) return 0;
+    if (len > out->ring_size) return -1;
+
+    pthread_mutex_lock(&out->lock);
+    while (!out->error && (out->ring_size - out->used) < len)
+        pthread_cond_wait(&out->can_write, &out->lock);
+    if (out->error) {
+        pthread_mutex_unlock(&out->lock);
+        return -1;
+    }
+
+    size_t first = out->ring_size - out->head;
+    if (first > len) first = len;
+    memcpy(out->ring + out->head, buf, first);
+    if (len > first)
+        memcpy(out->ring, buf + first, len - first);
+    out->head = (out->head + len) % out->ring_size;
+    out->used += len;
+    pthread_cond_signal(&out->can_read);
+    pthread_mutex_unlock(&out->lock);
+    return 0;
+}
+
 static void emit_line(const char *line, size_t len)
 {
-    fwrite(line, 1, len, g_out);
-    fflush(g_out);
+    (void)trace_output_enqueue(line, len);
 }
 
 /* ================================================================
@@ -282,15 +424,13 @@ static pid_t get_tgid(pid_t pid)
 }
 
 /* Read a process's memory at a given address. */
+static int ensure_proc_mem_fd(pid_t pid);
+
 static ssize_t read_proc_mem(pid_t pid, unsigned long addr, void *buf, size_t len)
 {
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/mem", (int)pid);
-    int fd = open(path, O_RDONLY);
+    int fd = ensure_proc_mem_fd(pid);
     if (fd < 0) return -1;
-    ssize_t n = pread(fd, buf, len, (off_t)addr);
-    close(fd);
-    return n;
+    return pread(fd, buf, len, (off_t)addr);
 }
 
 /* Write to a process's memory at a given address. */
@@ -437,7 +577,9 @@ static int pidset_contains(struct pid_set *s, pid_t pid)
 struct proc_state {
     pid_t pid;
     pid_t tgid;           /* thread group leader — cached at first sight */
+    pid_t ppid;           /* cached parent pid */
     int   is_thread;      /* 1 if pid != tgid (a non-leader thread) */
+    int   mem_fd;         /* cached /proc/pid/mem fd */
     int   in_syscall;     /* 1 if we're at syscall entry, 0 at exit */
     long  saved_syscall;  /* syscall number at entry */
     /* saved args for specific syscalls */
@@ -462,7 +604,9 @@ static struct proc_state *get_state(pid_t pid)
     s->pid = pid;
     /* Cache tgid at creation so it's available even after /proc disappears */
     s->tgid = get_tgid(pid);
+    s->ppid = get_ppid(pid);
     s->is_thread = (s->tgid != pid);
+    s->mem_fd = -1;
     s->next = g_states;
     g_states = s;
     return s;
@@ -475,11 +619,37 @@ static void free_state(pid_t pid)
         if ((*pp)->pid == pid) {
             struct proc_state *tmp = *pp;
             *pp = tmp->next;
+            if (tmp->mem_fd >= 0) close(tmp->mem_fd);
             free(tmp);
             return;
         }
         pp = &(*pp)->next;
     }
+}
+
+static int ensure_proc_mem_fd(pid_t pid)
+{
+    struct proc_state *ps = get_state(pid);
+    char path[256];
+    if (!ps) return -1;
+    if (ps->mem_fd >= 0) return ps->mem_fd;
+    snprintf(path, sizeof(path), "/proc/%d/mem", (int)pid);
+    ps->mem_fd = open(path, O_RDONLY);
+    return ps->mem_fd;
+}
+
+static void get_cached_ids(pid_t pid, pid_t *tgid, pid_t *ppid)
+{
+    struct proc_state *ps = get_state(pid);
+    if (!ps) {
+        *tgid = pid;
+        *ppid = 0;
+        return;
+    }
+    if (ps->tgid <= 0) ps->tgid = get_tgid(pid);
+    if (ps->ppid <= 0) ps->ppid = get_ppid(pid);
+    *tgid = ps->tgid > 0 ? ps->tgid : pid;
+    *ppid = ps->ppid;
 }
 
 /* ================================================================
@@ -506,9 +676,9 @@ static char *read_tracee_string(pid_t pid, unsigned long addr, size_t max)
 
 static void emit_cwd_event(pid_t pid)
 {
-    pid_t tgid = get_tgid(pid);
-    pid_t ppid = get_ppid(pid);
+    pid_t tgid, ppid;
     struct timespec ts;
+    get_cached_ids(pid, &tgid, &ppid);
     get_timestamp(&ts);
 
     char cwd_buf[PATH_MAX];
@@ -526,9 +696,9 @@ static void emit_cwd_event(pid_t pid)
 
 static void emit_exec_event(pid_t pid)
 {
-    pid_t tgid = get_tgid(pid);
-    pid_t ppid = get_ppid(pid);
+    pid_t tgid, ppid;
     struct timespec ts;
+    get_cached_ids(pid, &tgid, &ppid);
     get_timestamp(&ts);
 
     /* exe */
@@ -630,9 +800,9 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
 
 static void emit_inherited_open_events(pid_t pid)
 {
-    pid_t tgid = get_tgid(pid);
-    pid_t ppid = get_ppid(pid);
+    pid_t tgid, ppid;
     struct timespec ts;
+    get_cached_ids(pid, &tgid, &ppid);
     get_timestamp(&ts);
 
     char dir_path[256];
@@ -652,9 +822,9 @@ static void emit_inherited_open_events(pid_t pid)
 static void emit_open_event(pid_t pid, const char *path, int flags,
                             long fd_or_err)
 {
-    pid_t tgid = get_tgid(pid);
-    pid_t ppid = get_ppid(pid);
+    pid_t tgid, ppid;
     struct timespec ts;
+    get_cached_ids(pid, &tgid, &ppid);
     get_timestamp(&ts);
 
     char path_esc[PATH_MAX * 2];
@@ -697,9 +867,9 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
 static void emit_write_event(pid_t pid, const char *stream,
                              unsigned long buf_addr, size_t count)
 {
-    pid_t tgid = get_tgid(pid);
-    pid_t ppid = get_ppid(pid);
+    pid_t tgid, ppid;
     struct timespec ts;
+    get_cached_ids(pid, &tgid, &ppid);
     get_timestamp(&ts);
 
     size_t to_read = count;
@@ -728,9 +898,9 @@ static void emit_write_event(pid_t pid, const char *stream,
 
 static void emit_exit_event(pid_t pid, int status)
 {
-    pid_t tgid = get_tgid(pid);
-    pid_t ppid = get_ppid(pid);
+    pid_t tgid, ppid;
     struct timespec ts;
+    get_cached_ids(pid, &tgid, &ppid);
     get_timestamp(&ts);
 
     char line[384];
@@ -1466,7 +1636,7 @@ static int handle_syscall_exit(pid_t pid, struct proc_state *ps)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-o FILE] [--backend auto|module|sud|ptrace] [--module|--sud|--ptrace] -- command [args...]\n",
+            "Usage: %s [-o FILE[.zst]] [--backend auto|module|sud|ptrace] [--module|--sud|--ptrace] -- command [args...]\n",
             prog);
     exit(1);
 }
@@ -1538,26 +1708,102 @@ static int kernel_supports_proctrace_module(void)
     return 1;
 }
 
+static int trace_output_uses_zstd(const char *outfile)
+{
+    return outfile && path_has_suffix(outfile, ".zst");
+}
+
 static int open_trace_output(const char *outfile)
 {
+    memset(&g_out, 0, sizeof(g_out));
+    g_out.ring_size = TRACE_OUT_RING_SIZE;
+    g_out.ring = malloc(g_out.ring_size);
+    if (!g_out.ring) {
+        perror("malloc");
+        return -1;
+    }
+    pthread_mutex_init(&g_out.lock, NULL);
+    pthread_cond_init(&g_out.can_read, NULL);
+    pthread_cond_init(&g_out.can_write, NULL);
+
     if (outfile) {
-        g_out = fopen(outfile, "w");
-        if (!g_out) {
+        g_out.stream = fopen(outfile, "wb");
+        if (!g_out.stream) {
             perror("fopen");
+            free(g_out.ring);
+            g_out.ring = NULL;
             return -1;
         }
+        g_out.owns_stream = 1;
     } else {
-        g_out = stdout;
+        g_out.stream = stdout;
+        g_out.owns_stream = 0;
+    }
+    setvbuf(g_out.stream, NULL, _IOFBF, TRACE_OUT_RING_SIZE);
+    g_out.use_zstd = trace_output_uses_zstd(outfile);
+    if (g_out.use_zstd) {
+        g_out.zstd_cctx = ZSTD_createCCtx();
+        g_out.zstd_out_cap = ZSTD_CStreamOutSize();
+        g_out.zstd_out_buf = malloc(g_out.zstd_out_cap);
+        if (!g_out.zstd_cctx || !g_out.zstd_out_buf) {
+            perror("malloc");
+            if (g_out.owns_stream) fclose(g_out.stream);
+            free(g_out.zstd_out_buf);
+            if (g_out.zstd_cctx) ZSTD_freeCCtx(g_out.zstd_cctx);
+            free(g_out.ring);
+            g_out.ring = NULL;
+            return -1;
+        }
+        if (ZSTD_isError(ZSTD_CCtx_setParameter(g_out.zstd_cctx, ZSTD_c_compressionLevel, 3))
+            || ZSTD_isError(ZSTD_CCtx_setParameter(g_out.zstd_cctx, ZSTD_c_nbWorkers, 2))) {
+            fprintf(stderr, "uproctrace: zstd output setup failed\n");
+            if (g_out.owns_stream) fclose(g_out.stream);
+            free(g_out.zstd_out_buf);
+            ZSTD_freeCCtx(g_out.zstd_cctx);
+            free(g_out.ring);
+            g_out.ring = NULL;
+            return -1;
+        }
+    }
+    if (pthread_create(&g_out.writer, NULL, trace_output_writer_main, &g_out) != 0) {
+        perror("pthread_create");
+        if (g_out.owns_stream) fclose(g_out.stream);
+        free(g_out.zstd_out_buf);
+        if (g_out.zstd_cctx) ZSTD_freeCCtx(g_out.zstd_cctx);
+        free(g_out.ring);
+        g_out.ring = NULL;
+        return -1;
     }
     return 0;
 }
 
-static void close_trace_output(const char *outfile)
+static int close_trace_output(const char *outfile)
 {
-    if (outfile && g_out) {
-        fclose(g_out);
-        g_out = NULL;
+    int rc = 0;
+    if (!g_out.stream) return 0;
+
+    pthread_mutex_lock(&g_out.lock);
+    g_out.closing = 1;
+    pthread_cond_broadcast(&g_out.can_read);
+    pthread_mutex_unlock(&g_out.lock);
+    pthread_join(g_out.writer, NULL);
+
+    if (g_out.error) {
+        fprintf(stderr, "uproctrace: trace output failed\n");
+        rc = -1;
     }
+    if (outfile && g_out.owns_stream && fclose(g_out.stream) != 0)
+        rc = -1;
+    else if (!outfile)
+        fflush(g_out.stream);
+    pthread_cond_destroy(&g_out.can_read);
+    pthread_cond_destroy(&g_out.can_write);
+    pthread_mutex_destroy(&g_out.lock);
+    free(g_out.ring);
+    free(g_out.zstd_out_buf);
+    if (g_out.zstd_cctx) ZSTD_freeCCtx(g_out.zstd_cctx);
+    memset(&g_out, 0, sizeof(g_out));
+    return rc;
 }
 
 static int copy_fd_to_output(int fd)
@@ -1571,11 +1817,10 @@ static int copy_fd_to_output(int fd)
             perror("read");
             return -1;
         }
-        if (fwrite(buf, 1, (size_t)n, g_out) != (size_t)n) {
-            perror("fwrite");
+        if (trace_output_enqueue(buf, (size_t)n) != 0) {
+            fprintf(stderr, "uproctrace: trace output queue failed\n");
             return -1;
         }
-        fflush(g_out);
     }
 }
 
@@ -1605,7 +1850,7 @@ static int run_module_trace(char **cmd, const char *outfile)
     if (child < 0) {
         perror("fork");
         close(trace_fd);
-        close_trace_output(outfile);
+        (void)close_trace_output(outfile);
         return 1;
     }
     if (child == 0) {
@@ -1618,7 +1863,8 @@ static int run_module_trace(char **cmd, const char *outfile)
     close(trace_fd);
     if (wait_for_child(child) != 0)
         rc = 1;
-    close_trace_output(outfile);
+    if (close_trace_output(outfile) != 0)
+        rc = 1;
     return rc == 0 ? 0 : 1;
 }
 
@@ -1652,6 +1898,49 @@ static int build_exec_argv(char ***out_argv, const char *exe,
 
 static int run_sud_trace(char **cmd, const char *outfile, const char *sudtrace_exe)
 {
+    if (trace_output_uses_zstd(outfile)) {
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            perror("pipe");
+            return 1;
+        }
+        if (open_trace_output(outfile) < 0) {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return 1;
+        }
+        pid_t child = fork();
+        if (child < 0) {
+            perror("fork");
+            close(pipefd[0]);
+            close(pipefd[1]);
+            (void)close_trace_output(outfile);
+            return 1;
+        }
+        if (child == 0) {
+            char **sub_argv = NULL;
+            close(pipefd[0]);
+            if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
+            close(pipefd[1]);
+            if (build_exec_argv(&sub_argv, sudtrace_exe, NULL, cmd) != 0)
+                _exit(127);
+            if (strchr(sudtrace_exe, '/'))
+                execv(sudtrace_exe, sub_argv);
+            else
+                execvp(sudtrace_exe, sub_argv);
+            perror("exec sudtrace");
+            _exit(127);
+        }
+        close(pipefd[1]);
+        int rc = copy_fd_to_output(pipefd[0]);
+        close(pipefd[0]);
+        if (wait_for_child(child) != 0)
+            rc = 1;
+        if (close_trace_output(outfile) != 0)
+            rc = 1;
+        return rc == 0 ? 0 : 1;
+    }
+
     pid_t child = fork();
     if (child < 0) {
         perror("fork");
@@ -1898,13 +2187,15 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
         ptrace(PTRACE_SYSCALL, wpid, NULL, (void *)(long)sig);
     }
 
-    close_trace_output(outfile);
+    if (close_trace_output(outfile) != 0)
+        return 1;
 
     /* Clean up */
     free(g_tracked.pids);
     while (g_states) {
         struct proc_state *s = g_states;
         g_states = s->next;
+        if (s->mem_fd >= 0) close(s->mem_fd);
         free(s);
     }
     while (g_emu_tracees) {

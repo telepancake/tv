@@ -41,6 +41,7 @@ install:
 	depmod -a
 
 CFLAGS := -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0
+TV_LIBS := -lm -pthread -lzstd
 
 gen_sql_h: gen_sql_h.c
 	cc -O2 -o gen_sql_h gen_sql_h.c
@@ -49,7 +50,7 @@ tv_sql.h: tv.sql gen_sql_h
 	./gen_sql_h tv.sql tv_sql.h
 
 tv: main.c engine.c engine.h tv_sql.h uproctrace.c
-	cc $(CFLAGS) -o tv main.c engine.c uproctrace.c sqlite3.c -static -lm
+	cc $(CFLAGS) -o tv main.c engine.c uproctrace.c sqlite3.c -static $(TV_LIBS)
 
 sudtrace: sudtrace.c sudtrace.lds
 	cc -O2 -fno-stack-protector -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm

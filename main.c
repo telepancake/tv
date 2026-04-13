@@ -27,6 +27,8 @@
 #include <fcntl.h>
 #include <time.h>
 
+#include <zstd.h>
+
 #include "engine.h"
 #include "tv_sql.h"
 
@@ -294,7 +296,128 @@ static void process_trace_batch(void) {
     g_pending_trace_rows = 0;
 }
 
+static int path_has_suffix(const char *path, const char *suffix) {
+    size_t path_len, suffix_len;
+    if (!path || !suffix) return 0;
+    path_len = strlen(path);
+    suffix_len = strlen(suffix);
+    return path_len >= suffix_len && strcmp(path + path_len - suffix_len, suffix) == 0;
+}
+
+static void ingest_zstd_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "tv: cannot open %s\n", path); exit(1); }
+
+    size_t in_cap = ZSTD_DStreamInSize();
+    size_t out_cap = ZSTD_DStreamOutSize();
+    unsigned char *in_buf = malloc(in_cap);
+    unsigned char *out_buf = malloc(out_cap);
+    char *line = malloc(1 << 20);
+    ZSTD_DStream *stream = ZSTD_createDStream();
+    size_t line_len = 0, line_cap = 1 << 20;
+
+    if (!in_buf || !out_buf || !line || !stream) {
+        fprintf(stderr, "tv: out of memory reading %s\n", path);
+        fclose(f);
+        free(in_buf);
+        free(out_buf);
+        free(line);
+        if (stream) ZSTD_freeDStream(stream);
+        exit(1);
+    }
+    if (ZSTD_isError(ZSTD_initDStream(stream))) {
+        fprintf(stderr, "tv: zstd init failed for %s\n", path);
+        fclose(f);
+        free(in_buf);
+        free(out_buf);
+        free(line);
+        ZSTD_freeDStream(stream);
+        exit(1);
+    }
+
+    xexec("BEGIN");
+    for (;;) {
+        size_t nread = fread(in_buf, 1, in_cap, f);
+        ZSTD_inBuffer input = { in_buf, nread, 0 };
+        if (nread == 0 && ferror(f)) {
+            fprintf(stderr, "tv: read failed for %s\n", path);
+            xexec("ROLLBACK");
+            fclose(f);
+            free(in_buf);
+            free(out_buf);
+            free(line);
+            ZSTD_freeDStream(stream);
+            exit(1);
+        }
+        while (input.pos < input.size) {
+            ZSTD_outBuffer output = { out_buf, out_cap, 0 };
+            size_t rc = ZSTD_decompressStream(stream, &output, &input);
+            if (ZSTD_isError(rc)) {
+                fprintf(stderr, "tv: zstd decompress failed for %s: %s\n",
+                        path, ZSTD_getErrorName(rc));
+                xexec("ROLLBACK");
+                fclose(f);
+                free(in_buf);
+                free(out_buf);
+                free(line);
+                ZSTD_freeDStream(stream);
+                exit(1);
+            }
+            size_t pos = 0;
+            while (pos < output.pos) {
+                unsigned char *nl = memchr(out_buf + pos, '\n', output.pos - pos);
+                size_t chunk_len = nl ? (size_t)(nl - (out_buf + pos)) : (output.pos - pos);
+                if (line_len + chunk_len + 1 > line_cap) {
+                    size_t new_cap = line_cap;
+                    while (line_len + chunk_len + 1 > new_cap) new_cap *= 2;
+                    char *tmp = realloc(line, new_cap);
+                    if (!tmp) {
+                        fprintf(stderr, "tv: out of memory reading %s\n", path);
+                        xexec("ROLLBACK");
+                        fclose(f);
+                        free(in_buf);
+                        free(out_buf);
+                        free(line);
+                        ZSTD_freeDStream(stream);
+                        exit(1);
+                    }
+                    line = tmp;
+                    line_cap = new_cap;
+                }
+                memcpy(line + line_len, out_buf + pos, chunk_len);
+                line_len += chunk_len;
+                pos += chunk_len;
+                if (nl) {
+                    if (line_len > 0 && line[line_len - 1] == '\r') line_len--;
+                    line[line_len] = 0;
+                    ingest_line(line);
+                    line_len = 0;
+                    pos++;
+                }
+            }
+        }
+        if (nread == 0) break;
+    }
+    if (line_len > 0) {
+        if (line[line_len - 1] == '\r') line_len--;
+        line[line_len] = 0;
+        ingest_line(line);
+    }
+    process_trace_batch();
+    xexec("COMMIT");
+
+    fclose(f);
+    free(in_buf);
+    free(out_buf);
+    free(line);
+    ZSTD_freeDStream(stream);
+}
+
 static void ingest_file(const char *path) {
+    if (path_has_suffix(path, ".zst")) {
+        ingest_zstd_file(path);
+        return;
+    }
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "tv: cannot open %s\n", path); exit(1); }
     char line[1 << 20];
@@ -901,9 +1024,9 @@ int main(int argc, char **argv) {
     if (!load_mode && !trace_file[0] && !cmd) {
         fprintf(stderr, "Usage: tv [--module|--sud|--ptrace] -- <command> [args...]\n"
             "       tv --load <file.db>\n"
-            "       tv --trace <file.jsonl> [--save <file.db>]\n"
-            "       tv --load <file.db> --trace <input.jsonl>\n"
-            "       tv --uproctrace [-o FILE] [--module|--sud|--ptrace|--backend auto|module|sud|ptrace] -- <command> [args...]\n"
+            "       tv --trace <file.jsonl[.zst]> [--save <file.db>]\n"
+            "       tv --load <file.db> --trace <input.jsonl[.zst]>\n"
+            "       tv --uproctrace [-o FILE[.zst]] [--module|--sud|--ptrace|--backend auto|module|sud|ptrace] -- <command> [args...]\n"
             "\n  --ptrace   Force ptrace backend (default: use proctrace kernel module if available)\n"
             "  --sud      Force sudtrace backend\n"
             "  --module   Force proctrace kernel module backend\n"
