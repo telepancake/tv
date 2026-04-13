@@ -176,10 +176,22 @@ static void tty_restore(tui_t *t) {
 }
 static void atexit_restore(void) { if (g_atexit_tui) tty_restore(g_atexit_tui); }
 static void sigwinch(int sig) { (void)sig; g_resized = 1; }
+static void sync_state_size(tui_t *t) {
+    if (!t || !t->db) return;
+    sqlite3_stmt *st;
+    if (sqlite3_prepare_v2(t->db,
+            "UPDATE state SET rows=?, cols=?", -1, &st, 0) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, t->rows);
+        sqlite3_bind_int(st, 2, t->cols);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+}
 static void tty_size(tui_t *t) {
     struct winsize ws;
     if (t->tty_fd >= 0 && ioctl(t->tty_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
         t->rows = ws.ws_row; t->cols = ws.ws_col;
+        sync_state_size(t);
     }
 }
 
@@ -505,7 +517,36 @@ static void render_all(tui_t *t) {
 }
 
 /* ── Default navigation ────────────────────────────────────────────── */
+static int is_engine_nav_key(int k) {
+    switch (k) {
+    case TUI_K_UP: case TUI_K_DOWN:
+    case TUI_K_PGUP: case TUI_K_PGDN:
+    case TUI_K_HOME: case TUI_K_END:
+    case TUI_K_TAB:
+    case 'j': case 'k': case 'g':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static void default_nav(tui_t *t, int k) {
+    if (k == TUI_K_TAB) {
+        if (t->npanels <= 0) return;
+        int start = t->focus;
+        if (start < 0) start = 0;
+        for (int off = 1; off <= t->npanels; off++) {
+            int idx = (start + off) % t->npanels;
+            if (t->panels[idx].def.flags & TUI_PANEL_CURSOR) {
+                t->focus = idx;
+                p_update_count(t, &t->panels[idx]);
+                p_clamp(&t->panels[idx]);
+                p_sync_id(t, &t->panels[idx]);
+                return;
+            }
+        }
+        return;
+    }
     if (t->focus < 0 || t->focus >= t->npanels) return;
     panel_st *p = &t->panels[t->focus];
     if (!(p->def.flags & TUI_PANEL_CURSOR)) return;
@@ -551,6 +592,7 @@ tui_t *tui_open(sqlite3 *db) {
 
     int wr = write(t->tty_fd, "\x1b[?1049h\x1b[?25l", 14); (void)wr;
     tty_size(t);
+    sync_state_size(t);
 
     struct sigaction sa = {{0}};
     sa.sa_handler = sigwinch;
@@ -575,6 +617,7 @@ tui_t *tui_open_headless(sqlite3 *db) {
             sqlite3_finalize(st);
         } else { t->rows = 24; t->cols = 80; }
     }
+    sync_state_size(t);
     return t;
 }
 
@@ -963,6 +1006,19 @@ void tui_run(tui_t *tui) {
         if (sel > 0 && tui->tty_fd >= 0 && FD_ISSET(tui->tty_fd, &rfds)) {
             int k = read_key(tui);
             if (k != TUI_K_NONE) {
+                if (is_engine_nav_key(k)) {
+                    default_nav(tui, k);
+                    if (tui->key_cb) {
+                        const char *fp2 = "", *fid2 = ""; int fc2 = 0;
+                        if (tui->focus >= 0 && tui->focus < tui->npanels) {
+                            panel_st *f2 = &tui->panels[tui->focus];
+                            fp2 = f2->def.name; fc2 = f2->cursor; fid2 = f2->cursor_id;
+                        }
+                        int res = tui->key_cb(tui, TUI_K_NONE, fp2, fc2, fid2, tui->key_ctx);
+                        if (res == TUI_QUIT) break;
+                    }
+                    continue;
+                }
                 const char *fp = "", *fid = ""; int fc = 0;
                 if (tui->focus >= 0 && tui->focus < tui->npanels) {
                     panel_st *f = &tui->panels[tui->focus];
@@ -1069,6 +1125,18 @@ void tui_input_key(tui_t *tui, int key) {
         /* Resolve cursor_id → position if dirty */
         if (p->dirty) { p_resolve_id(tui, p); p_clamp(p); p->dirty = 0; }
     }
+    if (is_engine_nav_key(key)) {
+        default_nav(tui, key);
+        if (tui->key_cb) {
+            const char *fp2 = "", *fid2 = ""; int fc2 = 0;
+            if (tui->focus >= 0 && tui->focus < tui->npanels) {
+                panel_st *f2 = &tui->panels[tui->focus];
+                fp2 = f2->def.name; fc2 = f2->cursor; fid2 = f2->cursor_id;
+            }
+            tui->key_cb(tui, TUI_K_NONE, fp2, fc2, fid2, tui->key_ctx);
+        }
+        return;
+    }
     /* Call key callback first, just like the event loop */
     int res = TUI_DEFAULT;
     const char *fp = "", *fid = ""; int fc = 0;
@@ -1089,6 +1157,14 @@ void tui_input_key(tui_t *tui, int key) {
             tui->key_cb(tui, TUI_K_NONE, fp2, fc2, fid2, tui->key_ctx);
         }
     }
+}
+
+void tui_resize(tui_t *tui, int rows, int cols) {
+    if (!tui) return;
+    if (rows > 0) tui->rows = rows;
+    if (cols > 0) tui->cols = cols;
+    sync_state_size(tui);
+    for (int i = 0; i < tui->npanels; i++) tui->panels[i].dirty = 1;
 }
 
 /* ── Dump panel or state for test mode ─────────────────────────────── */
