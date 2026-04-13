@@ -25,12 +25,20 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <time.h>
 
 #include "engine.h"
 #include "tv_sql.h"
 
 /* ── DB helper functions (app-side) ────────────────────────────────── */
 static sqlite3 *g_db;
+static sqlite3_stmt *g_ingest_line_st;
+static int g_pending_trace_rows;
+
+enum {
+    LIVE_TRACE_BATCH_ROWS = 256,
+    LIVE_TRACE_BATCH_MS = 50
+};
 
 static void xexec(const char *sql) {
     char *e;
@@ -58,6 +66,27 @@ static int qint(const char *sql, int def) {
         sqlite3_finalize(s);
     }
     return r;
+}
+
+static long long monotonic_millis(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static sqlite3_stmt *prepare_stmt_cached(sqlite3_stmt **slot, const char *sql) {
+    if (!*slot && sqlite3_prepare_v2(g_db, sql, -1, slot, 0) != SQLITE_OK) {
+        fprintf(stderr, "sql prepare: %s\n%.300s\n", sqlite3_errmsg(g_db), sql);
+        exit(1);
+    }
+    return *slot;
+}
+
+static void finalize_cached_stmts(void) {
+    if (g_ingest_line_st) {
+        sqlite3_finalize(g_ingest_line_st);
+        g_ingest_line_st = NULL;
+    }
 }
 
 
@@ -245,17 +274,21 @@ static void setup_fts(void) {
 static void ingest_line(const char *ln) {
     if (!ln || !ln[0] || ln[0] != '{') return;
     const char *kind = strstr(ln, "\"input\"") ? "input" : "trace";
-    sqlite3_stmt *st;
-    sqlite3_prepare_v2(g_db, "INSERT INTO inbox(kind,data) VALUES(?,?)", -1, &st, 0);
+    sqlite3_stmt *st = prepare_stmt_cached(&g_ingest_line_st,
+        "INSERT INTO inbox(kind,data) VALUES(?,?)");
+    sqlite3_reset(st);
+    sqlite3_clear_bindings(st);
     sqlite3_bind_text(st, 1, kind, -1, SQLITE_STATIC);
     sqlite3_bind_text(st, 2, ln, -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
-    sqlite3_finalize(st);
+    sqlite3_reset(st);
+    if (kind[0] == 't') g_pending_trace_rows++;
 }
 
 static void process_trace_batch(void) {
-    if (qint("SELECT COUNT(*) FROM inbox WHERE kind='trace'", 0) == 0) return;
+    if (g_pending_trace_rows == 0) return;
     xexec(tv_sql_ingest);
+    g_pending_trace_rows = 0;
 }
 
 static void ingest_file(const char *path) {
@@ -752,22 +785,37 @@ static int t_rbuf_len = 0;
 static FILE *t_trace_pipe = NULL;
 static int t_trace_fd = -1;
 static pid_t t_child_pid = 0;
+static int t_pending_live_trace_rows = 0;
+static long long t_live_trace_batch_start_ms = 0;
 
 /* ── Trace FD callback for engine event loop ───────────────────────── */
 static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
     (void)ctx;
     int n = read(fd, t_rbuf + t_rbuf_len, (int)(sizeof(t_rbuf) - t_rbuf_len - 1));
     if (n <= 0) {
+        int flushed = 0;
         if (t_rbuf_len > 0) {
             t_rbuf[t_rbuf_len] = 0;
             xexec("BEGIN"); ingest_line(t_rbuf); process_trace_batch(); xexec("COMMIT");
             t_rbuf_len = 0;
+            flushed = 1;
         }
+        if (!flushed && g_pending_trace_rows > 0) {
+            xexec("BEGIN");
+            process_trace_batch();
+            xexec("COMMIT");
+            flushed = 1;
+        }
+        t_pending_live_trace_rows = 0;
+        t_live_trace_batch_start_ms = 0;
         on_stream_end();
         tui_unwatch_fd(tui, fd);
         if (t_trace_pipe) { pclose(t_trace_pipe); t_trace_pipe = NULL; t_trace_fd = -1; }
         else { close(fd); t_trace_fd = -1; }
-        tui_dirty(tui, NULL);
+        if (flushed) {
+            xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
+            tui_dirty(tui, NULL);
+        }
     } else {
         t_rbuf_len += n;
         int did = 0;
@@ -789,9 +837,20 @@ static void on_trace_fd_cb(tui_t *tui, int fd, void *ctx) {
             did++;
             t_rbuf_len = 0;
         }
-        if (did) process_trace_batch();
-        xexec("COMMIT");
         if (did) {
+            long long now = monotonic_millis();
+            if (t_pending_live_trace_rows == 0)
+                t_live_trace_batch_start_ms = now;
+            t_pending_live_trace_rows += did;
+            if (t_pending_live_trace_rows >= LIVE_TRACE_BATCH_ROWS
+                || (now - t_live_trace_batch_start_ms) >= LIVE_TRACE_BATCH_MS) {
+                process_trace_batch();
+                t_pending_live_trace_rows = 0;
+                t_live_trace_batch_start_ms = 0;
+            }
+        }
+        xexec("COMMIT");
+        if (did && t_pending_live_trace_rows == 0) {
             xexec("UPDATE state SET base_ts=(SELECT COALESCE(MIN(ts),0) FROM events) WHERE base_ts=0");
             tui_dirty(tui, NULL);
             /* Reap child */
@@ -942,6 +1001,7 @@ int main(int argc, char **argv) {
     }
     if (!tui) {
         if (!headless_mode) fprintf(stderr, "tv: cannot open terminal\n");
+        finalize_cached_stmts();
         sqlite3_close(g_db);
         return headless_mode ? 0 : 1;
     }
@@ -962,6 +1022,7 @@ int main(int argc, char **argv) {
     if (g_headless || (save_file[0] && !cmd)) {
         g_tui = NULL;
         tui_close(tui);
+        finalize_cached_stmts();
         sqlite3_close(g_db);
         return 0;
     }
@@ -988,6 +1049,7 @@ int main(int argc, char **argv) {
     if (t_trace_pipe) { pclose(t_trace_pipe); t_trace_pipe = NULL; }
     else if (t_trace_fd >= 0) { close(t_trace_fd); t_trace_fd = -1; }
     if (t_child_pid > 0) { kill(t_child_pid, SIGTERM); waitpid(t_child_pid, NULL, 0); }
+    finalize_cached_stmts();
     sqlite3_close(g_db);
     return 0;
 }
