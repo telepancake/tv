@@ -11,3 +11,6 @@ gen_sql_h
 *.cmd
 *.symvers
 modules.order
+sudtrace
+tests/trace_compare/hello_static
+tests/trace_compare/hello_dynamic
