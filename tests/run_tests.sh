@@ -10,6 +10,7 @@ set -eo pipefail
 cd "$(dirname "$0")/.."
 TV=./tv
 TRACE=tests/trace.jsonl
+# Max runtime for drive_trace() regression cases that intentionally probe hangs.
 TV_TIMEOUT=${TV_TIMEOUT:-5s}
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT

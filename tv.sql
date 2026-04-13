@@ -291,23 +291,23 @@ CREATE TEMP VIEW _dep_reads AS
     SELECT DISTINCT tgid, path
     FROM (
         SELECT e.tgid, o.path,
-            '|' || replace(COALESCE(o.flags,''), ',', '|') || '|' AS norm_flags
+            '|' || replace(COALESCE(o.flags,''), ',', '|') || '|' AS normalized_flags
         FROM open_events o JOIN events e ON e.id=o.eid
         WHERE o.path IS NOT NULL
     )
-    WHERE instr(norm_flags, '|O_RDONLY|')>0
-       OR instr(norm_flags, '|O_RDWR|')>0;
+    WHERE instr(normalized_flags, '|O_RDONLY|')>0
+       OR instr(normalized_flags, '|O_RDWR|')>0;
 
 CREATE TEMP VIEW _dep_writes AS
     SELECT DISTINCT tgid, path
     FROM (
         SELECT e.tgid, o.path,
-            '|' || replace(COALESCE(o.flags,''), ',', '|') || '|' AS norm_flags
+            '|' || replace(COALESCE(o.flags,''), ',', '|') || '|' AS normalized_flags
         FROM open_events o JOIN events e ON e.id=o.eid
         WHERE o.path IS NOT NULL
     )
-    WHERE instr(norm_flags, '|O_WRONLY|')>0
-       OR instr(norm_flags, '|O_RDWR|')>0;
+    WHERE instr(normalized_flags, '|O_WRONLY|')>0
+       OR instr(normalized_flags, '|O_RDWR|')>0;
 
 CREATE TEMP VIEW _dep_written_paths AS
     SELECT DISTINCT path FROM _dep_writes;
@@ -324,6 +324,8 @@ CREATE TEMP VIEW _dep_root AS
 
 CREATE TEMP VIEW _dep_walk_rev AS
     WITH RECURSIVE walk(path, depth, trail) AS (
+        -- char(31) keeps path membership checks unambiguous without colliding
+        -- with normal filesystem path characters.
         SELECT path, 0, char(31) || path || char(31)
         FROM _dep_root
         UNION ALL
@@ -338,6 +340,8 @@ CREATE TEMP VIEW _dep_walk_rev AS
 
 CREATE TEMP VIEW _dep_walk_fwd AS
     WITH RECURSIVE walk(path, depth, trail) AS (
+        -- char(31) keeps path membership checks unambiguous without colliding
+        -- with normal filesystem path characters.
         SELECT path, 0, char(31) || path || char(31)
         FROM _dep_root
         UNION ALL
