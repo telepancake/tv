@@ -757,6 +757,20 @@ static int json_argv_array(char *dst, int dstsize, const char *raw, int rawlen)
     return di;
 }
 
+static int json_argv_array_vec(char *dst, int dstsize, char *const *argv, int argc)
+{
+    int di = 0;
+    dst[di++] = '[';
+    for (int i = 0; i < argc && di + 8 < dstsize; i++) {
+        const char *arg = argv[i] ? argv[i] : "";
+        if (di > 1) dst[di++] = ',';
+        di += json_escape(dst + di, dstsize - di, arg, strlen(arg));
+    }
+    if (di < dstsize) dst[di++] = ']';
+    if (di < dstsize) dst[di] = '\0';
+    return di;
+}
+
 static int json_env_object(char *dst, int dstsize, const char *raw, int rawlen)
 {
     int di = 0, si = 0;
@@ -1075,7 +1089,8 @@ static void emit_cwd_event(pid_t pid)
     if (pos > 0) emit_raw(line, pos);
 }
 
-static void emit_exec_event(pid_t pid)
+static void emit_exec_event(pid_t pid, const char *fallback_exe,
+                            int fallback_argc, char **fallback_argv)
 {
     pid_t tgid = get_tgid(pid);
     pid_t ppid = get_ppid(pid);
@@ -1084,6 +1099,8 @@ static void emit_exec_event(pid_t pid)
 
     char exe_buf[PATH_MAX];
     char *exe = read_proc_exe(pid, exe_buf, sizeof(exe_buf));
+    if (!exe && fallback_exe && fallback_exe[0])
+        exe = (char *)fallback_exe;
     char exe_esc[PATH_MAX * 2];
     if (exe) json_escape(exe_esc, sizeof(exe_esc), exe, strlen(exe));
 
@@ -1094,6 +1111,13 @@ static void emit_exec_event(pid_t pid)
         argv_j = malloc(argv_len * 6 + 64);
         if (argv_j)
             json_argv_array(argv_j, argv_len * 6 + 64, argv_raw, argv_len);
+    } else if (fallback_argv && fallback_argc > 0) {
+        size_t alloc = 64;
+        for (int i = 0; i < fallback_argc; i++)
+            alloc += strlen(fallback_argv[i] ? fallback_argv[i] : "") * 6 + 1;
+        argv_j = malloc(alloc);
+        if (argv_j)
+            json_argv_array_vec(argv_j, (int)alloc, fallback_argv, fallback_argc);
     }
 
     size_t env_len = 0;
@@ -2558,7 +2582,7 @@ static int run_wrapper_mode(int argc, char **argv)
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event(child);
+    emit_exec_event(child, argv[0], argc, argv);
     emit_inherited_open_events(child);
 
     for (;;) {
@@ -2730,7 +2754,7 @@ int main(int argc, char **argv)
     usleep(50000);
 
     emit_cwd_event(child);
-    emit_exec_event(child);
+    emit_exec_event(child, exec_argv[0], cmd_argc, exec_argv);
     emit_inherited_open_events(child);
 
     /* Main wait loop */
