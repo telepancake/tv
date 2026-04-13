@@ -41,6 +41,8 @@ enum {
     LIVE_TRACE_BATCH_ROWS = 256,
     LIVE_TRACE_BATCH_MS = 50,
     CURSOR_EVENT_DEBOUNCE_MS = 200,
+    CURSOR_EVENT_PANEL_MAX = 32,
+    CURSOR_EVENT_ROW_ID_MAX = 4096,
 };
 
 static void xexec(const char *sql) {
@@ -268,8 +270,8 @@ static void update_status(void) {
 
 static int g_cursor_event_timer = -1;
 static int g_cursor_event_use_timer = 0;
-static char g_pending_cursor_panel[32];
-static char g_pending_cursor_row_id[4096];
+static char g_pending_cursor_panel[CURSOR_EVENT_PANEL_MAX];
+static char g_pending_cursor_row_id[CURSOR_EVENT_ROW_ID_MAX];
 
 static void flush_pending_cursor_event(tui_t *tui);
 
@@ -285,8 +287,8 @@ static void queue_cursor_event(tui_t *tui, const char *panel, const char *row_id
         tui_remove_timer(tui, g_cursor_event_timer);
         g_cursor_event_timer = -1;
     }
-    snprintf(g_pending_cursor_panel, sizeof g_pending_cursor_panel, "%s", panel ? panel : "");
-    snprintf(g_pending_cursor_row_id, sizeof g_pending_cursor_row_id, "%s", row_id ? row_id : "");
+    snprintf(g_pending_cursor_panel, sizeof(g_pending_cursor_panel), "%s", panel ? panel : "");
+    snprintf(g_pending_cursor_row_id, sizeof(g_pending_cursor_row_id), "%s", row_id ? row_id : "");
     if (!g_pending_cursor_panel[0]) return;
     if (g_cursor_event_use_timer) {
         g_cursor_event_timer = tui_add_timer(tui, CURSOR_EVENT_DEBOUNCE_MS, on_cursor_event_timer, NULL);
