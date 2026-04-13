@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <time.h>
 
@@ -48,9 +49,10 @@ enum {
     CURSOR_EVENT_ROW_ID_MAX = 4096,
 };
 
-static int g_dep_walk_cache_dirty = 1;
+static bool g_dep_walk_cache_needs_rebuild = true;
 static char g_dep_walk_root[CURSOR_EVENT_ROW_ID_MAX];
 
+/* Keep string truncation explicit for cached row IDs and roots. */
 static void copy_cstr(char *dst, size_t dstsz, const char *src);
 
 static void xexec(const char *sql) {
@@ -125,7 +127,7 @@ static void build_dep_walk_table(const char *table, const char *next_expr,
         sqlite3_bind_int(step_st, 1, depth);
         sqlite3_bind_int(step_st, 2, depth + 1);
         sqlite3_step(step_st);
-        if (sqlite3_changes(g_db) == 0) break;
+        if (sqlite3_changes(g_db) == 0) break; /* frontier exhausted */
         depth++;
     }
 
@@ -150,20 +152,21 @@ static void ensure_dep_walk_cache(void) {
     }
     sqlite3_finalize(st);
 
-    if (!g_dep_walk_cache_dirty && strcmp(g_dep_walk_root, state_dep_root) == 0) return;
+    if (!g_dep_walk_cache_needs_rebuild && strcmp(g_dep_walk_root, state_dep_root) == 0) return;
     if (mode < 3 || mode > 6) {
         copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, state_dep_root);
-        g_dep_walk_cache_dirty = 0;
+        g_dep_walk_cache_needs_rebuild = false;
         return;
     }
 
     xexec("SAVEPOINT dep_walk_cache");
+    /* Empty roots are valid and intentionally yield empty dependency caches. */
     build_dep_walk_table("_dep_walk_rev", "de.src", "w.path=de.dst", state_dep_root);
     build_dep_walk_table("_dep_walk_fwd", "de.dst", "w.path=de.src", state_dep_root);
     xexec("RELEASE dep_walk_cache");
 
     copy_cstr(g_dep_walk_root, sizeof g_dep_walk_root, state_dep_root);
-    g_dep_walk_cache_dirty = 0;
+    g_dep_walk_cache_needs_rebuild = false;
 }
 
 static long long monotonic_millis(void) {
@@ -432,7 +435,7 @@ static void process_trace_batch(void) {
     if (g_pending_trace_rows == 0) return;
     xexec(tv_sql_ingest);
     g_pending_trace_rows = 0;
-    g_dep_walk_cache_dirty = 1;
+    g_dep_walk_cache_needs_rebuild = true;
 }
 
 static int path_has_suffix(const char *path, const char *suffix) {
