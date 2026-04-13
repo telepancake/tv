@@ -2766,8 +2766,6 @@ int main(int argc, char **argv)
         _exit(127);
     }
 
-    free_exec_argv(exec_argv);
-
     /* Give child time to exec so /proc reflects new image */
     usleep(50000);
 
@@ -2784,6 +2782,7 @@ int main(int argc, char **argv)
     emit_exec_event(child, event_argc > 0 ? event_argv[0] : exec_argv[0],
                     event_argc, event_argv);
     emit_inherited_open_events(child);
+    free_exec_argv(exec_argv);
 
     /* Main wait loop */
     for (;;) {
