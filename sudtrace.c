@@ -101,6 +101,7 @@ extern char __sud_end[];
 
 /* Reserve a high FD for our output so children are unlikely to clobber it */
 #define SUD_OUTPUT_FD      1023
+#define SUDTRACE_OUTFILE_ENV "SUDTRACE_OUTFILE"
 
 /* ================================================================
  * SUD selector byte.
@@ -2608,6 +2609,25 @@ static void usage(const char *prog)
     exit(1);
 }
 
+static void make_absolute_path(const char *path, char *out, size_t out_sz)
+{
+    if (!path || !path[0]) {
+        out[0] = '\0';
+        return;
+    }
+    if (path[0] == '/') {
+        snprintf(out, out_sz, "%s", path);
+        return;
+    }
+
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) {
+        snprintf(out, out_sz, "%s", path);
+        return;
+    }
+    snprintf(out, out_sz, "%s/%s", cwd, path);
+}
+
 /* ================================================================
  * Main entry point
  * ================================================================ */
@@ -2635,6 +2655,14 @@ int main(int argc, char **argv)
         struct stat st;
         if (fstat(SUD_OUTPUT_FD, &st) == 0)
             g_out_fd = SUD_OUTPUT_FD;
+        else {
+            const char *out_path = getenv(SUDTRACE_OUTFILE_ENV);
+            if (out_path && out_path[0]) {
+                int ofd = open(out_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (ofd >= 0)
+                    g_out_fd = ofd;
+            }
+        }
 
         g_creator_stdout_valid =
             (fstat(STDOUT_FILENO, &g_creator_stdout_st) == 0);
@@ -2666,11 +2694,15 @@ int main(int argc, char **argv)
 
     /* Setup output */
     if (outfile) {
+        char abs_out[PATH_MAX];
+        make_absolute_path(outfile, abs_out, sizeof(abs_out));
         int ofd = open(outfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (ofd < 0) { perror("sudtrace: open output"); exit(1); }
         g_out_fd = ofd;
+        setenv(SUDTRACE_OUTFILE_ENV, abs_out, 1);
     } else {
         g_out_fd = STDOUT_FILENO;
+        unsetenv(SUDTRACE_OUTFILE_ENV);
     }
 
     /* Move output to a high fd so children don't clobber it */
