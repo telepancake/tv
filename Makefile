@@ -44,7 +44,7 @@ tv: tv.c uproctrace.c
 	cc -O2 -flto=auto -DSQLITE_ENABLE_FTS5 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 -o tv tv.c uproctrace.c sqlite3.c -static -lm
 
 sudtrace: sudtrace.c sudtrace.lds
-	cc -O2 -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm
+	cc -O2 -fno-stack-protector -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm
 
 .PHONY: all keygen sign load unload clean install test
 test: tv
