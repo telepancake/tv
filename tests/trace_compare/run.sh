@@ -81,6 +81,28 @@ run_both() {
         > "$TMPDIR/${tag}_sud_stdout.txt" 2>&1 || true
 }
 
+exec_basenames() {
+    jq -r '
+        select(.event == "EXEC")
+        | (
+            (.argv // []) as $argv
+            | if ($argv | length) == 0 then (.exe // "")
+              elif (($argv[0] // "") | split("/") | last | test("^sud(32|64)?trace$")) then
+                  if ($argv | length) >= 3 and (($argv[1] // "") | split("/") | last | test("^ld-linux")) then
+                      ($argv[2] // "")
+                  else
+                      ($argv[1] // "")
+                  end
+              else
+                  ($argv[0] // "")
+              end
+          )
+        | split("/") | last
+    ' "$1" \
+        | grep -vE '^(|sudtrace|sud32|sud64|ld-linux[^[:space:]]*)$' \
+        | sort -u
+}
+
 # ── Helper: normalise a trace ─────────────────────────────────────────
 normalise() {
     jq -c '
@@ -267,6 +289,33 @@ normalise "$TMPDIR/dynamic_echo_upt.jsonl" > "$TMPDIR/echo_upt_norm.jsonl"
 normalise "$TMPDIR/dynamic_echo_sud.jsonl" > "$TMPDIR/echo_sud_norm.jsonl"
 diff --color=never -u "$TMPDIR/echo_upt_norm.jsonl" "$TMPDIR/echo_sud_norm.jsonl" \
     | head -30 || true
+
+# ═════════════════════════════════════════════════════════════════════
+# Test 6: Clean rebuild should trace subprocess execs too
+# ═════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== Test 6: Clean rebuild subprocess coverage ==="
+cp "$TV" "$TMPDIR/tv_trace"
+cp "$SUDTRACE" "$TMPDIR/sudtrace_trace"
+"$TMPDIR/tv_trace" --uproctrace --ptrace -o "$TMPDIR/rebuild_upt.jsonl" -- \
+    make -B tv sudtrace > "$TMPDIR/rebuild_upt_stdout.txt" 2>&1 || true
+"$TMPDIR/sudtrace_trace" -o "$TMPDIR/rebuild_sud.jsonl" -- \
+    make -B tv sudtrace > "$TMPDIR/rebuild_sud_stdout.txt" 2>&1 || true
+validate_schema "rebuild uproctrace" "$TMPDIR/rebuild_upt.jsonl"
+validate_schema "rebuild sudtrace"   "$TMPDIR/rebuild_sud.jsonl"
+exec_basenames "$TMPDIR/rebuild_upt.jsonl" > "$TMPDIR/rebuild_upt_execs.txt"
+exec_basenames "$TMPDIR/rebuild_sud.jsonl" > "$TMPDIR/rebuild_sud_execs.txt"
+check "rebuild sud sees gen_sql_h" 'gen_sql_h' "$TMPDIR/rebuild_sud_execs.txt"
+check_re "rebuild sud sees compiler exec" '(cc|gcc|x86_64-linux-gnu-gcc-13)' "$TMPDIR/rebuild_sud_execs.txt"
+TOTAL=$((TOTAL+1))
+if diff -u "$TMPDIR/rebuild_upt_execs.txt" "$TMPDIR/rebuild_sud_execs.txt" >/dev/null; then
+    PASS=$((PASS+1))
+    echo "  PASS  rebuild exec basename set matches ptrace"
+else
+    FAIL=$((FAIL+1))
+    echo "  FAIL  rebuild exec basename set differs from ptrace"
+    diff -u "$TMPDIR/rebuild_upt_execs.txt" "$TMPDIR/rebuild_sud_execs.txt" | sed 's/^/    /' || true
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""

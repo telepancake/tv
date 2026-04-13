@@ -298,6 +298,7 @@ __asm__(
     "    push %rax\n"
     "\n"
     "    movq $1, (%r13)\n"         /* signal parent: done reading from uc */
+    "    call prepare_child_sud\n"
     "\n"
     "    pop  %r8\n"                /* restore all registers from our stack */
     "    pop  %r9\n"
@@ -389,6 +390,7 @@ __asm__(
     "    mov  40(%r12),  %rax\n"
     "    push %rax\n"
     "    movq $1, (%r13)\n"
+    "    call prepare_child_sud\n"
     "    pop  %r8\n"
     "    pop  %r9\n"
     "    pop  %r10\n"
@@ -658,6 +660,7 @@ static int g_out_fd = -1;           /* fd for JSONL output */
 static struct stat g_creator_stdout_st;
 static int g_creator_stdout_valid;
 static char g_self_exe[PATH_MAX];   /* path to sudtrace binary itself */
+static char g_path_env[4096];       /* cached before entering SUD handler */
 
 /* ================================================================
  * Low-level output — write(2) directly, bypassing stdio.
@@ -1583,8 +1586,7 @@ static int resolve_path_raw(const char *cmd, char *out, size_t out_sz)
         return (raw_access(out, X_OK) == 0);
     }
 
-    const char *path_env = getenv("PATH");
-    if (!path_env) path_env = "/usr/bin:/bin";
+    const char *path_env = g_path_env[0] ? g_path_env : "/usr/bin:/bin";
 
     /* Walk PATH directories manually (strtok_r is safe but we avoid
      * snprintf; use manual string concat instead) */
@@ -1606,6 +1608,50 @@ static int resolve_path_raw(const char *cmd, char *out, size_t out_sz)
     }
 
     return 0;
+}
+
+static int resolve_execveat_path_raw(int dirfd, const char *path, long flags,
+                                     char *out, size_t out_sz)
+{
+#ifdef AT_EMPTY_PATH
+    if ((flags & AT_EMPTY_PATH) && path && path[0] == '\0')
+        return 0;
+#endif
+
+    if (!path || !path[0])
+        return 0;
+
+    if (dirfd == AT_FDCWD || path[0] == '/')
+        return resolve_path_raw(path, out, out_sz);
+
+    char proc_path[64];
+    int pos = 0;
+    const char prefix[] = "/proc/self/fd/";
+    memcpy(proc_path, prefix, sizeof(prefix) - 1);
+    pos += sizeof(prefix) - 1;
+    pos += fmt_int(proc_path + pos, (int)(sizeof(proc_path) - pos), dirfd);
+    if (pos <= 0 || pos >= (int)sizeof(proc_path))
+        return 0;
+    proc_path[pos] = '\0';
+
+    char dirbuf[PATH_MAX];
+    ssize_t dlen = raw_readlink(proc_path, dirbuf, sizeof(dirbuf) - 1);
+    if (dlen <= 0 || dlen >= (ssize_t)sizeof(dirbuf))
+        return 0;
+    dirbuf[dlen] = '\0';
+
+    size_t plen = strlen(path);
+    size_t base_len = (size_t)dlen;
+    int need_slash = (base_len > 0 && dirbuf[base_len - 1] != '/');
+    if (base_len + need_slash + plen + 1 > out_sz)
+        return 0;
+
+    memcpy(out, dirbuf, base_len);
+    if (need_slash)
+        out[base_len++] = '/';
+    memcpy(out + base_len, path, plen);
+    out[base_len + plen] = '\0';
+    return (raw_access(out, X_OK) == 0);
 }
 
 /*
@@ -1805,6 +1851,56 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
     return args;
 }
 
+static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw);
+
+struct kernel_sigaction_raw {
+    void (*handler)(int);
+    unsigned long flags;
+    void (*restorer)(void);
+    unsigned long mask;
+};
+
+static void install_sigsys_handler_raw(void)
+{
+#ifdef SYS_rt_sigaction
+    struct kernel_sigaction_raw sa;
+    sa.handler = (void (*)(int))sigsys_handler;
+    sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER;
+    sa.restorer = sud_rt_sigreturn_restorer;
+    sa.mask = 0;
+    raw_syscall6(SYS_rt_sigaction, SIGSYS, (long)&sa, 0,
+                 sizeof(sa.mask), 0, 0);
+#endif
+}
+
+static void unblock_sigsys_raw(void)
+{
+#ifdef SYS_rt_sigprocmask
+    unsigned long mask = 1UL << (SIGSYS - 1);
+    raw_syscall6(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&mask, 0,
+                 sizeof(mask), 0, 0);
+#endif
+}
+
+static void reenable_sud_in_child(void)
+{
+    unsigned long off = (unsigned long)__sud_begin;
+    unsigned long len = (unsigned long)__sud_end - (unsigned long)__sud_begin;
+    raw_syscall6(SYS_prctl, PR_SET_SYSCALL_USER_DISPATCH,
+                 PR_SYS_DISPATCH_ON, off, len,
+                 (long)g_sud_selector_ptr, 0);
+}
+
+void prepare_child_sud(void)
+    __attribute__((noinline));
+
+void prepare_child_sud(void)
+{
+    install_sigsys_handler_raw();
+    unblock_sigsys_raw();
+    reenable_sud_in_child();
+}
+
 /* ================================================================
  * SIGSYS handler — the core of SUD tracing.
  *
@@ -1913,7 +2009,58 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 
 #ifdef SYS_execveat
     if (nr == SYS_execveat) {
-        ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+        const char *fn = (const char *)a1;
+        char **orig_argv = (char **)a2;
+        long flags = a4;
+
+#ifdef AT_EMPTY_PATH
+        if ((flags & AT_EMPTY_PATH) && fn && fn[0] == '\0') {
+            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            return;
+        }
+#endif
+
+        if (flags != 0) {
+            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            return;
+        }
+
+        char resolved_fn[PATH_MAX];
+        if (!resolve_execveat_path_raw((int)a0, fn, flags,
+                                       resolved_fn, sizeof(resolved_fn))) {
+            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            return;
+        }
+
+        int orig_argc = 0;
+        if (orig_argv)
+            while (orig_argv[orig_argc]) orig_argc++;
+
+        arena_reset();
+
+        int build_argc = orig_argc > 0 ? orig_argc : 1;
+        char **build_argv = arena_alloc((build_argc + 1) * sizeof(char *));
+        if (build_argv) {
+            build_argv[0] = arena_strdup(resolved_fn);
+            for (int i = 1; i < orig_argc; i++)
+                build_argv[i] = arena_strdup(orig_argv[i]);
+            build_argv[build_argc] = NULL;
+
+            char **new_argv = build_exec_argv_raw(build_argc, build_argv);
+            if (new_argv) {
+                ret = raw_syscall6(SYS_execve, (long)new_argv[0],
+                                   (long)new_argv, a3, 0, 0, 0);
+            } else {
+                ret = -ENOMEM;
+            }
+        } else {
+            ret = -ENOMEM;
+        }
+
+        arena_reset();
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
     }
@@ -1957,16 +2104,14 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             c3_stack =
                 *(unsigned long long *)((char *)a0 + CLONE_ARGS_STACK_OFFSET);
         }
-        if ((c3_flags & (CLONE_VM | CLONE_THREAD)) ==
-            (CLONE_VM | CLONE_THREAD) && c3_stack) {
+        if ((c3_flags & CLONE_VM) && c3_stack) {
             ret = clone3_raw(a0, a1, uc);
             /* Only parent reaches here; child jumped to program's RIP */
-        } else if (c3_flags & CLONE_VFORK) {
-            /* glibc falls back to vfork/clone when clone3 reports ENOSYS */
-            ret = -ENOSYS;
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
+            if (ret == 0)
+                prepare_child_sud();
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
@@ -1981,6 +2126,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
             /* Both parent and child reach here */
+            if (ret == 0)
+                prepare_child_sud();
         }
         uc->uc_mcontext.gregs[REG_RAX] = ret;
         return;
@@ -1996,6 +2143,10 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         };
         const struct kernel_sigaction *act =
             (const struct kernel_sigaction *)a1;
+        if (a0 == SIGSYS && act) {
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            return;
+        }
         if (act) {
             struct kernel_sigaction patched = *act;
             patched.flags |= SA_RESTORER;
@@ -2017,6 +2168,15 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * wrapper would map every error to -1, which breaks glibc internals
      * in the traced program (e.g. clone3→clone fallback in pthread_create). */
     ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+
+#ifdef SYS_fork
+    if (nr == SYS_fork && ret == 0)
+        prepare_child_sud();
+#endif
+#ifdef SYS_vfork
+    if (nr == SYS_vfork && ret == 0)
+        prepare_child_sud();
+#endif
 
     /* Post-syscall tracing */
 
@@ -2456,6 +2616,11 @@ int main(int argc, char **argv)
         g_self_exe[slen] = '\0';
     else
         snprintf(g_self_exe, sizeof(g_self_exe), "%s", argv[0]);
+
+    const char *path_env = getenv("PATH");
+    if (!path_env || !path_env[0])
+        path_env = "/usr/bin:/bin";
+    snprintf(g_path_env, sizeof(g_path_env), "%s", path_env);
 
     /* Wrapper mode? (re-invoked for a static binary) */
     if (is_wrapper_mode(argc, argv)) {
