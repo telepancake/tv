@@ -31,41 +31,90 @@ CREATE TABLE IF NOT EXISTS _config(key TEXT PRIMARY KEY, val TEXT);
 CREATE TABLE IF NOT EXISTS expanded(id TEXT PRIMARY KEY, ex INT DEFAULT 1);
 
 --%% INGEST
-WITH src AS (
-    SELECT DISTINCT
-        CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
-        CAST(json_extract(data,'$.pid') AS INT) AS pid,
-        CAST(json_extract(data,'$.ppid') AS INT) AS ppid,
-        CAST(json_extract(data,'$.nspid') AS INT) AS nspid,
-        CAST(json_extract(data,'$.nstgid') AS INT) AS nstgid,
-        CAST(json_extract(data,'$.ts') AS REAL) AS ts
+CREATE TEMP TABLE IF NOT EXISTS _trace_src(
+    id INTEGER PRIMARY KEY,
+    event TEXT,
+    tgid INT,
+    pid INT,
+    ppid INT,
+    nspid INT,
+    nstgid INT,
+    ts REAL,
+    path TEXT,
+    data TEXT
+);
+CREATE INDEX IF NOT EXISTS _trace_src_event_id ON _trace_src(event,id);
+CREATE INDEX IF NOT EXISTS _trace_src_tgid_id ON _trace_src(tgid,id);
+DELETE FROM _trace_src;
+INSERT INTO _trace_src(id,event,tgid,pid,ppid,nspid,nstgid,ts,path,data)
+    SELECT id,
+           json_extract(data,'$.event'),
+           CAST(json_extract(data,'$.tgid') AS INT),
+           CAST(json_extract(data,'$.pid') AS INT),
+           CAST(json_extract(data,'$.ppid') AS INT),
+           CAST(json_extract(data,'$.nspid') AS INT),
+           CAST(json_extract(data,'$.nstgid') AS INT),
+           CAST(json_extract(data,'$.ts') AS REAL),
+           json_extract(data,'$.path'),
+           data
     FROM inbox
     WHERE kind='trace'
-      AND json_extract(data,'$.event') IS NOT NULL
-      AND json_extract(data,'$.tgid') IS NOT NULL
-      AND CAST(json_extract(data,'$.tgid') AS TEXT)
-          != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'')
+      AND json_extract(data,'$.event') IS NOT NULL;
+CREATE TEMP TABLE IF NOT EXISTS _trace_open_resolved(
+    inbox_id INTEGER PRIMARY KEY,
+    tgid INT NOT NULL,
+    ts REAL,
+    path TEXT,
+    flag0 TEXT,
+    data TEXT,
+    is_sys INT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS _trace_open_resolved_is_sys ON _trace_open_resolved(is_sys,inbox_id);
+DELETE FROM _trace_open_resolved;
+WITH src AS (
+    SELECT s.id,
+           s.tgid,
+           s.ts,
+           resolve_path(
+               s.path,
+               COALESCE(
+                   (SELECT c.path
+                    FROM _trace_src c
+                    WHERE c.event='CWD'
+                      AND c.tgid=s.tgid
+                      AND c.id<=s.id
+                    ORDER BY c.id DESC LIMIT 1),
+                   (SELECT cwd FROM cwd_cache WHERE tgid=s.tgid)
+               )
+           ) AS path,
+           COALESCE(json_extract(s.data,'$.flags[0]'),'O_RDONLY') AS flag0,
+           s.data
+    FROM _trace_src s
+    WHERE s.event='OPEN'
+)
+INSERT INTO _trace_open_resolved(inbox_id,tgid,ts,path,flag0,data,is_sys)
+    SELECT id,tgid,ts,path,flag0,data,is_sys_path(path, flag0)
+    FROM src;
+WITH src AS (
+    SELECT DISTINCT tgid,pid,ppid,nspid,nstgid,ts
+    FROM _trace_src
+    WHERE tgid IS NOT NULL
+      AND CAST(tgid AS TEXT) != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'')
 )
 INSERT OR IGNORE INTO processes(tgid,pid,ppid,nspid,nstgid,first_ts,last_ts)
     SELECT tgid,pid,ppid,nspid,nstgid,ts,ts FROM src;
 WITH src AS (
-    SELECT DISTINCT CAST(json_extract(data,'$.tgid') AS TEXT) AS id
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event') IS NOT NULL
-      AND json_extract(data,'$.tgid') IS NOT NULL
-      AND CAST(json_extract(data,'$.tgid') AS TEXT)
-          != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'')
+    SELECT DISTINCT CAST(tgid AS TEXT) AS id
+    FROM _trace_src
+    WHERE tgid IS NOT NULL
+      AND CAST(tgid AS TEXT) != COALESCE((SELECT val FROM _config WHERE key='own_tgid'),'')
 )
 INSERT OR IGNORE INTO expanded(id,ex)
     SELECT id,1 FROM src;
 WITH src AS (
-    SELECT id,
-           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
-           json_extract(data,'$.path') AS path
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event')='CWD'
+    SELECT id,tgid,path
+    FROM _trace_src
+    WHERE event='CWD'
 ), last_cwd AS (
     SELECT s.tgid, s.path
     FROM src s
@@ -74,12 +123,9 @@ WITH src AS (
 INSERT OR REPLACE INTO cwd_cache(tgid,cwd)
     SELECT tgid,path FROM last_cwd;
 WITH src AS (
-    SELECT id,
-           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
-           json_extract(data,'$.path') AS path
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event')='CWD'
+    SELECT id,tgid,path
+    FROM _trace_src
+    WHERE event='CWD'
 ), last_cwd AS (
     SELECT s.tgid, s.path
     FROM src s
@@ -89,12 +135,9 @@ UPDATE processes
 SET cwd=(SELECT path FROM last_cwd WHERE tgid=processes.tgid)
 WHERE tgid IN (SELECT tgid FROM last_cwd);
 WITH src AS (
-    SELECT id,
-           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
-           data
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event')='EXEC'
+    SELECT id,tgid,data
+    FROM _trace_src
+    WHERE event='EXEC'
 ), last_exec AS (
     SELECT s.tgid, s.data
     FROM src s
@@ -122,94 +165,45 @@ CREATE TEMP TABLE IF NOT EXISTS _trace_event_ids(
 DELETE FROM _trace_event_ids;
 WITH event_rows AS (
     SELECT id
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event') IN ('EXEC','EXIT','STDOUT','STDERR')
+    FROM _trace_src
+    WHERE event IN ('EXEC','EXIT','STDOUT','STDERR')
     UNION ALL
-    SELECT s.id
-    FROM inbox s
-    WHERE s.kind='trace'
-      AND json_extract(s.data,'$.event')='OPEN'
-      AND NOT is_sys_path(
-          resolve_path(
-              json_extract(s.data,'$.path'),
-              COALESCE(
-                  (SELECT json_extract(c.data,'$.path')
-                   FROM inbox c
-                   WHERE c.kind='trace'
-                     AND json_extract(c.data,'$.event')='CWD'
-                     AND CAST(json_extract(c.data,'$.tgid') AS INT)=CAST(json_extract(s.data,'$.tgid') AS INT)
-                     AND c.id<=s.id
-                   ORDER BY c.id DESC LIMIT 1),
-                  (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(s.data,'$.tgid') AS INT))
-              )
-          ),
-          COALESCE(json_extract(s.data,'$.flags[0]'),'O_RDONLY')
-      )
+    SELECT inbox_id
+    FROM _trace_open_resolved
+    WHERE is_sys=0
 )
 INSERT INTO _trace_event_ids(inbox_id,eid)
     SELECT id,
            COALESCE((SELECT MAX(id) FROM events),0) + ROW_NUMBER()OVER(ORDER BY id)
     FROM event_rows;
 WITH src AS (
-    SELECT id,
-           CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
-           CAST(json_extract(data,'$.ts') AS REAL) AS ts,
-           json_extract(data,'$.event') AS event
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event') IN ('EXEC','EXIT','STDOUT','STDERR')
+    SELECT id,tgid,ts,event
+    FROM _trace_src
+    WHERE event IN ('EXEC','EXIT','STDOUT','STDERR')
     UNION ALL
-    SELECT s.id,
-           CAST(json_extract(s.data,'$.tgid') AS INT),
-           CAST(json_extract(s.data,'$.ts') AS REAL),
-           'OPEN'
-    FROM inbox s
-    WHERE s.kind='trace'
-      AND json_extract(s.data,'$.event')='OPEN'
-      AND EXISTS(SELECT 1 FROM _trace_event_ids m WHERE m.inbox_id=s.id)
+    SELECT inbox_id,tgid,ts,'OPEN'
+    FROM _trace_open_resolved
+    WHERE is_sys=0
 )
 INSERT INTO events(id,tgid,ts,event)
     SELECT m.eid, src.tgid, src.ts, src.event
     FROM src
     JOIN _trace_event_ids m ON m.inbox_id=src.id;
-WITH src AS (
-    SELECT s.id,
-           resolve_path(
-               json_extract(s.data,'$.path'),
-               COALESCE(
-                   (SELECT json_extract(c.data,'$.path')
-                    FROM inbox c
-                    WHERE c.kind='trace'
-                      AND json_extract(c.data,'$.event')='CWD'
-                      AND CAST(json_extract(c.data,'$.tgid') AS INT)=CAST(json_extract(s.data,'$.tgid') AS INT)
-                      AND c.id<=s.id
-                    ORDER BY c.id DESC LIMIT 1),
-                   (SELECT cwd FROM cwd_cache WHERE tgid=CAST(json_extract(s.data,'$.tgid') AS INT))
-               )
-           ) AS path,
-           COALESCE(json_extract(s.data,'$.flags[0]'),'O_RDONLY') AS flag0,
-           s.data
-    FROM inbox s
-    WHERE s.kind='trace'
-      AND json_extract(s.data,'$.event')='OPEN'
-)
 INSERT INTO open_events(eid,path,flags,fd,err)
     SELECT m.eid,
            path,
            CASE WHEN json_type(data,'$.flags')='array' THEN
-               (SELECT GROUP_CONCAT(value,'|') FROM json_each(json_extract(data,'$.flags')))
-               ELSE NULL END,
+                (SELECT GROUP_CONCAT(value,'|') FROM json_each(json_extract(data,'$.flags')))
+                ELSE NULL END,
            json_extract(data,'$.fd'),
            json_extract(data,'$.err')
-    FROM src
-    JOIN _trace_event_ids m ON m.inbox_id=src.id
-    WHERE NOT is_sys_path(path, flag0);
+    FROM _trace_open_resolved src
+    JOIN _trace_event_ids m ON m.inbox_id=src.inbox_id
+    WHERE is_sys=0;
 WITH src AS (
     SELECT id,data
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event')='EXIT'
+    FROM _trace_src
+    WHERE event='EXIT'
 )
 INSERT INTO exit_events(eid,status,code,signal,core_dumped,raw)
     SELECT m.eid,
@@ -222,9 +216,8 @@ INSERT INTO exit_events(eid,status,code,signal,core_dumped,raw)
     JOIN _trace_event_ids m ON m.inbox_id=src.id;
 WITH src AS (
     SELECT id,data
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event') IN ('STDOUT','STDERR')
+    FROM _trace_src
+    WHERE event IN ('STDOUT','STDERR')
 )
 INSERT INTO io_events(eid,stream,len,data)
     SELECT m.eid,
@@ -234,14 +227,12 @@ INSERT INTO io_events(eid,stream,len,data)
     FROM src
     JOIN _trace_event_ids m ON m.inbox_id=src.id;
 WITH src AS (
-    SELECT CAST(json_extract(data,'$.tgid') AS INT) AS tgid,
-           MIN(CAST(json_extract(data,'$.ts') AS REAL)) AS min_ts,
-           MAX(CAST(json_extract(data,'$.ts') AS REAL)) AS max_ts
-    FROM inbox
-    WHERE kind='trace'
-      AND json_extract(data,'$.event') IS NOT NULL
-      AND json_extract(data,'$.tgid') IS NOT NULL
-    GROUP BY CAST(json_extract(data,'$.tgid') AS INT)
+    SELECT tgid,
+           MIN(ts) AS min_ts,
+           MAX(ts) AS max_ts
+    FROM _trace_src
+    WHERE tgid IS NOT NULL
+    GROUP BY tgid
 )
 UPDATE processes
 SET first_ts=MIN(first_ts, (SELECT min_ts FROM src WHERE tgid=processes.tgid)),

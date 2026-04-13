@@ -991,7 +991,10 @@ int main(int argc, char **argv) {
     int headless_mode = 0;
     {   /* Check if there are pending input commands → headless mode */
         int pending = qint("SELECT COUNT(*) FROM inbox WHERE kind='input'", 0);
-        if (pending > 0 || (trace_file[0] && !cmd)) headless_mode = 1;
+        if (pending > 0
+            || (trace_file[0] && !cmd && !isatty(STDIN_FILENO))
+            || (save_file[0] && !cmd))
+            headless_mode = 1;
     }
 
     if (headless_mode) {
