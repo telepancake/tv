@@ -75,7 +75,7 @@ run_both() {
     echo "═══ Testing: $tag ═══"
     echo "  Command: $*"
 
-    "$TV" --uproctrace -o "$TMPDIR/${tag}_upt.jsonl" -- "$@" \
+    "$TV" --uproctrace --ptrace -o "$TMPDIR/${tag}_upt.jsonl" -- "$@" \
         > "$TMPDIR/${tag}_upt_stdout.txt" 2>&1 || true
     "$SUDTRACE" -o "$TMPDIR/${tag}_sud.jsonl" -- "$@" \
         > "$TMPDIR/${tag}_sud_stdout.txt" 2>&1 || true

@@ -34,8 +34,16 @@
 #include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/prctl.h>
 #include <linux/ptrace.h>
 #include <elf.h>          /* AT_* constants, ElfW, NT_PRSTATUS */
+
+#ifndef PR_SET_SYSCALL_USER_DISPATCH
+#define PR_SET_SYSCALL_USER_DISPATCH 59
+#endif
+#ifndef PR_SYS_DISPATCH_OFF
+#define PR_SYS_DISPATCH_OFF 0
+#endif
 
 /* ================================================================
  * Constants
@@ -1457,42 +1465,216 @@ static int handle_syscall_exit(pid_t pid, struct proc_state *ps)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s [-o FILE] -- command [args...]\n", prog);
+    fprintf(stderr,
+            "Usage: %s [-o FILE] [--backend auto|module|sud|ptrace] [--module|--sud|--ptrace] -- command [args...]\n",
+            prog);
     exit(1);
 }
 
-int uproctrace_main(int argc, char **argv)
-{
-    const char *outfile = NULL;
-    int cmd_start = -1;
+enum trace_backend {
+    TRACE_BACKEND_AUTO = 0,
+    TRACE_BACKEND_MODULE,
+    TRACE_BACKEND_SUD,
+    TRACE_BACKEND_PTRACE,
+};
 
-    /* Parse options before "--" */
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--") == 0) {
-            cmd_start = i + 1;
-            break;
-        }
-        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            outfile = argv[++i];
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-        } else {
-            /* Assume everything from here is the command if no "--" yet */
-            cmd_start = i;
-            break;
+static const char *trace_backend_name(enum trace_backend backend)
+{
+    switch (backend) {
+    case TRACE_BACKEND_MODULE: return "module";
+    case TRACE_BACKEND_SUD:    return "sud";
+    case TRACE_BACKEND_PTRACE: return "ptrace";
+    default:                   return "auto";
+    }
+}
+
+static int parse_trace_backend(const char *name, enum trace_backend *backend)
+{
+    if (strcmp(name, "auto") == 0) *backend = TRACE_BACKEND_AUTO;
+    else if (strcmp(name, "module") == 0) *backend = TRACE_BACKEND_MODULE;
+    else if (strcmp(name, "sud") == 0) *backend = TRACE_BACKEND_SUD;
+    else if (strcmp(name, "ptrace") == 0) *backend = TRACE_BACKEND_PTRACE;
+    else return -1;
+    return 0;
+}
+
+static int resolve_self_exe(char *buf, size_t bufsz)
+{
+    ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+    return 0;
+}
+
+static int resolve_sudtrace_exe(char *buf, size_t bufsz)
+{
+    char self_exe[PATH_MAX];
+    if (resolve_self_exe(self_exe, sizeof(self_exe)) == 0) {
+        char *slash = strrchr(self_exe, '/');
+        if (slash) {
+            int len = snprintf(buf, bufsz, "%.*s/sudtrace",
+                               (int)(slash - self_exe), self_exe);
+            if (len > 0 && (size_t)len < bufsz && access(buf, X_OK) == 0)
+                return 0;
         }
     }
+    if (snprintf(buf, bufsz, "%s", "sudtrace") >= (int)bufsz)
+        return -1;
+    return access(buf, X_OK) == 0 ? 0 : -1;
+}
 
-    if (cmd_start < 0 || cmd_start >= argc)
-        usage(argv[0]);
+static int kernel_supports_sud(void)
+{
+    errno = 0;
+    return prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0) == 0;
+}
 
-    /* Setup output */
+static int kernel_supports_proctrace_module(void)
+{
+    int fd = open("/proc/proctrace/new", O_RDONLY);
+    if (fd < 0)
+        return 0;
+    close(fd);
+    return 1;
+}
+
+static int open_trace_output(const char *outfile)
+{
     if (outfile) {
         g_out = fopen(outfile, "w");
-        if (!g_out) { perror("fopen"); exit(1); }
+        if (!g_out) {
+            perror("fopen");
+            return -1;
+        }
     } else {
         g_out = stdout;
     }
+    return 0;
+}
+
+static void close_trace_output(const char *outfile)
+{
+    if (outfile && g_out) {
+        fclose(g_out);
+        g_out = NULL;
+    }
+}
+
+static int copy_fd_to_output(int fd)
+{
+    char buf[8192];
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n == 0) return 0;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            perror("read");
+            return -1;
+        }
+        if (fwrite(buf, 1, (size_t)n, g_out) != (size_t)n) {
+            perror("fwrite");
+            return -1;
+        }
+        fflush(g_out);
+    }
+}
+
+static int wait_for_child(pid_t child)
+{
+    int status;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            perror("waitpid");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int run_module_trace(char **cmd, const char *outfile)
+{
+    int trace_fd = open("/proc/proctrace/new", O_RDONLY);
+    if (trace_fd < 0)
+        return -1;
+    if (open_trace_output(outfile) < 0) {
+        close(trace_fd);
+        return 1;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        perror("fork");
+        close(trace_fd);
+        close_trace_output(outfile);
+        return 1;
+    }
+    if (child == 0) {
+        execvp(cmd[0], cmd);
+        perror(cmd[0]);
+        _exit(127);
+    }
+
+    int rc = copy_fd_to_output(trace_fd);
+    close(trace_fd);
+    if (wait_for_child(child) != 0)
+        rc = 1;
+    close_trace_output(outfile);
+    return rc == 0 ? 0 : 1;
+}
+
+static int build_exec_argv(char ***out_argv, const char *exe,
+                           const char *outfile, char **cmd)
+{
+    size_t cmdc = 0;
+    while (cmd[cmdc]) cmdc++;
+
+    size_t argc = 1 + (outfile ? 2 : 0) + 1 + cmdc + 1;
+    char **sub_argv = calloc(argc, sizeof(*sub_argv));
+    if (!sub_argv) {
+        perror("calloc");
+        return -1;
+    }
+
+    size_t i = 0;
+    sub_argv[i++] = (char *)exe;
+    if (outfile) {
+        sub_argv[i++] = "-o";
+        sub_argv[i++] = (char *)outfile;
+    }
+    sub_argv[i++] = "--";
+    for (size_t j = 0; j < cmdc; j++)
+        sub_argv[i++] = cmd[j];
+    sub_argv[i] = NULL;
+
+    *out_argv = sub_argv;
+    return 0;
+}
+
+static int run_sud_trace(char **cmd, const char *outfile, const char *sudtrace_exe)
+{
+    pid_t child = fork();
+    if (child < 0) {
+        perror("fork");
+        return 1;
+    }
+    if (child == 0) {
+        char **sub_argv = NULL;
+        if (build_exec_argv(&sub_argv, sudtrace_exe, outfile, cmd) != 0)
+            _exit(127);
+        if (strchr(sudtrace_exe, '/'))
+            execv(sudtrace_exe, sub_argv);
+        else
+            execvp(sudtrace_exe, sub_argv);
+        perror("exec sudtrace");
+        _exit(127);
+    }
+    return wait_for_child(child);
+}
+
+static int run_ptrace_trace(char **cmd, const char *outfile)
+{
+    if (open_trace_output(outfile) < 0)
+        return 1;
 
     /* Record the creator's stdout inode for STDOUT filtering */
     g_creator_stdout_valid = (fstat(STDOUT_FILENO, &g_creator_stdout_st) == 0);
@@ -1508,7 +1690,7 @@ int uproctrace_main(int argc, char **argv)
             _exit(127);
         }
         raise(SIGSTOP); /* Wait for parent to set options */
-        execvp(argv[cmd_start], argv + cmd_start);
+        execvp(cmd[0], cmd);
         perror("execvp");
         _exit(127);
     }
@@ -1716,8 +1898,7 @@ int uproctrace_main(int argc, char **argv)
         ptrace(PTRACE_SYSCALL, wpid, NULL, (void *)(long)sig);
     }
 
-    if (outfile && g_out)
-        fclose(g_out);
+    close_trace_output(outfile);
 
     /* Clean up */
     free(g_tracked.pids);
@@ -1733,4 +1914,76 @@ int uproctrace_main(int argc, char **argv)
     }
 
     return 0;
+}
+
+int uproctrace_main(int argc, char **argv)
+{
+    const char *outfile = NULL;
+    enum trace_backend requested = TRACE_BACKEND_AUTO;
+    int cmd_start = -1;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            cmd_start = i + 1;
+            break;
+        }
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            outfile = argv[++i];
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            if (parse_trace_backend(argv[++i], &requested) != 0)
+                usage(argv[0]);
+        } else if (strncmp(argv[i], "--backend=", 10) == 0) {
+            if (parse_trace_backend(argv[i] + 10, &requested) != 0)
+                usage(argv[0]);
+        } else if (strcmp(argv[i], "--module") == 0) {
+            requested = TRACE_BACKEND_MODULE;
+        } else if (strcmp(argv[i], "--sud") == 0) {
+            requested = TRACE_BACKEND_SUD;
+        } else if (strcmp(argv[i], "--ptrace") == 0) {
+            requested = TRACE_BACKEND_PTRACE;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+        } else {
+            cmd_start = i;
+            break;
+        }
+    }
+
+    if (cmd_start < 0 || cmd_start >= argc)
+        usage(argv[0]);
+
+    char **cmd = argv + cmd_start;
+    char sudtrace_exe[PATH_MAX];
+    int have_module = kernel_supports_proctrace_module();
+    int have_sud = resolve_sudtrace_exe(sudtrace_exe, sizeof(sudtrace_exe)) == 0 &&
+                   kernel_supports_sud();
+
+    enum trace_backend selected = requested;
+    if (selected == TRACE_BACKEND_AUTO) {
+        if (have_module) selected = TRACE_BACKEND_MODULE;
+        else if (have_sud) selected = TRACE_BACKEND_SUD;
+        else selected = TRACE_BACKEND_PTRACE;
+    }
+
+    switch (selected) {
+    case TRACE_BACKEND_MODULE:
+        if (!have_module) {
+            fprintf(stderr, "uproctrace: requested backend '%s' is unavailable\n",
+                    trace_backend_name(selected));
+            return 1;
+        }
+        return run_module_trace(cmd, outfile);
+    case TRACE_BACKEND_SUD:
+        if (!have_sud) {
+            fprintf(stderr, "uproctrace: requested backend '%s' is unavailable\n",
+                    trace_backend_name(selected));
+            return 1;
+        }
+        return run_sud_trace(cmd, outfile, sudtrace_exe);
+    case TRACE_BACKEND_PTRACE:
+        return run_ptrace_trace(cmd, outfile);
+    case TRACE_BACKEND_AUTO:
+    default:
+        return run_ptrace_trace(cmd, outfile);
+    }
 }

@@ -60,7 +60,7 @@ echo ""
 echo "═══ Nested tracing: sudtrace → uproctrace → echo ═══"
 
 timeout 30 "$SUDTRACE" -o "$TMPDIR/sud.jsonl" \
-    -- "$TV" --uproctrace -o "$TMPDIR/upt.jsonl" \
+    -- "$TV" --uproctrace --ptrace -o "$TMPDIR/upt.jsonl" \
     -- /bin/echo "hello from nested" \
     > "$TMPDIR/stdout.txt" 2>&1
 RC=$?
@@ -130,7 +130,7 @@ echo ""
 echo "═══ Nested tracing: sudtrace → uproctrace → sh -c (fork+exec) ═══"
 
 timeout 30 "$SUDTRACE" -o "$TMPDIR/sud2.jsonl" \
-    -- "$TV" --uproctrace -o "$TMPDIR/upt2.jsonl" \
+    -- "$TV" --uproctrace --ptrace -o "$TMPDIR/upt2.jsonl" \
     -- /bin/sh -c 'echo "child1"; /bin/echo "child2"' \
     > "$TMPDIR/stdout2.txt" 2>&1
 RC2=$?
