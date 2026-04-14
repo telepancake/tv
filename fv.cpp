@@ -217,32 +217,33 @@ static int fv_row_count(const char *panel)
     return 0;
 }
 
-static int fv_row_get(const char *panel, int rownum, RowRef *row)
+static RowData fv_row_get(const char *panel, int rownum)
 {
-    static char idbuf[32];
-    static char namebuf[258];
-
     if (std::strcmp(panel, "content") == 0) {
-        if (rownum < 0 || rownum >= static_cast<int>(g.lines.size())) return 0;
+        if (rownum < 0 || rownum >= static_cast<int>(g.lines.size())) return {};
+        RowData d;
+        char idbuf[32];
         std::snprintf(idbuf, sizeof idbuf, "%d", rownum);
-        row->id     = idbuf;
-        row->style  = "";
-        row->cols[0] = g.lines[static_cast<size_t>(rownum)].c_str();
-        return 1;
+        d.id     = idbuf;
+        d.style  = "";
+        d.cols[0] = g.lines[static_cast<size_t>(rownum)];
+        return d;
     }
 
-    int d;
-    if (std::sscanf(panel, "d%d", &d) != 1) return 0;
-    if (d < 0 || d >= FV_MAX_DEPTH || g.entries[d].empty()) return 0;
-    if (rownum < 0 || rownum >= static_cast<int>(g.entries[d].size())) return 0;
+    int depth;
+    if (std::sscanf(panel, "d%d", &depth) != 1) return {};
+    if (depth < 0 || depth >= FV_MAX_DEPTH || g.entries[depth].empty()) return {};
+    if (rownum < 0 || rownum >= static_cast<int>(g.entries[depth].size())) return {};
 
-    auto &e = g.entries[d][static_cast<size_t>(rownum)];
-    row->id    = e.name;
-    row->style = e.is_dir ? "cyan" : "";
+    auto &e = g.entries[depth][static_cast<size_t>(rownum)];
+    RowData d;
+    d.id    = e.name;
+    d.style = e.is_dir ? "cyan" : "";
+    char namebuf[258];
     if (e.is_dir) std::snprintf(namebuf, sizeof namebuf, "%s/", e.name);
     else          std::snprintf(namebuf, sizeof namebuf, "%s",  e.name);
-    row->cols[0] = namebuf;
-    return 1;
+    d.cols[0] = namebuf;
+    return d;
 }
 
 static int fv_row_find(const char *panel, const char *id)
