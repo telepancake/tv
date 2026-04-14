@@ -704,8 +704,11 @@ static int compute_descendants(int idx) {
 }
 
 static void finalize_process_tree() {
-    for (int i = 0; i < static_cast<int>(g_processes.size()); i++)
+    for (int i = 0; i < static_cast<int>(g_processes.size()); i++) {
         g_processes[i].parent_index = process_index(g_processes[i].ppid);
+        g_processes[i].children.clear();
+        g_processes[i].descendant_count = 0;
+    }
     for (int i = 0; i < static_cast<int>(g_processes.size()); i++) {
         auto &p = g_processes[i];
         if (p.parent_index >= 0)
@@ -1073,6 +1076,59 @@ static void build_lpane_deps(int reverse) {
     }
 }
 
+static void build_lpane_dep_cmds(int reverse) {
+    const std::string &start = g_state.cursor_id;
+    if (start.empty()) return;
+    auto edges = build_file_edges();
+    /* Walk the file dependency chain to collect all reachable files */
+    std::vector<std::string> queue, seen;
+    int qh = 0;
+    queue.push_back(start);
+    while (qh < static_cast<int>(queue.size())) {
+        std::string cur = queue[qh++];
+        if (std::find(seen.begin(), seen.end(), cur) != seen.end()) continue;
+        seen.push_back(cur);
+        for (const auto &e : edges) {
+            std::string next;
+            if (reverse && e.dst == cur) next = e.src;
+            else if (!reverse && e.src == cur) next = e.dst;
+            if (!next.empty() && std::find(seen.begin(), seen.end(), next) == seen.end())
+                queue.push_back(next);
+        }
+    }
+    /* Collect processes that touched any file in the chain */
+    std::vector<int> pindices;
+    for (int i = 0; i < static_cast<int>(g_processes.size()); i++) {
+        auto &p = g_processes[i];
+        bool involved = false;
+        for (const auto &rp : p.read_paths)
+            if (!involved && std::find(seen.begin(), seen.end(), rp) != seen.end())
+                involved = true;
+        for (const auto &wp : p.write_paths)
+            if (!involved && std::find(seen.begin(), seen.end(), wp) != seen.end())
+                involved = true;
+        if (involved) pindices.push_back(i);
+    }
+    /* Sort reverse chronologically (latest end_ts first) */
+    std::sort(pindices.begin(), pindices.end(), [](int a, int b) {
+        return g_processes[a].end_ts > g_processes[b].end_ts;
+    });
+    for (int pi : pindices) {
+        auto &p = g_processes[pi];
+        std::string id_str = std::to_string(p.tgid);
+        auto name = p.display_name();
+        std::string marker;
+        if (p.exit_status == "exited")
+            marker = p.exit_code == 0 ? " ✓" : " ✗";
+        else if (p.exit_status == "signaled")
+            marker = sfmt(" ⚡%d", p.exit_signal);
+        std::string dur = format_duration(p.start_ts, p.end_ts, p.exit_status.empty());
+        std::string text = sfmt("[%d] %s%s%s%s", p.tgid, name.c_str(), marker.c_str(),
+                                dur.empty() ? "" : "  ", dur.c_str());
+        view_add_row(g_lpane, id_str, proc_style(p), "", text, 0, id_str, false);
+    }
+}
+
 /* ── Right pane ────────────────────────────────────────────────────── */
 
 static int format_ts(char *buf, size_t bufsz, double ts, double prev) {
@@ -1203,7 +1259,8 @@ static void build_rpane_output(const std::string &id) {
 static void build_rpane() {
     const auto &id = g_state.cursor_id;
     if (id.empty()) return;
-    if (g_state.mode == 0) build_rpane_process(id);
+    if (g_state.mode == 0 || g_state.mode == 5 || g_state.mode == 6)
+        build_rpane_process(id);
     else if (g_state.mode == 1 || g_state.mode >= 3) build_rpane_file(id);
     else build_rpane_output(id);
 }
@@ -1260,8 +1317,10 @@ static void rebuild_views() {
     case 0: build_lpane_process(); break;
     case 1: build_lpane_files(); break;
     case 2: build_lpane_output(); break;
-    case 3: case 5: build_lpane_deps(0); break;
-    case 4: case 6: build_lpane_deps(1); break;
+    case 3: build_lpane_deps(1); break;
+    case 4: build_lpane_deps(0); break;
+    case 5: build_lpane_dep_cmds(1); break;
+    case 6: build_lpane_dep_cmds(0); break;
     default: build_lpane_process(); break;
     }
     ensure_selection(g_lpane, g_state.cursor_id);
