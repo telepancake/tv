@@ -942,6 +942,17 @@ static int is_ld_linux_basename(const char *path)
     return strncmp(base, "ld-linux", 8) == 0;
 }
 
+static void visible_exec_args(const char *path, int argc, char **argv,
+                              const char **exe_out, int *argc_out, char ***argv_out)
+{
+    int skip = 0;
+    if (argc > 1 && argv && is_ld_linux_basename(argv[0]))
+        skip = 1;
+    if (exe_out) *exe_out = (argc > skip && argv) ? argv[skip] : path;
+    if (argc_out) *argc_out = argc > skip ? argc - skip : 0;
+    if (argv_out) *argv_out = (argc > skip && argv) ? argv + skip : NULL;
+}
+
 static int json_env_object(char *dst, int dstsize, const char *raw, int rawlen)
 {
     int di = 0, si = 0;
@@ -2579,6 +2590,15 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
 
 static void load_and_run_elf(const char *path, int argc, char **argv)
 {
+    pid_t self = raw_getpid();
+    const char *event_exe = path;
+    char **event_argv = argv;
+    int event_argc = argc;
+    visible_exec_args(path, argc, argv, &event_exe, &event_argc, &event_argv);
+    emit_cwd_event(self);
+    emit_exec_event(self, event_exe, event_argc, event_argv);
+    emit_inherited_open_events(self);
+
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("sudtrace: open ELF");
@@ -2933,20 +2953,6 @@ static int run_wrapper_mode(int argc, char **argv)
         load_and_run_elf(resolved, argc - argi, argv + argi);
     }
 
-    /* Parent: emit initial events, then monitor */
-    usleep(50000);
-
-    emit_cwd_event(child);
-    char **event_argv = argv + 1;
-    int event_argc = argc - 1;
-    if (event_argc > 1 && is_ld_linux_basename(event_argv[0])) {
-        event_argv++;
-        event_argc--;
-    }
-    emit_exec_event(child, event_argc > 0 ? event_argv[0] : resolved,
-                    event_argc, event_argv);
-    emit_inherited_open_events(child);
-
     for (;;) {
         int wstatus;
         pid_t wpid = waitpid(-1, &wstatus, __WALL);
@@ -3138,22 +3144,6 @@ int main(int argc, char **argv)
         _exit(127);
     }
 
-    /* Give child time to exec so /proc reflects new image */
-    usleep(50000);
-
-    emit_cwd_event(child);
-    char **event_argv = exec_argv + 1;
-    int event_argc = 0;
-    while (exec_argv[event_argc])
-        event_argc++;
-    event_argc--;
-    if (event_argc > 1 && is_ld_linux_basename(event_argv[0])) {
-        event_argv++;
-        event_argc--;
-    }
-    emit_exec_event(child, event_argc > 0 ? event_argv[0] : exec_argv[0],
-                    event_argc, event_argv);
-    emit_inherited_open_events(child);
     free_exec_argv(exec_argv);
 
     /* Main wait loop */
