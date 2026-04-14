@@ -5,19 +5,18 @@
  *
  * Layout:
  *   ┌──────┬──────┬──────┐
- *   │ d0   │ d1   │ d2   │   <- equally-wide dir columns (one per depth)
- *   │ ...  │ ...  │ ...  │      engine auto-scrolls to keep focused column
- *   ├──────┴──────┴──────┤      visible (TUI_BOX_HSCROLL)
- *   │ content            │   <- large file-content pane (text or hex+text)
+ *   │ d0   │ d1   │ d2   │   <- dir columns (engine auto-scrolls via HSCROLL)
+ *   ├──────┴──────┴──────┤
+ *   │ content            │   <- file content (text or hex)
  *   └────────────────────┘
- *   full path of entity under cursor               <- status bar
+ *   status bar
  *
  * Keys:
  *   ↑ ↓ j k  PgUp PgDn  Home/g End   Navigate within a column
  *   ←  h                              Focus the left column
  *   →  Enter                          Enter dir / focus content pane
  *   Tab                               Cycle all panels
- *   H                                 Toggle hex mode in content pane
+ *   H                                 Toggle hex mode
  *   .                                 Toggle hidden files
  *   ?                                 Help
  *   q  Esc                            Quit
@@ -42,16 +41,10 @@
 #define PATH_MAX 4096
 #endif
 
-/* Maximum depth we can navigate.  We create one engine panel per depth,
- * and the engine scrolls the hbox so only a visible subset is rendered.
- * Reserve 1 panel slot for the content pane. */
-#define FV_MAX_DEPTH  (TUI_MAX_PANELS - 1)
-/* Maximum bytes read from a file for the content pane. */
+#define FV_MAX_DEPTH  16
 #define FV_READ_MAX   (4 * 1024 * 1024)
 
-/* -----------------------------------------------------------------------
- * Data types
- * --------------------------------------------------------------------- */
+/* ── Data types ──────────────────────────────────────────────────────── */
 
 typedef struct {
     char name[256];
@@ -59,67 +52,44 @@ typedef struct {
 } fv_entry_t;
 
 typedef struct {
-    /* navigation: one path per depth */
     char        path_stack[FV_MAX_DEPTH][PATH_MAX];
-    int         depth_count;  /* number of panel depth slots */
-
-    /* per-depth directory listings */
+    int         depth_count;
     fv_entry_t *entries[FV_MAX_DEPTH];
     int         nentries[FV_MAX_DEPTH];
-
-    /* file content */
     char      **lines;
     int         nlines;
     int         hex_mode;
     int         show_hidden;
     char        shown_path[PATH_MAX];
+    tui_t      *tui;
 
-    /* terminal / tui */
-    int rows, cols;
-    tui_t *tui;
-
-    /* layout: one panel_def per depth + content */
+    /* panel defs */
     tui_panel_def dir_def[FV_MAX_DEPTH];
-    tui_col_def   dir_col;           /* shared: all columns use same col_def */
+    tui_col_def   dir_col;
     tui_panel_def content_def;
     tui_col_def   content_col;
-
-    /* box tree for layout (heap-allocated) */
-    tui_box_t *dir_pbox[FV_MAX_DEPTH]; /* leaf boxes for dir panels */
-    tui_box_t *content_pbox;
-    tui_box_t *top_hbox;
-    tui_box_t *root_vbox;
-    tui_box_t **hbox_children;
-    tui_box_t **root_children;
-
-    /* panel name strings */
-    char pnames[FV_MAX_DEPTH][8];
+    char          pnames[FV_MAX_DEPTH][8];
 } fv_state_t;
 
 static fv_state_t g;
 
-/* -----------------------------------------------------------------------
- * Helpers
- * --------------------------------------------------------------------- */
+/* ── Layout: static box tree ─────────────────────────────────────────── */
 
-static void *xm(size_t n)
-{
-    void *p = calloc(1, n ? n : 1);
-    if (!p) { perror("fv: calloc"); exit(1); }
-    return p;
-}
+static tui_box_t  dir_boxes[FV_MAX_DEPTH];
+static tui_box_t  content_box;
+static tui_box_t  top_hbox, root_vbox;
+static tui_box_t *hbox_ch[FV_MAX_DEPTH];
+static tui_box_t *root_ch[2];
+
+/* ── Helpers ──────────────────────────────────────────────────────────── */
 
 static void child_path(char *out, size_t sz, const char *parent, const char *name)
 {
-    if (strcmp(parent, "/") == 0)
-        snprintf(out, sz, "/%s", name);
-    else
-        snprintf(out, sz, "%s/%s", parent, name);
+    if (strcmp(parent, "/") == 0) snprintf(out, sz, "/%s", name);
+    else snprintf(out, sz, "%s/%s", parent, name);
 }
 
-/* -----------------------------------------------------------------------
- * Directory loading
- * --------------------------------------------------------------------- */
+/* ── Directory loading ────────────────────────────────────────────────── */
 
 static int entry_cmp(const void *a, const void *b)
 {
@@ -140,14 +110,13 @@ static void load_dir(int depth)
     if (!dir) return;
 
     int cap = 64, n = 0;
-    fv_entry_t *arr = xm((size_t)cap * sizeof *arr);
+    fv_entry_t *arr = calloc((size_t)cap, sizeof *arr);
+    if (!arr) { closedir(dir); return; }
     struct dirent *de;
     while ((de = readdir(dir))) {
         const char *nm = de->d_name;
-        if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
-            continue;
-        if (!g.show_hidden && nm[0] == '.')
-            continue;
+        if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+        if (!g.show_hidden && nm[0] == '.') continue;
         if (n >= cap) {
             cap *= 2;
             fv_entry_t *tmp = realloc(arr, (size_t)cap * sizeof *arr);
@@ -167,9 +136,7 @@ static void load_dir(int depth)
     g.nentries[depth] = n;
 }
 
-/* -----------------------------------------------------------------------
- * Content (file) loading
- * --------------------------------------------------------------------- */
+/* ── Content (file) loading ───────────────────────────────────────────── */
 
 static void free_lines(void)
 {
@@ -185,8 +152,7 @@ static int looks_binary(const unsigned char *buf, int n)
     int check = n < 512 ? n : 512;
     for (int i = 0; i < check; i++) {
         unsigned char c = buf[i];
-        if (c == 0) return 1;
-        if (c < 8 && c != '\t' && c != '\n' && c != '\r') return 1;
+        if (c == 0 || (c < 8 && c != '\t' && c != '\n' && c != '\r')) return 1;
     }
     return 0;
 }
@@ -220,13 +186,13 @@ static void load_content(const char *path)
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        g.lines = xm(sizeof(char *));
-        g.lines[0] = strdup(strerror(errno));
-        g.nlines = 1;
+        g.lines = calloc(1, sizeof(char *));
+        if (g.lines) { g.lines[0] = strdup(strerror(errno)); g.nlines = 1; }
         return;
     }
 
-    unsigned char *buf = xm(FV_READ_MAX + 1);
+    unsigned char *buf = calloc(1, FV_READ_MAX + 1);
+    if (!buf) { close(fd); return; }
     int bufsz = 0;
     while (bufsz < FV_READ_MAX) {
         int n = (int)read(fd, buf + bufsz, (size_t)(FV_READ_MAX - bufsz));
@@ -237,17 +203,14 @@ static void load_content(const char *path)
 
     if (g.hex_mode || looks_binary(buf, bufsz)) {
         int nlines = bufsz ? (bufsz + 15) / 16 : 1;
-        g.lines = xm((size_t)nlines * sizeof(char *));
-        if (bufsz == 0) {
-            g.lines[0] = strdup("(empty)");
-            g.nlines = 1;
-        } else {
-            for (int off = 0; off < bufsz; off += 16)
-                g.lines[g.nlines++] = mk_hex_line(buf, off, bufsz);
-        }
+        g.lines = calloc((size_t)nlines, sizeof(char *));
+        if (!g.lines) { free(buf); return; }
+        if (bufsz == 0) { g.lines[0] = strdup("(empty)"); g.nlines = 1; }
+        else for (int off = 0; off < bufsz; off += 16) g.lines[g.nlines++] = mk_hex_line(buf, off, bufsz);
     } else {
         int cap = 256, n = 0;
-        char **arr = xm((size_t)cap * sizeof(char *));
+        char **arr = calloc((size_t)cap, sizeof(char *));
+        if (!arr) { free(buf); return; }
         char *cp = (char *)buf, *end = cp + bufsz;
         while (cp < end) {
             char *nl = memchr(cp, '\n', (size_t)(end - cp));
@@ -258,28 +221,21 @@ static void load_content(const char *path)
                 if (!tmp) { free(arr); arr = NULL; break; }
                 arr = tmp;
             }
-            char *line = xm((size_t)len + 1);
-            memcpy(line, cp, (size_t)len);
-            if (len > 0 && line[len - 1] == '\r') line[len - 1] = '\0';
+            char *line = calloc(1, (size_t)len + 1);
+            if (line) { memcpy(line, cp, (size_t)len); if (len > 0 && line[len - 1] == '\r') line[len - 1] = '\0'; }
             arr[n++] = line;
             cp = nl ? nl + 1 : end;
         }
         if (!arr || n == 0) {
-            if (arr) free(arr);
-            g.lines = xm(sizeof(char *));
-            g.lines[0] = strdup("(empty)");
-            g.nlines = 1;
-        } else {
-            g.lines = arr;
-            g.nlines = n;
-        }
+            free(arr);
+            g.lines = calloc(1, sizeof(char *));
+            if (g.lines) { g.lines[0] = strdup("(empty)"); g.nlines = 1; }
+        } else { g.lines = arr; g.nlines = n; }
     }
     free(buf);
 }
 
-/* -----------------------------------------------------------------------
- * Data source callbacks
- * --------------------------------------------------------------------- */
+/* ── Data source callbacks ────────────────────────────────────────────── */
 
 static int fv_row_count(const char *panel, void *ctx)
 {
@@ -331,20 +287,13 @@ static int fv_row_find(const char *panel, const char *id, void *ctx)
     return -1;
 }
 
-static void fv_size_changed(int rows, int cols, void *ctx)
-{
-    (void)ctx;
-    g.rows = rows;
-    g.cols = cols;
-}
+static void fv_size_changed(int rows, int cols, void *ctx) { (void)ctx; (void)rows; (void)cols; }
 
 static const tui_data_source g_src = {
     fv_row_count, fv_row_get, fv_row_find, fv_size_changed
 };
 
-/* -----------------------------------------------------------------------
- * Sync helpers
- * --------------------------------------------------------------------- */
+/* ── Sync helpers ─────────────────────────────────────────────────────── */
 
 static const char *dpname(int d)
 {
@@ -356,19 +305,14 @@ static void sync_right_of(int d)
     if (d < 0 || d >= FV_MAX_DEPTH) return;
     int cursor = tui_get_cursor(g.tui, dpname(d));
 
-    /* Clear deeper levels. */
     for (int i = d + 1; i < g.depth_count; i++) {
-        free(g.entries[i]);
-        g.entries[i] = NULL;
-        g.nentries[i] = 0;
+        free(g.entries[i]); g.entries[i] = NULL; g.nentries[i] = 0;
         g.path_stack[i][0] = '\0';
         tui_dirty(g.tui, dpname(i));
     }
 
     if (cursor < 0 || cursor >= g.nentries[d] || !g.entries[d]) {
-        free_lines();
-        tui_dirty(g.tui, "content");
-        return;
+        free_lines(); tui_dirty(g.tui, "content"); return;
     }
 
     fv_entry_t *e = &g.entries[d][cursor];
@@ -393,9 +337,7 @@ static void sync_right_of(int d)
     tui_dirty(g.tui, "content");
 }
 
-/* -----------------------------------------------------------------------
- * Status bar
- * --------------------------------------------------------------------- */
+/* ── Status bar ───────────────────────────────────────────────────────── */
 
 static void update_status(void)
 {
@@ -422,23 +364,7 @@ static void update_status(void)
     tui_set_status(g.tui, status);
 }
 
-/* -----------------------------------------------------------------------
- * Cursor change callback (fires automatically on cursor movement)
- * --------------------------------------------------------------------- */
-
-static void on_cursor_change(tui_t *tui, const char *panel,
-                             int cursor, const char *row_id, void *ctx)
-{
-    (void)tui; (void)cursor; (void)row_id; (void)ctx;
-    int d = -1;
-    if (panel && sscanf(panel, "d%d", &d) == 1)
-        sync_right_of(d);
-    update_status();
-}
-
-/* -----------------------------------------------------------------------
- * Key callback — only app-specific keys
- * --------------------------------------------------------------------- */
+/* ── Key callback ─────────────────────────────────────────────────────── */
 
 static const char *HELP[] = {
     "",
@@ -471,19 +397,15 @@ static int on_key(tui_t *tui, int key, const char *panel,
     int in_content = (panel && strcmp(panel, "content") == 0);
     if (panel) sscanf(panel, "d%d", &d);
 
-    /* The TUI_K_NONE notification is still fired for backward compat
-     * but we use on_cursor_change now, so ignore it here. */
-    if (key == TUI_K_NONE) return TUI_HANDLED;
+    /* Engine fires TUI_K_NONE after handling navigation. */
+    if (key == TUI_K_NONE) {
+        if (d >= 0) sync_right_of(d);
+        update_status();
+        return TUI_HANDLED;
+    }
 
-    if (key == 'q' || key == TUI_K_ESC) {
-        tui_quit(tui);
-        return TUI_HANDLED;
-    }
-    if (key == '?') {
-        tui_show_help(tui, HELP);
-        tui_dirty(tui, NULL);
-        return TUI_HANDLED;
-    }
+    if (key == 'q' || key == TUI_K_ESC) { tui_quit(tui); return TUI_HANDLED; }
+    if (key == '?') { tui_show_help(tui, HELP); tui_dirty(tui, NULL); return TUI_HANDLED; }
     if (key == 'H') {
         g.hex_mode = !g.hex_mode;
         if (g.shown_path[0]) {
@@ -504,156 +426,72 @@ static int on_key(tui_t *tui, int key, const char *panel,
         tui_dirty(tui, "content");
         return TUI_HANDLED;
     }
-
-    /* LEFT: move focus to the left column. */
     if (key == TUI_K_LEFT || key == 'h') {
         if (in_content) {
-            /* Find the deepest populated dir column. */
-            for (int i = g.depth_count - 1; i >= 0; i--) {
-                if (g.nentries[i] > 0 || g.path_stack[i][0]) {
-                    tui_focus(tui, dpname(i));
-                    update_status();
-                    break;
-                }
-            }
+            for (int i = g.depth_count - 1; i >= 0; i--)
+                if (g.nentries[i] > 0 || g.path_stack[i][0]) { tui_focus(tui, dpname(i)); break; }
         } else if (d > 0) {
             tui_focus(tui, dpname(d - 1));
-            update_status();
         }
+        update_status();
         return TUI_HANDLED;
     }
-
-    /* RIGHT / ENTER: enter directory or focus content pane. */
     if (key == TUI_K_RIGHT || (key == TUI_K_ENTER && !in_content)) {
         if (d >= 0 && d < FV_MAX_DEPTH && g.entries[d]) {
             int c = tui_get_cursor(tui, dpname(d));
             if (c >= 0 && c < g.nentries[d]) {
                 fv_entry_t *e = &g.entries[d][c];
-                if (e->is_dir && d + 1 < g.depth_count) {
-                    /* Focus next column; engine hscroll auto-scrolls. */
-                    tui_focus(tui, dpname(d + 1));
-                    update_status();
-                } else if (!e->is_dir) {
-                    tui_focus(tui, "content");
-                    update_status();
-                }
+                if (e->is_dir && d + 1 < g.depth_count) tui_focus(tui, dpname(d + 1));
+                else if (!e->is_dir) tui_focus(tui, "content");
             }
         }
+        update_status();
         return TUI_HANDLED;
     }
-
     return TUI_DEFAULT;
 }
 
-/* -----------------------------------------------------------------------
- * Layout builder: create all dir panel slots + content panel.
- * The dir panels live in an hbox with TUI_BOX_HSCROLL; the engine
- * decides how many columns fit on screen and scrolls automatically.
- * --------------------------------------------------------------------- */
+/* ── Layout: fill the static box tree ─────────────────────────────────── */
 
 static void build_layout(void)
 {
-    int ndepths = FV_MAX_DEPTH;
-    g.depth_count = ndepths;
+    g.depth_count = FV_MAX_DEPTH;
+    g.dir_col = (tui_col_def){"name", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS};
+    g.content_col = (tui_col_def){"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE};
 
-    /* Shared column definition for all dir panels */
-    g.dir_col.name     = "name";
-    g.dir_col.width    = -1;
-    g.dir_col.align    = TUI_ALIGN_LEFT;
-    g.dir_col.overflow = TUI_OVERFLOW_ELLIPSIS;
-
-    /* Panel definitions and leaf boxes for each depth */
-    g.hbox_children = xm((size_t)ndepths * sizeof(tui_box_t *));
-    for (int i = 0; i < ndepths; i++) {
+    for (int i = 0; i < FV_MAX_DEPTH; i++) {
         snprintf(g.pnames[i], sizeof g.pnames[i], "d%d", i);
-        g.dir_def[i].name   = g.pnames[i];
-        g.dir_def[i].title  = NULL;
-        g.dir_def[i].cols   = &g.dir_col;
-        g.dir_def[i].ncols  = 1;
-        g.dir_def[i].flags  = TUI_PANEL_CURSOR | TUI_PANEL_BORDER;
-
-        g.dir_pbox[i] = xm(sizeof(tui_box_t));
-        g.dir_pbox[i]->type      = TUI_BOX_PANEL;
-        g.dir_pbox[i]->weight    = 1;
-        g.dir_pbox[i]->min_size  = 0;
-        g.dir_pbox[i]->box_flags = 0;
-        g.dir_pbox[i]->def       = &g.dir_def[i];
-        g.dir_pbox[i]->children  = NULL;
-        g.dir_pbox[i]->nchildren = 0;
-
-        g.hbox_children[i] = g.dir_pbox[i];
+        g.dir_def[i] = (tui_panel_def){g.pnames[i], NULL, &g.dir_col, 1,
+                                        TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
+        dir_boxes[i] = (tui_box_t){TUI_BOX_PANEL, 1, 0, 0, &g.dir_def[i], NULL, 0};
+        hbox_ch[i] = &dir_boxes[i];
     }
+    g.content_def = (tui_panel_def){"content", NULL, &g.content_col, 1, TUI_PANEL_CURSOR};
+    content_box = (tui_box_t){TUI_BOX_PANEL, 3, 3, 0, &g.content_def, NULL, 0};
 
-    /* Content panel */
-    g.content_col.name     = "text";
-    g.content_col.width    = -1;
-    g.content_col.align    = TUI_ALIGN_LEFT;
-    g.content_col.overflow = TUI_OVERFLOW_TRUNCATE;
-
-    g.content_def.name   = "content";
-    g.content_def.title  = NULL;
-    g.content_def.cols   = &g.content_col;
-    g.content_def.ncols  = 1;
-    g.content_def.flags  = TUI_PANEL_CURSOR;
-
-    g.content_pbox = xm(sizeof(tui_box_t));
-    g.content_pbox->type      = TUI_BOX_PANEL;
-    g.content_pbox->weight    = 3;
-    g.content_pbox->min_size  = 3;
-    g.content_pbox->box_flags = 0;
-    g.content_pbox->def       = &g.content_def;
-    g.content_pbox->children  = NULL;
-    g.content_pbox->nchildren = 0;
-
-    /* Top hbox with HSCROLL flag: engine decides visible column count. */
-    /* Top hbox with HSCROLL flag: engine auto-scrolls to keep the
-     * focused column visible; fv does not manage visible column count. */
-    g.top_hbox = xm(sizeof(tui_box_t));
-    g.top_hbox->type      = TUI_BOX_HBOX;
-    g.top_hbox->weight    = 1;
-    g.top_hbox->min_size  = 3;
-    g.top_hbox->box_flags = TUI_BOX_HSCROLL;
-    g.top_hbox->def       = NULL;
-    g.top_hbox->children  = g.hbox_children;
-    g.top_hbox->nchildren = ndepths;
-
-    /* Root vbox */
-    g.root_children = xm(2 * sizeof(tui_box_t *));
-    g.root_children[0] = g.top_hbox;
-    g.root_children[1] = g.content_pbox;
-
-    g.root_vbox = xm(sizeof(tui_box_t));
-    g.root_vbox->type      = TUI_BOX_VBOX;
-    g.root_vbox->weight    = 1;
-    g.root_vbox->min_size  = 0;
-    g.root_vbox->box_flags = 0;
-    g.root_vbox->def       = NULL;
-    g.root_vbox->children  = g.root_children;
-    g.root_vbox->nchildren = 2;
+    top_hbox = (tui_box_t){TUI_BOX_HBOX, 1, 3, TUI_BOX_HSCROLL, NULL, hbox_ch, FV_MAX_DEPTH};
+    root_ch[0] = &top_hbox;
+    root_ch[1] = &content_box;
+    root_vbox = (tui_box_t){TUI_BOX_VBOX, 1, 0, 0, NULL, root_ch, 2};
 }
 
-/* -----------------------------------------------------------------------
- * main
- * --------------------------------------------------------------------- */
+/* ── main ─────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
 {
     memset(&g, 0, sizeof g);
 
     const char *startpath = (argc > 1) ? argv[1] : ".";
-
     char abspath[PATH_MAX];
     if (!realpath(startpath, abspath)) {
         fprintf(stderr, "fv: %s: %s\n", startpath, strerror(errno));
         return 1;
     }
-
     struct stat st;
     if (stat(abspath, &st) != 0) {
         fprintf(stderr, "fv: %s: %s\n", abspath, strerror(errno));
         return 1;
     }
-
     if (S_ISREG(st.st_mode)) {
         char *slash = strrchr(abspath, '/');
         if (slash && slash > abspath) *slash = '\0';
@@ -662,18 +500,12 @@ int main(int argc, char **argv)
     snprintf(g.path_stack[0], sizeof g.path_stack[0], "%s", abspath);
 
     tui_t *tui = tui_open(&g_src, NULL);
-    if (!tui) {
-        fprintf(stderr, "fv: cannot open terminal\n");
-        return 1;
-    }
-    g.tui  = tui;
-    g.rows = tui_rows(tui);
-    g.cols = tui_cols(tui);
+    if (!tui) { fprintf(stderr, "fv: cannot open terminal\n"); return 1; }
+    g.tui = tui;
 
     build_layout();
-    tui_set_layout(tui, g.root_vbox);
+    tui_set_layout(tui, &root_vbox);
     tui_on_key(tui, on_key, NULL);
-    tui_on_cursor_change(tui, on_cursor_change, NULL);
 
     load_dir(0);
     tui_focus(tui, "d0");

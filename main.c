@@ -1943,9 +1943,13 @@ int main(int argc, char **argv) {
         return headless_mode ? 0 : 1;
     }
 
-    tui_set_layout(g_tui, tui_hbox(2,
-        tui_panel_box(&g_lpane_def, 1, 0),
-        tui_panel_box(&g_rpane_def, 1, 0)));
+    {
+        static tui_box_t lbox = {TUI_BOX_PANEL, 1, 0, 0, &g_lpane_def, NULL, 0};
+        static tui_box_t rbox = {TUI_BOX_PANEL, 1, 0, 0, &g_rpane_def, NULL, 0};
+        static tui_box_t *hch[] = {&lbox, &rbox};
+        static tui_box_t hbox = {TUI_BOX_HBOX, 1, 0, 0, NULL, hch, 2};
+        tui_set_layout(g_tui, &hbox);
+    }
     tui_on_key(g_tui, on_key_cb, NULL);
     sync_engine_from_state();
     update_status();
