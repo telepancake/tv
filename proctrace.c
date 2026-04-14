@@ -365,7 +365,6 @@ struct trace_session {
     atomic_t            tag_count;
 
     struct list_head    list;
-    struct rcu_head     rcu_s;
 };
 
 static LIST_HEAD(sessions);
@@ -432,12 +431,20 @@ static bool session_is_tagged(struct trace_session *s, pid_t tgid)
 
 static int session_tag_pid(struct trace_session *s, pid_t tgid)
 {
-    struct tagged_pid *entry; unsigned long flags;
+    struct tagged_pid *entry, *cur; unsigned long flags;
     if (session_is_tagged(s, tgid)) return 0;
     entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
     if (!entry) return -ENOMEM;
     entry->pid = tgid; INIT_HLIST_NODE(&entry->hnode);
     spin_lock_irqsave(&s->tag_lock, flags);
+    /* Re-check under lock to prevent duplicate entries (TOCTOU). */
+    hash_for_each_possible(s->tags, cur, hnode, tgid) {
+        if (cur->pid == tgid) {
+            spin_unlock_irqrestore(&s->tag_lock, flags);
+            kfree(entry);
+            return 0;
+        }
+    }
     hash_add_rcu(s->tags, &entry->hnode, tgid);
     spin_unlock_irqrestore(&s->tag_lock, flags);
     atomic_inc(&s->tag_count); return 0;
@@ -512,21 +519,34 @@ static struct trace_session *session_create(pid_t root_tgid)
     return s;
 }
 
-static void session_destroy_rcu(struct rcu_head *head)
-{ kfree(container_of(head, struct trace_session, rcu_s)); }
-
-static void session_destroy_locked(struct trace_session *s)
+static void session_destroy(struct trace_session *s)
 {
     s->dead = true; smp_wmb();
     s->ring.closed = true;
     wake_up_interruptible(&s->ring.wq_writer);
     wake_up_interruptible(&s->ring.wq_reader);
 
+    mutex_lock(&sessions_mutex);
     list_del_rcu(&s->list);
+    mutex_unlock(&sessions_mutex);
+
+    /*
+     * Wait for all RCU readers (kprobe handlers) to finish so no new
+     * work items referencing this session can be queued afterwards.
+     */
+    synchronize_rcu();
+
+    /*
+     * Now drain any work items that were queued before the grace period.
+     * This is safe to call without sessions_mutex — the previous deadlock
+     * came from flush_workqueue() blocking on OTHER sessions' ring-full
+     * workers while holding the mutex, which prevented all forward progress.
+     */
     flush_workqueue(log_wq);
+
     session_free_all_tags(s);
     ring_destroy(&s->ring);
-    call_rcu(&s->rcu_s, session_destroy_rcu);
+    kfree(s);
 }
 
 /* ===============================================================
@@ -1259,9 +1279,7 @@ static int proc_new_release(struct inode *inode, struct file *filp)
     struct trace_session *s = filp->private_data;
     if (!s) return 0;
     filp->private_data = NULL;
-    mutex_lock(&sessions_mutex);
-    session_destroy_locked(s);
-    mutex_unlock(&sessions_mutex);
+    session_destroy(s);
     return 0;
 }
 
@@ -1398,6 +1416,9 @@ static void __exit proctrace_exit(void)
     unregister_kretprobe(&exec_kretprobe);
     unregister_kretprobe(&fork_kretprobe);
     proc_remove(proc_dir);
+    /* After kprobes are unregistered, no new events can fire.
+     * Wait for any in-flight RCU readers, then drain the workqueue. */
+    synchronize_rcu();
     flush_workqueue(log_wq); destroy_workqueue(log_wq);
     mutex_lock(&sessions_mutex);
     list_for_each_entry_safe(s,tmp,&sessions,list){

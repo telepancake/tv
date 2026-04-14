@@ -569,6 +569,32 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags)
 #endif
 }
 
+/*
+ * Older glibc (< 2.33, e.g. Ubuntu 18.04) defines fstat/fstatat as inline
+ * wrappers that call __fxstat/__fxstatat with a version argument.  When
+ * linking with -nostdlib those symbols are missing.  Provide them so that
+ * both the inline wrappers AND our own explicit definitions resolve.
+ */
+int __fxstat(int ver, int fd, struct stat *st)
+{
+    (void)ver;
+#if defined(__i386__) && defined(SYS_fstat64)
+    return mini_set_errno(mini_syscall2(SYS_fstat64, fd, (long)st));
+#else
+    return mini_set_errno(mini_syscall2(SYS_fstat, fd, (long)st));
+#endif
+}
+
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *st, int flags)
+{
+    (void)ver;
+#ifdef SYS_newfstatat
+    return mini_set_errno(mini_syscall4(SYS_newfstatat, dirfd, (long)path, (long)st, flags));
+#else
+    return mini_set_errno(mini_syscall4(SYS_fstatat64, dirfd, (long)path, (long)st, flags));
+#endif
+}
+
 char *getcwd(char *buf, size_t size)
 {
     long ret = mini_syscall2(SYS_getcwd, (long)buf, size);
