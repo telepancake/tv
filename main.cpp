@@ -35,11 +35,14 @@ class sorted_vec_set {
     bool sorted_ = true;
     Cmp cmp_;
 
+    /* Two values are equivalent under the comparator when neither is less than the other. */
+    bool equiv(const T &a, const T &b) const { return !cmp_(a,b) && !cmp_(b,a); }
+
     void ensure_sorted() {
         if (sorted_) return;
         std::sort(v_.begin(), v_.end(), cmp_);
         v_.erase(std::unique(v_.begin(), v_.end(),
-                     [this](const T &a, const T &b){ return !cmp_(a,b) && !cmp_(b,a); }),
+                     [this](const T &a, const T &b){ return equiv(a,b); }),
                  v_.end());
         sorted_ = true;
     }
@@ -48,14 +51,14 @@ public:
 
     void insert(const T &val) {
         if (!v_.empty() && !cmp_(v_.back(), val)) {
-            if (!cmp_(val, v_.back())) return;   /* duplicate of last */
+            if (equiv(val, v_.back())) return;   /* duplicate of last */
             sorted_ = false;
         }
         v_.push_back(val);
     }
     void insert(T &&val) {
         if (!v_.empty() && !cmp_(v_.back(), val)) {
-            if (!cmp_(val, v_.back())) return;
+            if (equiv(val, v_.back())) return;
             sorted_ = false;
         }
         v_.push_back(std::move(val));
@@ -79,8 +82,9 @@ public:
     /* iterators – ensure sorted before use */
     auto begin() { ensure_sorted(); return v_.begin(); }
     auto end()   { ensure_sorted(); return v_.end(); }
-    auto begin() const { return v_.begin(); }   /* const: caller guarantees sorted */
-    auto end()   const { return v_.end(); }
+    /* const iterators: caller must have called a non-const method first to ensure sorted */
+    auto begin() const { assert(sorted_); return v_.begin(); }
+    auto end()   const { assert(sorted_); return v_.end(); }
 
     /* pair<iterator,bool> emplace for unordered_set compatibility */
     std::pair<typename std::vector<T>::iterator, bool> emplace(const T &val) {
@@ -121,13 +125,14 @@ public:
 /* ── abs_path_t — interned absolute path token ─────────────────────── */
 
 struct abs_path_data {
-    std::string path;
-    /* file stats, aggregated incrementally */
-    int opens = 0;
-    int errs  = 0;
-    std::unordered_set<int> proc_tgids;
-    std::vector<int> event_indices;     /* OPEN events into g_events */
-    std::vector<int> path_event_indices; /* all events for this path */
+    std::string path;           /* key - never modified after insertion */
+    /* file stats, aggregated incrementally.  Mutable because they are
+       non-key fields that must be updated while the object lives in std::set. */
+    mutable int opens = 0;
+    mutable int errs  = 0;
+    mutable std::unordered_set<int> proc_tgids;
+    mutable std::vector<int> event_indices;     /* OPEN events into g_events */
+    mutable std::vector<int> path_event_indices; /* all events for this path */
 };
 
 struct abs_path_cmp {
@@ -165,15 +170,16 @@ struct abs_path_t {
     explicit operator bool() const { return ptr != nullptr; }
 };
 
-/* Get-or-create interned path.  Returns mutable data pointer for ingestion. */
-static abs_path_data *intern_path(const std::string &path) {
+/* Get-or-create interned path.  Returns const pointer; mutable fields
+   allow updating stats without casting away constness. */
+static const abs_path_data *intern_path(const std::string &path) {
     if (path.empty()) return nullptr;
     auto it = g_path_pool.find(path);
-    if (it != g_path_pool.end()) return const_cast<abs_path_data*>(&*it);
+    if (it != g_path_pool.end()) return &*it;
     abs_path_data d;
     d.path = path;
     auto [nit, _] = g_path_pool.insert(std::move(d));
-    return const_cast<abs_path_data*>(&*nit);
+    return &*nit;
 }
 
 /* Immutable lookup (returns nullptr if not found). */
@@ -716,7 +722,8 @@ static void ingest_trace_line(const char *line) {
     if (ev.nspid > 0 || proc.nspid == 0) proc.nspid = ev.nspid;
     if (ev.nstgid > 0 || proc.nstgid == 0) proc.nstgid = ev.nstgid;
 
-    /* Parent-child linking: set parent exactly once */
+    /* Parent-child linking: set parent exactly once; subsequent events
+       with a different ppid are ignored to maintain tree consistency. */
     if (!proc.parent_set && ev.ppid > 0 && ev.ppid != proc.tgid) {
         proc.ppid = ev.ppid;
         proc.parent_set = true;
@@ -753,7 +760,7 @@ static void ingest_trace_line(const char *line) {
             if (is_read_open(ev)) proc.read_paths.insert(ap);
             if (is_write_open(ev)) proc.write_paths.insert(ap);
             /* Incremental file stats stored in abs_path_data */
-            abs_path_data *fs = intern_path(ev.resolved_path);
+            const abs_path_data *fs = intern_path(ev.resolved_path);
             fs->opens++;
             if (ev.err) fs->errs++;
             fs->proc_tgids.insert(ev.tgid);
@@ -1219,10 +1226,11 @@ static void build_lpane_output() {
 /* ── Deps view ─────────────────────────────────────────────────────── */
 
 static std::vector<file_edge_t> build_file_edges() {
-    /* Use sorted_vec_set of (src_ptr, dst_ptr) pairs for dedup */
+    /* Use sorted_vec_set of (src, dst) pairs for dedup */
     struct Edge { abs_path_t src, dst;
         bool operator<(const Edge &o) const {
-            if (src.ptr != o.src.ptr) return src < o.src;
+            if (src < o.src) return true;
+            if (o.src < src) return false;
             return dst < o.dst;
         }
     };
@@ -1249,14 +1257,13 @@ static void build_lpane_deps(int reverse) {
     int qh = 0;
     queue.push_back(start);
     while (qh < static_cast<int>(queue.size())) {
-        std::string cur = queue[qh++];
+        const std::string &cur = queue[qh++];
         if (!seen.emplace(cur).second) continue;
         for (const auto &e : edges) {
-            std::string next;
-            if (reverse && e.dst.str() == cur) next = e.src.str();
-            else if (!reverse && e.src.str() == cur) next = e.dst.str();
-            if (!next.empty() && !seen.contains(next))
-                queue.push_back(next);
+            if (reverse && e.dst == cur && !seen.contains(e.src.str()))
+                queue.push_back(e.src.str());
+            else if (!reverse && e.src == cur && !seen.contains(e.dst.str()))
+                queue.push_back(e.dst.str());
         }
     }
     for (const auto &s : seen) {
@@ -1274,14 +1281,13 @@ static void build_lpane_dep_cmds(int reverse) {
     int qh = 0;
     queue.push_back(start);
     while (qh < static_cast<int>(queue.size())) {
-        std::string cur = queue[qh++];
+        const std::string &cur = queue[qh++];
         if (!seen.emplace(cur).second) continue;
         for (const auto &e : edges) {
-            std::string next;
-            if (reverse && e.dst.str() == cur) next = e.src.str();
-            else if (!reverse && e.src.str() == cur) next = e.dst.str();
-            if (!next.empty() && !seen.contains(next))
-                queue.push_back(next);
+            if (reverse && e.dst == cur && !seen.contains(e.src.str()))
+                queue.push_back(e.src.str());
+            else if (!reverse && e.src == cur && !seen.contains(e.dst.str()))
+                queue.push_back(e.dst.str());
         }
     }
     /* Collect processes that touched any file in the chain */
