@@ -9,6 +9,7 @@ extern "C" {
 
 /* ── Limits ────────────────────────────────────────────────────────── */
 
+/* Maximum number of panels (statically allocated; not growable). */
 #define TUI_MAX_PANELS   32
 #define TUI_MAX_COLS     32
 

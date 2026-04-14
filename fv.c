@@ -606,6 +606,8 @@ static void build_layout(void)
     g.content_pbox->nchildren = 0;
 
     /* Top hbox with HSCROLL flag: engine decides visible column count. */
+    /* Top hbox with HSCROLL flag: engine auto-scrolls to keep the
+     * focused column visible; fv does not manage visible column count. */
     g.top_hbox = xm(sizeof(tui_box_t));
     g.top_hbox->type      = TUI_BOX_HBOX;
     g.top_hbox->weight    = 1;
