@@ -15,7 +15,7 @@
 
 #include "engine.h"
 
-#define MAX_PANELS  8
+#define MAX_PANELS  32
 #define MAX_WATCHES 16
 #define MAX_TIMERS  16
 #define PANEL_CACHE_ROWS  256
@@ -294,6 +294,17 @@ static void p_ensure_cached(tui_t *t, panel_st *p, int rn) {
     p_load_cache(t, p, from);
 }
 
+static int box_contains_focus(tui_t *t, tui_box_t *b) {
+    if (!b) return 0;
+    if (b->type == TUI_BOX_PANEL) {
+        if (t->focus < 0 || t->focus >= t->npanels) return 0;
+        return b->def && strcmp(b->def->name, t->panels[t->focus].def.name) == 0;
+    }
+    for (int i = 0; i < b->nchildren; i++)
+        if (box_contains_focus(t, b->children[i])) return 1;
+    return 0;
+}
+
 static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
     if (!b) return;
     if (b->type == TUI_BOX_PANEL) {
@@ -301,7 +312,35 @@ static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
         if (p) { p->x = x; p->y = y; p->w = w < 1 ? 1 : w; p->h = h < 1 ? 1 : h; }
         return;
     }
-    int axis = (b->type == TUI_BOX_HBOX) ? w : h;
+    int is_hbox = (b->type == TUI_BOX_HBOX);
+    int axis = is_hbox ? w : h;
+
+    /* hscroll: visible subset of children, auto-scroll to keep focus visible */
+    if (is_hbox && (b->flags & TUI_BOX_HSCROLL) && b->nchildren > 0) {
+        int min_col = 14, nvis = w / min_col;
+        if (nvis < 1) nvis = 1;
+        if (nvis > b->nchildren) nvis = b->nchildren;
+        int cw = w / nvis;
+        int focus_child = 0;
+        for (int i = 0; i < b->nchildren; i++)
+            if (box_contains_focus(t, b->children[i])) { focus_child = i; break; }
+        int first = focus_child - nvis / 2;
+        if (first < 0) first = 0;
+        if (first + nvis > b->nchildren) first = b->nchildren - nvis;
+        if (first < 0) first = 0;
+        int pos = x;
+        for (int i = 0; i < b->nchildren; i++) {
+            if (i >= first && i < first + nvis) {
+                int tw = (i == first + nvis - 1) ? w - (pos - x) : cw;
+                resolve_box(t, b->children[i], pos, y, tw, h);
+                pos += tw;
+            } else {
+                resolve_box(t, b->children[i], -9999, y, 1, h);
+            }
+        }
+        return;
+    }
+
     int total_weight = 0, fixed_sum = 0;
     for (int i = 0; i < b->nchildren; i++) {
         tui_box_t *c = b->children[i];
@@ -310,7 +349,7 @@ static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
     }
     int flex = axis - fixed_sum;
     if (flex < 0) flex = 0;
-    int pos = (b->type == TUI_BOX_HBOX) ? x : y;
+    int pos = is_hbox ? x : y;
     int remaining = axis;
     for (int i = 0; i < b->nchildren; i++) {
         tui_box_t *c = b->children[i];
@@ -329,7 +368,7 @@ static void resolve_box(tui_t *t, tui_box_t *b, int x, int y, int w, int h) {
             }
         }
         if (sz < 1) sz = 1;
-        if (b->type == TUI_BOX_HBOX) resolve_box(t, c, pos, y, sz, h);
+        if (is_hbox) resolve_box(t, c, pos, y, sz, h);
         else resolve_box(t, c, x, pos, w, sz);
         pos += sz;
         remaining -= sz;
@@ -397,6 +436,7 @@ static int read_key(tui_t *t) {
 }
 
 static void render_panel(tui_t *t, panel_st *p) {
+    if (p->x < -9000) return;  /* hidden by hscroll */
     const tui_panel_def *d = &p->def;
     int focused = (t->focus >= 0 && &t->panels[t->focus] == p);
     int cy = p->y, ch = p->h;
@@ -589,7 +629,7 @@ void tui_close(tui_t *t) {
 void tui_set_layout(tui_t *tui, tui_box_t *root) {
     if (!tui) return;
     tui->layout_root = root;
-    struct { tui_box_t *b; } stack[128];
+    struct { tui_box_t *b; } stack[256];
     int top = 0;
     stack[top++].b = root;
     while (top > 0) {
@@ -611,46 +651,9 @@ void tui_set_layout(tui_t *tui, tui_box_t *root) {
                 tui->npanels++;
             }
         } else {
-            for (int i = 0; i < b->nchildren && top < 128; i++) stack[top++].b = b->children[i];
+            for (int i = b->nchildren - 1; i >= 0 && top < 256; i--) stack[top++].b = b->children[i];
         }
     }
-}
-
-tui_box_t *tui_panel_box(const tui_panel_def *def, int weight, int min_size) {
-    static tui_box_t pool[256];
-    static int pool_n = 0;
-    if (pool_n >= 256) return NULL;
-    tui_box_t *b = &pool[pool_n++];
-    *b = (tui_box_t){TUI_BOX_PANEL, weight, min_size, def, NULL, 0};
-    return b;
-}
-
-tui_box_t *tui_hbox(int n, ...) {
-    static tui_box_t pool[256];
-    static tui_box_t *ptrs[1024];
-    static int pool_n = 0, ptr_n = 0;
-    if (pool_n >= 256 || ptr_n + n > 1024) return NULL;
-    tui_box_t *b = &pool[pool_n++];
-    b->type = TUI_BOX_HBOX; b->weight = 1; b->min_size = 0;
-    b->def = NULL; b->children = &ptrs[ptr_n]; b->nchildren = n;
-    va_list ap; va_start(ap, n);
-    for (int i = 0; i < n; i++) ptrs[ptr_n++] = va_arg(ap, tui_box_t *);
-    va_end(ap);
-    return b;
-}
-
-tui_box_t *tui_vbox(int n, ...) {
-    static tui_box_t pool[256];
-    static tui_box_t *ptrs[1024];
-    static int pool_n = 0, ptr_n = 0;
-    if (pool_n >= 256 || ptr_n + n > 1024) return NULL;
-    tui_box_t *b = &pool[pool_n++];
-    b->type = TUI_BOX_VBOX; b->weight = 1; b->min_size = 0;
-    b->def = NULL; b->children = &ptrs[ptr_n]; b->nchildren = n;
-    va_list ap; va_start(ap, n);
-    for (int i = 0; i < n; i++) ptrs[ptr_n++] = va_arg(ap, tui_box_t *);
-    va_end(ap);
-    return b;
 }
 
 void tui_dirty(tui_t *tui, const char *panel) {

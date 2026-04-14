@@ -124,8 +124,6 @@ typedef struct {
     int lp_filter;
     int dep_filter;
     int rows, cols;
-    int focus;
-    int cursor, scroll, dcursor, dscroll;
     char cursor_id[4096];
     char dcursor_id[4096];
     char search[256];
@@ -1442,15 +1440,11 @@ static void build_rpane(void) {
     else build_rpane_output(id);
 }
 
-static void ensure_selection(view_t *v, char *id_buf, int *idx, int *scroll) {
-    int pos = view_find_index(v, id_buf);
-    if (pos < 0 && v->count > 0) {
-        snprintf(id_buf, 4096, "%s", v->rows[0].id);
-        pos = 0;
+static void ensure_selection(view_t *v, char *id_buf) {
+    if (view_find_index(v, id_buf) < 0) {
+        if (v->count > 0) snprintf(id_buf, 4096, "%s", v->rows[0].id);
+        else id_buf[0] = 0;
     }
-    if (pos < 0) { id_buf[0] = 0; pos = 0; }
-    *idx = pos;
-    if (*scroll < 0) *scroll = 0;
 }
 
 static void rebuild_views(void) {
@@ -1464,27 +1458,16 @@ static void rebuild_views(void) {
     case 4: case 6: build_lpane_deps(1); break;
     default: build_lpane_process(); break;
     }
-    ensure_selection(&g_lpane, g_state.cursor_id, &g_state.cursor, &g_state.scroll);
+    ensure_selection(&g_lpane, g_state.cursor_id);
     build_rpane();
-    ensure_selection(&g_rpane, g_state.dcursor_id, &g_state.dcursor, &g_state.dscroll);
+    ensure_selection(&g_rpane, g_state.dcursor_id);
 }
 
-static void sync_engine_from_state(void) {
+static void push_cursors(void) {
     if (!g_tui) return;
     tui_set_cursor(g_tui, "lpane", g_state.cursor_id[0] ? g_state.cursor_id : NULL);
     tui_set_cursor(g_tui, "rpane", g_state.dcursor_id[0] ? g_state.dcursor_id : NULL);
-    tui_focus(g_tui, g_state.focus ? "rpane" : "lpane");
-}
-
-static void sync_state_from_engine(void) {
-    if (!g_tui) return;
-    g_state.cursor = tui_get_cursor(g_tui, "lpane");
-    g_state.scroll = tui_get_scroll(g_tui, "lpane");
-    g_state.dcursor = tui_get_cursor(g_tui, "rpane");
-    g_state.dscroll = tui_get_scroll(g_tui, "rpane");
-    snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", tui_get_cursor_id(g_tui, "lpane"));
-    snprintf(g_state.dcursor_id, sizeof g_state.dcursor_id, "%s", tui_get_cursor_id(g_tui, "rpane"));
-    g_state.focus = strcmp(tui_get_focus(g_tui), "rpane") == 0;
+    tui_dirty(g_tui, NULL);
 }
 
 static int search_hit_count(void) {
@@ -1497,8 +1480,9 @@ static void update_status(void) {
     static const char *mn[] = {"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};
     static const char *tsl[] = {"abs","rel","Δ"};
     char s[1024];
+    int cur = g_tui ? tui_get_cursor(g_tui, "lpane") : 0;
     int p = snprintf(s, sizeof s, " %s%s | %d/%d | TS:%s", mn[g_state.mode], g_state.grouped ? " tree" : "",
-                     g_state.cursor + 1, g_lpane.count, tsl[g_state.ts_mode]);
+                     cur + 1, g_lpane.count, tsl[g_state.ts_mode]);
     if (g_state.evfilt[0]) p += snprintf(s + p, sizeof s - (size_t)p, " | F:%s", g_state.evfilt);
     if (g_state.search[0]) p += snprintf(s + p, sizeof s - (size_t)p, " | /%s[%d]", g_state.search, search_hit_count());
     if (g_state.lp_filter == 1) p += snprintf(s + p, sizeof s - (size_t)p, " | V:failed");
@@ -1546,10 +1530,9 @@ static const tui_data_source g_source = {
 };
 
 static void reset_mode_selection(void) {
-    g_state.focus = 0;
-    g_state.cursor = g_state.scroll = g_state.dcursor = g_state.dscroll = 0;
     g_state.cursor_id[0] = 0;
     g_state.dcursor_id[0] = 0;
+    if (g_tui) tui_focus(g_tui, "lpane");
 }
 
 static strset_t *collapsed_set_for_mode(void) {
@@ -1561,12 +1544,11 @@ static strset_t *collapsed_set_for_mode(void) {
 
 static void set_cursor_to_search_hit(int dir) {
     if (g_lpane.count == 0) return;
-    int start = g_state.cursor;
+    int start = g_tui ? tui_get_cursor(g_tui, "lpane") : 0;
     for (int step = 1; step <= g_lpane.count; step++) {
         int idx = (start + dir * step + g_lpane.count) % g_lpane.count;
         if (strcmp(g_lpane.rows[idx].style, "search") == 0) {
             snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", g_lpane.rows[idx].id);
-            g_state.cursor = idx;
             return;
         }
     }
@@ -1578,7 +1560,6 @@ static void apply_search(const char *q) {
     for (int i = 0; i < g_lpane.count; i++) {
         if (strcmp(g_lpane.rows[i].style, "search") == 0) {
             snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", g_lpane.rows[i].id);
-            g_state.cursor = i;
             break;
         }
     }
@@ -1588,16 +1569,17 @@ static void collapse_or_back(void) {
     view_row_t *row = view_find_row(&g_lpane, g_state.cursor_id);
     strset_t *set = collapsed_set_for_mode();
     if (!row) return;
-    if (g_state.focus) { g_state.focus = 0; return; }
+    if (g_tui && strcmp(tui_get_focus(g_tui), "rpane") == 0) { tui_focus(g_tui, "lpane"); return; }
     if (row->has_children && !strset_contains(set, row->id)) strset_add(set, row->id);
     else if (row->parent_id && row->parent_id[0]) snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", row->parent_id);
 }
 
 static void expand_or_detail(void) {
-    view_row_t *row = g_state.focus ? view_find_row(&g_rpane, g_state.dcursor_id) : view_find_row(&g_lpane, g_state.cursor_id);
+    int in_rpane = g_tui && strcmp(tui_get_focus(g_tui), "rpane") == 0;
+    view_row_t *row = in_rpane ? view_find_row(&g_rpane, g_state.dcursor_id) : view_find_row(&g_lpane, g_state.cursor_id);
     strset_t *set = collapsed_set_for_mode();
     if (!row) return;
-    if (g_state.focus) {
+    if (in_rpane) {
         if (row->link_mode >= 0 && row->link_id && row->link_id[0]) {
             g_state.mode = row->link_mode;
             reset_mode_selection();
@@ -1606,7 +1588,7 @@ static void expand_or_detail(void) {
         return;
     }
     if (row->has_children && strset_contains(set, row->id)) strset_remove(set, row->id);
-    else g_state.focus = 1;
+    else if (g_tui) tui_focus(g_tui, "rpane");
 }
 
 static void expand_subtree(int expand) {
@@ -1647,10 +1629,14 @@ static void dump_rpane(FILE *out) {
 }
 
 static void dump_state(FILE *out) {
-    sync_state_from_engine();
+    int cursor = g_tui ? tui_get_cursor(g_tui, "lpane") : 0;
+    int scroll = g_tui ? tui_get_scroll(g_tui, "lpane") : 0;
+    int focus = g_tui && strcmp(tui_get_focus(g_tui), "rpane") == 0 ? 1 : 0;
+    int dcursor = g_tui ? tui_get_cursor(g_tui, "rpane") : 0;
+    int dscroll = g_tui ? tui_get_scroll(g_tui, "rpane") : 0;
     fprintf(out, "=== STATE ===\n");
     fprintf(out, "cursor=%d scroll=%d focus=%d dcursor=%d dscroll=%d ts_mode=%d sort_key=%d grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d dep_filter=%d\n",
-            g_state.cursor, g_state.scroll, g_state.focus, g_state.dcursor, g_state.dscroll,
+            cursor, scroll, focus, dcursor, dscroll,
             g_state.ts_mode, g_state.sort_key, g_state.grouped, g_state.mode, g_state.lp_filter,
             g_state.search, g_state.evfilt, g_state.rows, g_state.cols, g_state.dep_filter);
     fprintf(out, "=== END STATE ===\n");
@@ -1666,8 +1652,7 @@ static void process_print(const char *what) {
 
 static void apply_state_change(void) {
     rebuild_views();
-    sync_engine_from_state();
-    if (g_tui) tui_dirty(g_tui, NULL);
+    push_cursors();
     update_status();
 }
 
@@ -1676,10 +1661,8 @@ static int on_key_cb(tui_t *tui, int key, const char *panel, int cursor, const c
     if (key == TUI_K_NONE) {
         if (strcmp(panel ? panel : "", "lpane") == 0) snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", row_id ? row_id : "");
         else snprintf(g_state.dcursor_id, sizeof g_state.dcursor_id, "%s", row_id ? row_id : "");
-        sync_state_from_engine();
         rebuild_views();
-        sync_engine_from_state();
-        tui_dirty(tui, NULL);
+        push_cursors();
         update_status();
         return TUI_HANDLED;
     }
@@ -1762,7 +1745,6 @@ static void process_input_cmd(const input_cmd_t *cmd) {
         break;
     case INPUT_RESIZE:
         tui_resize(g_tui, cmd->rows, cmd->cols);
-        sync_state_from_engine();
         update_status();
         break;
     case INPUT_SELECT:
@@ -1772,7 +1754,8 @@ static void process_input_cmd(const input_cmd_t *cmd) {
         break;
     case INPUT_SEARCH:
         apply_search(cmd->text ? cmd->text : "");
-        sync_engine_from_state();
+        push_cursors();
+        update_status();
         break;
     case INPUT_EVFILT:
         snprintf(g_state.evfilt, sizeof g_state.evfilt, "%s", cmd->text ? cmd->text : "");
@@ -1943,13 +1926,16 @@ int main(int argc, char **argv) {
         return headless_mode ? 0 : 1;
     }
 
-    tui_set_layout(g_tui, tui_hbox(2,
-        tui_panel_box(&g_lpane_def, 1, 0),
-        tui_panel_box(&g_rpane_def, 1, 0)));
+    {
+        static tui_box_t lbox = {TUI_BOX_PANEL, 1, 0, 0, &g_lpane_def, NULL, 0};
+        static tui_box_t rbox = {TUI_BOX_PANEL, 1, 0, 0, &g_rpane_def, NULL, 0};
+        static tui_box_t *hch[] = {&lbox, &rbox};
+        static tui_box_t hbox = {TUI_BOX_HBOX, 1, 0, 0, NULL, hch, 2};
+        tui_set_layout(g_tui, &hbox);
+    }
     tui_on_key(g_tui, on_key_cb, NULL);
-    sync_engine_from_state();
+    push_cursors();
     update_status();
-    tui_dirty(g_tui, NULL);
 
     for (int i = 0; i < g_ninputs; i++) process_input_cmd(&g_inputs[i]);
     if (g_headless || (save_file[0] && !cmd)) {

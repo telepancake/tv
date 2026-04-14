@@ -46,10 +46,14 @@ typedef struct {
 #define TUI_BOX_VBOX  1
 #define TUI_BOX_PANEL 2
 
+/* Box flags */
+#define TUI_BOX_HSCROLL  0x01  /* hbox: auto-scroll to keep focused child visible */
+
 typedef struct tui_box {
     int type;
     int weight;
     int min_size;
+    int flags;
     const tui_panel_def *def;
     struct tui_box **children;
     int nchildren;
@@ -75,10 +79,6 @@ typedef int (*tui_key_cb)(tui_t *tui, int key,
                           const char *row_id, void *ctx);
 typedef void (*tui_fd_cb)(tui_t *tui, int fd, void *ctx);
 typedef int (*tui_timer_cb)(tui_t *tui, void *ctx);
-
-tui_box_t *tui_panel_box(const tui_panel_def *def, int weight, int min_size);
-tui_box_t *tui_hbox(int n, ...);
-tui_box_t *tui_vbox(int n, ...);
 
 void tui_set_layout(tui_t *tui, tui_box_t *root);
 
