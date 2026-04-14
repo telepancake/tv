@@ -2590,7 +2590,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
 
 static void load_and_run_elf(const char *path, int argc, char **argv)
 {
-    pid_t self = raw_getpid();
+    pid_t self = raw_gettid();
     const char *event_exe = path;
     char **event_argv = argv;
     int event_argc = argc;
