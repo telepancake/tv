@@ -1604,8 +1604,15 @@ static void expand_subtree(int expand) {
     if (!row) return;
     std::string root_id = row->id;
 
-    /* Walk the cached lpane rows to find descendants via parent chain. */
+    /* Build a parent_id → row index map for O(n) ancestor lookup. */
     int n = g_tui->row_count("lpane");
+    std::unordered_map<std::string, int> id_to_idx;
+    for (int i = 0; i < n; i++) {
+        auto *r = g_tui->get_cached_row("lpane", i);
+        if (r) id_to_idx[r->id] = i;
+    }
+
+    /* Walk the cached lpane rows to find descendants via parent chain. */
     for (int i = 0; i < n; i++) {
         auto *r = g_tui->get_cached_row("lpane", i);
         if (!r) continue;
@@ -1614,13 +1621,11 @@ static void expand_subtree(int expand) {
         bool is_desc = false;
         while (!pid.empty()) {
             if (pid == root_id) { is_desc = true; break; }
-            /* Walk up — find parent in cached rows. */
-            bool found = false;
-            for (int j = 0; j < n; j++) {
-                auto *pr = g_tui->get_cached_row("lpane", j);
-                if (pr && pr->id == pid) { pid = pr->parent_id; found = true; break; }
-            }
-            if (!found) break;
+            auto it = id_to_idx.find(pid);
+            if (it == id_to_idx.end()) break;
+            auto *pr = g_tui->get_cached_row("lpane", it->second);
+            if (!pr) break;
+            pid = pr->parent_id;
         }
         if (is_desc && r->has_children) {
             if (expand) g_collapsed.erase(r->id);
