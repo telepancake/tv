@@ -60,10 +60,10 @@ struct Box {
     std::vector<Box*>      children;
 };
 
-struct RowRef {
-    const char *id;
-    const char *style;
-    const char *cols[32];
+struct RowData {
+    std::string id;
+    std::string style;
+    std::string cols[32];
 };
 
 /* ── Tui class ─────────────────────────────────────────────────────── */
@@ -76,9 +76,9 @@ using FdCallback    = std::function<void(Tui &tui, int fd)>;
 using TimerCallback = std::function<int(Tui &tui)>;
 
 struct DataSource {
-    std::function<int(const char *panel)>                       row_count;
-    std::function<int(const char *panel, int rownum, RowRef *row)> row_get;
-    std::function<int(const char *panel, const char *id)>       row_find;
+    std::function<int(const char *panel)>                          row_count;
+    std::function<RowData(const char *panel, int rownum)>          row_get;
+    std::function<int(const char *panel, const char *id)>          row_find;
 };
 
 class Tui {

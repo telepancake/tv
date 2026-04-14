@@ -257,9 +257,9 @@ static void p_sync_id(Tui::Impl *m, Panel *p) {
                       p->cache_pool.data() + p->cache_rows[ci].id_off);
         return;
     }
-    RowRef row{};
-    if (m->source.row_get(p->def.name, p->cursor, &row) && row.id)
-        std::snprintf(p->cursor_id, sizeof p->cursor_id, "%s", row.id);
+    auto row = m->source.row_get(p->def.name, p->cursor);
+    if (!row.id.empty())
+        std::snprintf(p->cursor_id, sizeof p->cursor_id, "%s", row.id.c_str());
 }
 
 static void p_resolve_id(Tui::Impl *m, Panel *p) {
@@ -270,11 +270,9 @@ static void p_resolve_id(Tui::Impl *m, Panel *p) {
         return;
     }
     if (!m->source.row_get) return;
-    RowRef row{};
     for (int i = 0; i < p->row_count; i++) {
-        std::memset(&row, 0, sizeof row);
-        if (m->source.row_get(p->def.name, i, &row) && row.id &&
-            std::strcmp(row.id, p->cursor_id) == 0) {
+        auto row = m->source.row_get(p->def.name, i);
+        if (!row.id.empty() && std::strcmp(row.id.c_str(), p->cursor_id) == 0) {
             p->cursor = i;
             return;
         }
@@ -288,15 +286,14 @@ static void p_load_cache(Tui::Impl *m, Panel *p, int from_row) {
     p->cache_count    = 0;
     p->cache_start    = from_row;
     int nc = std::min(p->def.ncols, PANEL_NCOLS_MAX);
-    RowRef row{};
     for (int i = from_row; i < p->row_count && p->cache_count < PANEL_CACHE_ROWS; i++) {
-        std::memset(&row, 0, sizeof row);
-        if (!m->source.row_get(p->def.name, i, &row)) break;
+        auto row = m->source.row_get(p->def.name, i);
+        if (row.id.empty()) break;
         auto &r = p->cache_rows[p->cache_count++];
         r = CacheRow{};
-        r.id_off    = pool_add(p, row.id);
-        r.style_off = pool_add(p, row.style);
-        for (int c = 0; c < nc; c++) r.col_off[c] = pool_add(p, row.cols[c]);
+        r.id_off    = pool_add(p, row.id.c_str());
+        r.style_off = pool_add(p, row.style.c_str());
+        for (int c = 0; c < nc; c++) r.col_off[c] = pool_add(p, row.cols[c].c_str());
     }
 }
 
