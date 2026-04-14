@@ -58,9 +58,9 @@ fv: fv.c engine.c engine.h
 sudtrace: sudtrace.c sudtrace.lds
 	cc -O2 -fno-stack-protector -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm
 
-.PHONY: all keygen sign load unload clean install test
+.PHONY: all keygen sign load unload clean clean-bins install test
 test: tv
 	bash tests/run_tests.sh
 
-clean_bins:
+clean-bins:
 	rm -f tv fv gen_sql_h

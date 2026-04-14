@@ -151,8 +151,9 @@ static void load_dir(int depth)
             continue; /* skip . and .. */
         if (n >= cap) {
             cap *= 2;
-            arr = realloc(arr, (size_t)cap * sizeof *arr);
-            if (!arr) { closedir(dir); return; }
+            fv_entry_t *tmp = realloc(arr, (size_t)cap * sizeof *arr);
+            if (!tmp) { free(arr); closedir(dir); return; }
+            arr = tmp;
         }
         snprintf(arr[n].name, sizeof arr[n].name, "%s", nm);
         char full[PATH_MAX];
@@ -256,8 +257,9 @@ static void load_content(const char *path)
             int len = nl ? (int)(nl - p) : (int)(end - p);
             if (n >= cap) {
                 cap *= 2;
-                arr = realloc(arr, (size_t)cap * sizeof(char *));
-                if (!arr) break;
+                char **tmp = realloc(arr, (size_t)cap * sizeof(char *));
+                if (!tmp) { free(arr); arr = NULL; break; }
+                arr = tmp;
             }
             char *line = xm((size_t)len + 1);
             memcpy(line, p, (size_t)len);
@@ -265,9 +267,15 @@ static void load_content(const char *path)
             arr[n++] = line;
             p = nl ? nl + 1 : end;
         }
-        if (n == 0) { arr[0] = strdup("(empty)"); n = 1; }
-        g.lines = arr;
-        g.nlines = n;
+        if (!arr || n == 0) {
+            if (arr) free(arr);
+            g.lines = xm(sizeof(char *));
+            g.lines[0] = strdup("(empty)");
+            g.nlines = 1;
+        } else {
+            g.lines = arr;
+            g.nlines = n;
+        }
     }
     free(buf);
 }
@@ -357,7 +365,7 @@ static void sync_right_of(int col)
     int d = g.top_depth + col;
     if (d < 0 || d >= FV_MAX_DEPTH) return;
 
-    char pname[8];
+    char pname[16];
     snprintf(pname, sizeof pname, "d%d", col);
     int cursor = tui_get_cursor(g.tui, pname);
 
@@ -370,7 +378,7 @@ static void sync_right_of(int col)
             g.nentries[nd] = 0;
             g.path_stack[nd][0] = '\0';
         }
-        char np[8];
+        char np[16];
         snprintf(np, sizeof np, "d%d", c);
         tui_dirty(g.tui, np);
     }
@@ -392,7 +400,7 @@ static void sync_right_of(int col)
             if (nd >= 0 && nd < FV_MAX_DEPTH) {
                 snprintf(g.path_stack[nd], sizeof g.path_stack[nd], "%s", full);
                 load_dir(nd);
-                char np[8];
+                char np[16];
                 snprintf(np, sizeof np, "d%d", col + 1);
                 tui_set_cursor_idx(g.tui, np, 0);
                 tui_dirty(g.tui, np);
@@ -426,7 +434,7 @@ static void update_status(void)
 
     if (focus && sscanf(focus, "d%d", &col) == 1) {
         int d = g.top_depth + col;
-        char pname[8];
+        char pname[16];
         snprintf(pname, sizeof pname, "d%d", col);
         int cursor = tui_get_cursor(g.tui, pname);
         if (d >= 0 && d < FV_MAX_DEPTH &&
@@ -454,16 +462,16 @@ static void update_status(void)
 
 static const char *HELP[] = {
     "",
-    "  fv \xe2\x80\x94 filesystem viewer",
-    "  \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80",
+    "  fv \xe2\x80\x94 filesystem viewer",   /* em dash */
+    "  ──────────────────────",             /* box-drawing horizontal lines */
     "",
-    "  \xe2\x86\x91 \xe2\x86\x93  j k   Navigate within column",
+    "  ↑ ↓  j k   Navigate within column",
     "  PgUp PgDn  Page up / down",
     "  Home g     First item     End  Last item",
     "  Tab        Cycle between columns and content pane",
     "",
-    "  \xe2\x86\x90  h       Move focus to the left column",
-    "  \xe2\x86\x92  Enter   Move focus to the right column / enter dir",
+    "  ←  h       Move focus to the left column",
+    "  →  Enter   Move focus to the right column / enter dir",
     "",
     "  H           Toggle hex mode in the content pane",
     "  ?           This help",
@@ -519,13 +527,13 @@ static int on_key(tui_t *tui, int key, const char *panel,
     if (key == TUI_K_LEFT || key == 'h') {
         if (in_content) {
             /* From content pane → focus the rightmost dir column. */
-            char pname[8];
+            char pname[16];
             snprintf(pname, sizeof pname, "d%d", g.nvis - 1);
             tui_focus(tui, pname);
             update_status();
         } else if (col > 0) {
             /* Move one column left. */
-            char pname[8];
+            char pname[16];
             snprintf(pname, sizeof pname, "d%d", col - 1);
             tui_focus(tui, pname);
             update_status();
@@ -539,7 +547,7 @@ static int on_key(tui_t *tui, int key, const char *panel,
                 int nd = g.top_depth + c;
                 if (nd >= 0 && nd < FV_MAX_DEPTH && g.path_stack[nd][0])
                     load_dir(nd);
-                char np[8];
+                char np[16];
                 snprintf(np, sizeof np, "d%d", c);
                 tui_dirty(tui, np);
             }
@@ -560,7 +568,7 @@ static int on_key(tui_t *tui, int key, const char *panel,
                     if (e->is_dir) {
                         if (col + 1 < g.nvis) {
                             /* Focus the next column (already populated). */
-                            char np[8];
+                            char np[16];
                             snprintf(np, sizeof np, "d%d", col + 1);
                             tui_focus(tui, np);
                         } else {
@@ -574,7 +582,7 @@ static int on_key(tui_t *tui, int key, const char *panel,
                                 if (nd >= 0 && nd < FV_MAX_DEPTH &&
                                     g.path_stack[nd][0])
                                     load_dir(nd);
-                                char np[8];
+                                char np[16];
                                 snprintf(np, sizeof np, "d%d", c2);
                                 tui_dirty(tui, np);
                             }
