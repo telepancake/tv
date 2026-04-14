@@ -3,6 +3,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 /* ── Key constants ─────────────────────────────────────────────────── */
 
@@ -51,13 +52,12 @@ struct PanelDef {
 };
 
 struct Box {
-    int             type;
-    int             weight;
-    int             min_size;
-    int             flags;
-    const PanelDef *def;
-    Box           **children;
-    int             nchildren;
+    int                    type;
+    int                    weight;
+    int                    min_size;
+    int                    flags;
+    const PanelDef        *def;
+    std::vector<Box*>      children;
 };
 
 struct RowRef {
@@ -79,7 +79,6 @@ struct DataSource {
     std::function<int(const char *panel)>                       row_count;
     std::function<int(const char *panel, int rownum, RowRef *row)> row_get;
     std::function<int(const char *panel, const char *id)>       row_find;
-    std::function<void(int rows, int cols)>                     size_changed;
 };
 
 class Tui {

@@ -131,7 +131,6 @@ struct app_state_t {
     int sort_key = 0;
     int lp_filter = 0;
     int dep_filter = 0;
-    int rows = 24, cols = 80;
     std::string cursor_id;
     std::string dcursor_id;
     std::string search;
@@ -1413,11 +1412,13 @@ static void dump_state(FILE *out) {
     int focus_r = g_tui && std::strcmp(g_tui->get_focus(), "rpane") == 0 ? 1 : 0;
     int dcursor = g_tui ? g_tui->get_cursor("rpane") : 0;
     int dscroll = g_tui ? g_tui->get_scroll("rpane") : 0;
+    int rows = g_tui ? g_tui->rows() : 24;
+    int cols = g_tui ? g_tui->cols() : 80;
     std::fprintf(out, "=== STATE ===\n");
     std::fprintf(out, "cursor=%d scroll=%d focus=%d dcursor=%d dscroll=%d ts_mode=%d sort_key=%d grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d dep_filter=%d\n",
             cursor, scroll, focus_r, dcursor, dscroll,
             g_state.ts_mode, g_state.sort_key, g_state.grouped, g_state.mode, g_state.lp_filter,
-            g_state.search.c_str(), g_state.evfilt.c_str(), g_state.rows, g_state.cols, g_state.dep_filter);
+            g_state.search.c_str(), g_state.evfilt.c_str(), rows, cols, g_state.dep_filter);
     std::fprintf(out, "=== END STATE ===\n");
 }
 
@@ -1719,13 +1720,9 @@ int main(int argc, char **argv) {
         .row_find = [](const char *panel, const char *id) -> int {
             return view_find_index(std::strcmp(panel, "lpane") == 0 ? g_lpane : g_rpane, id ? id : "");
         },
-        .size_changed = [](int rows, int cols) {
-            g_state.rows = rows;
-            g_state.cols = cols;
-        },
     };
 
-    if (headless_mode) g_tui = Tui::open_headless(std::move(src), g_state.rows, g_state.cols);
+    if (headless_mode) g_tui = Tui::open_headless(std::move(src), 24, 80);
     else g_tui = Tui::open(std::move(src));
     if (!g_tui) {
         if (!headless_mode) std::fprintf(stderr, "tv: cannot open terminal\n");
@@ -1734,10 +1731,9 @@ int main(int argc, char **argv) {
     }
 
     {
-        static Box lbox = {TUI_BOX_PANEL, 1, 0, 0, &g_lpane_def, nullptr, 0};
-        static Box rbox = {TUI_BOX_PANEL, 1, 0, 0, &g_rpane_def, nullptr, 0};
-        static Box *hch[] = {&lbox, &rbox};
-        static Box hbox = {TUI_BOX_HBOX, 1, 0, 0, nullptr, hch, 2};
+        static Box lbox = {TUI_BOX_PANEL, 1, 0, 0, &g_lpane_def, {}};
+        static Box rbox = {TUI_BOX_PANEL, 1, 0, 0, &g_rpane_def, {}};
+        static Box hbox = {TUI_BOX_HBOX, 1, 0, 0, nullptr, {&lbox, &rbox}};
         g_tui->set_layout(&hbox);
     }
     g_tui->on_key(on_key_cb);

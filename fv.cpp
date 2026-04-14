@@ -78,8 +78,6 @@ static FvState g;
 static Box   dir_boxes[FV_MAX_DEPTH];
 static Box   content_box;
 static Box   top_hbox, root_vbox;
-static Box  *hbox_ch[FV_MAX_DEPTH];
-static Box  *root_ch[2];
 
 /* ── Helpers ──────────────────────────────────────────────────────────── */
 
@@ -258,8 +256,6 @@ static int fv_row_find(const char *panel, const char *id)
     return -1;
 }
 
-static void fv_size_changed(int /*rows*/, int /*cols*/) {}
-
 /* ── Sync helpers ─────────────────────────────────────────────────────── */
 
 static const char *dpname(int d)
@@ -418,20 +414,19 @@ static void build_layout()
     g.dir_col = ColDef{"name", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS};
     g.content_col = ColDef{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE};
 
+    std::vector<Box*> hbox_ch;
     for (int i = 0; i < FV_MAX_DEPTH; i++) {
         std::snprintf(g.pnames[i], sizeof g.pnames[i], "d%d", i);
         g.dir_def[i] = PanelDef{g.pnames[i], nullptr, &g.dir_col, 1,
                                  TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
-        dir_boxes[i] = Box{TUI_BOX_PANEL, 1, 0, 0, &g.dir_def[i], nullptr, 0};
-        hbox_ch[i] = &dir_boxes[i];
+        dir_boxes[i] = Box{TUI_BOX_PANEL, 1, 0, 0, &g.dir_def[i], {}};
+        hbox_ch.push_back(&dir_boxes[i]);
     }
     g.content_def = PanelDef{"content", nullptr, &g.content_col, 1, TUI_PANEL_CURSOR};
-    content_box = Box{TUI_BOX_PANEL, 3, 3, 0, &g.content_def, nullptr, 0};
+    content_box = Box{TUI_BOX_PANEL, 3, 3, 0, &g.content_def, {}};
 
-    top_hbox = Box{TUI_BOX_HBOX, 1, 3, TUI_BOX_HSCROLL, nullptr, hbox_ch, FV_MAX_DEPTH};
-    root_ch[0] = &top_hbox;
-    root_ch[1] = &content_box;
-    root_vbox = Box{TUI_BOX_VBOX, 1, 0, 0, nullptr, root_ch, 2};
+    top_hbox = Box{TUI_BOX_HBOX, 1, 3, TUI_BOX_HSCROLL, nullptr, std::move(hbox_ch)};
+    root_vbox = Box{TUI_BOX_VBOX, 1, 0, 0, nullptr, {&top_hbox, &content_box}};
 }
 
 /* ── main ─────────────────────────────────────────────────────────────── */
@@ -456,7 +451,7 @@ int main(int argc, char **argv)
     }
     g.path_stack[0] = abspath;
 
-    DataSource src{fv_row_count, fv_row_get, fv_row_find, fv_size_changed};
+    DataSource src{fv_row_count, fv_row_get, fv_row_find};
     g.tui = Tui::open(std::move(src));
     if (!g.tui) { std::fprintf(stderr, "fv: cannot open terminal\n"); return 1; }
 
