@@ -285,17 +285,6 @@ struct input_cmd_t {
     std::string text;
 };
 
-struct ViewRow {
-    std::string id;
-    std::string style;
-    std::string text;
-    std::string parent_id;
-    int link_mode = 0;
-    std::string link_id;
-    bool has_children = false;
-    bool is_collapsed = false;
-};
-
 struct app_state_t {
     int mode = 0;
     int grouped = 1;
@@ -352,14 +341,14 @@ static int g_next_event_id = 1;
 static std::unordered_map<int, process_t> g_proc_map;
 static FILE *g_save_fp = nullptr;       /* temp file for raw trace lines */
 static std::vector<input_cmd_t> g_inputs;
-static std::vector<ViewRow> g_lpane, g_rpane;
 static app_state_t g_state;
 static std::unique_ptr<Tui> g_tui;
 static int g_headless;
 static double g_base_ts;
-/* Collapsed row IDs per mode (0=proc, 1=file, 2=output, 3=dep).
-   Replaces the old four separate hashmaps; populated from ViewRow::is_collapsed. */
-static std::unordered_set<std::string> g_collapsed[4];
+/* Single collapsed-ID set shared across all modes.  IDs are unique:
+   process tgids are numeric strings, directory paths start with "/",
+   output group ids start with "io_". */
+static std::unordered_set<std::string> g_collapsed;
 
 static char t_rbuf[MAX_JSON_LINE];
 static int t_rbuf_len = 0;
@@ -561,38 +550,24 @@ static std::string resolve_path_dup(const std::string &raw, const std::string &c
 
 /* ── View helpers ──────────────────────────────────────────────────── */
 
-/* Map mode to collapsed-set index: modes 0-2 map 1:1, modes 3-6 all share index 3 */
-static int collapsed_index_for_mode() {
-    if (g_state.mode <= 2) return g_state.mode;
-    return 3;
-}
-static std::unordered_set<std::string> &collapsed_set() {
-    return g_collapsed[collapsed_index_for_mode()];
-}
-/* Check if an id is collapsed in current mode */
-static bool is_row_collapsed(const std::string &id) {
-    return collapsed_set().contains(id);
+static bool is_collapsed(const std::string &id) {
+    return g_collapsed.contains(id);
 }
 
-static ViewRow &view_add_row(std::vector<ViewRow> &v, const std::string &id,
-                             const char *style, const std::string &parent_id,
-                             const std::string &text, int link_mode,
-                             const std::string &link_id, bool has_children,
-                             bool is_collapsed = false) {
-    v.push_back({id, style ? style : "normal", text, parent_id, link_mode, link_id, has_children, is_collapsed});
-    return v.back();
-}
-
-static ViewRow *view_find_row(std::vector<ViewRow> &v, const std::string &id) {
-    for (auto &r : v) if (r.id == id) return &r;
-    return nullptr;
-}
-
-static int view_find_index(const std::vector<ViewRow> &v, const std::string &id) {
-    if (id.empty()) return -1;
-    for (int i = 0; i < static_cast<int>(v.size()); i++)
-        if (v[i].id == id) return i;
-    return -1;
+/* Emit one row into a RowData vector. */
+static void emit_row(std::vector<RowData> &v, const std::string &id,
+                     const char *style, const std::string &parent_id,
+                     const std::string &text, int link_mode,
+                     const std::string &link_id, bool has_children) {
+    RowData d;
+    d.id = id;
+    d.style = style ? style : "normal";
+    d.cols[0] = text;
+    d.parent_id = parent_id;
+    d.link_mode = link_mode;
+    d.link_id = link_id;
+    d.has_children = has_children;
+    v.push_back(std::move(d));
 }
 
 /* ── Process model ─────────────────────────────────────────────────── */
@@ -618,18 +593,6 @@ static void append_raw_trace(const char *line) {
 static trace_event_t &append_event() {
     auto &ev = g_events.emplace_back();
     return ev;
-}
-
-static int parse_key_name(const char *n) {
-    static const struct { const char *name; int key; } table[] = {
-        {"up", TUI_K_UP}, {"down", TUI_K_DOWN}, {"left", TUI_K_LEFT}, {"right", TUI_K_RIGHT},
-        {"pgup", TUI_K_PGUP}, {"pgdn", TUI_K_PGDN}, {"home", TUI_K_HOME}, {"end", TUI_K_END},
-        {"tab", TUI_K_TAB}, {"enter", TUI_K_ENTER}, {"esc", TUI_K_ESC},
-    };
-    for (const auto &e : table)
-        if (std::strcmp(n, e.name) == 0) return e.key;
-    if (std::strlen(n) == 1) return static_cast<unsigned char>(n[0]);
-    return TUI_K_NONE;
 }
 
 static bool has_flag(const std::string &flags, const char *flag) {
@@ -664,9 +627,10 @@ static void ingest_input_line(const char *line) {
     input_cmd_t cmd;
     if (kind == "key") {
         cmd.kind = INPUT_KEY;
-        std::string name;
-        if (json_get(line, "key", sp)) name = json_decode_string(sp);
-        cmd.key = !name.empty() ? parse_key_name(name.c_str()) : TUI_K_NONE;
+        if (json_get(line, "key", sp))
+            cmd.key = span_to_int(sp, TUI_K_NONE);
+        else
+            cmd.key = TUI_K_NONE;
     } else if (kind == "resize") {
         cmd.kind = INPUT_RESIZE;
         if (json_get(line, "rows", sp)) cmd.rows = span_to_int(sp, 0);
@@ -956,12 +920,12 @@ static const char *proc_style(const process_t &p) {
     return "normal";
 }
 
-static void build_proc_rows_rec(int tgid, int depth) {
+static void build_proc_rows_rec(std::vector<RowData> &rows, int tgid, int depth) {
     auto *p = find_process(tgid);
     if (!p) return;
     std::string id_str = std::to_string(tgid);
     bool has_kids = !p->children.empty();
-    bool collapsed = has_kids && is_row_collapsed(id_str);
+    bool collapsed = has_kids && is_collapsed(id_str);
     const auto &name = p->display_name();
     std::string marker;
     if (p->exit_status == "exited")
@@ -977,16 +941,16 @@ static void build_proc_rows_rec(int tgid, int depth) {
     std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), tgid, name.c_str(),
                             marker.c_str(), extra.c_str(), dur.empty() ? "" : "  ", dur.c_str());
     std::string parent_id = (p->ppid > 0 && find_process(p->ppid)) ? std::to_string(p->ppid) : std::string();
-    view_add_row(g_lpane, id_str, proc_style(*p), parent_id, text, 0, id_str, has_kids, collapsed);
+    emit_row(rows, id_str, proc_style(*p), parent_id, text, 0, id_str, has_kids);
     if (g_state.grouped && collapsed) return;
     auto sorted_children = p->children;
     if (sorted_children.size() > 1) std::sort(sorted_children.begin(), sorted_children.end(), cmp_proc_tgid);
     for (int ct : sorted_children)
         if (proc_should_show(ct))
-            build_proc_rows_rec(ct, g_state.grouped ? depth + 1 : 0);
+            build_proc_rows_rec(rows, ct, g_state.grouped ? depth + 1 : 0);
 }
 
-static void build_lpane_process() {
+static void build_lpane_process(std::vector<RowData> &rows) {
     rebuild_children();
     std::vector<int> roots;
     for (auto &[tgid, p] : g_proc_map)
@@ -994,7 +958,7 @@ static void build_lpane_process() {
             roots.push_back(tgid);
     if (roots.size() > 1) std::sort(roots.begin(), roots.end(), cmp_proc_tgid);
     if (g_state.grouped) {
-        for (int rt : roots) build_proc_rows_rec(rt, 0);
+        for (int rt : roots) build_proc_rows_rec(rows, rt, 0);
     } else {
         std::vector<int> all;
         for (auto &[tgid, p] : g_proc_map)
@@ -1012,7 +976,7 @@ static void build_lpane_process() {
                 marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
             std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
             std::string text = sfmt("[%d] %s%s%s%s", at, name.c_str(), marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
-            view_add_row(g_lpane, id_str, proc_style(*p), "", text, 0, id_str, false);
+            emit_row(rows, id_str, proc_style(*p), "", text, 0, id_str, false);
         }
     }
 }
@@ -1091,7 +1055,8 @@ static std::vector<dir_stat_t> build_dir_stats(const std::vector<file_stat_view>
     return dirs;
 }
 
-static void add_file_tree_rec(const std::string &dir, std::vector<dir_stat_t> &dirs,
+static void add_file_tree_rec(std::vector<RowData> &rows, const std::string &dir,
+                              std::vector<dir_stat_t> &dirs,
                               std::vector<file_stat_view> &fs, int depth) {
     std::vector<std::string> children_dirs, children_files;
     for (const auto &d : dirs) if (d.parent == dir) children_dirs.push_back(d.path);
@@ -1108,15 +1073,15 @@ static void add_file_tree_rec(const std::string &dir, std::vector<dir_stat_t> &d
         dir_stat_t *d = nullptr;
         for (auto &dd : dirs) if (dd.path == cd) { d = &dd; break; }
         if (!d) continue;
-        bool collapsed = is_row_collapsed(d->path);
+        bool collapsed_flag = is_collapsed(d->path);
         std::string errs_text = d->errs ? sfmt(", %d errs", d->errs) : std::string();
         std::string text = sfmt("%*s%s%s/  [%d opens, %d procs%s]", depth * 2, "",
-                                collapsed ? "▶ " : "▼ ", d->name.c_str(),
+                                collapsed_flag ? "▶ " : "▼ ", d->name.c_str(),
                                 d->opens, d->procs, errs_text.c_str());
-        view_add_row(g_lpane, d->path,
-                     file_matches_search(d->path) ? "search" : (d->errs ? "error" : "normal"),
-                     d->parent, text, 1, d->path, true, collapsed);
-        if (!collapsed) add_file_tree_rec(d->path, dirs, fs, depth + 1);
+        emit_row(rows, d->path,
+                 file_matches_search(d->path) ? "search" : (d->errs ? "error" : "normal"),
+                 d->parent, text, 1, d->path, true);
+        if (!collapsed_flag) add_file_tree_rec(rows, d->path, dirs, fs, depth + 1);
     }
     for (const auto &cf : children_files) {
         file_stat_view *fp = nullptr;
@@ -1130,13 +1095,13 @@ static void add_file_tree_rec(const std::string &dir, std::vector<dir_stat_t> &d
         std::string parent;
         if (slash != std::string::npos)
             parent = (slash == 0) ? "/" : fp->path.substr(0, slash);
-        view_add_row(g_lpane, fp->path,
-                     file_matches_search(fp->path) ? "search" : (fp->errs ? "error" : "normal"),
-                     parent, text, 1, fp->path, false);
+        emit_row(rows, fp->path,
+                 file_matches_search(fp->path) ? "search" : (fp->errs ? "error" : "normal"),
+                 parent, text, 1, fp->path, false);
     }
 }
 
-static void build_lpane_files() {
+static void build_lpane_files(std::vector<RowData> &rows) {
     auto fs = build_file_stats();
     if (!g_state.grouped) {
         std::vector<std::string> paths;
@@ -1149,21 +1114,21 @@ static void build_lpane_files() {
             std::string errs_text = fp->errs ? sfmt(", %d errs", fp->errs) : std::string();
             std::string text = sfmt("%s  [%d opens, %d procs%s]", fp->path.c_str(),
                                     fp->opens, fp->nprocs, errs_text.c_str());
-            view_add_row(g_lpane, fp->path,
-                         file_matches_search(fp->path) ? "search" : (fp->errs ? "error" : "normal"),
-                         "", text, 1, fp->path, false);
+            emit_row(rows, fp->path,
+                     file_matches_search(fp->path) ? "search" : (fp->errs ? "error" : "normal"),
+                     "", text, 1, fp->path, false);
         }
     } else {
         auto dirs = build_dir_stats(fs);
-        add_file_tree_rec("/", dirs, fs, 0);
+        add_file_tree_rec(rows, "/", dirs, fs, 0);
         for (auto &f : fs) {
             if (!f.path.empty() && f.path[0] == '/') continue;
             std::string errs_text = f.errs ? sfmt(", %d errs", f.errs) : std::string();
             std::string text = sfmt("  %s  [%d opens, %d procs%s]", f.path.c_str(),
                                     f.opens, f.nprocs, errs_text.c_str());
-            view_add_row(g_lpane, f.path,
-                         file_matches_search(f.path) ? "search" : (f.errs ? "error" : "normal"),
-                         "", text, 1, f.path, false);
+            emit_row(rows, f.path,
+                     file_matches_search(f.path) ? "search" : (f.errs ? "error" : "normal"),
+                     "", text, 1, f.path, false);
         }
     }
 }
@@ -1191,7 +1156,7 @@ static std::vector<output_group_t> build_output_groups() {
     return groups;
 }
 
-static void build_lpane_output() {
+static void build_lpane_output(std::vector<RowData> &rows) {
     auto groups = build_output_groups();
     if (!g_state.grouped) {
         for (int i = 0; i < static_cast<int>(g_events.size()); i++) {
@@ -1203,20 +1168,20 @@ static void build_lpane_output() {
                 ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", ev.tgid,
                 p ? p->display_name().c_str() : "",
                 ev.data.c_str());
-            view_add_row(g_lpane, id_str, ev.kind == EV_STDERR ? "error" : "normal", "", text, 2, id_str, false);
+            emit_row(rows, id_str, ev.kind == EV_STDERR ? "error" : "normal", "", text, 2, id_str, false);
         }
     } else {
         for (auto &og : groups) {
             std::string gid = sfmt("io_%d", og.tgid);
-            bool collapsed = is_row_collapsed(gid);
-            std::string text = sfmt("%sPID %d %s", collapsed ? "▶ " : "▼ ", og.tgid, og.name.c_str());
-            view_add_row(g_lpane, gid, "heading", "", text, 2, gid, true, collapsed);
-            if (!collapsed) {
+            bool collapsed_flag = is_collapsed(gid);
+            std::string text = sfmt("%sPID %d %s", collapsed_flag ? "▶ " : "▼ ", og.tgid, og.name.c_str());
+            emit_row(rows, gid, "heading", "", text, 2, gid, true);
+            if (!collapsed_flag) {
                 for (int ei : og.event_indices) {
                     auto &ev = g_events[ei];
                     std::string id_str = std::to_string(ev.id);
                     std::string row = sfmt("  [%s] %s", ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", ev.data.c_str());
-                    view_add_row(g_lpane, id_str, ev.kind == EV_STDERR ? "error" : "normal", gid, row, 2, id_str, false);
+                    emit_row(rows, id_str, ev.kind == EV_STDERR ? "error" : "normal", gid, row, 2, id_str, false);
                 }
             }
         }
@@ -1248,7 +1213,7 @@ static std::vector<file_edge_t> build_file_edges() {
     return edges;
 }
 
-static void build_lpane_deps(int reverse) {
+static void build_lpane_deps(std::vector<RowData> &rows, int reverse) {
     const std::string &start = g_state.cursor_id;
     if (start.empty()) return;
     auto edges = build_file_edges();
@@ -1268,11 +1233,11 @@ static void build_lpane_deps(int reverse) {
     }
     for (const auto &s : seen) {
         int mode = reverse ? 4 : 3;
-        view_add_row(g_lpane, s, file_matches_search(s) ? "search" : "normal", "", s, mode, s, false);
+        emit_row(rows, s, file_matches_search(s) ? "search" : "normal", "", s, mode, s, false);
     }
 }
 
-static void build_lpane_dep_cmds(int reverse) {
+static void build_lpane_dep_cmds(std::vector<RowData> &rows, int reverse) {
     const std::string &start = g_state.cursor_id;
     if (start.empty()) return;
     auto edges = build_file_edges();
@@ -1318,7 +1283,7 @@ static void build_lpane_dep_cmds(int reverse) {
         std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
         std::string text = sfmt("[%d] %s%s%s%s", pt, name.c_str(), marker.c_str(),
                                 dur.empty() ? "" : "  ", dur.c_str());
-        view_add_row(g_lpane, id_str, proc_style(*p), "", text, 0, id_str, false);
+        emit_row(rows, id_str, proc_style(*p), "", text, 0, id_str, false);
     }
 }
 
@@ -1345,25 +1310,25 @@ static bool event_allowed(const trace_event_t &ev) {
     return std::strstr(kind, g_state.evfilt.c_str()) != nullptr;
 }
 
-static void build_rpane_process(const std::string &id) {
+static void build_rpane_process(std::vector<RowData> &rows, const std::string &id) {
     auto *p = find_process(id.empty() ? 0 : std::atoi(id.c_str()));
     if (!p) return;
     rebuild_children();
-    view_add_row(g_rpane, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", 0);
-    view_add_row(g_rpane, "tgid", "normal", "", sfmt("TGID:  %d", p->tgid), -1, "", 0);
-    view_add_row(g_rpane, "ppid", "normal", "", sfmt("PPID:  %d", p->ppid), -1, "", 0);
-    view_add_row(g_rpane, "exe", "normal", "", sfmt("EXE:   %s", p->exe.c_str()), -1, "", 0);
+    emit_row(rows, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
+    emit_row(rows, "tgid", "normal", "", sfmt("TGID:  %d", p->tgid), -1, "", false);
+    emit_row(rows, "ppid", "normal", "", sfmt("PPID:  %d", p->ppid), -1, "", false);
+    emit_row(rows, "exe", "normal", "", sfmt("EXE:   %s", p->exe.c_str()), -1, "", false);
     if (!p->exit_status.empty()) {
         std::string text = p->exit_status == "signaled"
             ? sfmt("Exit: signal %d%s", p->exit_signal, p->core_dumped ? " (core)" : "")
             : sfmt("Exit: exited code=%d", p->exit_code);
-        view_add_row(g_rpane, "exit",
-                     (p->exit_status == "exited" && p->exit_code == 0) ? "green" : "error",
-                     "", text, -1, "", 0);
+        emit_row(rows, "exit",
+                 (p->exit_status == "exited" && p->exit_code == 0) ? "green" : "error",
+                 "", text, -1, "", false);
     }
     int desc_count = compute_descendants(p->tgid);
     if (desc_count > 0) {
-        view_add_row(g_rpane, "kids_hdr", "heading", "", sfmt("Children (%d)", desc_count), -1, "", 0);
+        emit_row(rows, "kids_hdr", "heading", "", sfmt("Children (%d)", desc_count), -1, "", false);
         auto sorted_ch = p->children;
         if (sorted_ch.size() > 1) std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
         for (int ct : sorted_ch) {
@@ -1371,15 +1336,15 @@ static void build_rpane_process(const std::string &id) {
             if (!c) continue;
             std::string cid = sfmt("child_%d", ct);
             std::string text = sfmt("[%d] %s", ct, c->display_name().c_str());
-            view_add_row(g_rpane, cid, "normal", "", text, 0, std::to_string(ct), 0);
+            emit_row(rows, cid, "normal", "", text, 0, std::to_string(ct), false);
         }
     }
     if (!p->argv.empty()) {
-        view_add_row(g_rpane, "argv_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Argv \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", 0);
+        emit_row(rows, "argv_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Argv \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
         for (int i = 0; i < static_cast<int>(p->argv.size()); i++)
-            view_add_row(g_rpane, sfmt("argv_%d", i), "normal", "", sfmt("[%d] %s", i, p->argv[i].c_str()), -1, "", 0);
+            emit_row(rows, sfmt("argv_%d", i), "normal", "", sfmt("[%d] %s", i, p->argv[i].c_str()), -1, "", false);
     }
-    view_add_row(g_rpane, "evt_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Events \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", 0);
+    emit_row(rows, "evt_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Events \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
     double prev_ts = -1;
     for (int ei : p->event_indices) {
         auto &ev = g_events[ei];
@@ -1405,21 +1370,21 @@ static void build_rpane_process(const std::string &id) {
         case EV_STDOUT: text = sfmt("%s [STDOUT] %s", tsbuf, ev.data.c_str()); break;
         case EV_STDERR: text = sfmt("%s [STDERR] %s", tsbuf, ev.data.c_str()); break;
         }
-        view_add_row(g_rpane, sfmt("ev_%d", ev.id), ev.kind == EV_STDERR ? "error" : "normal", "", text, -1, "", 0);
+        emit_row(rows, sfmt("ev_%d", ev.id), ev.kind == EV_STDERR ? "error" : "normal", "", text, -1, "", false);
     }
 }
 
-static void build_rpane_file(const std::string &id) {
+static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) {
     if (id.empty()) return;
-    view_add_row(g_rpane, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 File \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
-    view_add_row(g_rpane, "path", "normal", "", id, -1, "", false);
+    emit_row(rows, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 File \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
+    emit_row(rows, "path", "normal", "", id, -1, "", false);
     const abs_path_data *pd = find_path(id);
     int opens = pd ? pd->opens : 0;
     int errs  = pd ? pd->errs  : 0;
     int nprocs = pd ? static_cast<int>(pd->proc_tgids.size()) : 0;
-    view_add_row(g_rpane, "opens", "normal", "", sfmt("Opens: %d", opens), -1, "", false);
-    view_add_row(g_rpane, "procs", "normal", "", sfmt("Procs: %d", nprocs), -1, "", false);
-    view_add_row(g_rpane, "errs", errs ? "error" : "normal", "", sfmt("Errors: %d", errs), -1, "", false);
+    emit_row(rows, "opens", "normal", "", sfmt("Opens: %d", opens), -1, "", false);
+    emit_row(rows, "procs", "normal", "", sfmt("Procs: %d", nprocs), -1, "", false);
+    emit_row(rows, "errs", errs ? "error" : "normal", "", sfmt("Errors: %d", errs), -1, "", false);
     if (pd) {
         for (int ei : pd->path_event_indices) {
             auto &ev = g_events[ei];
@@ -1428,45 +1393,40 @@ static void build_rpane_file(const std::string &id) {
             std::string text = sfmt("PID %d %s [%s]%s", ev.tgid,
                 p ? p->display_name().c_str() : "",
                 ev.flags_text.c_str(), err_text.c_str());
-            view_add_row(g_rpane, sfmt("open_%d", ev.id),
-                         ev.err ? "error" : (ev.kind == EV_STDERR ? "error" : "normal"),
-                         "", text, 0, std::to_string(ev.tgid), false);
+            emit_row(rows, sfmt("open_%d", ev.id),
+                     ev.err ? "error" : (ev.kind == EV_STDERR ? "error" : "normal"),
+                     "", text, 0, std::to_string(ev.tgid), false);
         }
     }
 }
 
-static void build_rpane_output(const std::string &id) {
+static void build_rpane_output(std::vector<RowData> &rows, const std::string &id) {
     int eid = id.empty() ? 0 : std::atoi(id.c_str());
     trace_event_t *ev = nullptr;
     for (auto &e : g_events) if (e.id == eid) { ev = &e; break; }
     if (!ev) return;
     auto *p = find_process(ev->tgid);
-    view_add_row(g_rpane, "hdr", "heading", "", "─── Output ───", -1, "", 0);
-    view_add_row(g_rpane, "stream", ev->kind == EV_STDERR ? "error" : "normal", "",
-                 sfmt("Stream: %s", ev->kind == EV_STDOUT ? "STDOUT" : "STDERR"), -1, "", 0);
-    view_add_row(g_rpane, "pid", "normal", "", sfmt("PID: %d", ev->tgid), -1, "", 0);
-    view_add_row(g_rpane, "proc", "normal", "",
-                 sfmt("Proc: %s", p ? p->display_name().c_str() : ""),
-                 -1, "", 0);
-    view_add_row(g_rpane, "content_hdr", "heading", "", "─── Content ───", -1, "", 0);
-    view_add_row(g_rpane, "content", ev->kind == EV_STDERR ? "error" : "normal", "", ev->data, -1, "", 0);
+    emit_row(rows, "hdr", "heading", "", "─── Output ───", -1, "", false);
+    emit_row(rows, "stream", ev->kind == EV_STDERR ? "error" : "normal", "",
+             sfmt("Stream: %s", ev->kind == EV_STDOUT ? "STDOUT" : "STDERR"), -1, "", false);
+    emit_row(rows, "pid", "normal", "", sfmt("PID: %d", ev->tgid), -1, "", false);
+    emit_row(rows, "proc", "normal", "",
+             sfmt("Proc: %s", p ? p->display_name().c_str() : ""),
+             -1, "", false);
+    emit_row(rows, "content_hdr", "heading", "", "─── Content ───", -1, "", false);
+    emit_row(rows, "content", ev->kind == EV_STDERR ? "error" : "normal", "", ev->data, -1, "", false);
 }
 
-static void build_rpane() {
+static void build_rpane(std::vector<RowData> &rows) {
     const auto &id = g_state.cursor_id;
     if (id.empty()) return;
     if (g_state.mode == 0 || g_state.mode == 5 || g_state.mode == 6)
-        build_rpane_process(id);
-    else if (g_state.mode == 1 || g_state.mode >= 3) build_rpane_file(id);
-    else build_rpane_output(id);
+        build_rpane_process(rows, id);
+    else if (g_state.mode == 1 || g_state.mode >= 3) build_rpane_file(rows, id);
+    else build_rpane_output(rows, id);
 }
 
 /* ── State management ──────────────────────────────────────────────── */
-
-static void ensure_selection(const std::vector<ViewRow> &v, std::string &id) {
-    if (view_find_index(v, id) < 0)
-        id = v.empty() ? std::string() : v[0].id;
-}
 
 static void cancel_detail_update() {
     g_detail_update_pending = 0;
@@ -1475,28 +1435,18 @@ static void cancel_detail_update() {
     g_detail_timer_id = -1;
 }
 
-static void rebuild_rpane_only() {
-    g_rpane.clear();
-    build_rpane();
-    ensure_selection(g_rpane, g_state.dcursor_id);
-    if (!g_tui) return;
-    g_tui->set_cursor("rpane", g_state.dcursor_id.empty() ? nullptr : g_state.dcursor_id.c_str());
-    g_tui->dirty("rpane");
-}
-
 static int on_detail_update_timer(Tui &tui) {
     (void)tui;
     g_detail_timer_id = -1;
     if (!g_detail_update_pending) return 0;
     g_detail_update_pending = 0;
-    rebuild_rpane_only();
-    update_status();
+    if (g_tui) g_tui->dirty("rpane");
     return 0;
 }
 
 static void schedule_detail_update() {
     if (!g_tui || g_headless) {
-        rebuild_rpane_only();
+        if (g_tui) g_tui->dirty("rpane");
         update_status();
         return;
     }
@@ -1506,43 +1456,65 @@ static void schedule_detail_update() {
     g_detail_timer_id = g_tui->add_timer(DETAIL_UPDATE_DELAY_MS, on_detail_update_timer);
 }
 
-static void rebuild_views() {
-    g_lpane.clear();
-    g_rpane.clear();
+/* ── Iterator-based DataSource ─────────────────────────────────────── */
+
+static struct {
+    std::vector<RowData> rows;
+    int idx = 0;
+} g_lp_iter, g_rp_iter;
+
+static void build_lpane(std::vector<RowData> &rows) {
     switch (g_state.mode) {
-    case 0: build_lpane_process(); break;
-    case 1: build_lpane_files(); break;
-    case 2: build_lpane_output(); break;
-    case 3: build_lpane_deps(1); break;
-    case 4: build_lpane_deps(0); break;
-    case 5: build_lpane_dep_cmds(1); break;
-    case 6: build_lpane_dep_cmds(0); break;
-    default: build_lpane_process(); break;
+    case 0: build_lpane_process(rows); break;
+    case 1: build_lpane_files(rows); break;
+    case 2: build_lpane_output(rows); break;
+    case 3: build_lpane_deps(rows, 1); break;
+    case 4: build_lpane_deps(rows, 0); break;
+    case 5: build_lpane_dep_cmds(rows, 1); break;
+    case 6: build_lpane_dep_cmds(rows, 0); break;
+    default: build_lpane_process(rows); break;
     }
-    ensure_selection(g_lpane, g_state.cursor_id);
-    build_rpane();
-    ensure_selection(g_rpane, g_state.dcursor_id);
 }
 
-static void push_cursors() {
-    if (!g_tui) return;
-    g_tui->set_cursor("lpane", g_state.cursor_id.empty() ? nullptr : g_state.cursor_id.c_str());
-    g_tui->set_cursor("rpane", g_state.dcursor_id.empty() ? nullptr : g_state.dcursor_id.c_str());
-    g_tui->dirty(nullptr);
+static void ds_row_begin(const char *panel) {
+    if (std::strcmp(panel, "lpane") == 0) {
+        g_lp_iter.rows.clear();
+        g_lp_iter.idx = 0;
+        build_lpane(g_lp_iter.rows);
+    } else {
+        g_rp_iter.rows.clear();
+        g_rp_iter.idx = 0;
+        build_rpane(g_rp_iter.rows);
+    }
+}
+
+static bool ds_row_has_more(const char *panel) {
+    auto &it = (std::strcmp(panel, "lpane") == 0) ? g_lp_iter : g_rp_iter;
+    return it.idx < static_cast<int>(it.rows.size());
+}
+
+static RowData ds_row_next(const char *panel) {
+    auto &it = (std::strcmp(panel, "lpane") == 0) ? g_lp_iter : g_rp_iter;
+    return std::move(it.rows[it.idx++]);
 }
 
 static int search_hit_count() {
-    int n = 0;
-    for (const auto &r : g_lpane) if (r.style == "search") n++;
-    return n;
+    int n = g_tui ? g_tui->row_count("lpane") : 0;
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        auto *r = g_tui->get_cached_row("lpane", i);
+        if (r && r->style == "search") hits++;
+    }
+    return hits;
 }
 
 static void update_status() {
     static const char *mn[] = {"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};
     static const char *tsl[] = {"abs","rel","Δ"};
     int cur = g_tui ? g_tui->get_cursor("lpane") : 0;
+    int total = g_tui ? g_tui->row_count("lpane") : 0;
     std::string s = sfmt(" %s%s | %d/%d | TS:%s", mn[g_state.mode], g_state.grouped ? " tree" : "",
-                         cur + 1, static_cast<int>(g_lpane.size()), tsl[g_state.ts_mode]);
+                         cur + 1, total, tsl[g_state.ts_mode]);
     if (!g_state.evfilt.empty()) s += sfmt(" | F:%s", g_state.evfilt.c_str());
     if (!g_state.search.empty()) s += sfmt(" | /%s[%d]", g_state.search.c_str(), search_hit_count());
     if (g_state.lp_filter == 1) s += " | V:failed";
@@ -1567,13 +1539,14 @@ static void reset_mode_selection() {
 }
 
 static void set_cursor_to_search_hit(int dir) {
-    if (g_lpane.empty()) return;
+    int count = g_tui ? g_tui->row_count("lpane") : 0;
+    if (count == 0) return;
     int start = g_tui ? g_tui->get_cursor("lpane") : 0;
-    int count = static_cast<int>(g_lpane.size());
     for (int step = 1; step <= count; step++) {
         int idx = (start + dir * step + count) % count;
-        if (g_lpane[idx].style == "search") {
-            g_state.cursor_id = g_lpane[idx].id;
+        auto *r = g_tui->get_cached_row("lpane", idx);
+        if (r && r->style == "search") {
+            g_state.cursor_id = r->id;
             return;
         }
     }
@@ -1581,29 +1554,34 @@ static void set_cursor_to_search_hit(int dir) {
 
 static void apply_search(const std::string &q) {
     g_state.search = q;
-    rebuild_views();
-    for (const auto &r : g_lpane) {
-        if (r.style == "search") {
-            g_state.cursor_id = r.id;
+    /* Dirty lpane so the engine re-reads with search highlighting. */
+    if (g_tui) g_tui->dirty("lpane");
+    /* Force read so we can find the first hit. */
+    int n = g_tui ? g_tui->row_count("lpane") : 0;
+    for (int i = 0; i < n; i++) {
+        auto *r = g_tui->get_cached_row("lpane", i);
+        if (r && r->style == "search") {
+            g_state.cursor_id = r->id;
             break;
         }
     }
 }
 
 static void collapse_or_back() {
-    auto *row = view_find_row(g_lpane, g_state.cursor_id);
-    if (!row) return;
     if (g_tui && std::strcmp(g_tui->get_focus(), "rpane") == 0) { g_tui->focus("lpane"); return; }
-    if (row->has_children && !row->is_collapsed) {
-        row->is_collapsed = true;
-        collapsed_set().insert(row->id);
+    int cur = g_tui ? g_tui->get_cursor("lpane") : -1;
+    auto *row = g_tui ? g_tui->get_cached_row("lpane", cur) : nullptr;
+    if (!row) return;
+    if (row->has_children && !is_collapsed(row->id)) {
+        g_collapsed.insert(row->id);
     }
     else if (!row->parent_id.empty()) g_state.cursor_id = row->parent_id;
 }
 
 static void expand_or_detail() {
     bool in_rpane = g_tui && std::strcmp(g_tui->get_focus(), "rpane") == 0;
-    auto *row = in_rpane ? view_find_row(g_rpane, g_state.dcursor_id) : view_find_row(g_lpane, g_state.cursor_id);
+    int cur = g_tui ? g_tui->get_cursor(in_rpane ? "rpane" : "lpane") : -1;
+    auto *row = g_tui ? g_tui->get_cached_row(in_rpane ? "rpane" : "lpane", cur) : nullptr;
     if (!row) return;
     if (in_rpane) {
         if (row->link_mode >= 0 && !row->link_id.empty()) {
@@ -1613,48 +1591,72 @@ static void expand_or_detail() {
         }
         return;
     }
-    if (row->has_children && row->is_collapsed) {
-        row->is_collapsed = false;
-        collapsed_set().erase(row->id);
+    if (row->has_children && is_collapsed(row->id)) {
+        g_collapsed.erase(row->id);
     }
     else if (g_tui) g_tui->focus("rpane");
 }
 
+/* Expand/collapse all descendants of the current node. */
 static void expand_subtree(int expand) {
-    auto *row = view_find_row(g_lpane, g_state.cursor_id);
+    int cur = g_tui ? g_tui->get_cursor("lpane") : -1;
+    auto *row = g_tui ? g_tui->get_cached_row("lpane", cur) : nullptr;
     if (!row) return;
-    auto &cset = collapsed_set();
-    for (auto &r : g_lpane) {
-        std::string p = r.parent_id;
-        while (!p.empty()) {
-            if (p == row->id) {
-                if (expand) { r.is_collapsed = false; cset.erase(r.id); }
-                else if (r.has_children) { r.is_collapsed = true; cset.insert(r.id); }
-                break;
+    std::string root_id = row->id;
+
+    /* Walk the cached lpane rows to find descendants via parent chain. */
+    int n = g_tui->row_count("lpane");
+    for (int i = 0; i < n; i++) {
+        auto *r = g_tui->get_cached_row("lpane", i);
+        if (!r) continue;
+        /* Check if r is a descendant of root_id. */
+        std::string pid = r->parent_id;
+        bool is_desc = false;
+        while (!pid.empty()) {
+            if (pid == root_id) { is_desc = true; break; }
+            /* Walk up — find parent in cached rows. */
+            bool found = false;
+            for (int j = 0; j < n; j++) {
+                auto *pr = g_tui->get_cached_row("lpane", j);
+                if (pr && pr->id == pid) { pid = pr->parent_id; found = true; break; }
             }
-            auto *pr = view_find_row(g_lpane, p);
-            p = pr ? pr->parent_id : std::string();
+            if (!found) break;
+        }
+        if (is_desc && r->has_children) {
+            if (expand) g_collapsed.erase(r->id);
+            else g_collapsed.insert(r->id);
         }
     }
-    if (!expand && row->has_children) { row->is_collapsed = true; cset.insert(row->id); }
-    if (expand) { row->is_collapsed = false; cset.erase(row->id); }
+    /* Collapse/expand the root itself. */
+    if (row->has_children) {
+        if (expand) g_collapsed.erase(root_id);
+        else g_collapsed.insert(root_id);
+    }
 }
 
 /* ── Diagnostics ───────────────────────────────────────────────────── */
 
 static void dump_lpane(FILE *out) {
     std::fprintf(out, "=== LPANE ===\n");
-    for (int i = 0; i < static_cast<int>(g_lpane.size()); i++)
-        std::fprintf(out, "%d|%s|%s|%s|%s\n", i, g_lpane[i].style.c_str(), g_lpane[i].id.c_str(),
-                     g_lpane[i].parent_id.c_str(), g_lpane[i].text.c_str());
+    int n = g_tui ? g_tui->row_count("lpane") : 0;
+    for (int i = 0; i < n; i++) {
+        auto *r = g_tui->get_cached_row("lpane", i);
+        if (!r) continue;
+        std::fprintf(out, "%d|%s|%s|%s|%s\n", i, r->style.c_str(), r->id.c_str(),
+                     r->parent_id.c_str(), r->cols[0].c_str());
+    }
     std::fprintf(out, "=== END LPANE ===\n");
 }
 
 static void dump_rpane(FILE *out) {
     std::fprintf(out, "=== RPANE ===\n");
-    for (int i = 0; i < static_cast<int>(g_rpane.size()); i++)
-        std::fprintf(out, "%d|%s|%s|%d|%s\n", i, g_rpane[i].style.c_str(), g_rpane[i].text.c_str(),
-                     g_rpane[i].link_mode, g_rpane[i].link_id.c_str());
+    int n = g_tui ? g_tui->row_count("rpane") : 0;
+    for (int i = 0; i < n; i++) {
+        auto *r = g_tui->get_cached_row("rpane", i);
+        if (!r) continue;
+        std::fprintf(out, "%d|%s|%s|%d|%s\n", i, r->style.c_str(), r->cols[0].c_str(),
+                     r->link_mode, r->link_id.c_str());
+    }
     std::fprintf(out, "=== END RPANE ===\n");
 }
 
@@ -1686,8 +1688,13 @@ static void process_print(const std::string &what) {
 
 static void apply_state_change() {
     cancel_detail_update();
-    rebuild_views();
-    push_cursors();
+    if (g_tui) {
+        g_tui->dirty(nullptr);
+        if (!g_state.cursor_id.empty())
+            g_tui->set_cursor("lpane", g_state.cursor_id.c_str());
+        if (!g_state.dcursor_id.empty())
+            g_tui->set_cursor("rpane", g_state.dcursor_id.c_str());
+    }
     update_status();
 }
 
@@ -1800,8 +1807,7 @@ static void process_input_cmd(const input_cmd_t &cmd) {
         break;
     case INPUT_SEARCH:
         apply_search(cmd.text);
-        push_cursors();
-        update_status();
+        apply_state_change();
         break;
     case INPUT_EVFILT:
         g_state.evfilt = cmd.text;
@@ -1876,14 +1882,12 @@ static void on_trace_fd_cb(Tui &tui, int fd) {
 /* ── Cleanup ───────────────────────────────────────────────────────── */
 
 static void free_all() {
-    g_lpane.clear();
-    g_rpane.clear();
     g_events.clear();
     g_proc_map.clear();
     g_path_pool.clear();
     if (g_save_fp) { std::fclose(g_save_fp); g_save_fp = nullptr; }
     g_inputs.clear();
-    for (auto &c : g_collapsed) c.clear();
+    g_collapsed.clear();
 }
 
 /* ── Main ──────────────────────────────────────────────────────────── */
@@ -1956,28 +1960,11 @@ int main(int argc, char **argv) {
         g_state.lp_filter = 2;
     }
 
-    rebuild_views();
     int headless_mode = (!g_inputs.empty()) ||
                         (trace_file[0] && !cmd && !isatty(STDIN_FILENO)) ||
                         (save_file[0] && !cmd);
 
-    DataSource src{
-        .row_count = [](const char *panel) -> int {
-            return std::strcmp(panel, "lpane") == 0 ? static_cast<int>(g_lpane.size()) : static_cast<int>(g_rpane.size());
-        },
-        .row_get = [](const char *panel, int rownum) -> RowData {
-            auto &v = (std::strcmp(panel, "lpane") == 0) ? g_lpane : g_rpane;
-            if (rownum < 0 || rownum >= static_cast<int>(v.size())) return {};
-            RowData d;
-            d.id = v[rownum].id;
-            d.style = v[rownum].style;
-            d.cols[0] = v[rownum].text;
-            return d;
-        },
-        .row_find = [](const char *panel, const char *id) -> int {
-            return view_find_index(std::strcmp(panel, "lpane") == 0 ? g_lpane : g_rpane, id ? id : "");
-        },
-    };
+    DataSource src{ds_row_begin, ds_row_has_more, ds_row_next};
 
     if (headless_mode) g_tui = Tui::open_headless(std::move(src), 24, 80);
     else g_tui = Tui::open(std::move(src));
@@ -1994,7 +1981,7 @@ int main(int argc, char **argv) {
         g_tui->set_layout(&hbox);
     }
     g_tui->on_key(on_key_cb);
-    push_cursors();
+    g_tui->dirty(nullptr);
     update_status();
 
     for (const auto &cmd_i : g_inputs) process_input_cmd(cmd_i);

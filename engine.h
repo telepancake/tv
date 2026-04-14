@@ -64,6 +64,12 @@ struct RowData {
     std::string id;
     std::string style;
     std::string cols[32];
+
+    /* App-level metadata (engine ignores; carried through for app use) */
+    std::string parent_id;
+    int         link_mode = -1;
+    std::string link_id;
+    bool        has_children = false;
 };
 
 /* ── Tui class ─────────────────────────────────────────────────────── */
@@ -75,10 +81,14 @@ using KeyCallback   = std::function<int(Tui &tui, int key, const char *panel,
 using FdCallback    = std::function<void(Tui &tui, int fd)>;
 using TimerCallback = std::function<int(Tui &tui)>;
 
+/* Iterator-based data source.  The engine calls row_begin() once, then
+   loops row_has_more() / row_next() to read every row.  All rows are
+   cached by the engine; counting, finding, and buffering are handled
+   internally—the app just provides a forward iterator. */
 struct DataSource {
-    std::function<int(const char *panel)>                          row_count;
-    std::function<RowData(const char *panel, int rownum)>          row_get;
-    std::function<int(const char *panel, const char *id)>          row_find;
+    std::function<void(const char *panel)>     row_begin;
+    std::function<bool(const char *panel)>     row_has_more;
+    std::function<RowData(const char *panel)>  row_next;
 };
 
 class Tui {
@@ -105,6 +115,7 @@ public:
     int         get_scroll(const char *panel) const;
     const char *get_cursor_id(const char *panel) const;
     int         row_count(const char *panel);
+    const RowData *get_cached_row(const char *panel, int idx) const;
 
     /* Callbacks */
     void on_key(KeyCallback cb);
