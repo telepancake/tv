@@ -11,7 +11,9 @@
  * Events emitted: CWD, EXEC, OPEN (real + inherited), EXIT, STDOUT, STDERR.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +57,12 @@
 #ifndef PR_SYS_DISPATCH_OFF
 #define PR_SYS_DISPATCH_OFF 0
 #endif
+
+/* C++ ptrace wrapper: glibc's C++ prototype wants __ptrace_request enum */
+template <typename... Args>
+static inline long xptrace(int req, Args... args) {
+    return ptrace(static_cast<__ptrace_request>(req), args...);
+}
 
 /* ================================================================
  * Constants
@@ -959,7 +967,7 @@ static int get_syscall_info(pid_t pid, long *nr,
 {
     struct user_regs_struct regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (xptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
         return -1;
     *nr  = regs.orig_rax;
     *a0  = regs.rdi;
@@ -974,20 +982,20 @@ static int set_syscall_nr(pid_t pid, long nr)
 {
     struct user_regs_struct regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (xptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
         return -1;
     regs.orig_rax = nr;
-    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    return xptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
 }
 
 static int set_syscall_ret(pid_t pid, long ret)
 {
     struct user_regs_struct regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (xptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
         return -1;
     regs.rax = ret;
-    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    return xptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
 }
 
 #elif defined(__aarch64__)
@@ -1003,7 +1011,7 @@ static int get_syscall_info(pid_t pid, long *nr,
 {
     struct aarch64_user_regs regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (xptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
         return -1;
     /* On arm64, the syscall number is in x8, return value in x0 */
     *nr  = regs.regs[8];
@@ -1019,20 +1027,20 @@ static int set_syscall_nr(pid_t pid, long nr)
 {
     struct aarch64_user_regs regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (xptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
         return -1;
     regs.regs[8] = nr;
-    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    return xptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
 }
 
 static int set_syscall_ret(pid_t pid, long ret)
 {
     struct aarch64_user_regs regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-    if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
+    if (xptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) < 0)
         return -1;
     regs.regs[0] = ret;
-    return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
+    return xptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
 }
 
 #else
@@ -1165,11 +1173,11 @@ static void try_deliver_to_tracer(pid_t tracer_pid)
     tps->emu_waiting = false;
 
     /* Resume the sub-tracer */
-    ptrace(PTRACE_SYSCALL, tracer_pid, NULL, 0);
+    xptrace(PTRACE_SYSCALL, tracer_pid, NULL, 0);
 }
 
 /* ================================================================
- * Ptrace emulation — handle emulated ptrace() syscall
+ * Ptrace emulation — handle emulated xptrace() syscall
  * ================================================================ */
 
 static long emu_handle_ptrace(pid_t caller, unsigned long request,
@@ -1205,7 +1213,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
         int sig = static_cast<int>(data);  /* signal to deliver */
         et->stopped = false;
         et->stop_reported = false;
-        ptrace(PTRACE_SYSCALL, target, NULL, (void *)(long)sig);
+        xptrace(PTRACE_SYSCALL, target, NULL, (void *)(long)sig);
         return 0;
     }
 
@@ -1218,7 +1226,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
         et->stop_reported = false;
         remove_emu_tracee(target);
         /* Resume normally */
-        ptrace(PTRACE_SYSCALL, target, NULL, (void *)(long)sig);
+        xptrace(PTRACE_SYSCALL, target, NULL, (void *)(long)sig);
         return 0;
     }
 
@@ -1239,7 +1247,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
 #if defined(__x86_64__)
         struct user_regs_struct regs;
         struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-        if (ptrace(PTRACE_GETREGSET, target, NT_PRSTATUS, &iov) < 0)
+        if (xptrace(PTRACE_GETREGSET, target, NT_PRSTATUS, &iov) < 0)
             return -EIO;
         if (data)
             write_proc_mem(caller, data, &regs, sizeof(regs));
@@ -1260,7 +1268,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
         if (read_proc_mem(caller, data, &regs, sizeof(regs)) < static_cast<ssize_t>(sizeof(regs)))
             return -EIO;
         struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-        if (ptrace(PTRACE_SETREGSET, target, NT_PRSTATUS, &iov) < 0)
+        if (xptrace(PTRACE_SETREGSET, target, NT_PRSTATUS, &iov) < 0)
             return -EIO;
 #else
         return -EIO;
@@ -1284,7 +1292,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
         void *buf = malloc(bufsz);
         if (!buf) return -ENOMEM;
         struct iovec local_iov = { .iov_base = buf, .iov_len = bufsz };
-        if (ptrace(PTRACE_GETREGSET, target, addr, &local_iov) < 0) {
+        if (xptrace(PTRACE_GETREGSET, target, addr, &local_iov) < 0) {
             free(buf);
             return -EIO;
         }
@@ -1315,7 +1323,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
             return -EIO;
         }
         struct iovec local_iov = { .iov_base = buf, .iov_len = bufsz };
-        int rc = ptrace(PTRACE_SETREGSET, target, addr, &local_iov) < 0 ? -EIO : 0;
+        int rc = xptrace(PTRACE_SETREGSET, target, addr, &local_iov) < 0 ? -EIO : 0;
         free(buf);
         return rc;
     }
@@ -1326,7 +1334,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
         emu_tracee *et = find_emu_tracee_for(caller, target);
         if (!et) return -ESRCH;
         errno = 0;
-        long val = ptrace(PTRACE_PEEKDATA, target, (void *)addr, NULL);
+        long val = xptrace(PTRACE_PEEKDATA, target, (void *)addr, NULL);
         if (errno) return -errno;
         return val;
     }
@@ -1336,7 +1344,7 @@ static long emu_handle_ptrace(pid_t caller, unsigned long request,
     case PTRACE_POKETEXT: {
         emu_tracee *et = find_emu_tracee_for(caller, target);
         if (!et) return -ESRCH;
-        if (ptrace(PTRACE_POKEDATA, target, (void *)addr, (void *)data) < 0)
+        if (xptrace(PTRACE_POKEDATA, target, (void *)addr, (void *)data) < 0)
             return -errno;
         return 0;
     }
@@ -1429,7 +1437,7 @@ static void handle_syscall_entry(pid_t pid, proc_state *ps)
     ps->arg3 = a3;
     ps->emu_neutralized = false;
 
-    /* ---- Intercept ptrace() syscall ---- */
+    /* ---- Intercept xptrace() syscall ---- */
     if (nr == SYS_ptrace) {
         set_syscall_nr(pid, -1);   /* neutralise → kernel returns -ENOSYS */
         ps->emu_neutralized = true;
@@ -2145,8 +2153,8 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
 
     if (child == 0) {
         /* Child: request tracing, then exec */
-        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
-            perror("ptrace(TRACEME)");
+        if (xptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+            perror("xptrace(TRACEME)");
             _exit(127);
         }
         raise(SIGSTOP); /* Wait for parent to set options */
@@ -2169,8 +2177,8 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
               | PTRACE_O_TRACEVFORK
               | PTRACE_O_TRACECLONE
               | PTRACE_O_TRACEEXEC;
-    if (ptrace(PTRACE_SETOPTIONS, child, NULL, opts) < 0) {
-        perror("ptrace(SETOPTIONS)");
+    if (xptrace(PTRACE_SETOPTIONS, child, NULL, opts) < 0) {
+        perror("xptrace(SETOPTIONS)");
         std::exit(1);
     }
 
@@ -2178,7 +2186,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
     pidset_add(child);
 
     /* Resume child (it will immediately hit execve) */
-    ptrace(PTRACE_SYSCALL, child, NULL, 0);
+    xptrace(PTRACE_SYSCALL, child, NULL, 0);
 
     /* Main event loop */
     while (!g_tracked.empty()) {
@@ -2219,7 +2227,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
             event == PTRACE_EVENT_VFORK ||
             event == PTRACE_EVENT_CLONE) {
             unsigned long new_pid;
-            ptrace(PTRACE_GETEVENTMSG, wpid, NULL, &new_pid);
+            xptrace(PTRACE_GETEVENTMSG, wpid, NULL, &new_pid);
             if (new_pid > 0) {
                 pidset_add(static_cast<pid_t>(new_pid));
             }
@@ -2247,7 +2255,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
                 }
             }
 
-            ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+            xptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
 
@@ -2259,7 +2267,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
                 emu_queue_stop(et, emu_wstatus);
                 continue;  /* hold sub-tracee */
             }
-            ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+            xptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
 
@@ -2289,7 +2297,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
             }
 
             if (!hold)
-                ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+                xptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
 
@@ -2301,16 +2309,16 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
                 emu_queue_stop(et, emu_wstatus);
                 continue;  /* hold sub-tracee */
             }
-            ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+            xptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             continue;
         }
 
         /* Group stop / PTRACE_INTERRUPT stop */
         if (event == PTRACE_EVENT_STOP) {
             if (sig == SIGTRAP) {
-                ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+                xptrace(PTRACE_SYSCALL, wpid, NULL, 0);
             } else {
-                ptrace(PTRACE_LISTEN, wpid, NULL, 0);
+                xptrace(PTRACE_LISTEN, wpid, NULL, 0);
             }
             continue;
         }
@@ -2320,7 +2328,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
             proc_state *sigps = get_state(wpid);
             if (sig == SIGCHLD && sigps->emu_race_interrupt) {
                 sigps->emu_race_interrupt = false;
-                ptrace(PTRACE_SYSCALL, wpid, NULL, 0);
+                xptrace(PTRACE_SYSCALL, wpid, NULL, 0);
                 continue;
             }
 
@@ -2334,7 +2342,7 @@ static int run_ptrace_trace(char **cmd, const char *outfile)
         }
 
         /* Deliver the signal to the tracee */
-        ptrace(PTRACE_SYSCALL, wpid, NULL, (void *)(long)sig);
+        xptrace(PTRACE_SYSCALL, wpid, NULL, (void *)(long)sig);
     }
 
     if (close_trace_output(outfile) != 0)

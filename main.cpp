@@ -24,7 +24,7 @@
 
 #include "engine.h"
 
-extern "C" int uproctrace_main(int argc, char **argv);
+extern int uproctrace_main(int argc, char **argv);
 
 static constexpr int MAX_JSON_LINE = 1 << 20;
 
@@ -95,6 +95,16 @@ struct process_t {
     int has_stderr = 0;
     std::vector<std::string> read_paths;
     std::vector<std::string> write_paths;
+
+    /* short display name: basename of exe or argv[0] */
+    std::string display_name() const {
+        std::string_view s;
+        if (!exe.empty()) s = exe;
+        else if (!argv.empty()) s = argv[0];
+        if (s.empty()) return {};
+        auto pos = s.rfind('/');
+        return std::string(pos != std::string_view::npos ? s.substr(pos + 1) : s);
+    }
 };
 
 struct input_cmd_t {
@@ -352,43 +362,35 @@ static std::vector<std::string> json_array_of_strings(std::string_view sp) {
     return arr;
 }
 
-static const char *basename_c(const char *path) {
-    if (!path || !path[0]) return "";
-    const char *s = std::strrchr(path, '/');
-    return s ? s + 1 : path;
-}
-
-static void canon_path_c(char *path, int maxlen) {
-    if (!path || !path[0]) return;
-    char *parts[256]; int np = 0;
-    char tmp[4096]; std::snprintf(tmp, sizeof tmp, "%s", path);
-    int ab = (tmp[0] == '/'); char *s = tmp; if (ab) s++;
-    while (*s && np < 256) {
-        char *sl = std::strchr(s, '/'); if (sl) *sl = 0;
-        if (std::strcmp(s, "..") == 0) { if (np > 0) np--; }
-        else if (std::strcmp(s, ".") != 0 && *s) parts[np++] = s;
-        if (sl) s = sl + 1; else break;
+static std::string canon_path(std::string_view path) {
+    if (path.empty()) return {};
+    bool absolute = (path[0] == '/');
+    std::vector<std::string_view> parts;
+    size_t i = absolute ? 1 : 0;
+    while (i < path.size()) {
+        auto sl = path.find('/', i);
+        auto seg = path.substr(i, (sl == std::string_view::npos) ? std::string_view::npos : sl - i);
+        i = (sl == std::string_view::npos) ? path.size() : sl + 1;
+        if (seg == ".." ) { if (!parts.empty()) parts.pop_back(); }
+        else if (seg != "." && !seg.empty()) parts.push_back(seg);
     }
-    char out[4096]; int p = 0;
-    if (ab && p < static_cast<int>(sizeof(out)) - 1) out[p++] = '/';
-    for (int i = 0; i < np; i++) {
-        if (i > 0 && p < static_cast<int>(sizeof(out)) - 1) out[p++] = '/';
-        int l = static_cast<int>(std::strlen(parts[i]));
-        if (p + l >= static_cast<int>(sizeof(out))) l = static_cast<int>(sizeof(out)) - p - 1;
-        std::memcpy(out + p, parts[i], static_cast<size_t>(l)); p += l;
+    std::string out;
+    if (absolute) out += '/';
+    for (size_t j = 0; j < parts.size(); j++) {
+        if (j > 0) out += '/';
+        out += parts[j];
     }
-    out[p] = 0;
-    std::snprintf(path, maxlen, "%s", out);
+    return out;
 }
 
 static std::string resolve_path_dup(const std::string &raw, const std::string &cwd) {
-    char out[8192];
     if (raw.empty()) return {};
     if (raw[0] != '/' && raw[0] != '.' && raw.find(':') != std::string::npos) return raw;
-    if (raw[0] == '/') std::snprintf(out, sizeof out, "%s", raw.c_str());
-    else if (!cwd.empty()) std::snprintf(out, sizeof out, "%s/%s", cwd.c_str(), raw.c_str());
-    else std::snprintf(out, sizeof out, "%s", raw.c_str());
-    if (out[0] == '/') canon_path_c(out, sizeof out);
+    std::string out;
+    if (raw[0] == '/') out = raw;
+    else if (!cwd.empty()) out = cwd + "/" + raw;
+    else out = raw;
+    if (!out.empty() && out[0] == '/') out = canon_path(out);
     return out;
 }
 
@@ -773,7 +775,7 @@ static void build_proc_rows_rec(int idx, int depth) {
     auto &p = g_processes[idx];
     std::string id_str = std::to_string(p.tgid);
     bool collapsed = g_proc_collapsed.contains(id_str);
-    const char *name = basename_c(!p.exe.empty() ? p.exe.c_str() : (!p.argv.empty() ? p.argv[0].c_str() : ""));
+    auto name = p.display_name();
     std::string marker;
     if (p.exit_status == "exited")
         marker = p.exit_code == 0 ? " ✓" : " ✗";
@@ -784,7 +786,7 @@ static void build_proc_rows_rec(int idx, int depth) {
         ? sfmt("%*s%s", depth * 4, "", p.children.empty() ? "  " : (collapsed ? "▶ " : "▼ "))
         : std::string();
     std::string extra = p.descendant_count > 0 ? sfmt(" (%d)", p.descendant_count) : std::string();
-    std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), p.tgid, name,
+    std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), p.tgid, name.c_str(),
                             marker.c_str(), extra.c_str(), dur.empty() ? "" : "  ", dur.c_str());
     std::string parent_id = p.parent_index >= 0 ? std::to_string(g_processes[p.parent_index].tgid) : std::string();
     view_add_row(g_lpane, id_str, proc_style(p), parent_id, text, 0, id_str, !p.children.empty());
@@ -809,14 +811,14 @@ static void build_lpane_process() {
         for (int ai : all) {
             auto &p = g_processes[ai];
             std::string id_str = std::to_string(p.tgid);
-            const char *name = basename_c(!p.exe.empty() ? p.exe.c_str() : (!p.argv.empty() ? p.argv[0].c_str() : ""));
+            auto name = p.display_name();
             std::string marker;
             if (p.exit_status == "exited")
                 marker = p.exit_code == 0 ? " ✓" : " ✗";
             else if (p.exit_status == "signaled")
                 marker = sfmt(" ⚡%d", p.exit_signal);
             std::string dur = format_duration(p.start_ts, p.end_ts, p.exit_status.empty());
-            std::string text = sfmt("[%d] %s%s%s%s", p.tgid, name, marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
+            std::string text = sfmt("[%d] %s%s%s%s", p.tgid, name.c_str(), marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
             view_add_row(g_lpane, id_str, proc_style(p), "", text, 0, id_str, false);
         }
     }
@@ -988,7 +990,7 @@ static std::vector<output_group_t> build_output_groups() {
             output_group_t og;
             og.tgid = ev.tgid;
             auto *p = find_process(ev.tgid);
-            og.name = p ? basename_c(!p->exe.empty() ? p->exe.c_str() : (!p->argv.empty() ? p->argv[0].c_str() : "")) : "";
+            og.name = p ? p->display_name() : "";
             groups.push_back(std::move(og));
             it = groups.end() - 1;
         }
@@ -1007,7 +1009,7 @@ static void build_lpane_output() {
             std::string id_str = std::to_string(ev.id);
             std::string text = sfmt("[%s] PID %d %s: %s",
                 ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", ev.tgid,
-                p ? basename_c(!p->exe.empty() ? p->exe.c_str() : (!p->argv.empty() ? p->argv[0].c_str() : "")) : "",
+                p ? p->display_name().c_str() : "",
                 ev.data.c_str());
             view_add_row(g_lpane, id_str, ev.kind == EV_STDERR ? "error" : "normal", "", text, 2, id_str, 0);
         }
@@ -1115,8 +1117,7 @@ static void build_rpane_process(const std::string &id) {
         for (int ci : p->children) {
             auto &c = g_processes[ci];
             std::string cid = sfmt("child_%d", c.tgid);
-            std::string text = sfmt("[%d] %s", c.tgid,
-                basename_c(!c.exe.empty() ? c.exe.c_str() : (!c.argv.empty() ? c.argv[0].c_str() : "")));
+            std::string text = sfmt("[%d] %s", c.tgid, c.display_name().c_str());
             view_add_row(g_rpane, cid, "normal", "", text, 0, std::to_string(c.tgid), 0);
         }
     }
@@ -1175,7 +1176,7 @@ static void build_rpane_file(const std::string &id) {
         auto *p = find_process(ev.tgid);
         std::string err_text = ev.err ? sfmt(" err=%d", ev.err) : std::string();
         std::string text = sfmt("PID %d %s [%s]%s", ev.tgid,
-            p ? basename_c(!p->exe.empty() ? p->exe.c_str() : (!p->argv.empty() ? p->argv[0].c_str() : "")) : "",
+            p ? p->display_name().c_str() : "",
             ev.flags_text.c_str(), err_text.c_str());
         view_add_row(g_rpane, sfmt("open_%d", ev.id),
                      ev.err ? "error" : (ev.kind == EV_STDERR ? "error" : "normal"),
@@ -1194,7 +1195,7 @@ static void build_rpane_output(const std::string &id) {
                  sfmt("Stream: %s", ev->kind == EV_STDOUT ? "STDOUT" : "STDERR"), -1, "", 0);
     view_add_row(g_rpane, "pid", "normal", "", sfmt("PID: %d", ev->tgid), -1, "", 0);
     view_add_row(g_rpane, "proc", "normal", "",
-                 sfmt("Proc: %s", p ? basename_c(!p->exe.empty() ? p->exe.c_str() : (!p->argv.empty() ? p->argv[0].c_str() : "")) : ""),
+                 sfmt("Proc: %s", p ? p->display_name().c_str() : ""),
                  -1, "", 0);
     view_add_row(g_rpane, "content_hdr", "heading", "", "─── Content ───", -1, "", 0);
     view_add_row(g_rpane, "content", ev->kind == EV_STDERR ? "error" : "normal", "", ev->data, -1, "", 0);

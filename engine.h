@@ -133,8 +133,10 @@ public:
     int rows() const;
     int cols() const;
 
+    // Impl is exposed for internal free-function helpers in engine.cpp
+    struct Impl;
+
 private:
     Tui();
-    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
