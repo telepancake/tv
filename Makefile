@@ -41,7 +41,7 @@ install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
-CFLAGS := -O2 -flto=auto
+CXXFLAGS := -std=c++23 -O2 -flto=auto
 TV_LIBS := -lm -pthread -lzstd
 SUD_COMMON_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer
 SUD_COMMON_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
@@ -54,11 +54,11 @@ gen_sql_h: gen_sql_h.c
 tv_sql.h: tv.sql gen_sql_h
 	./gen_sql_h tv.sql tv_sql.h
 
-tv: main.c engine.c engine.h uproctrace.c
-	cc $(CFLAGS) -o tv main.c engine.c uproctrace.c -static $(TV_LIBS)
+tv: main.cpp engine.cpp engine.h uproctrace.cpp
+	g++ $(CXXFLAGS) -o tv main.cpp engine.cpp uproctrace.cpp -static $(TV_LIBS)
 
-fv: fv.c engine.c engine.h
-	cc $(CFLAGS) -o fv fv.c engine.c
+fv: fv.cpp engine.cpp engine.h
+	g++ $(CXXFLAGS) -o fv fv.cpp engine.cpp
 
 sudtrace: sudtrace.c sudtrace.lds
 	cc -O2 -fno-stack-protector -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm

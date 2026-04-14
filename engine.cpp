@@ -51,8 +51,8 @@ struct Panel {
     bool dirty = true;
     char cursor_id[4096]{};
 
-    std::vector<CacheRow> cache_rows{PANEL_CACHE_ROWS};
-    std::vector<char>     cache_pool{PANEL_CACHE_POOL};
+    std::vector<CacheRow> cache_rows = std::vector<CacheRow>(PANEL_CACHE_ROWS);
+    std::vector<char>     cache_pool = std::vector<char>(PANEL_CACHE_POOL);
     int cache_pool_pos = 0;
     int cache_start    = 0;
     int cache_count    = 0;
