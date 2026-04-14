@@ -277,6 +277,7 @@ static ssize_t ring_write(struct ring_buffer *rb, const char *data, size_t len)
         avail = ring_free(rb);
         if (avail == 0) {
             spin_unlock_irqrestore(&rb->lock, flags);
+            cond_resched();
             continue;
         }
         chunk = len - written;
@@ -364,6 +365,9 @@ struct trace_session {
     spinlock_t          tag_lock;
     atomic_t            tag_count;
 
+    atomic_t            pending_work;
+    wait_queue_head_t   wq_drain;
+
     struct list_head    list;
 };
 
@@ -400,6 +404,9 @@ static void log_work_fn(struct work_struct *work)
     if (s && !s->dead && s->id == lw->session_id)
         ring_write(&s->ring, lw->data, lw->len);
 
+    if (s && atomic_dec_and_test(&s->pending_work))
+        wake_up(&s->wq_drain);
+
     kfree(lw);
 }
 
@@ -413,6 +420,7 @@ static void session_log_queue(struct trace_session *s,
     INIT_WORK(&lw->work, log_work_fn);
     lw->session = s; lw->session_id = s->id; lw->len = len;
     memcpy(lw->data, buf, len);
+    atomic_inc(&s->pending_work);
     queue_work(log_wq, &lw->work);
 }
 
@@ -469,11 +477,15 @@ static void session_free_all_tags(struct trace_session *s)
 {
     struct tagged_pid *entry; struct hlist_node *tmp;
     unsigned long flags; int bkt;
+    HLIST_HEAD(free_list);
     spin_lock_irqsave(&s->tag_lock, flags);
     hash_for_each_safe(s->tags, bkt, tmp, entry, hnode) {
-        hash_del(&entry->hnode); kfree(entry);
+        hash_del(&entry->hnode);
+        hlist_add_head(&entry->hnode, &free_list);
     }
     spin_unlock_irqrestore(&s->tag_lock, flags);
+    hlist_for_each_entry_safe(entry, tmp, &free_list, hnode)
+        kfree(entry);
     atomic_set(&s->tag_count, 0);
 }
 
@@ -506,7 +518,9 @@ static struct trace_session *session_create(pid_t root_tgid)
     s->root_tgid = root_tgid; s->dead = false;
     s->creator_stdout_ino = get_fd_inode(1);
     atomic_set(&s->tag_count, 0);
+    atomic_set(&s->pending_work, 0);
     hash_init(s->tags); spin_lock_init(&s->tag_lock);
+    init_waitqueue_head(&s->wq_drain);
     INIT_LIST_HEAD(&s->list);
 
     session_tag_pid(s, root_tgid);
@@ -537,12 +551,17 @@ static void session_destroy(struct trace_session *s)
     synchronize_rcu();
 
     /*
-     * Now drain any work items that were queued before the grace period.
-     * This is safe to call without sessions_mutex — the previous deadlock
-     * came from flush_workqueue() blocking on OTHER sessions' ring-full
-     * workers while holding the mutex, which prevented all forward progress.
+     * All RCU readers have finished, so no new work items for this
+     * session will be queued.  Wait only for this session's pending
+     * items to complete.  Because the ring is closed, any workers
+     * blocked in ring_write() will see ->closed and return promptly.
+     *
+     * Unlike the old flush_workqueue() call, this does NOT wait for
+     * workers belonging to other sessions — that was the source of
+     * the deadlock where a full ring on session B prevented
+     * session A's destroy from ever completing.
      */
-    flush_workqueue(log_wq);
+    wait_event(s->wq_drain, atomic_read(&s->pending_work) == 0);
 
     session_free_all_tags(s);
     ring_destroy(&s->ring);
@@ -1419,11 +1438,22 @@ static void __exit proctrace_exit(void)
     /* After kprobes are unregistered, no new events can fire.
      * Wait for any in-flight RCU readers, then drain the workqueue. */
     synchronize_rcu();
+    /* Close all session rings so blocked workers wake up and exit.
+     * This MUST happen before flush_workqueue — otherwise workers
+     * stuck in ring_write() waiting for ring space will never return
+     * and the flush will hang forever. */
+    mutex_lock(&sessions_mutex);
+    list_for_each_entry(s, &sessions, list) {
+        s->dead = true; smp_wmb();
+        s->ring.closed = true;
+        wake_up_interruptible(&s->ring.wq_writer);
+        wake_up_interruptible(&s->ring.wq_reader);
+    }
+    mutex_unlock(&sessions_mutex);
     flush_workqueue(log_wq); destroy_workqueue(log_wq);
     mutex_lock(&sessions_mutex);
     list_for_each_entry_safe(s,tmp,&sessions,list){
-        list_del(&s->list); s->ring.closed=true;
-        wake_up_interruptible(&s->ring.wq_writer);
+        list_del(&s->list);
         session_free_all_tags(s); ring_destroy(&s->ring); kfree(s);
     }
     mutex_unlock(&sessions_mutex);
