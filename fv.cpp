@@ -208,24 +208,43 @@ static void load_content(const std::string &path)
 
 /* ── Data source callbacks ────────────────────────────────────────────── */
 
-static int fv_row_count(const char *panel)
+/* Per-panel iterator state (only one panel is iterated at a time). */
+static struct {
+    const char *panel = nullptr;
+    int idx   = 0;
+    int count = 0;
+} g_fv_iter;
+
+static void fv_row_begin(const char *panel)
 {
-    if (std::strcmp(panel, "content") == 0) return static_cast<int>(g.lines.size());
+    g_fv_iter.panel = panel;
+    g_fv_iter.idx   = 0;
+    if (std::strcmp(panel, "content") == 0) {
+        g_fv_iter.count = static_cast<int>(g.lines.size());
+        return;
+    }
     int d;
     if (std::sscanf(panel, "d%d", &d) == 1 && d >= 0 && d < FV_MAX_DEPTH)
-        return static_cast<int>(g.entries[d].size());
-    return 0;
+        g_fv_iter.count = static_cast<int>(g.entries[d].size());
+    else
+        g_fv_iter.count = 0;
 }
 
-static RowData fv_row_get(const char *panel, int rownum)
+static bool fv_row_has_more(const char * /*panel*/)
 {
+    return g_fv_iter.idx < g_fv_iter.count;
+}
+
+static RowData fv_row_next(const char *panel)
+{
+    int rownum = g_fv_iter.idx++;
+
     if (std::strcmp(panel, "content") == 0) {
-        if (rownum < 0 || rownum >= static_cast<int>(g.lines.size())) return {};
         RowData d;
         char idbuf[32];
         std::snprintf(idbuf, sizeof idbuf, "%d", rownum);
-        d.id     = idbuf;
-        d.style  = "";
+        d.id      = idbuf;
+        d.style   = "";
         d.cols[0] = g.lines[static_cast<size_t>(rownum)];
         return d;
     }
@@ -233,7 +252,6 @@ static RowData fv_row_get(const char *panel, int rownum)
     int depth;
     if (std::sscanf(panel, "d%d", &depth) != 1) return {};
     if (depth < 0 || depth >= FV_MAX_DEPTH || g.entries[depth].empty()) return {};
-    if (rownum < 0 || rownum >= static_cast<int>(g.entries[depth].size())) return {};
 
     auto &e = g.entries[depth][static_cast<size_t>(rownum)];
     RowData d;
@@ -244,17 +262,6 @@ static RowData fv_row_get(const char *panel, int rownum)
     else          std::snprintf(namebuf, sizeof namebuf, "%s",  e.name);
     d.cols[0] = namebuf;
     return d;
-}
-
-static int fv_row_find(const char *panel, const char *id)
-{
-    if (std::strcmp(panel, "content") == 0) return id ? std::atoi(id) : 0;
-    int d;
-    if (std::sscanf(panel, "d%d", &d) != 1) return -1;
-    if (d < 0 || d >= FV_MAX_DEPTH || g.entries[d].empty()) return -1;
-    for (int i = 0; i < static_cast<int>(g.entries[d].size()); i++)
-        if (std::strcmp(g.entries[d][static_cast<size_t>(i)].name, id) == 0) return i;
-    return -1;
 }
 
 /* ── Sync helpers ─────────────────────────────────────────────────────── */
@@ -452,7 +459,7 @@ int main(int argc, char **argv)
     }
     g.path_stack[0] = abspath;
 
-    DataSource src{fv_row_count, fv_row_get, fv_row_find};
+    DataSource src{fv_row_begin, fv_row_has_more, fv_row_next};
     g.tui = Tui::open(std::move(src));
     if (!g.tui) { std::fprintf(stderr, "fv: cannot open terminal\n"); return 1; }
 
