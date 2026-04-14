@@ -171,6 +171,7 @@ enum {
 enum {
     LIVE_TRACE_BATCH_ROWS = 256,
     LIVE_TRACE_BATCH_MS = 50,
+    DETAIL_UPDATE_DELAY_MS = 120,
 };
 
 static trace_event_t *g_events;
@@ -194,6 +195,10 @@ static int t_trace_fd = -1;
 static pid_t t_child_pid = 0;
 static int t_pending_live_rows = 0;
 static long long t_live_batch_start_ms = 0;
+static int g_detail_timer_id = -1;
+static int g_detail_update_pending = 0;
+
+static void update_status(void);
 
 static const char *HELP[] = {
     "", "  Process Trace Viewer", "  ════════════════════", "",
@@ -721,10 +726,10 @@ static void ingest_trace_line(const char *line) {
     proc = get_process(ev->tgid);
     if (!proc->has_start || ev->ts < proc->start_ts) { proc->start_ts = ev->ts; proc->has_start = 1; }
     if (!proc->has_end || ev->ts > proc->end_ts) { proc->end_ts = ev->ts; proc->has_end = 1; }
-    proc->pid = ev->pid;
-    proc->ppid = ev->ppid;
-    proc->nspid = ev->nspid;
-    proc->nstgid = ev->nstgid;
+    if (ev->pid > 0 || proc->pid == 0) proc->pid = ev->pid;
+    if (ev->ppid > 0 || proc->ppid == 0) proc->ppid = ev->ppid;
+    if (ev->nspid > 0 || proc->nspid == 0) proc->nspid = ev->nspid;
+    if (ev->nstgid > 0 || proc->nstgid == 0) proc->nstgid = ev->nstgid;
 
     switch (ev->kind) {
     case EV_CWD:
@@ -1447,6 +1452,45 @@ static void ensure_selection(view_t *v, char *id_buf) {
     }
 }
 
+static void cancel_detail_update(void) {
+    g_detail_update_pending = 0;
+    if (g_tui && g_detail_timer_id >= 0)
+        tui_remove_timer(g_tui, g_detail_timer_id);
+    g_detail_timer_id = -1;
+}
+
+static void rebuild_rpane_only(void) {
+    free_view(&g_rpane);
+    build_rpane();
+    ensure_selection(&g_rpane, g_state.dcursor_id);
+    if (!g_tui) return;
+    tui_set_cursor(g_tui, "rpane", g_state.dcursor_id[0] ? g_state.dcursor_id : NULL);
+    tui_dirty(g_tui, "rpane");
+}
+
+static int on_detail_update_timer(tui_t *tui, void *ctx) {
+    (void)tui;
+    (void)ctx;
+    g_detail_timer_id = -1;
+    if (!g_detail_update_pending) return 0;
+    g_detail_update_pending = 0;
+    rebuild_rpane_only();
+    update_status();
+    return 0;
+}
+
+static void schedule_detail_update(void) {
+    if (!g_tui || g_headless) {
+        rebuild_rpane_only();
+        update_status();
+        return;
+    }
+    g_detail_update_pending = 1;
+    if (g_detail_timer_id >= 0)
+        tui_remove_timer(g_tui, g_detail_timer_id);
+    g_detail_timer_id = tui_add_timer(g_tui, DETAIL_UPDATE_DELAY_MS, on_detail_update_timer, NULL);
+}
+
 static void rebuild_views(void) {
     free_view(&g_lpane);
     free_view(&g_rpane);
@@ -1651,6 +1695,7 @@ static void process_print(const char *what) {
 }
 
 static void apply_state_change(void) {
+    cancel_detail_update();
     rebuild_views();
     push_cursors();
     update_status();
@@ -1659,10 +1704,12 @@ static void apply_state_change(void) {
 static int on_key_cb(tui_t *tui, int key, const char *panel, int cursor, const char *row_id, void *ctx) {
     (void)cursor; (void)ctx;
     if (key == TUI_K_NONE) {
-        if (strcmp(panel ? panel : "", "lpane") == 0) snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", row_id ? row_id : "");
-        else snprintf(g_state.dcursor_id, sizeof g_state.dcursor_id, "%s", row_id ? row_id : "");
-        rebuild_views();
-        push_cursors();
+        if (strcmp(panel ? panel : "", "lpane") == 0) {
+            snprintf(g_state.cursor_id, sizeof g_state.cursor_id, "%s", row_id ? row_id : "");
+            schedule_detail_update();
+        } else {
+            snprintf(g_state.dcursor_id, sizeof g_state.dcursor_id, "%s", row_id ? row_id : "");
+        }
         update_status();
         return TUI_HANDLED;
     }

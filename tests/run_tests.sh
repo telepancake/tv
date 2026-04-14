@@ -140,6 +140,12 @@ cat > "$TMPDIR/no_env_trace.jsonl" <<'EOF'
 {"event":"EXEC","tgid":3000,"pid":3000,"ppid":1,"nspid":3000,"nstgid":3000,"ts":3.001,"exe":"/usr/bin/tool3","argv":["tool3","--flag"],"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}}
 {"event":"EXIT","tgid":3000,"pid":3000,"ppid":1,"nspid":3000,"nstgid":3000,"ts":3.020,"status":"exited","code":0,"raw":0}
 EOF
+
+cat > "$TMPDIR/exit_ppid_zero_trace.jsonl" <<'EOF'
+{"event":"CWD","tgid":3100,"pid":3100,"ppid":42,"nspid":3100,"nstgid":3100,"ts":4.000,"path":"/tmp"}
+{"event":"EXEC","tgid":3100,"pid":3100,"ppid":42,"nspid":3100,"nstgid":3100,"ts":4.001,"exe":"/usr/bin/tool4","argv":["tool4"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}}
+{"event":"EXIT","tgid":3100,"pid":3100,"ppid":0,"nspid":3100,"nstgid":3100,"ts":4.020,"status":"exited","code":0,"raw":0}
+EOF
 echo "Ingesting compressed trace and saving DB…"
 zstd -q -f "$TRACE" -o "$TMPDIR/trace.jsonl.zst"
 "$TV" --trace "$TMPDIR/trace.jsonl.zst" --save "$TMPDIR/test_zstd.db"
@@ -163,6 +169,15 @@ run_test "trace ingest: exec without env" \
     'assert_contains t "$OUT" "EXE:   /usr/bin/tool3"' \
     'assert_contains t "$OUT" "[0] tool3"' \
     'assert_contains t "$OUT" "[1] --flag"'
+
+OUT=$(drive_trace "$TMPDIR/exit_ppid_zero_trace.jsonl" '{"input":"resize","rows":40,"cols":100}
+{"input":"select","id":"3100"}
+{"input":"print","what":"rpane"}')
+run_test "trace ingest: exit with missing ppid keeps earlier parent" \
+    'assert_ok_or_timeout t "$DRIVE_RC"' \
+    'assert_contains t "$OUT" "TGID:  3100"' \
+    'assert_contains t "$OUT" "PPID:  42"' \
+    'assert_contains t "$OUT" "Exit: exited code=0"'
 
 # ═══════════════════════════════════════════════════════════════════════
 # Test: process tree default view
