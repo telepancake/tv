@@ -197,17 +197,11 @@ static const char *style_ansi(const char *s) {
 
 /* ── Panel helpers ────────────────────────────────────────────────── */
 
-static void notify_size(Tui::Impl *m) {
-    if (m->source.size_changed)
-        m->source.size_changed(m->term_rows, m->term_cols);
-}
-
 static void tty_size(Tui::Impl *m) {
     struct winsize ws;
     if (m->tty_fd >= 0 && ioctl(m->tty_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
         m->term_rows = ws.ws_row;
         m->term_cols = ws.ws_col;
-        notify_size(m);
     }
 }
 
@@ -322,8 +316,8 @@ static int box_contains_focus(Tui::Impl *m, Box *b) {
         if (m->focus < 0 || m->focus >= static_cast<int>(m->panels.size())) return 0;
         return b->def && std::strcmp(b->def->name, m->panels[m->focus].def.name) == 0;
     }
-    for (int i = 0; i < b->nchildren; i++)
-        if (box_contains_focus(m, b->children[i])) return 1;
+    for (auto *child : b->children)
+        if (box_contains_focus(m, child)) return 1;
     return 0;
 }
 
@@ -335,19 +329,19 @@ static void resolve_box(Tui::Impl *m, Box *b, int x, int y, int w, int h) {
         return;
     }
     bool is_hbox = (b->type == TUI_BOX_HBOX);
+    int nc = static_cast<int>(b->children.size());
 
     /* hscroll: visible subset of children, auto-scroll to keep focus visible */
-    if (is_hbox && (b->flags & TUI_BOX_HSCROLL) && b->nchildren > 0) {
+    if (is_hbox && (b->flags & TUI_BOX_HSCROLL) && nc > 0) {
         int min_col = 14;
-        int nvis = std::clamp(w / min_col, 1, b->nchildren);
+        int nvis = std::clamp(w / min_col, 1, nc);
         int cw   = w / nvis;
         int focus_child = 0;
-        for (int i = 0; i < b->nchildren; i++)
+        for (int i = 0; i < nc; i++)
             if (box_contains_focus(m, b->children[i])) { focus_child = i; break; }
-        int first = std::clamp(focus_child - nvis / 2, 0,
-                               std::max(b->nchildren - nvis, 0));
+        int first = std::clamp(focus_child - nvis / 2, 0, std::max(nc - nvis, 0));
         int pos = x;
-        for (int i = 0; i < b->nchildren; i++) {
+        for (int i = 0; i < nc; i++) {
             if (i >= first && i < first + nvis) {
                 int tw = (i == first + nvis - 1) ? w - (pos - x) : cw;
                 resolve_box(m, b->children[i], pos, y, tw, h);
@@ -361,14 +355,13 @@ static void resolve_box(Tui::Impl *m, Box *b, int x, int y, int w, int h) {
 
     int axis = is_hbox ? w : h;
     int total_weight = 0, fixed_sum = 0;
-    for (int i = 0; i < b->nchildren; i++) {
-        auto *c = b->children[i];
+    for (auto *c : b->children) {
         if (c->weight == 0) fixed_sum += c->min_size;
         else { total_weight += c->weight; if (c->min_size > 0) fixed_sum += c->min_size; }
     }
     int flex = std::max(axis - fixed_sum, 0);
     int pos = is_hbox ? x : y, remaining = axis;
-    for (int i = 0; i < b->nchildren; i++) {
+    for (int i = 0; i < nc; i++) {
         auto *c = b->children[i];
         int sz;
         if (c->weight == 0) {
@@ -376,11 +369,11 @@ static void resolve_box(Tui::Impl *m, Box *b, int x, int y, int w, int h) {
         } else {
             sz = c->min_size + (total_weight > 0 ? flex * c->weight / total_weight : 0);
             bool is_last_flex = true;
-            for (int j = i + 1; j < b->nchildren; j++)
+            for (int j = i + 1; j < nc; j++)
                 if (b->children[j]->weight > 0) { is_last_flex = false; break; }
             if (is_last_flex) {
                 int tail_fixed = 0;
-                for (int j = i + 1; j < b->nchildren; j++)
+                for (int j = i + 1; j < nc; j++)
                     if (b->children[j]->weight == 0) tail_fixed += b->children[j]->min_size;
                 sz = remaining - tail_fixed;
             }
@@ -630,7 +623,6 @@ std::unique_ptr<Tui> Tui::open(DataSource src) {
     m->tty_raw = true;
     (void)write(m->tty_fd, "\x1b[?1049h\x1b[?25l", 14);
     tty_size(m);
-    notify_size(m);
     struct sigaction sa{};
     sa.sa_handler = sigwinch_handler;
     sigaction(SIGWINCH, &sa, nullptr);
@@ -643,7 +635,6 @@ std::unique_ptr<Tui> Tui::open_headless(DataSource src, int rows, int cols) {
     m->source = std::move(src);
     m->term_rows = rows > 0 ? rows : 24;
     m->term_cols = cols > 0 ? cols : 80;
-    notify_size(m);
     return t;
 }
 
@@ -667,8 +658,8 @@ void Tui::set_layout(Box *root) {
                     m->focus = static_cast<int>(m->panels.size()) - 1;
             }
         } else {
-            for (int i = b->nchildren - 1; i >= 0; i--)
-                stack.push_back({b->children[i]});
+            for (auto it = b->children.rbegin(); it != b->children.rend(); ++it)
+                stack.push_back({*it});
         }
     }
 }
@@ -947,6 +938,5 @@ void Tui::resize(int rows, int cols) {
     auto *m = impl_.get();
     if (rows > 0) m->term_rows = rows;
     if (cols > 0) m->term_cols = cols;
-    notify_size(m);
     for (auto &p : m->panels) p.dirty = true;
 }
