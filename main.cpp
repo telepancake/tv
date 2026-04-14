@@ -1588,12 +1588,12 @@ static int on_key_cb(Tui &tui, int key, const char *panel, int cursor, const cha
         if (tui.line_edit("Save to: ", fname, sizeof fname) && fname[0]) {
             FILE *f = std::fopen(fname, "w");
             if (f) {
-            if (g_save_fp) {
-                std::rewind(g_save_fp);
-                char cbuf[4096]; size_t nr;
-                while ((nr = std::fread(cbuf, 1, sizeof cbuf, g_save_fp)) > 0)
-                    std::fwrite(cbuf, 1, nr, f);
-            }
+                if (g_save_fp) {
+                    std::rewind(g_save_fp);
+                    char cbuf[4096]; size_t nr;
+                    while ((nr = std::fread(cbuf, 1, sizeof cbuf, g_save_fp)) > 0)
+                        std::fwrite(cbuf, 1, nr, f);
+                }
                 std::fclose(f);
             }
         }
