@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <algorithm>
 #include <memory>
 
@@ -77,9 +78,7 @@ struct trace_event_t {
 
 struct process_t {
     int tgid = 0, pid = 0, ppid = 0, nspid = 0, nstgid = 0;
-    int parent_index = -1;
-    std::vector<int> children;
-    int descendant_count = 0;
+    std::vector<int> children;          /* tgids, maintained incrementally */
     double start_ts = 0, end_ts = 0;
     int has_start = 0, has_end = 0;
     std::string exe;
@@ -93,8 +92,9 @@ struct process_t {
     int has_write_open = 0;
     int has_stdout = 0;
     int has_stderr = 0;
-    std::vector<std::string> read_paths;
-    std::vector<std::string> write_paths;
+    std::unordered_set<std::string> read_paths;
+    std::unordered_set<std::string> write_paths;
+    std::vector<int> event_indices;     /* indices into g_events */
 
     /* short display name: basename of exe or argv[0] */
     std::string display_name() const {
@@ -146,8 +146,9 @@ struct output_group_t {
 struct file_stat_t {
     std::string path;
     int opens = 0;
-    int procs = 0;
     int errs = 0;
+    std::unordered_set<int> proc_tgids;
+    std::vector<int> event_indices;     /* indices into g_events (OPEN events) */
 };
 
 struct dir_stat_t {
@@ -184,14 +185,17 @@ enum {
 
 static std::vector<trace_event_t> g_events;
 static int g_next_event_id = 1;
-static std::vector<process_t> g_processes;
-static std::vector<std::string> g_raw_trace_lines;
+static std::unordered_map<int, process_t> g_proc_map;
+static std::unordered_map<std::string, file_stat_t> g_file_stats;
+static std::unordered_map<std::string, std::vector<int>> g_path_events; /* path → event indices */
+static FILE *g_save_fp = nullptr;       /* temp file for raw trace lines */
 static std::vector<input_cmd_t> g_inputs;
 static std::vector<ViewRow> g_lpane, g_rpane;
 static app_state_t g_state;
 static std::unique_ptr<Tui> g_tui;
 static int g_headless;
 static double g_base_ts;
+static bool g_tree_dirty;
 static std::unordered_set<std::string> g_proc_collapsed, g_file_collapsed,
                                        g_output_collapsed, g_dep_collapsed;
 
@@ -418,33 +422,21 @@ static int view_find_index(const std::vector<ViewRow> &v, const std::string &id)
 /* ── Process model ─────────────────────────────────────────────────── */
 
 static process_t *find_process(int tgid) {
-    for (auto &p : g_processes) if (p.tgid == tgid) return &p;
-    return nullptr;
-}
-
-static int process_index(int tgid) {
-    for (int i = 0; i < static_cast<int>(g_processes.size()); i++)
-        if (g_processes[i].tgid == tgid) return i;
-    return -1;
+    auto it = g_proc_map.find(tgid);
+    return it != g_proc_map.end() ? &it->second : nullptr;
 }
 
 static process_t &get_process(int tgid) {
-    for (auto &p : g_processes) if (p.tgid == tgid) return p;
-    auto &p = g_processes.emplace_back();
-    p.tgid = tgid;
-    return p;
-}
-
-static void proc_add_path(std::vector<std::string> &arr, const std::string &path) {
-    if (path.empty()) return;
-    for (const auto &s : arr) if (s == path) return;
-    arr.push_back(path);
+    auto [it, inserted] = g_proc_map.try_emplace(tgid);
+    if (inserted) { it->second.tgid = tgid; g_tree_dirty = true; }
+    return it->second;
 }
 
 /* ── Trace ingestion ───────────────────────────────────────────────── */
 
 static void append_raw_trace(const char *line) {
-    g_raw_trace_lines.emplace_back(line);
+    if (!g_save_fp) g_save_fp = std::tmpfile();
+    if (g_save_fp) { std::fputs(line, g_save_fp); std::fputc('\n', g_save_fp); }
 }
 
 static trace_event_t &append_event() {
@@ -531,7 +523,7 @@ static void ingest_trace_line(const char *line) {
     std::string kind = json_decode_string(sp);
     if (kind.empty()) return;
     append_raw_trace(line);
-    auto &ev = append_event();
+    auto &ev = g_events.emplace_back();
     if (kind == "CWD") ev.kind = EV_CWD;
     else if (kind == "EXEC") ev.kind = EV_EXEC;
     else if (kind == "OPEN") ev.kind = EV_OPEN;
@@ -540,6 +532,7 @@ static void ingest_trace_line(const char *line) {
     else if (kind == "STDERR") ev.kind = EV_STDERR;
     else { g_events.pop_back(); return; }
     ev.id = (ev.kind == EV_CWD) ? 0 : g_next_event_id++;
+    int event_idx = static_cast<int>(g_events.size()) - 1;
 
     if (json_get(line, "ts", sp)) ev.ts = span_to_double(sp, 0.0);
     if (json_get(line, "pid", sp)) ev.pid = span_to_int(sp, 0);
@@ -550,12 +543,22 @@ static void ingest_trace_line(const char *line) {
     if (g_base_ts == 0.0 || ev.ts < g_base_ts) g_base_ts = ev.ts;
 
     auto &proc = get_process(ev.tgid);
+    proc.event_indices.push_back(event_idx);
     if (!proc.has_start || ev.ts < proc.start_ts) { proc.start_ts = ev.ts; proc.has_start = 1; }
     if (!proc.has_end || ev.ts > proc.end_ts) { proc.end_ts = ev.ts; proc.has_end = 1; }
     if (ev.pid > 0 || proc.pid == 0) proc.pid = ev.pid;
-    if (ev.ppid > 0 || proc.ppid == 0) proc.ppid = ev.ppid;
     if (ev.nspid > 0 || proc.nspid == 0) proc.nspid = ev.nspid;
     if (ev.nstgid > 0 || proc.nstgid == 0) proc.nstgid = ev.nstgid;
+
+    /* Incremental parent-child linking */
+    int old_ppid = proc.ppid;
+    if (ev.ppid > 0 || proc.ppid == 0) proc.ppid = ev.ppid;
+    if (proc.ppid > 0 && old_ppid == 0 && proc.ppid != proc.tgid) {
+        auto pit = g_proc_map.find(proc.ppid);
+        if (pit != g_proc_map.end())
+            pit->second.children.push_back(ev.tgid);
+        g_tree_dirty = true;
+    }
 
     switch (ev.kind) {
     case EV_CWD:
@@ -580,8 +583,16 @@ static void ingest_trace_line(const char *line) {
         ev.resolved_path = resolve_path_dup(ev.path, proc.cwd);
         if (is_write_open(ev)) proc.has_write_open = 1;
         if (!ev.resolved_path.empty()) {
-            if (is_read_open(ev)) proc_add_path(proc.read_paths, ev.resolved_path);
-            if (is_write_open(ev)) proc_add_path(proc.write_paths, ev.resolved_path);
+            if (is_read_open(ev)) proc.read_paths.insert(ev.resolved_path);
+            if (is_write_open(ev)) proc.write_paths.insert(ev.resolved_path);
+            /* Incremental file stats */
+            auto &fs = g_file_stats[ev.resolved_path];
+            if (fs.path.empty()) fs.path = ev.resolved_path;
+            fs.opens++;
+            if (ev.err) fs.errs++;
+            fs.proc_tgids.insert(ev.tgid);
+            fs.event_indices.push_back(event_idx);
+            g_path_events[ev.resolved_path].push_back(event_idx);
         }
         break;
     }
@@ -683,44 +694,44 @@ static void ingest_file(const char *path) {
 
 /* ── Process tree ──────────────────────────────────────────────────── */
 
-static bool cmp_child_index(int ia, int ib) {
-    const auto &pa = g_processes[ia], &pb = g_processes[ib];
+static bool cmp_proc_tgid(int a, int b) {
+    auto *pa = find_process(a), *pb = find_process(b);
+    if (!pa || !pb) return a < b;
     if (g_state.sort_key == 1) {
-        if (pa.start_ts < pb.start_ts) return true;
-        if (pa.start_ts > pb.start_ts) return false;
+        if (pa->start_ts < pb->start_ts) return true;
+        if (pa->start_ts > pb->start_ts) return false;
     } else if (g_state.sort_key == 2) {
-        if (pa.end_ts < pb.end_ts) return true;
-        if (pa.end_ts > pb.end_ts) return false;
+        if (pa->end_ts < pb->end_ts) return true;
+        if (pa->end_ts > pb->end_ts) return false;
     }
-    return pa.tgid < pb.tgid;
+    return a < b;
 }
 
-static int compute_descendants(int idx) {
-    auto &p = g_processes[idx];
+static int compute_descendants(int tgid) {
+    auto *p = find_process(tgid);
+    if (!p) return 0;
     int total = 0;
-    for (int ci : p.children) total += 1 + compute_descendants(ci);
-    p.descendant_count = total;
+    for (int ct : p->children) total += 1 + compute_descendants(ct);
     return total;
 }
 
-static void finalize_process_tree() {
-    for (int i = 0; i < static_cast<int>(g_processes.size()); i++) {
-        g_processes[i].parent_index = process_index(g_processes[i].ppid);
-        g_processes[i].children.clear();
-        g_processes[i].descendant_count = 0;
+/*
+ * Rebuild parent→child links from ppid. Only runs when g_tree_dirty is set
+ * (i.e. a new process appeared whose parent was not yet in the map at link time).
+ * O(n) with map lookups, vs the old O(n²) linear-scan approach.
+ */
+static void rebuild_tree_if_dirty() {
+    if (!g_tree_dirty) return;
+    g_tree_dirty = false;
+    for (auto &[tgid, p] : g_proc_map) p.children.clear();
+    for (auto &[tgid, p] : g_proc_map) {
+        if (p.ppid > 0 && p.ppid != tgid) {
+            auto pit = g_proc_map.find(p.ppid);
+            if (pit != g_proc_map.end())
+                pit->second.children.push_back(tgid);
+        }
     }
-    for (int i = 0; i < static_cast<int>(g_processes.size()); i++) {
-        auto &p = g_processes[i];
-        if (p.parent_index >= 0)
-            g_processes[p.parent_index].children.push_back(i);
-    }
-    for (auto &p : g_processes)
-        if (p.children.size() > 1)
-            std::sort(p.children.begin(), p.children.end(), cmp_child_index);
-    for (int i = 0; i < static_cast<int>(g_processes.size()); i++)
-        if (g_processes[i].parent_index < 0) compute_descendants(i);
 }
-
 /* ── View building ─────────────────────────────────────────────────── */
 
 static bool proc_matches_search(const process_t &p) {
@@ -729,8 +740,8 @@ static bool proc_matches_search(const process_t &p) {
     if (!p.exe.empty() && p.exe.find(g_state.search) != std::string::npos) return true;
     for (const auto &a : p.argv)
         if (a.find(g_state.search) != std::string::npos) return true;
-    for (const auto &ev : g_events) {
-        if (ev.tgid != p.tgid) continue;
+    for (int ei : p.event_indices) {
+        auto &ev = g_events[ei];
         if ((ev.kind == EV_STDOUT || ev.kind == EV_STDERR) &&
             !ev.data.empty() && ev.data.find(g_state.search) != std::string::npos) return true;
     }
@@ -751,11 +762,12 @@ static bool proc_matches_filter(const process_t &p) {
     return true;
 }
 
-static bool proc_should_show(int idx) {
-    auto &p = g_processes[idx];
+static bool proc_should_show(int tgid) {
+    auto *p = find_process(tgid);
+    if (!p) return false;
     if (g_state.lp_filter == 0) return true;
-    if (proc_matches_filter(p)) return true;
-    for (int ci : p.children) if (proc_should_show(ci)) return true;
+    if (proc_matches_filter(*p)) return true;
+    for (int ct : p->children) if (proc_should_show(ct)) return true;
     return false;
 }
 
@@ -773,55 +785,62 @@ static const char *proc_style(const process_t &p) {
     return "normal";
 }
 
-static void build_proc_rows_rec(int idx, int depth) {
-    auto &p = g_processes[idx];
-    std::string id_str = std::to_string(p.tgid);
+static void build_proc_rows_rec(int tgid, int depth) {
+    auto *p = find_process(tgid);
+    if (!p) return;
+    std::string id_str = std::to_string(tgid);
     bool collapsed = g_proc_collapsed.contains(id_str);
-    auto name = p.display_name();
+    auto name = p->display_name();
     std::string marker;
-    if (p.exit_status == "exited")
-        marker = p.exit_code == 0 ? " ✓" : " ✗";
-    else if (p.exit_status == "signaled")
-        marker = sfmt(" ⚡%d", p.exit_signal);
-    std::string dur = format_duration(p.start_ts, p.end_ts, p.exit_status.empty());
+    if (p->exit_status == "exited")
+        marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
+    else if (p->exit_status == "signaled")
+        marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
+    std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
+    int desc_count = compute_descendants(tgid);
     std::string prefix = g_state.grouped
-        ? sfmt("%*s%s", depth * 4, "", p.children.empty() ? "  " : (collapsed ? "▶ " : "▼ "))
+        ? sfmt("%*s%s", depth * 4, "", p->children.empty() ? "  " : (collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "))
         : std::string();
-    std::string extra = p.descendant_count > 0 ? sfmt(" (%d)", p.descendant_count) : std::string();
-    std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), p.tgid, name.c_str(),
+    std::string extra = desc_count > 0 ? sfmt(" (%d)", desc_count) : std::string();
+    std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), tgid, name.c_str(),
                             marker.c_str(), extra.c_str(), dur.empty() ? "" : "  ", dur.c_str());
-    std::string parent_id = p.parent_index >= 0 ? std::to_string(g_processes[p.parent_index].tgid) : std::string();
-    view_add_row(g_lpane, id_str, proc_style(p), parent_id, text, 0, id_str, !p.children.empty());
+    std::string parent_id = (p->ppid > 0 && find_process(p->ppid)) ? std::to_string(p->ppid) : std::string();
+    view_add_row(g_lpane, id_str, proc_style(*p), parent_id, text, 0, id_str, !p->children.empty());
     if (g_state.grouped && collapsed) return;
-    for (int ci : p.children)
-        if (proc_should_show(ci))
-            build_proc_rows_rec(ci, g_state.grouped ? depth + 1 : 0);
+    auto sorted_children = p->children;
+    if (sorted_children.size() > 1) std::sort(sorted_children.begin(), sorted_children.end(), cmp_proc_tgid);
+    for (int ct : sorted_children)
+        if (proc_should_show(ct))
+            build_proc_rows_rec(ct, g_state.grouped ? depth + 1 : 0);
 }
 
 static void build_lpane_process() {
+    rebuild_tree_if_dirty();
     std::vector<int> roots;
-    for (int i = 0; i < static_cast<int>(g_processes.size()); i++)
-        if (g_processes[i].parent_index < 0 && proc_should_show(i)) roots.push_back(i);
-    if (roots.size() > 1) std::sort(roots.begin(), roots.end(), cmp_child_index);
+    for (auto &[tgid, p] : g_proc_map)
+        if ((p.ppid == 0 || !find_process(p.ppid)) && proc_should_show(tgid))
+            roots.push_back(tgid);
+    if (roots.size() > 1) std::sort(roots.begin(), roots.end(), cmp_proc_tgid);
     if (g_state.grouped) {
-        for (int ri : roots) build_proc_rows_rec(ri, 0);
+        for (int rt : roots) build_proc_rows_rec(rt, 0);
     } else {
         std::vector<int> all;
-        for (int i = 0; i < static_cast<int>(g_processes.size()); i++)
-            if (proc_should_show(i)) all.push_back(i);
-        if (all.size() > 1) std::sort(all.begin(), all.end(), cmp_child_index);
-        for (int ai : all) {
-            auto &p = g_processes[ai];
-            std::string id_str = std::to_string(p.tgid);
-            auto name = p.display_name();
+        for (auto &[tgid, p] : g_proc_map)
+            if (proc_should_show(tgid)) all.push_back(tgid);
+        if (all.size() > 1) std::sort(all.begin(), all.end(), cmp_proc_tgid);
+        for (int at : all) {
+            auto *p = find_process(at);
+            if (!p) continue;
+            std::string id_str = std::to_string(at);
+            auto name = p->display_name();
             std::string marker;
-            if (p.exit_status == "exited")
-                marker = p.exit_code == 0 ? " ✓" : " ✗";
-            else if (p.exit_status == "signaled")
-                marker = sfmt(" ⚡%d", p.exit_signal);
-            std::string dur = format_duration(p.start_ts, p.end_ts, p.exit_status.empty());
-            std::string text = sfmt("[%d] %s%s%s%s", p.tgid, name.c_str(), marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
-            view_add_row(g_lpane, id_str, proc_style(p), "", text, 0, id_str, false);
+            if (p->exit_status == "exited")
+                marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
+            else if (p->exit_status == "signaled")
+                marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
+            std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
+            std::string text = sfmt("[%d] %s%s%s%s", at, name.c_str(), marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
+            view_add_row(g_lpane, id_str, proc_style(*p), "", text, 0, id_str, false);
         }
     }
 }
@@ -830,25 +849,15 @@ static void build_lpane_process() {
 
 static std::vector<file_stat_t> build_file_stats() {
     std::vector<file_stat_t> fs;
-    for (const auto &ev : g_events) {
-        if (ev.kind != EV_OPEN || ev.resolved_path.empty()) continue;
-        auto it = std::find_if(fs.begin(), fs.end(),
-            [&](const file_stat_t &f) { return f.path == ev.resolved_path; });
-        if (it == fs.end()) {
-            fs.push_back({ev.resolved_path, 0, 0, 0});
-            it = fs.end() - 1;
-        }
-        it->opens++;
-        if (ev.err) it->errs++;
-    }
-    for (auto &f : fs) {
-        std::vector<int> tgids;
-        for (const auto &ev : g_events) {
-            if (ev.kind != EV_OPEN || ev.resolved_path != f.path) continue;
-            if (std::find(tgids.begin(), tgids.end(), ev.tgid) == tgids.end())
-                tgids.push_back(ev.tgid);
-        }
-        f.procs = static_cast<int>(tgids.size());
+    fs.reserve(g_file_stats.size());
+    for (auto &[path, stat] : g_file_stats) {
+        file_stat_t f;
+        f.path = stat.path;
+        f.opens = stat.opens;
+        f.errs = stat.errs;
+        f.proc_tgids = stat.proc_tgids;
+        f.event_indices = stat.event_indices;
+        fs.push_back(std::move(f));
     }
     return fs;
 }
@@ -887,7 +896,7 @@ static std::vector<dir_stat_t> build_dir_stats(const std::vector<file_stat_t> &f
             size_t m = d.path.size();
             if (f.path.compare(0, m, d.path) == 0 && ((f.path.size() > m && f.path[m] == '/') || (m == 1 && f.path[0] == '/'))) {
                 d.opens += f.opens;
-                d.procs += f.procs;
+                d.procs += static_cast<int>(f.proc_tgids.size());
                 d.errs += f.errs;
             }
         }
@@ -936,7 +945,7 @@ static void add_file_tree_rec(const std::string &dir, std::vector<dir_stat_t> &d
         std::string errs_text = fp->errs ? sfmt(", %d errs", fp->errs) : std::string();
         std::string text = sfmt("%*s%s  [%d opens, %d procs%s]", depth * 2, "",
                                 fp->path[0] == '/' ? path_leaf(fp->path.c_str()) : fp->path.c_str(),
-                                fp->opens, fp->procs, errs_text.c_str());
+                                fp->opens, static_cast<int>(fp->proc_tgids.size()), errs_text.c_str());
         auto slash = fp->path.rfind('/');
         std::string parent;
         if (slash != std::string::npos)
@@ -959,7 +968,7 @@ static void build_lpane_files() {
             if (!fp) continue;
             std::string errs_text = fp->errs ? sfmt(", %d errs", fp->errs) : std::string();
             std::string text = sfmt("%s  [%d opens, %d procs%s]", fp->path.c_str(),
-                                    fp->opens, fp->procs, errs_text.c_str());
+                                    fp->opens, static_cast<int>(fp->proc_tgids.size()), errs_text.c_str());
             view_add_row(g_lpane, fp->path,
                          file_matches_search(fp->path) ? "search" : (fp->errs ? "error" : "normal"),
                          "", text, 1, fp->path, 0);
@@ -971,7 +980,7 @@ static void build_lpane_files() {
             if (!f.path.empty() && f.path[0] == '/') continue;
             std::string errs_text = f.errs ? sfmt(", %d errs", f.errs) : std::string();
             std::string text = sfmt("  %s  [%d opens, %d procs%s]", f.path.c_str(),
-                                    f.opens, f.procs, errs_text.c_str());
+                                    f.opens, static_cast<int>(f.proc_tgids.size()), errs_text.c_str());
             view_add_row(g_lpane, f.path,
                          file_matches_search(f.path) ? "search" : (f.errs ? "error" : "normal"),
                          "", text, 1, f.path, 0);
@@ -982,22 +991,23 @@ static void build_lpane_files() {
 /* ── Output view ───────────────────────────────────────────────────── */
 
 static std::vector<output_group_t> build_output_groups() {
-    std::vector<output_group_t> groups;
+    std::unordered_map<int, output_group_t> gmap;
+    std::vector<int> order;
     for (int i = 0; i < static_cast<int>(g_events.size()); i++) {
         auto &ev = g_events[i];
         if (ev.kind != EV_STDOUT && ev.kind != EV_STDERR) continue;
-        auto it = std::find_if(groups.begin(), groups.end(),
-            [&](const output_group_t &g) { return g.tgid == ev.tgid; });
-        if (it == groups.end()) {
-            output_group_t og;
-            og.tgid = ev.tgid;
+        auto [it, inserted] = gmap.try_emplace(ev.tgid);
+        if (inserted) {
+            it->second.tgid = ev.tgid;
             auto *p = find_process(ev.tgid);
-            og.name = p ? p->display_name() : "";
-            groups.push_back(std::move(og));
-            it = groups.end() - 1;
+            it->second.name = p ? p->display_name() : "";
+            order.push_back(ev.tgid);
         }
-        it->event_indices.push_back(i);
+        it->second.event_indices.push_back(i);
     }
+    std::vector<output_group_t> groups;
+    groups.reserve(order.size());
+    for (int tgid : order) groups.push_back(std::move(gmap[tgid]));
     return groups;
 }
 
@@ -1036,14 +1046,18 @@ static void build_lpane_output() {
 /* ── Deps view ─────────────────────────────────────────────────────── */
 
 static std::vector<file_edge_t> build_file_edges() {
+    struct PairHash { size_t operator()(const std::pair<std::string,std::string> &p) const {
+        size_t h1 = std::hash<std::string>{}(p.first);
+        size_t h2 = std::hash<std::string>{}(p.second);
+        return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+    }};
+    std::unordered_set<std::pair<std::string,std::string>, PairHash> seen;
     std::vector<file_edge_t> edges;
-    for (auto &p : g_processes) {
+    for (auto &[tgid, p] : g_proc_map) {
         for (const auto &rp : p.read_paths) {
             for (const auto &wp : p.write_paths) {
-                bool seen = false;
-                for (const auto &e : edges)
-                    if (e.src == rp && e.dst == wp) { seen = true; break; }
-                if (!seen) edges.push_back({rp, wp});
+                if (seen.emplace(rp, wp).second)
+                    edges.push_back({rp, wp});
             }
         }
     }
@@ -1054,23 +1068,24 @@ static void build_lpane_deps(int reverse) {
     const std::string &start = g_state.cursor_id;
     if (start.empty()) return;
     auto edges = build_file_edges();
-    std::vector<std::string> queue, seen;
+    std::vector<std::string> queue;
+    std::unordered_set<std::string> seen;
     int qh = 0;
     queue.push_back(start);
     while (qh < static_cast<int>(queue.size())) {
         std::string cur = queue[qh++];
-        if (std::find(seen.begin(), seen.end(), cur) != seen.end()) continue;
-        seen.push_back(cur);
+        if (!seen.insert(cur).second) continue;
         for (const auto &e : edges) {
             std::string next;
             if (reverse && e.dst == cur) next = e.src;
             else if (!reverse && e.src == cur) next = e.dst;
-            if (!next.empty() && std::find(seen.begin(), seen.end(), next) == seen.end())
+            if (!next.empty() && !seen.count(next))
                 queue.push_back(next);
         }
     }
-    std::sort(seen.begin(), seen.end());
-    for (const auto &s : seen) {
+    std::vector<std::string> sorted(seen.begin(), seen.end());
+    std::sort(sorted.begin(), sorted.end());
+    for (const auto &s : sorted) {
         int mode = reverse ? 4 : 3;
         view_add_row(g_lpane, s, file_matches_search(s) ? "search" : "normal", "", s, mode, s, 0);
     }
@@ -1080,52 +1095,50 @@ static void build_lpane_dep_cmds(int reverse) {
     const std::string &start = g_state.cursor_id;
     if (start.empty()) return;
     auto edges = build_file_edges();
-    /* Walk the file dependency chain to collect all reachable files */
-    std::vector<std::string> queue, seen;
+    std::vector<std::string> queue;
+    std::unordered_set<std::string> seen;
     int qh = 0;
     queue.push_back(start);
     while (qh < static_cast<int>(queue.size())) {
         std::string cur = queue[qh++];
-        if (std::find(seen.begin(), seen.end(), cur) != seen.end()) continue;
-        seen.push_back(cur);
+        if (!seen.insert(cur).second) continue;
         for (const auto &e : edges) {
             std::string next;
             if (reverse && e.dst == cur) next = e.src;
             else if (!reverse && e.src == cur) next = e.dst;
-            if (!next.empty() && std::find(seen.begin(), seen.end(), next) == seen.end())
+            if (!next.empty() && !seen.count(next))
                 queue.push_back(next);
         }
     }
     /* Collect processes that touched any file in the chain */
-    std::vector<int> pindices;
-    for (int i = 0; i < static_cast<int>(g_processes.size()); i++) {
-        auto &p = g_processes[i];
+    std::vector<int> ptgids;
+    for (auto &[tgid, p] : g_proc_map) {
         bool involved = false;
         for (const auto &rp : p.read_paths)
-            if (!involved && std::find(seen.begin(), seen.end(), rp) != seen.end())
-                involved = true;
+            if (!involved && seen.count(rp)) involved = true;
         for (const auto &wp : p.write_paths)
-            if (!involved && std::find(seen.begin(), seen.end(), wp) != seen.end())
-                involved = true;
-        if (involved) pindices.push_back(i);
+            if (!involved && seen.count(wp)) involved = true;
+        if (involved) ptgids.push_back(tgid);
     }
-    /* Sort reverse chronologically (latest end_ts first) */
-    std::sort(pindices.begin(), pindices.end(), [](int a, int b) {
-        return g_processes[a].end_ts > g_processes[b].end_ts;
+    std::sort(ptgids.begin(), ptgids.end(), [](int a, int b) {
+        auto *pa = find_process(a), *pb = find_process(b);
+        if (!pa || !pb) return a < b;
+        return pa->end_ts > pb->end_ts;
     });
-    for (int pi : pindices) {
-        auto &p = g_processes[pi];
-        std::string id_str = std::to_string(p.tgid);
-        auto name = p.display_name();
+    for (int pt : ptgids) {
+        auto *p = find_process(pt);
+        if (!p) continue;
+        std::string id_str = std::to_string(pt);
+        auto name = p->display_name();
         std::string marker;
-        if (p.exit_status == "exited")
-            marker = p.exit_code == 0 ? " ✓" : " ✗";
-        else if (p.exit_status == "signaled")
-            marker = sfmt(" ⚡%d", p.exit_signal);
-        std::string dur = format_duration(p.start_ts, p.end_ts, p.exit_status.empty());
-        std::string text = sfmt("[%d] %s%s%s%s", p.tgid, name.c_str(), marker.c_str(),
+        if (p->exit_status == "exited")
+            marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
+        else if (p->exit_status == "signaled")
+            marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
+        std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
+        std::string text = sfmt("[%d] %s%s%s%s", pt, name.c_str(), marker.c_str(),
                                 dur.empty() ? "" : "  ", dur.c_str());
-        view_add_row(g_lpane, id_str, proc_style(p), "", text, 0, id_str, false);
+        view_add_row(g_lpane, id_str, proc_style(*p), "", text, 0, id_str, false);
     }
 }
 
@@ -1155,7 +1168,8 @@ static bool event_allowed(const trace_event_t &ev) {
 static void build_rpane_process(const std::string &id) {
     auto *p = find_process(id.empty() ? 0 : std::atoi(id.c_str()));
     if (!p) return;
-    view_add_row(g_rpane, "hdr", "heading", "", "─── Process ───", -1, "", 0);
+    rebuild_tree_if_dirty();
+    view_add_row(g_rpane, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", 0);
     view_add_row(g_rpane, "tgid", "normal", "", sfmt("TGID:  %d", p->tgid), -1, "", 0);
     view_add_row(g_rpane, "ppid", "normal", "", sfmt("PPID:  %d", p->ppid), -1, "", 0);
     view_add_row(g_rpane, "exe", "normal", "", sfmt("EXE:   %s", p->exe.c_str()), -1, "", 0);
@@ -1167,24 +1181,29 @@ static void build_rpane_process(const std::string &id) {
                      (p->exit_status == "exited" && p->exit_code == 0) ? "green" : "error",
                      "", text, -1, "", 0);
     }
-    if (p->descendant_count > 0) {
-        view_add_row(g_rpane, "kids_hdr", "heading", "", sfmt("Children (%d)", p->descendant_count), -1, "", 0);
-        for (int ci : p->children) {
-            auto &c = g_processes[ci];
-            std::string cid = sfmt("child_%d", c.tgid);
-            std::string text = sfmt("[%d] %s", c.tgid, c.display_name().c_str());
-            view_add_row(g_rpane, cid, "normal", "", text, 0, std::to_string(c.tgid), 0);
+    int desc_count = compute_descendants(p->tgid);
+    if (desc_count > 0) {
+        view_add_row(g_rpane, "kids_hdr", "heading", "", sfmt("Children (%d)", desc_count), -1, "", 0);
+        auto sorted_ch = p->children;
+        if (sorted_ch.size() > 1) std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
+        for (int ct : sorted_ch) {
+            auto *c = find_process(ct);
+            if (!c) continue;
+            std::string cid = sfmt("child_%d", ct);
+            std::string text = sfmt("[%d] %s", ct, c->display_name().c_str());
+            view_add_row(g_rpane, cid, "normal", "", text, 0, std::to_string(ct), 0);
         }
     }
     if (!p->argv.empty()) {
-        view_add_row(g_rpane, "argv_hdr", "heading", "", "─── Argv ───", -1, "", 0);
+        view_add_row(g_rpane, "argv_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Argv \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", 0);
         for (int i = 0; i < static_cast<int>(p->argv.size()); i++)
             view_add_row(g_rpane, sfmt("argv_%d", i), "normal", "", sfmt("[%d] %s", i, p->argv[i].c_str()), -1, "", 0);
     }
-    view_add_row(g_rpane, "evt_hdr", "heading", "", "─── Events ───", -1, "", 0);
+    view_add_row(g_rpane, "evt_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Events \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", 0);
     double prev_ts = -1;
-    for (auto &ev : g_events) {
-        if (ev.tgid != p->tgid || !event_allowed(ev)) continue;
+    for (int ei : p->event_indices) {
+        auto &ev = g_events[ei];
+        if (!event_allowed(ev)) continue;
         char tsbuf[64];
         format_ts(tsbuf, sizeof tsbuf, ev.ts, prev_ts);
         prev_ts = ev.ts;
@@ -1212,30 +1231,28 @@ static void build_rpane_process(const std::string &id) {
 
 static void build_rpane_file(const std::string &id) {
     if (id.empty()) return;
-    int opens = 0, errs = 0;
-    std::vector<int> ptgids;
-    view_add_row(g_rpane, "hdr", "heading", "", "─── File ───", -1, "", 0);
+    view_add_row(g_rpane, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 File \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", 0);
     view_add_row(g_rpane, "path", "normal", "", id, -1, "", 0);
-    for (const auto &ev : g_events) {
-        if (ev.kind != EV_OPEN || ev.resolved_path != id) continue;
-        opens++;
-        if (ev.err) errs++;
-        if (std::find(ptgids.begin(), ptgids.end(), ev.tgid) == ptgids.end())
-            ptgids.push_back(ev.tgid);
-    }
+    auto sit = g_file_stats.find(id);
+    int opens = sit != g_file_stats.end() ? sit->second.opens : 0;
+    int errs = sit != g_file_stats.end() ? sit->second.errs : 0;
+    int nprocs = sit != g_file_stats.end() ? static_cast<int>(sit->second.proc_tgids.size()) : 0;
     view_add_row(g_rpane, "opens", "normal", "", sfmt("Opens: %d", opens), -1, "", 0);
-    view_add_row(g_rpane, "procs", "normal", "", sfmt("Procs: %d", static_cast<int>(ptgids.size())), -1, "", 0);
+    view_add_row(g_rpane, "procs", "normal", "", sfmt("Procs: %d", nprocs), -1, "", 0);
     view_add_row(g_rpane, "errs", errs ? "error" : "normal", "", sfmt("Errors: %d", errs), -1, "", 0);
-    for (const auto &ev : g_events) {
-        if (ev.kind != EV_OPEN || ev.resolved_path != id) continue;
-        auto *p = find_process(ev.tgid);
-        std::string err_text = ev.err ? sfmt(" err=%d", ev.err) : std::string();
-        std::string text = sfmt("PID %d %s [%s]%s", ev.tgid,
-            p ? p->display_name().c_str() : "",
-            ev.flags_text.c_str(), err_text.c_str());
-        view_add_row(g_rpane, sfmt("open_%d", ev.id),
-                     ev.err ? "error" : (ev.kind == EV_STDERR ? "error" : "normal"),
-                     "", text, 0, std::to_string(ev.tgid), 0);
+    auto pit = g_path_events.find(id);
+    if (pit != g_path_events.end()) {
+        for (int ei : pit->second) {
+            auto &ev = g_events[ei];
+            auto *p = find_process(ev.tgid);
+            std::string err_text = ev.err ? sfmt(" err=%d", ev.err) : std::string();
+            std::string text = sfmt("PID %d %s [%s]%s", ev.tgid,
+                p ? p->display_name().c_str() : "",
+                ev.flags_text.c_str(), err_text.c_str());
+            view_add_row(g_rpane, sfmt("open_%d", ev.id),
+                         ev.err ? "error" : (ev.kind == EV_STDERR ? "error" : "normal"),
+                         "", text, 0, std::to_string(ev.tgid), 0);
+        }
     }
 }
 
@@ -1571,7 +1588,12 @@ static int on_key_cb(Tui &tui, int key, const char *panel, int cursor, const cha
         if (tui.line_edit("Save to: ", fname, sizeof fname) && fname[0]) {
             FILE *f = std::fopen(fname, "w");
             if (f) {
-                for (const auto &line : g_raw_trace_lines) std::fprintf(f, "%s\n", line.c_str());
+            if (g_save_fp) {
+                std::rewind(g_save_fp);
+                char cbuf[4096]; size_t nr;
+                while ((nr = std::fread(cbuf, 1, sizeof cbuf, g_save_fp)) > 0)
+                    std::fwrite(cbuf, 1, nr, f);
+            }
                 std::fclose(f);
             }
         }
@@ -1617,16 +1639,19 @@ static void process_input_cmd(const input_cmd_t &cmd) {
 }
 
 static void save_to_file(const char *path) {
-    FILE *f = std::fopen(path, "w");
-    if (!f) { std::fprintf(stderr, "tv: cannot create %s\n", path); return; }
-    for (const auto &line : g_raw_trace_lines) std::fprintf(f, "%s\n", line.c_str());
-    std::fclose(f);
+    if (!g_save_fp) return;
+    FILE *out = std::fopen(path, "w");
+    if (!out) { std::fprintf(stderr, "tv: cannot create %s\n", path); return; }
+    std::rewind(g_save_fp);
+    char buf[4096]; size_t nr;
+    while ((nr = std::fread(buf, 1, sizeof buf, g_save_fp)) > 0)
+        std::fwrite(buf, 1, nr, out);
+    std::fclose(out);
 }
 
 /* ── Live trace ────────────────────────────────────────────────────── */
 
 static void on_live_batch() {
-    finalize_process_tree();
     apply_state_change();
 }
 
@@ -1664,7 +1689,6 @@ static void on_trace_fd_cb(Tui &tui, int fd) {
         t_pending_live_rows += did;
         if (t_pending_live_rows >= LIVE_TRACE_BATCH_ROWS || now < 0 ||
             (t_live_batch_start_ms > 0 && now - t_live_batch_start_ms >= LIVE_TRACE_BATCH_MS)) {
-            finalize_process_tree();
             apply_state_change();
             t_pending_live_rows = 0;
             t_live_batch_start_ms = 0;
@@ -1679,8 +1703,10 @@ static void free_all() {
     g_lpane.clear();
     g_rpane.clear();
     g_events.clear();
-    g_processes.clear();
-    g_raw_trace_lines.clear();
+    g_proc_map.clear();
+    g_file_stats.clear();
+    g_path_events.clear();
+    if (g_save_fp) { std::fclose(g_save_fp); g_save_fp = nullptr; }
     g_inputs.clear();
     g_proc_collapsed.clear();
     g_file_collapsed.clear();
@@ -1726,7 +1752,6 @@ int main(int argc, char **argv) {
 
     if (load_mode) ingest_file(load_file);
     if (trace_file[0]) ingest_file(trace_file);
-    finalize_process_tree();
     if (save_file[0]) save_to_file(save_file);
 
     if (cmd) {
