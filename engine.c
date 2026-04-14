@@ -651,7 +651,7 @@ void tui_set_layout(tui_t *tui, tui_box_t *root) {
                 tui->npanels++;
             }
         } else {
-            for (int i = 0; i < b->nchildren && top < 256; i++) stack[top++].b = b->children[i];
+            for (int i = b->nchildren - 1; i >= 0 && top < 256; i--) stack[top++].b = b->children[i];
         }
     }
 }
