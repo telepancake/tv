@@ -54,7 +54,10 @@ f.close()
 `tv --uproctrace -o trace.jsonl.zst -- ...` writes zstd-compressed traces when the
 output filename ends in `.zst`, and `tv --trace trace.jsonl.zst` reads them back
 directly. Pass `--no-env` to `tv --uproctrace`, `tv -- ...`, or `sudtrace` to omit
-environment variables from emitted `EXEC` events.
+environment variables from emitted `EXEC` events. `make sudtrace` now builds
+freestanding static `sud32` and `sud64` helpers as well as the native `sudtrace`
+launcher, which prepends the matching helper automatically for static 32-bit and
+64-bit executables.
 
 ---
 

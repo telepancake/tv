@@ -35,6 +35,7 @@ unload:
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f sudtrace sud32 sud64
 
 install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
@@ -42,6 +43,10 @@ install:
 
 CFLAGS := -O2 -flto=auto
 TV_LIBS := -lm -pthread -lzstd
+SUD_COMMON_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer
+SUD_COMMON_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
+SUD_COMMON_SRCS := sudtrace.c sudmini.c
+SUD_NATIVE := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
 gen_sql_h: gen_sql_h.c
 	cc -O2 -o gen_sql_h gen_sql_h.c
@@ -57,6 +62,14 @@ fv: fv.c engine.c engine.h
 
 sudtrace: sudtrace.c sudtrace.lds
 	cc -O2 -fno-stack-protector -static -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sudtrace sudtrace.c -lm
+sud64: $(SUD_COMMON_SRCS) sudtrace.lds
+	cc -m64 $(SUD_COMMON_CFLAGS) $(SUD_COMMON_LDFLAGS) -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sud64 $(SUD_COMMON_SRCS) -lgcc
+
+sud32: $(SUD_COMMON_SRCS) sudtrace.lds
+	cc -m32 $(SUD_COMMON_CFLAGS) $(SUD_COMMON_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_COMMON_SRCS) -lgcc
+
+sudtrace: sud32 sud64
+	cp $(SUD_NATIVE) sudtrace
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv

@@ -53,6 +53,22 @@
 #include <linux/prctl.h>
 #include <elf.h>
 
+#if defined(__x86_64__)
+#define SUD_NATIVE_ELF_CLASS ELFCLASS64
+#define SUD_VARIANT_NAME "sud64"
+typedef Elf64_Ehdr sud_elf_ehdr_t;
+typedef Elf64_Phdr sud_elf_phdr_t;
+typedef Elf64_auxv_t sud_auxv_t;
+#elif defined(__i386__)
+#define SUD_NATIVE_ELF_CLASS ELFCLASS32
+#define SUD_VARIANT_NAME "sud32"
+typedef Elf32_Ehdr sud_elf_ehdr_t;
+typedef Elf32_Phdr sud_elf_phdr_t;
+typedef Elf32_auxv_t sud_auxv_t;
+#else
+#error Unsupported architecture
+#endif
+
 /* ================================================================
  * SUD constants (may not be in older headers)
  * ================================================================ */
@@ -81,6 +97,12 @@
 
 #define STR_VALUE(x) #x
 #define STR(x) STR_VALUE(x)
+
+#if defined(__i386__)
+typedef unsigned long long sud_sigset_word_t;
+#else
+typedef unsigned long sud_sigset_word_t;
+#endif
 
 /* ================================================================
  * Linker-provided symbols marking sudtrace's own address range.
@@ -158,6 +180,7 @@ static volatile unsigned char *g_sud_selector_ptr = &sud_selector_storage;
 static inline long raw_syscall6(long nr, long a0, long a1, long a2,
                                 long a3, long a4, long a5)
 {
+#if defined(__x86_64__)
     long ret;
     register long r10 __asm__("r10") = a3;
     register long r8  __asm__("r8")  = a4;
@@ -170,12 +193,28 @@ static inline long raw_syscall6(long nr, long a0, long a1, long a2,
         : "rcx", "r11", "memory"  /* syscall clobbers rcx (saves RIP) and r11 (saves RFLAGS) */
     );
     return ret;
+#else
+    long ret;
+    __asm__ volatile(
+        "push %%ebp\n\t"
+        "mov %[a5], %%ebp\n\t"
+        "int $0x80\n\t"
+        "pop %%ebp"
+        : "=a"(ret)
+        : "a"(nr), "b"(a0), "c"(a1), "d"(a2), "S"(a3), "D"(a4),
+          [a5] "rm"(a5)
+        : "memory"
+    );
+    return ret;
+#endif
 }
 
 void sud_rt_sigreturn_restorer(void);
 
+#if defined(__x86_64__)
 __asm__(
     "    .text\n"
+    "    .globl sud_rt_sigreturn_restorer\n"
     "    .type sud_rt_sigreturn_restorer, @function\n"
     "sud_rt_sigreturn_restorer:\n"
     "    mov  $" STR(SYS_rt_sigreturn) ", %eax\n"
@@ -183,6 +222,18 @@ __asm__(
     "    hlt\n"
     "    .size sud_rt_sigreturn_restorer, .-sud_rt_sigreturn_restorer\n"
 );
+#else
+__asm__(
+    "    .text\n"
+    "    .globl sud_rt_sigreturn_restorer\n"
+    "    .type sud_rt_sigreturn_restorer, @function\n"
+    "sud_rt_sigreturn_restorer:\n"
+    "    mov  $" STR(SYS_rt_sigreturn) ", %eax\n"
+    "    int  $0x80\n"
+    "    hlt\n"
+    "    .size sud_rt_sigreturn_restorer, .-sud_rt_sigreturn_restorer\n"
+);
+#endif
 
 /* ================================================================
  * Raw clone3/clone — special assembly for thread-creating syscalls.
@@ -214,6 +265,7 @@ __asm__(
  *   RCX=152 RSP=160 RIP=168
  * ================================================================ */
 
+#if defined(__x86_64__)
 /*
  * clone3_raw(clone_args, size, ucontext_ptr)
  *   rdi = clone_args pointer (arg0)
@@ -429,6 +481,99 @@ _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RBX]) == 128
 _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RDX]) == 136, "RDX offset");
 _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RAX]) == 144, "RAX offset");
 _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_RIP]) == 168, "RIP offset");
+#else
+volatile ucontext_t *g_clone_uc_i386;
+volatile int g_clone_sync_i386;
+static volatile int g_clone_lock_i386;
+
+static long clone3_raw(long clone_args, long size, ucontext_t *uc_ptr)
+{
+    (void)clone_args;
+    (void)size;
+    (void)uc_ptr;
+    return -ENOSYS;
+}
+
+long clone_raw_impl(long flags, long stack, long parent_tid,
+                    long tls, long child_tid);
+
+__asm__(
+    "    .text\n"
+    "    .globl clone_raw_impl\n"
+    "    .type clone_raw_impl, @function\n"
+    "clone_raw_impl:\n"
+    "    push %ebp\n"
+    "    mov  %esp, %ebp\n"
+    "    push %edi\n"
+    "    push %esi\n"
+    "    push %ebx\n"
+    "    mov  $120, %eax\n"
+    "    mov  8(%ebp), %ebx\n"
+    "    mov  12(%ebp), %ecx\n"
+    "    mov  16(%ebp), %edx\n"
+    "    mov  20(%ebp), %esi\n"
+    "    mov  24(%ebp), %edi\n"
+    "    int  $0x80\n"
+    "    test %eax, %eax\n"
+    "    jnz  .Lcl_i386_parent\n"
+    "    mov  g_clone_uc_i386, %ebp\n"
+    "    mov  76(%ebp), %eax\n"
+    "    push %eax\n"
+    "    mov  56(%ebp), %eax\n"
+    "    push %eax\n"
+    "    mov  52(%ebp), %eax\n"
+    "    push %eax\n"
+    "    mov  44(%ebp), %eax\n"
+    "    push %eax\n"
+    "    mov  40(%ebp), %eax\n"
+    "    push %eax\n"
+    "    mov  36(%ebp), %eax\n"
+    "    push %eax\n"
+    "    movl $1, g_clone_sync_i386\n"
+    "    call prepare_child_sud\n"
+    "    pop  %edi\n"
+    "    pop  %esi\n"
+    "    pop  %ebp\n"
+    "    pop  %ebx\n"
+    "    pop  %edx\n"
+    "    pop  %ecx\n"
+    "    xor  %eax, %eax\n"
+    "    jmp  *%ecx\n"
+    ".Lcl_i386_parent:\n"
+    "    pop  %ebx\n"
+    "    pop  %esi\n"
+    "    pop  %edi\n"
+    "    pop  %ebp\n"
+    "    ret\n"
+    "    .size clone_raw_impl, .-clone_raw_impl\n"
+);
+
+static long clone_raw(long flags, long stack, long parent_tid,
+                      long child_tid, long tls, ucontext_t *uc_ptr)
+{
+    while (__sync_lock_test_and_set(&g_clone_lock_i386, 1))
+        __asm__ volatile("pause");
+    g_clone_uc_i386 = uc_ptr;
+    g_clone_sync_i386 = 0;
+    long ret = clone_raw_impl(flags, stack, parent_tid, tls, child_tid);
+    if (ret > 0) {
+        while (!g_clone_sync_i386)
+            __asm__ volatile("pause");
+    }
+    __sync_lock_release(&g_clone_lock_i386);
+    return ret;
+}
+
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EDI]) == 36, "EDI offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_ESI]) == 40, "ESI offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EBP]) == 44, "EBP offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_ESP]) == 48, "ESP offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EBX]) == 52, "EBX offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EDX]) == 56, "EDX offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_ECX]) == 60, "ECX offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EAX]) == 64, "EAX offset");
+_Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EIP]) == 76, "EIP offset");
+#endif
 
 /* ================================================================
  * Raw syscall convenience wrappers.
@@ -479,14 +624,25 @@ static inline ssize_t raw_readlink(const char *path, char *buf, size_t bufsz)
 static inline int raw_fstatat(int dirfd, const char *path, struct stat *st,
                               int flags)
 {
+#ifdef SYS_newfstatat
     return (int)raw_syscall6(SYS_newfstatat, dirfd, (long)path, (long)st,
                               flags, 0, 0);
+#else
+    return (int)raw_syscall6(SYS_fstatat64, dirfd, (long)path, (long)st,
+                              flags, 0, 0);
+#endif
 }
 
 static inline ssize_t raw_pread(int fd, void *buf, size_t count, off_t offset)
 {
+#if defined(__x86_64__)
     return (ssize_t)raw_syscall6(SYS_pread64, fd, (long)buf, count,
                                   offset, 0, 0);
+#else
+    unsigned long long off = (unsigned long long)offset;
+    return (ssize_t)raw_syscall6(SYS_pread64, fd, (long)buf, count,
+                                  (uint32_t)off, (uint32_t)(off >> 32), 0);
+#endif
 }
 
 static inline pid_t raw_gettid(void)
@@ -512,7 +668,11 @@ static inline int raw_access(const char *path, int mode)
 
 static inline long raw_getdents64(int fd, void *buf, size_t count)
 {
+#ifdef SYS_getdents64
     return raw_syscall6(SYS_getdents64, fd, (long)buf, count, 0, 0, 0);
+#else
+    return raw_syscall6(SYS_getdents, fd, (long)buf, count, 0, 0, 0);
+#endif
 }
 
 /* ================================================================
@@ -661,6 +821,8 @@ static int g_out_fd = -1;           /* fd for JSONL output */
 static struct stat g_creator_stdout_st;
 static int g_creator_stdout_valid;
 static char g_self_exe[PATH_MAX];   /* path to sudtrace binary itself */
+static char g_self_exe32[PATH_MAX];
+static char g_self_exe64[PATH_MAX];
 static char g_path_env[4096];       /* cached before entering SUD handler */
 static int g_trace_exec_env = 1;
 
@@ -1008,8 +1170,8 @@ static int format_auxv_json(pid_t pid, char *buf, int buflen)
     if (n <= 0) return 0;
 
     int pos = 0, first = 1;
-    Elf64_auxv_t *av = (Elf64_auxv_t *)raw;
-    int count = n / sizeof(Elf64_auxv_t);
+    sud_auxv_t *av = (sud_auxv_t *)raw;
+    int count = n / sizeof(sud_auxv_t);
     for (int i = 0; i < count; i++) {
         unsigned long type = av[i].a_type;
         unsigned long val  = av[i].a_un.a_val;
@@ -1477,53 +1639,80 @@ static int check_shebang(const char *path, char *interp, size_t interp_sz,
     return 1;
 }
 
-static int check_elf_dynamic(const char *path, char *interp, size_t interp_sz)
+static void trim_interp(char *interp)
+{
+    size_t len = strlen(interp);
+    while (len > 0 && interp[len - 1] == '\n')
+        len--;
+    interp[len] = '\0';
+}
+
+static int inspect_elf_dynamic_fd(int fd, char *interp, size_t interp_sz,
+                                  int *elf_class)
+{
+    unsigned char ident[EI_NIDENT];
+    if (pread(fd, ident, sizeof(ident), 0) != (ssize_t)sizeof(ident))
+        return -1;
+    if (memcmp(ident, ELFMAG, SELFMAG) != 0)
+        return -1;
+    if (elf_class)
+        *elf_class = ident[EI_CLASS];
+
+    if (ident[EI_CLASS] == ELFCLASS64) {
+        Elf64_Ehdr ehdr;
+        if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
+            return -1;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            Elf64_Phdr phdr;
+            if (pread(fd, &phdr, sizeof(phdr),
+                      ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+                continue;
+            if (phdr.p_type != PT_INTERP)
+                continue;
+            size_t sz = phdr.p_filesz;
+            if (sz >= interp_sz) sz = interp_sz - 1;
+            if (pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
+                return -1;
+            interp[sz] = '\0';
+            trim_interp(interp);
+            return 1;
+        }
+        return 0;
+    }
+
+    if (ident[EI_CLASS] == ELFCLASS32) {
+        Elf32_Ehdr ehdr;
+        if (pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
+            return -1;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            Elf32_Phdr phdr;
+            if (pread(fd, &phdr, sizeof(phdr),
+                      ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+                continue;
+            if (phdr.p_type != PT_INTERP)
+                continue;
+            size_t sz = phdr.p_filesz;
+            if (sz >= interp_sz) sz = interp_sz - 1;
+            if (pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
+                return -1;
+            interp[sz] = '\0';
+            trim_interp(interp);
+            return 1;
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
+static int check_elf_dynamic(const char *path, char *interp, size_t interp_sz,
+                             int *elf_class)
 {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
-
-    Elf64_Ehdr ehdr;
-    if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
-        close(fd);
-        return -1;
-    }
-
-    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
-        close(fd);
-        return -1;
-    }
-
-    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        close(fd);
-        return -1;
-    }
-
-    for (int i = 0; i < ehdr.e_phnum; i++) {
-        Elf64_Phdr phdr;
-        if (pread(fd, &phdr, sizeof(phdr),
-                  ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
-            continue;
-
-        if (phdr.p_type == PT_INTERP) {
-            size_t sz = phdr.p_filesz;
-            if (sz >= interp_sz) sz = interp_sz - 1;
-            if (pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz) {
-                close(fd);
-                return -1;
-            }
-            interp[sz] = '\0';
-            size_t len = strlen(interp);
-            while (len > 0 &&
-                   (interp[len-1] == '\n' || interp[len-1] == '\0'))
-                len--;
-            interp[len] = '\0';
-            close(fd);
-            return 1;
-        }
-    }
-
+    int ret = inspect_elf_dynamic_fd(fd, interp, interp_sz, elf_class);
     close(fd);
-    return 0;
+    return ret;
 }
 
 /*
@@ -1574,54 +1763,72 @@ static int check_shebang_raw(const char *path, char *interp, size_t interp_sz,
     return 1;
 }
 
+static int inspect_elf_dynamic_fd_raw(int fd, char *interp, size_t interp_sz,
+                                      int *elf_class)
+{
+    unsigned char ident[EI_NIDENT];
+    if (raw_pread(fd, ident, sizeof(ident), 0) != (ssize_t)sizeof(ident))
+        return -1;
+    if (memcmp(ident, ELFMAG, SELFMAG) != 0)
+        return -1;
+    if (elf_class)
+        *elf_class = ident[EI_CLASS];
+
+    if (ident[EI_CLASS] == ELFCLASS64) {
+        Elf64_Ehdr ehdr;
+        if (raw_pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
+            return -1;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            Elf64_Phdr phdr;
+            if (raw_pread(fd, &phdr, sizeof(phdr),
+                          ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+                continue;
+            if (phdr.p_type != PT_INTERP)
+                continue;
+            size_t sz = phdr.p_filesz;
+            if (sz >= interp_sz) sz = interp_sz - 1;
+            if (raw_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
+                return -1;
+            interp[sz] = '\0';
+            trim_interp(interp);
+            return 1;
+        }
+        return 0;
+    }
+
+    if (ident[EI_CLASS] == ELFCLASS32) {
+        Elf32_Ehdr ehdr;
+        if (raw_pread(fd, &ehdr, sizeof(ehdr), 0) != sizeof(ehdr))
+            return -1;
+        for (int i = 0; i < ehdr.e_phnum; i++) {
+            Elf32_Phdr phdr;
+            if (raw_pread(fd, &phdr, sizeof(phdr),
+                          ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
+                continue;
+            if (phdr.p_type != PT_INTERP)
+                continue;
+            size_t sz = phdr.p_filesz;
+            if (sz >= interp_sz) sz = interp_sz - 1;
+            if (raw_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz)
+                return -1;
+            interp[sz] = '\0';
+            trim_interp(interp);
+            return 1;
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
 static int check_elf_dynamic_raw(const char *path, char *interp,
-                                  size_t interp_sz)
+                                  size_t interp_sz, int *elf_class)
 {
     int fd = raw_open(path, O_RDONLY);
     if (fd < 0) return -1;
-
-    Elf64_Ehdr ehdr;
-    if (raw_read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
-        raw_close(fd);
-        return -1;
-    }
-
-    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
-        raw_close(fd);
-        return -1;
-    }
-
-    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        raw_close(fd);
-        return -1;
-    }
-
-    for (int i = 0; i < ehdr.e_phnum; i++) {
-        Elf64_Phdr phdr;
-        if (raw_pread(fd, &phdr, sizeof(phdr),
-                      ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
-            continue;
-
-        if (phdr.p_type == PT_INTERP) {
-            size_t sz = phdr.p_filesz;
-            if (sz >= interp_sz) sz = interp_sz - 1;
-            if (raw_pread(fd, interp, sz, phdr.p_offset) != (ssize_t)sz) {
-                raw_close(fd);
-                return -1;
-            }
-            interp[sz] = '\0';
-            size_t len = strlen(interp);
-            while (len > 0 &&
-                   (interp[len-1] == '\n' || interp[len-1] == '\0'))
-                len--;
-            interp[len] = '\0';
-            raw_close(fd);
-            return 1;
-        }
-    }
-
+    int ret = inspect_elf_dynamic_fd_raw(fd, interp, interp_sz, elf_class);
     raw_close(fd);
-    return 0;
+    return ret;
 }
 static int resolve_path_raw(const char *cmd, char *out, size_t out_sz)
 {
@@ -1732,6 +1939,17 @@ static int resolve_path(const char *cmd, char *out, size_t out_sz)
     return 0;
 }
 
+static const char *self_exe_for_class(int elf_class)
+{
+    if (elf_class == ELFCLASS32 && g_self_exe32[0])
+        return g_self_exe32;
+    if (elf_class == ELFCLASS64 && g_self_exe64[0])
+        return g_self_exe64;
+    if (elf_class == SUD_NATIVE_ELF_CLASS)
+        return g_self_exe;
+    return NULL;
+}
+
 /*
  * Build the argv for exec.  The algorithm:
  *
@@ -1780,7 +1998,9 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
         }
 
         char elf_interp[PATH_MAX];
-        int dyn = check_elf_dynamic(resolved, elf_interp, sizeof(elf_interp));
+        int elf_class = 0;
+        int dyn = check_elf_dynamic(resolved, elf_interp, sizeof(elf_interp),
+                                    &elf_class);
 
         if (dyn == 1) {
             if (nargs + 1 >= max_args) {
@@ -1794,12 +2014,15 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
         }
 
         if (dyn == 0) {
+            const char *self_exe = self_exe_for_class(elf_class);
+            if (!self_exe)
+                break;
             if (nargs + 1 >= max_args) {
                 max_args = nargs + 8;
                 args = realloc(args, (max_args + 1) * sizeof(char *));
             }
             memmove(args + 1, args, (nargs + 1) * sizeof(char *));
-            args[0] = strdup(g_self_exe);
+            args[0] = strdup(self_exe);
             nargs++;
             if (!g_trace_exec_env) {
                 if (nargs + 1 >= max_args) {
@@ -1873,8 +2096,9 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
         }
 
         char elf_interp[PATH_MAX];
+        int elf_class = 0;
         int dyn = check_elf_dynamic_raw(resolved, elf_interp,
-                                         sizeof(elf_interp));
+                                         sizeof(elf_interp), &elf_class);
 
         if (dyn == 1) {
             if (nargs + 1 >= max_args) {
@@ -1891,6 +2115,9 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
         }
 
         if (dyn == 0) {
+            const char *self_exe = self_exe_for_class(elf_class);
+            if (!self_exe)
+                return args;
             if (nargs + 1 >= max_args) {
                 max_args = nargs + 8;
                 char **new_args = arena_alloc((max_args + 1) * sizeof(char *));
@@ -1899,7 +2126,7 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
                 args = new_args;
             }
             memmove(args + 1, args, (nargs + 1) * sizeof(char *));
-            args[0] = arena_strdup(g_self_exe);
+            args[0] = arena_strdup(self_exe);
             nargs++;
             if (!g_trace_exec_env) {
                 if (nargs + 1 >= max_args) {
@@ -1928,7 +2155,7 @@ struct kernel_sigaction_raw {
     void (*handler)(int);
     unsigned long flags;
     void (*restorer)(void);
-    unsigned long mask;
+    sud_sigset_word_t mask;
 };
 
 static void install_sigsys_handler_raw(void)
@@ -1948,7 +2175,7 @@ static void install_sigsys_handler_raw(void)
 static void unblock_sigsys_raw(void)
 {
 #ifdef SYS_rt_sigprocmask
-    unsigned long mask = 1UL << (SIGSYS - 1);
+    sud_sigset_word_t mask = (sud_sigset_word_t)1 << (SIGSYS - 1);
     raw_syscall6(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&mask, 0,
                  sizeof(mask), 0, 0);
 #endif
@@ -1972,6 +2199,26 @@ void prepare_child_sud(void)
     unblock_sigsys_raw();
     reenable_sud_in_child();
 }
+
+#if defined(__x86_64__)
+#define UC_SYSCALL_NR(uc) ((long)(uc)->uc_mcontext.gregs[REG_RAX])
+#define UC_ARG0(uc) ((long)(uc)->uc_mcontext.gregs[REG_RDI])
+#define UC_ARG1(uc) ((long)(uc)->uc_mcontext.gregs[REG_RSI])
+#define UC_ARG2(uc) ((long)(uc)->uc_mcontext.gregs[REG_RDX])
+#define UC_ARG3(uc) ((long)(uc)->uc_mcontext.gregs[REG_R10])
+#define UC_ARG4(uc) ((long)(uc)->uc_mcontext.gregs[REG_R8])
+#define UC_ARG5(uc) ((long)(uc)->uc_mcontext.gregs[REG_R9])
+#define UC_SET_RET(uc, v) ((uc)->uc_mcontext.gregs[REG_RAX] = (v))
+#else
+#define UC_SYSCALL_NR(uc) ((long)(uc)->uc_mcontext.gregs[REG_EAX])
+#define UC_ARG0(uc) ((long)(uc)->uc_mcontext.gregs[REG_EBX])
+#define UC_ARG1(uc) ((long)(uc)->uc_mcontext.gregs[REG_ECX])
+#define UC_ARG2(uc) ((long)(uc)->uc_mcontext.gregs[REG_EDX])
+#define UC_ARG3(uc) ((long)(uc)->uc_mcontext.gregs[REG_ESI])
+#define UC_ARG4(uc) ((long)(uc)->uc_mcontext.gregs[REG_EDI])
+#define UC_ARG5(uc) ((long)(uc)->uc_mcontext.gregs[REG_EBP])
+#define UC_SET_RET(uc, v) ((uc)->uc_mcontext.gregs[REG_EAX] = (v))
+#endif
 
 /* ================================================================
  * SIGSYS handler — the core of SUD tracing.
@@ -2003,14 +2250,13 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 
     pid_t tid = raw_gettid();
 
-    /* x86_64 ABI: nr=rax, args=rdi,rsi,rdx,r10,r8,r9, ret→rax */
-    long nr  = (long)uc->uc_mcontext.gregs[REG_RAX];
-    long a0  = (long)uc->uc_mcontext.gregs[REG_RDI];
-    long a1  = (long)uc->uc_mcontext.gregs[REG_RSI];
-    long a2  = (long)uc->uc_mcontext.gregs[REG_RDX];
-    long a3  = (long)uc->uc_mcontext.gregs[REG_R10];
-    long a4  = (long)uc->uc_mcontext.gregs[REG_R8];
-    long a5  = (long)uc->uc_mcontext.gregs[REG_R9];
+    long nr  = UC_SYSCALL_NR(uc);
+    long a0  = UC_ARG0(uc);
+    long a1  = UC_ARG1(uc);
+    long a2  = UC_ARG2(uc);
+    long a3  = UC_ARG3(uc);
+    long a4  = UC_ARG4(uc);
+    long a5  = UC_ARG5(uc);
 
     long ret;
 
@@ -2033,10 +2279,10 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             /* Disable SUD: the sub-tracer now manages this process. */
             raw_syscall6(SYS_prctl, PR_SET_SYSCALL_USER_DISPATCH,
                          PR_SYS_DISPATCH_OFF, 0, 0, 0, 0);
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            UC_SET_RET(uc, 0);
             return;
         }
-        uc->uc_mcontext.gregs[REG_RAX] = r;  /* raw kernel negative errno */
+        UC_SET_RET(uc, r);  /* raw kernel negative errno */
         return;
     }
 
@@ -2075,7 +2321,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         }
 
         arena_reset();
-        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        UC_SET_RET(uc, ret);
         return;
     }
 
@@ -2088,13 +2334,13 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 #ifdef AT_EMPTY_PATH
         if ((flags & AT_EMPTY_PATH) && fn && fn[0] == '\0') {
             ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
-            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            UC_SET_RET(uc, ret);
             return;
         }
 #endif
         if (flags != 0) {
             ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
-            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            UC_SET_RET(uc, ret);
             return;
         }
 
@@ -2102,7 +2348,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         if (!resolve_execveat_path_raw((int)a0, fn, flags,
                                        resolved_fn, sizeof(resolved_fn))) {
             ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
-            uc->uc_mcontext.gregs[REG_RAX] = ret;
+            UC_SET_RET(uc, ret);
             return;
         }
 
@@ -2132,7 +2378,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         }
 
         arena_reset();
-        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        UC_SET_RET(uc, ret);
         return;
     }
 #endif
@@ -2179,7 +2425,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             /* glibc uses clone3(CLONE_VM|CLONE_VFORK|...) for posix_spawn-
              * style exec helpers.  Force its vfork fallback, which returns
              * through code paths that we already reinitialize correctly. */
-            uc->uc_mcontext.gregs[REG_RAX] = -ENOSYS;
+            UC_SET_RET(uc, -ENOSYS);
             return;
         }
         if ((c3_flags & CLONE_VM) && c3_stack) {
@@ -2194,7 +2440,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
                 prepare_child_sud();
             }
         }
-        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        UC_SET_RET(uc, ret);
         return;
     }
 #endif
@@ -2202,7 +2448,11 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         /* clone: flags are in a0 (rdi) */
         unsigned long c_flags = (unsigned long)a0;
         if ((c_flags & CLONE_VM) && a1 != 0) {
+#if defined(__x86_64__)
             ret = clone_raw(a0, a1, a2, a3, a4, uc);
+#else
+            ret = clone_raw(a0, a1, a2, a4, a3, uc);
+#endif
             /* Only parent reaches here */
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
@@ -2213,7 +2463,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
                 prepare_child_sud();
             }
         }
-        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        UC_SET_RET(uc, ret);
         return;
     }
 
@@ -2226,7 +2476,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         ret = raw_syscall6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
         if (ret == 0)
             prepare_child_sud();
-        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        UC_SET_RET(uc, ret);
         return;
     }
 #endif
@@ -2235,7 +2485,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
         if (ret == 0)
             prepare_child_sud();
-        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        UC_SET_RET(uc, ret);
         return;
     }
 #endif
@@ -2251,7 +2501,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         const struct kernel_sigaction *act =
             (const struct kernel_sigaction *)a1;
         if (a0 == SIGSYS && act) {
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            UC_SET_RET(uc, 0);
             return;
         }
         if (act) {
@@ -2262,7 +2512,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
         }
-        uc->uc_mcontext.gregs[REG_RAX] = ret;
+        UC_SET_RET(uc, ret);
         return;
     }
 #endif
@@ -2309,7 +2559,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         }
     }
 
-    uc->uc_mcontext.gregs[REG_RAX] = ret;
+    UC_SET_RET(uc, ret);
 }
 
 /* ================================================================
@@ -2335,7 +2585,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         _exit(127);
     }
 
-    Elf64_Ehdr ehdr;
+    sud_elf_ehdr_t ehdr;
     if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
         fprintf(stderr, "sudtrace: cannot read ELF header\n");
         close(fd);
@@ -2343,8 +2593,9 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     }
 
     if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
-        ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        fprintf(stderr, "sudtrace: not a valid 64-bit ELF: %s\n", path);
+        ehdr.e_ident[EI_CLASS] != SUD_NATIVE_ELF_CLASS) {
+        fprintf(stderr, "sudtrace: not a valid native ELF for %s: %s\n",
+                SUD_VARIANT_NAME, path);
         close(fd);
         _exit(127);
     }
@@ -2357,7 +2608,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         /* Find total memory span of all PT_LOAD segments */
         unsigned long lo = ~0UL, hi = 0;
         for (int i = 0; i < ehdr.e_phnum; i++) {
-            Elf64_Phdr phdr;
+            sud_elf_phdr_t phdr;
             if (pread(fd, &phdr, sizeof(phdr),
                       ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
                 continue;
@@ -2385,7 +2636,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
 
     /* Load PT_LOAD segments */
     for (int i = 0; i < ehdr.e_phnum; i++) {
-        Elf64_Phdr phdr;
+        sud_elf_phdr_t phdr;
         if (pread(fd, &phdr, sizeof(phdr),
                   ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
             continue;
@@ -2435,15 +2686,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
      * SA_ONSTACK would crash those threads with SIGSEGV when SIGSYS
      * is delivered.  All thread stacks (main + pthread-created) are
      * large enough (≥ 2 MB) for the handler's needs. */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = sigsys_handler;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGSYS, &sa, NULL) < 0) {
-        perror("sudtrace: sigaction(SIGSYS)");
-        _exit(127);
-    }
+    install_sigsys_handler_raw();
 
     /* Allocate the SUD selector byte in a dedicated mmap page.
      * This survives the loaded binary's glibc TLS re-initialization,
@@ -2519,7 +2762,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         /* Find where phdr table sits in memory */
         unsigned long phdr_addr = 0;
         for (int i = 0; i < ehdr.e_phnum; i++) {
-            Elf64_Phdr phdr;
+            sud_elf_phdr_t phdr;
             if (pread(fd, &phdr, sizeof(phdr),
                       ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
                 continue;
@@ -2532,7 +2775,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
          * the first PT_LOAD segment */
         if (!phdr_addr) {
             for (int i = 0; i < ehdr.e_phnum; i++) {
-                Elf64_Phdr phdr;
+                sud_elf_phdr_t phdr;
                 if (pread(fd, &phdr, sizeof(phdr),
                           ehdr.e_phoff + i * ehdr.e_phentsize) != sizeof(phdr))
                     continue;
@@ -2551,11 +2794,11 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
 
         int aux_fd2 = open("/proc/self/auxv", O_RDONLY);
         if (aux_fd2 >= 0) {
-            Elf64_auxv_t avbuf[64];
+            sud_auxv_t avbuf[64];
             ssize_t n = read(aux_fd2, avbuf, sizeof(avbuf));
             close(aux_fd2);
             if (n > 0) {
-                int auxc = n / sizeof(Elf64_auxv_t);
+                int auxc = n / sizeof(sud_auxv_t);
                 for (int i = 0; i < auxc; i++) {
                     switch (avbuf[i].a_type) {
                     case AT_ENTRY:
@@ -2601,9 +2844,10 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
      * Fix: set rsp first, push the entry address onto the new stack,
      * zero all registers, then 'ret' pops the entry address into rip.
      */
+#if defined(__x86_64__)
     __asm__ volatile(
-        "mov %0, %%rsp\n\t"       /* switch to the new stack */
-        "push %1\n\t"             /* save entry address on stack */
+        "mov %0, %%rsp\n\t"
+        "push %1\n\t"
         "xor %%rax, %%rax\n\t"
         "xor %%rbx, %%rbx\n\t"
         "xor %%rcx, %%rcx\n\t"
@@ -2619,11 +2863,28 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         "xor %%r13, %%r13\n\t"
         "xor %%r14, %%r14\n\t"
         "xor %%r15, %%r15\n\t"
-        "ret\n\t"                  /* pop entry address → rip */
+        "ret\n\t"
         :
         : "r"(sp), "r"(entry)
         : "memory"
     );
+#else
+    __asm__ volatile(
+        "mov %0, %%esp\n\t"
+        "push %1\n\t"
+        "xor %%eax, %%eax\n\t"
+        "xor %%ebx, %%ebx\n\t"
+        "xor %%ecx, %%ecx\n\t"
+        "xor %%edx, %%edx\n\t"
+        "xor %%esi, %%esi\n\t"
+        "xor %%edi, %%edi\n\t"
+        "xor %%ebp, %%ebp\n\t"
+        "ret\n\t"
+        :
+        : "r"(sp), "r"(entry)
+        : "memory"
+    );
+#endif
 
     __builtin_unreachable();
 }
@@ -2740,6 +3001,31 @@ static void make_absolute_path(const char *path, char *out, size_t out_sz)
     snprintf(out, out_sz, "%s/%s", cwd, path);
 }
 
+static void init_sud_variant_paths(void)
+{
+    char *slash = strrchr(g_self_exe, '/');
+    if (!slash) {
+        if (SUD_NATIVE_ELF_CLASS == ELFCLASS32)
+            snprintf(g_self_exe32, sizeof(g_self_exe32), "%s", g_self_exe);
+        else
+            snprintf(g_self_exe64, sizeof(g_self_exe64), "%s", g_self_exe);
+        return;
+    }
+
+    int dirlen = (int)(slash - g_self_exe);
+    memcpy(g_self_exe32, g_self_exe, dirlen);
+    g_self_exe32[dirlen] = '\0';
+    memcpy(g_self_exe64, g_self_exe, dirlen);
+    g_self_exe64[dirlen] = '\0';
+    snprintf(g_self_exe32 + dirlen, sizeof(g_self_exe32) - dirlen, "/sud32");
+    snprintf(g_self_exe64 + dirlen, sizeof(g_self_exe64) - dirlen, "/sud64");
+
+    if (access(g_self_exe32, X_OK) != 0 && SUD_NATIVE_ELF_CLASS == ELFCLASS32)
+        snprintf(g_self_exe32, sizeof(g_self_exe32), "%s", g_self_exe);
+    if (access(g_self_exe64, X_OK) != 0 && SUD_NATIVE_ELF_CLASS == ELFCLASS64)
+        snprintf(g_self_exe64, sizeof(g_self_exe64), "%s", g_self_exe);
+}
+
 /* ================================================================
  * Main entry point
  * ================================================================ */
@@ -2753,6 +3039,7 @@ int main(int argc, char **argv)
         g_self_exe[slen] = '\0';
     else
         snprintf(g_self_exe, sizeof(g_self_exe), "%s", argv[0]);
+    init_sud_variant_paths();
 
     const char *path_env = getenv("PATH");
     if (!path_env || !path_env[0])

@@ -7,6 +7,8 @@ set -eo pipefail
 
 cd "$(dirname "$0")/.."
 SUDTRACE=./sudtrace
+SUD32=./sud32
+TV=./tv
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -73,6 +75,20 @@ all:
 	/bin/echo build-ok
 EOF
 
+cat > "$TMPDIR/static32.c" << 'EOF'
+#include <unistd.h>
+int main(void) {
+    write(2, "hi32\n", 5);
+    return 0;
+}
+EOF
+HAVE_STATIC32=0
+if gcc -m32 -static -o "$TMPDIR/static32" "$TMPDIR/static32.c" 2>/dev/null; then
+    HAVE_STATIC32=1
+else
+    echo "  SKIP  static32 toolchain unavailable"
+fi
+
 # ── Test: basic single-threaded tracing ────────────────────────────────
 
 if [ -x "$SUDTRACE" ]; then
@@ -107,6 +123,36 @@ run_test "make: external command traced without SIGSYS crash" \
     'grep -q "\"event\":\"EXEC\"" "$TMPDIR/make.jsonl"' \
     'grep -q "\"status\":\"exited\"" "$TMPDIR/make.jsonl"' \
     '! grep -q "\"signal\"" "$TMPDIR/make.jsonl"'
+
+if [ "$HAVE_STATIC32" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/static32.jsonl" -- "$TMPDIR/static32" 2>&1)
+run_test "static32: traced through sud32 wrapper" \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/static32.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/static32.jsonl"' \
+    'grep -q "\"STDERR\"" "$TMPDIR/static32.jsonl"' \
+    'grep -q "hi32" "$TMPDIR/static32.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/static32.jsonl"'
+
+if [ -x "$TV" ]; then
+OUT=$("$TV" --uproctrace --sud -o "$TMPDIR/up_static32.jsonl" -- "$TMPDIR/static32" 2>&1)
+run_test "uproctrace --sud: static32 uses matching sud launcher" \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/up_static32.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/up_static32.jsonl"' \
+    'grep -q "\"STDERR\"" "$TMPDIR/up_static32.jsonl"' \
+    'grep -q "hi32" "$TMPDIR/up_static32.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/up_static32.jsonl"'
+fi
+fi
+
+if [ -x "$SUD32" ]; then
+OUT=$("$SUD32" -o "$TMPDIR/sud32_hello.jsonl" -- "$TMPDIR/hello" 2>&1)
+run_test "sud32: mixed-arch launch selects traceable wrapper" \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/sud32_hello.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/sud32_hello.jsonl"' \
+    'grep -q "\"STDERR\"" "$TMPDIR/sud32_hello.jsonl"' \
+    'grep -q "hello world" "$TMPDIR/sud32_hello.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/sud32_hello.jsonl"'
+fi
 
 else
     echo "  SKIP  sudtrace not built (run 'make sudtrace' first)"
