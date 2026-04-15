@@ -169,19 +169,18 @@ static void sput_field(Tui::Impl *m, const char *s, int w, int align, int ovf) {
     }
 }
 
-static const char *style_ansi(const char *s) {
-    if (!s || !s[0]) return "\x1b[0m";
-    switch (s[0]) {
-    case 'b': return "\x1b[1m";
-    case 'c': return s[4] == '_' ? "\x1b[36;1m" : "\x1b[36m";
-    case 'd': return "\x1b[2m";
-    case 'e': return "\x1b[31m";
-    case 'g': return "\x1b[32m";
-    case 'h': return "\x1b[33;1m";
-    case 'n': return "\x1b[0m";
-    case 's': return "\x1b[1;35m";
-    case 'y': return "\x1b[33m";
-    default:  return "\x1b[0m";
+static const char *style_ansi(RowStyle s) {
+    switch (s) {
+    case RowStyle::Bold:    return "\x1b[1m";
+    case RowStyle::Cyan:    return "\x1b[36m";
+    case RowStyle::CyanBold:return "\x1b[36;1m";
+    case RowStyle::Dim:     return "\x1b[2m";
+    case RowStyle::Error:   return "\x1b[31m";
+    case RowStyle::Green:   return "\x1b[32m";
+    case RowStyle::Heading: return "\x1b[33;1m";
+    case RowStyle::Search:  return "\x1b[1;35m";
+    case RowStyle::Yellow:  return "\x1b[33m";
+    default:                return "\x1b[0m";
     }
 }
 
@@ -464,7 +463,7 @@ static void render_panel(Tui::Impl *m, Panel *p) {
         bool is_cur = (d->flags & TUI_PANEL_CURSOR) && rn == p->cursor;
         if (is_cur && focused) sp(m, "\x1b[1;7m");
         else if (is_cur) sp(m, "\x1b[7m");
-        else sp(m, style_ansi(r.style.c_str()));
+        else sp(m, style_ansi(r.style));
         for (int c = 0; c < nc; c++) {
             const char *cell = (c < static_cast<int>(r.cols.size())) ? r.cols[c].c_str() : "";
             sput_field(m, cell, cw[c], d->cols[c].align, d->cols[c].overflow);

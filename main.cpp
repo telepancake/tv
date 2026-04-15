@@ -38,15 +38,12 @@ struct Item {
 
     virtual ~Item() = default;
     virtual std::string_view getKey() const = 0;
-    virtual std::string printLine(int depth) const = 0;
-    virtual const char *style() const { return "normal"; }
-    virtual bool hasChildren() const { return !children.empty(); }
-
-    /* Set collapsed flag recursively on this subtree. */
-    void setCollapsedRecursive(bool c) {
-        if (!children.empty()) collapsed = c;
-        for (auto *ch : children) ch->setCollapsedRecursive(c);
-    }
+    virtual RowStyle  style()         const { return RowStyle::Normal; }
+    virtual bool      hasChildren()   const { return !children.empty(); }
+    virtual bool      shouldShow()    const { return true; }
+    virtual int       sortKey()       const { return 0; }
+    virtual std::string getParentKey()const { return {}; }
+    virtual RowData   makeRow(int depth) const = 0;
 };
 
 /* ── PathItem — hierarchical filesystem path node ──────────────────── */
@@ -79,10 +76,9 @@ struct PathItem : Item {
         return cached_key_;
     }
 
-    std::string printLine(int /*depth*/) const override {
-        /* Placeholder — actual line formatting is done by view builders. */
-        return name;
-    }
+    RowStyle    style()          const override;
+    std::string getParentKey()   const override;
+    RowData     makeRow(int depth) const override;
 
     /* Find or create a child directory/file by name. */
     PathItem *getOrCreateChild(const std::string &child_name, bool dir) {
@@ -281,7 +277,11 @@ struct process_t : Item {
         if (cached_key_.empty()) cached_key_ = std::to_string(tgid);
         return cached_key_;
     }
-    std::string printLine(int /*depth*/) const override { return cached_display_name; }
+    int         sortKey()        const override { return tgid; }
+    RowStyle    style()          const override;
+    bool        shouldShow()     const override;
+    std::string getParentKey()   const override;
+    RowData     makeRow(int depth) const override;
 };
 
 struct app_state_t {
@@ -424,12 +424,12 @@ static void set_collapsed(const std::string &id, bool c) {
 
 /* Emit one row into a RowData vector. */
 static void emit_row(std::vector<RowData> &v, const std::string &id,
-                     const char *style, const std::string &parent_id,
+                     RowStyle style, const std::string &parent_id,
                      const std::string &text, int link_mode,
                      const std::string &link_id, bool has_children) {
     RowData d;
     d.id = id;
-    d.style = style ? style : "normal";
+    d.style = style;
     d.cols = {text};
     d.parent_id = parent_id;
     d.link_mode = link_mode;
@@ -744,59 +744,62 @@ static std::string format_duration(double s, double e, int running) {
     return sfmt("%.1fms", d * 1000.0);
 }
 
-static const char *proc_style(const process_t &p) {
-    if (proc_matches_search(p)) return "search";
-    if (proc_is_interesting_failure(p)) return "error";
-    return "normal";
+/* ── process_t virtual method implementations ──────────────────────── */
+
+RowStyle process_t::style() const {
+    if (proc_matches_search(*this)) return RowStyle::Search;
+    if (proc_is_interesting_failure(*this)) return RowStyle::Error;
+    return RowStyle::Normal;
 }
 
-/* Build a single RowData for a process in tree mode. */
-static RowData make_proc_tree_row(process_t *p, int depth) {
-    int tgid = p->tgid;
-    std::string id_str = std::to_string(tgid);
-    bool has_kids = !p->children.empty();
-    bool collapsed = has_kids && p->collapsed;
-    const auto &name = p->display_name();
+bool process_t::shouldShow() const { return proc_should_show(tgid); }
+
+std::string process_t::getParentKey() const {
+    return (ppid > 0 && find_process(ppid)) ? std::to_string(ppid) : std::string();
+}
+
+RowData process_t::makeRow(int depth) const {
+    std::string id_str(getKey());
+    bool has_kids = !children.empty();
+    bool collapsed_flag = has_kids && collapsed;
     std::string marker;
-    if (p->exit_status == "exited")
-        marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-    else if (p->exit_status == "signaled")
-        marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
-    std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
-    int nchildren = static_cast<int>(p->children.size());
+    if (exit_status == "exited")
+        marker = exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
+    else if (exit_status == "signaled")
+        marker = sfmt(" \xe2\x9a\xa1%d", exit_signal);
+    std::string dur = format_duration(start_ts, end_ts, exit_status.empty());
+    int nch = static_cast<int>(children.size());
     std::string prefix = sfmt("%*s%s", depth * 4, "",
-        !has_kids ? "  " : (collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "));
-    std::string extra = nchildren > 0 ? sfmt(" (%d)", nchildren) : std::string();
-    std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), tgid, name.c_str(),
-                            marker.c_str(), extra.c_str(), dur.empty() ? "" : "  ", dur.c_str());
-    std::string parent_id = (p->ppid > 0 && find_process(p->ppid)) ? std::to_string(p->ppid) : std::string();
+        !has_kids ? "  " : (collapsed_flag ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "));
+    std::string extra = nch > 0 ? sfmt(" (%d)", nch) : std::string();
+    std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), tgid,
+                            display_name().c_str(), marker.c_str(), extra.c_str(),
+                            dur.empty() ? "" : "  ", dur.c_str());
     RowData d;
     d.id = id_str;
-    d.style = proc_style(*p);
+    d.style = style();
     d.cols = {text};
-    d.parent_id = parent_id;
+    d.parent_id = getParentKey();
     d.link_mode = 0;
     d.link_id = id_str;
     d.has_children = has_kids;
     return d;
 }
 
-/* Build a single RowData for a process in flat mode. */
+/* Build a single RowData for a process in flat mode (no tree indent). */
 static RowData make_proc_flat_row(process_t *p) {
-    int tgid = p->tgid;
-    std::string id_str = std::to_string(tgid);
-    const auto &name = p->display_name();
+    std::string id_str(p->getKey());
     std::string marker;
     if (p->exit_status == "exited")
         marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
     else if (p->exit_status == "signaled")
         marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
     std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
-    std::string text = sfmt("[%d] %s%s%s%s", tgid, name.c_str(), marker.c_str(),
-                            dur.empty() ? "" : "  ", dur.c_str());
+    std::string text = sfmt("[%d] %s%s%s%s", p->tgid, p->display_name().c_str(),
+                            marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
     RowData d;
     d.id = id_str;
-    d.style = proc_style(*p);
+    d.style = p->style();
     d.cols = {text};
     d.link_mode = 0;
     d.link_id = id_str;
@@ -810,9 +813,46 @@ static bool file_matches_search(const std::string &path) {
     return !g_state.search.empty() && path.find(g_state.search) != std::string::npos;
 }
 
+/* ── PathItem virtual method implementations ────────────────────────── */
+
+RowStyle PathItem::style() const {
+    if (file_matches_search(fullPath())) return RowStyle::Search;
+    if (errs) return RowStyle::Error;
+    return RowStyle::Normal;
+}
+
+std::string PathItem::getParentKey() const {
+    return (parent && parent->parent) ? std::string(parent->getKey()) : std::string();
+}
+
+RowData PathItem::makeRow(int depth) const {
+    std::string fullp(getKey());
+    int nprocs = static_cast<int>(proc_tgids.size());
+    std::string errs_text = errs ? sfmt(", %d errs", errs) : std::string();
+    bool has_kids = hasChildren();
+    std::string text;
+    if (has_kids) {
+        text = sfmt("%*s%s%s/  [%d opens, %d procs%s]", depth * 2, "",
+                    collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc ",
+                    name.c_str(), opens, nprocs, errs_text.c_str());
+    } else {
+        text = sfmt("%*s%s  [%d opens, %d procs%s]", depth * 2, "",
+                    name.c_str(), opens, nprocs, errs_text.c_str());
+    }
+    RowData d;
+    d.id = fullp;
+    d.style = style();
+    d.cols = {text};
+    d.parent_id = getParentKey();
+    d.link_mode = 1;
+    d.link_id = fullp;
+    d.has_children = has_kids;
+    return d;
+}
+
 /* Recursive DFS on PathItem tree → emit rows for file tree view. */
 static void add_file_tree_rec(std::vector<RowData> &rows, PathItem *node, int depth) {
-    /* Separate dirs and files among children. */
+    /* Separate dirs and files among children, skipping empty dirs. */
     std::vector<PathItem*> dirs, files;
     for (auto *c : node->children) {
         auto *pc = static_cast<PathItem*>(c);
@@ -824,30 +864,12 @@ static void add_file_tree_rec(std::vector<RowData> &rows, PathItem *node, int de
     std::sort(files.begin(), files.end(), [](PathItem *a, PathItem *b) { return a->name < b->name; });
 
     for (auto *d : dirs) {
-        std::string fullp = d->fullPath();
-        std::string parent_fullp = d->parent ? d->parent->fullPath() : std::string();
-        int nprocs = static_cast<int>(d->proc_tgids.size());
-        std::string errs_text = d->errs ? sfmt(", %d errs", d->errs) : std::string();
-        std::string text = sfmt("%*s%s%s/  [%d opens, %d procs%s]", depth * 2, "",
-                                d->collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc ",
-                                d->name.c_str(), d->opens, nprocs, errs_text.c_str());
-        bool has_kids = !d->children.empty();
-        emit_row(rows, fullp,
-                 file_matches_search(fullp) ? "search" : (d->errs ? "error" : "normal"),
-                 parent_fullp, text, 1, fullp, has_kids);
+        rows.push_back(d->makeRow(depth));
         if (!d->collapsed) add_file_tree_rec(rows, d, depth + 1);
     }
     for (auto *f : files) {
         if (f->opens == 0) continue;
-        std::string fullp = f->fullPath();
-        std::string parent_fullp = f->parent ? f->parent->fullPath() : std::string();
-        int nprocs = static_cast<int>(f->proc_tgids.size());
-        std::string errs_text = f->errs ? sfmt(", %d errs", f->errs) : std::string();
-        std::string text = sfmt("%*s%s  [%d opens, %d procs%s]", depth * 2, "",
-                                f->name.c_str(), f->opens, nprocs, errs_text.c_str());
-        emit_row(rows, fullp,
-                 file_matches_search(fullp) ? "search" : (f->errs ? "error" : "normal"),
-                 parent_fullp, text, 1, fullp, false);
+        rows.push_back(f->makeRow(depth));
     }
 }
 
@@ -876,7 +898,7 @@ static void build_lpane_files(std::vector<RowData> &rows) {
             std::string text = sfmt("%s  [%d opens, %d procs%s]", path.c_str(),
                                     fp->opens, nprocs, errs_text.c_str());
             emit_row(rows, path,
-                     file_matches_search(path) ? "search" : (fp->errs ? "error" : "normal"),
+                     file_matches_search(path) ? RowStyle::Search : (fp->errs ? RowStyle::Error : RowStyle::Normal),
                      "", text, 1, path, false);
         }
     } else {
@@ -891,7 +913,7 @@ static void build_lpane_files(std::vector<RowData> &rows) {
             std::string text = sfmt("  %s  [%d opens, %d procs%s]", path.c_str(),
                                     np->opens, nprocs, errs_text.c_str());
             emit_row(rows, path,
-                     file_matches_search(path) ? "search" : (np->errs ? "error" : "normal"),
+                     file_matches_search(path) ? RowStyle::Search : (np->errs ? RowStyle::Error : RowStyle::Normal),
                      "", text, 1, path, false);
         }
     }
@@ -932,20 +954,20 @@ static void build_lpane_output(std::vector<RowData> &rows) {
                 ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", ev.tgid,
                 p ? p->display_name().c_str() : "",
                 ev.data.c_str());
-            emit_row(rows, id_str, ev.kind == EV_STDERR ? "error" : "normal", "", text, 2, id_str, false);
+            emit_row(rows, id_str, ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "", text, 2, id_str, false);
         }
     } else {
         for (auto &og : groups) {
             std::string gid = sfmt("io_%d", og.tgid);
             bool collapsed_flag = is_collapsed(gid);
             std::string text = sfmt("%sPID %d %s", collapsed_flag ? "▶ " : "▼ ", og.tgid, og.name.c_str());
-            emit_row(rows, gid, "heading", "", text, 2, gid, true);
+            emit_row(rows, gid, RowStyle::Heading, "", text, 2, gid, true);
             if (!collapsed_flag) {
                 for (int ei : og.event_indices) {
                     auto &ev = g_events[ei];
                     std::string id_str = std::to_string(ev.id);
                     std::string row = sfmt("  [%s] %s", ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", ev.data.c_str());
-                    emit_row(rows, id_str, ev.kind == EV_STDERR ? "error" : "normal", gid, row, 2, id_str, false);
+                    emit_row(rows, id_str, ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, gid, row, 2, id_str, false);
                 }
             }
         }
@@ -1001,7 +1023,7 @@ static void build_lpane_deps(std::vector<RowData> &rows, int reverse) {
     collect_dep_files(start, reverse, seen);
     for (const auto &s : seen) {
         int mode = reverse ? 4 : 3;
-        emit_row(rows, s, file_matches_search(s) ? "search" : "normal", "", s, mode, s, false);
+        emit_row(rows, s, file_matches_search(s) ? RowStyle::Search : RowStyle::Normal, "", s, mode, s, false);
     }
 }
 
@@ -1037,7 +1059,7 @@ static void build_lpane_dep_cmds(std::vector<RowData> &rows, int reverse) {
         std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
         std::string text = sfmt("[%d] %s%s%s%s", pt, name.c_str(), marker.c_str(),
                                 dur.empty() ? "" : "  ", dur.c_str());
-        emit_row(rows, id_str, proc_style(*p), "", text, 0, id_str, false);
+        emit_row(rows, id_str, p->style(), "", text, 0, id_str, false);
     }
 }
 
@@ -1067,21 +1089,21 @@ static bool event_allowed(const trace_event_t &ev) {
 static void build_rpane_process(std::vector<RowData> &rows, const std::string &id) {
     auto *p = find_process(id.empty() ? 0 : std::atoi(id.c_str()));
     if (!p) return;
-    emit_row(rows, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
-    emit_row(rows, "tgid", "normal", "", sfmt("TGID:  %d", p->tgid), -1, "", false);
-    emit_row(rows, "ppid", "normal", "", sfmt("PPID:  %d", p->ppid), -1, "", false);
-    emit_row(rows, "exe", "normal", "", sfmt("EXE:   %s", p->exe.c_str()), -1, "", false);
+    emit_row(rows, "hdr", RowStyle::Heading, "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
+    emit_row(rows, "tgid", RowStyle::Normal, "", sfmt("TGID:  %d", p->tgid), -1, "", false);
+    emit_row(rows, "ppid", RowStyle::Normal, "", sfmt("PPID:  %d", p->ppid), -1, "", false);
+    emit_row(rows, "exe", RowStyle::Normal, "", sfmt("EXE:   %s", p->exe.c_str()), -1, "", false);
     if (!p->exit_status.empty()) {
         std::string text = p->exit_status == "signaled"
             ? sfmt("Exit: signal %d%s", p->exit_signal, p->core_dumped ? " (core)" : "")
             : sfmt("Exit: exited code=%d", p->exit_code);
         emit_row(rows, "exit",
-                 (p->exit_status == "exited" && p->exit_code == 0) ? "green" : "error",
+                 (p->exit_status == "exited" && p->exit_code == 0) ? RowStyle::Green : RowStyle::Error,
                  "", text, -1, "", false);
     }
     int nchildren = static_cast<int>(p->children.size());
     if (nchildren > 0) {
-        emit_row(rows, "kids_hdr", "heading", "", sfmt("Children (%d)", nchildren), -1, "", false);
+        emit_row(rows, "kids_hdr", RowStyle::Heading, "", sfmt("Children (%d)", nchildren), -1, "", false);
         auto sorted_ch = p->children;
         if (sorted_ch.size() > 1)
             std::sort(sorted_ch.begin(), sorted_ch.end(),
@@ -1091,15 +1113,15 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
             int ct = c->tgid;
             std::string cid = sfmt("child_%d", ct);
             std::string text = sfmt("[%d] %s", ct, c->display_name().c_str());
-            emit_row(rows, cid, "normal", "", text, 0, std::to_string(ct), false);
+            emit_row(rows, cid, RowStyle::Normal, "", text, 0, std::to_string(ct), false);
         }
     }
     if (!p->argv.empty()) {
-        emit_row(rows, "argv_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Argv \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
+        emit_row(rows, "argv_hdr", RowStyle::Heading, "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Argv \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
         for (int i = 0; i < static_cast<int>(p->argv.size()); i++)
-            emit_row(rows, sfmt("argv_%d", i), "normal", "", sfmt("[%d] %s", i, p->argv[i].c_str()), -1, "", false);
+            emit_row(rows, sfmt("argv_%d", i), RowStyle::Normal, "", sfmt("[%d] %s", i, p->argv[i].c_str()), -1, "", false);
     }
-    emit_row(rows, "evt_hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Events \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
+    emit_row(rows, "evt_hdr", RowStyle::Heading, "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Events \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
     double prev_ts = -1;
     for (int ei : p->event_indices) {
         auto &ev = g_events[ei];
@@ -1125,21 +1147,21 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
         case EV_STDOUT: text = sfmt("%s [STDOUT] %s", tsbuf, ev.data.c_str()); break;
         case EV_STDERR: text = sfmt("%s [STDERR] %s", tsbuf, ev.data.c_str()); break;
         }
-        emit_row(rows, sfmt("ev_%d", ev.id), ev.kind == EV_STDERR ? "error" : "normal", "", text, -1, "", false);
+        emit_row(rows, sfmt("ev_%d", ev.id), ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "", text, -1, "", false);
     }
 }
 
 static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) {
     if (id.empty()) return;
-    emit_row(rows, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 File \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
-    emit_row(rows, "path", "normal", "", id, -1, "", false);
+    emit_row(rows, "hdr", RowStyle::Heading, "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 File \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
+    emit_row(rows, "path", RowStyle::Normal, "", id, -1, "", false);
     PathItem *pd = find_path_item(id);
     int opens = pd ? pd->opens : 0;
     int errs  = pd ? pd->errs  : 0;
     int nprocs = pd ? static_cast<int>(pd->proc_tgids.size()) : 0;
-    emit_row(rows, "opens", "normal", "", sfmt("Opens: %d", opens), -1, "", false);
-    emit_row(rows, "procs", "normal", "", sfmt("Procs: %d", nprocs), -1, "", false);
-    emit_row(rows, "errs", errs ? "error" : "normal", "", sfmt("Errors: %d", errs), -1, "", false);
+    emit_row(rows, "opens", RowStyle::Normal, "", sfmt("Opens: %d", opens), -1, "", false);
+    emit_row(rows, "procs", RowStyle::Normal, "", sfmt("Procs: %d", nprocs), -1, "", false);
+    emit_row(rows, "errs", errs ? RowStyle::Error : RowStyle::Normal, "", sfmt("Errors: %d", errs), -1, "", false);
     if (pd) {
         for (int ei : pd->open_event_indices) {
             auto &ev = g_events[ei];
@@ -1149,7 +1171,7 @@ static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) 
                 p ? p->display_name().c_str() : "",
                 ev.flags_text.c_str(), err_text.c_str());
             emit_row(rows, sfmt("open_%d", ev.id),
-                     ev.err ? "error" : (ev.kind == EV_STDERR ? "error" : "normal"),
+                     ev.err ? RowStyle::Error : (ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal),
                      "", text, 0, std::to_string(ev.tgid), false);
         }
     }
@@ -1161,15 +1183,15 @@ static void build_rpane_output(std::vector<RowData> &rows, const std::string &id
     for (auto &e : g_events) if (e.id == eid) { ev = &e; break; }
     if (!ev) return;
     auto *p = find_process(ev->tgid);
-    emit_row(rows, "hdr", "heading", "", "─── Output ───", -1, "", false);
-    emit_row(rows, "stream", ev->kind == EV_STDERR ? "error" : "normal", "",
+    emit_row(rows, "hdr", RowStyle::Heading, "", "─── Output ───", -1, "", false);
+    emit_row(rows, "stream", ev->kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "",
              sfmt("Stream: %s", ev->kind == EV_STDOUT ? "STDOUT" : "STDERR"), -1, "", false);
-    emit_row(rows, "pid", "normal", "", sfmt("PID: %d", ev->tgid), -1, "", false);
-    emit_row(rows, "proc", "normal", "",
+    emit_row(rows, "pid", RowStyle::Normal, "", sfmt("PID: %d", ev->tgid), -1, "", false);
+    emit_row(rows, "proc", RowStyle::Normal, "",
              sfmt("Proc: %s", p ? p->display_name().c_str() : ""),
              -1, "", false);
-    emit_row(rows, "content_hdr", "heading", "", "─── Content ───", -1, "", false);
-    emit_row(rows, "content", ev->kind == EV_STDERR ? "error" : "normal", "", ev->data, -1, "", false);
+    emit_row(rows, "content_hdr", RowStyle::Heading, "", "─── Content ───", -1, "", false);
+    emit_row(rows, "content", ev->kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "", ev->data, -1, "", false);
 }
 
 static void build_rpane(std::vector<RowData> &rows) {
@@ -1215,7 +1237,7 @@ static void schedule_detail_update() {
 
 /* Process tree DFS iterator (mode 0, grouped) — yields one row at a time. */
 static struct {
-    std::vector<std::pair<process_t*,int>> dfs; /* (process, depth) stack */
+    std::vector<std::pair<Item*,int>> dfs; /* (item, depth) stack */
 } g_proc_tree_iter;
 
 /* Process flat iterator (mode 0, not grouped). */
@@ -1235,13 +1257,13 @@ static int g_lp_mode = -1; /* which lpane sub-iterator is active: 0=proc_tree 1=
 static void lpane_begin_proc_tree() {
     g_lp_mode = 0;
     g_proc_tree_iter.dfs.clear();
-    std::vector<process_t*> roots;
+    std::vector<Item*> roots;
     for (auto &[tgid, p] : g_proc_map)
-        if ((p->ppid == 0 || !find_process(p->ppid)) && proc_should_show(tgid))
+        if ((p->ppid == 0 || !find_process(p->ppid)) && p->shouldShow())
             roots.push_back(p.get());
     if (roots.size() > 1)
         std::sort(roots.begin(), roots.end(),
-            [](process_t *a, process_t *b) { return a->tgid < b->tgid; });
+            [](Item *a, Item *b) { return a->sortKey() < b->sortKey(); });
     for (int i = static_cast<int>(roots.size()) - 1; i >= 0; i--)
         g_proc_tree_iter.dfs.push_back({roots[i], 0});
 }
@@ -1305,23 +1327,21 @@ static RowData ds_row_next(int panel) {
         switch (g_lp_mode) {
         case 0: { /* proc tree DFS */
             auto &dfs = g_proc_tree_iter.dfs;
-            auto [p, depth] = dfs.back();
+            auto [item, depth] = dfs.back();
             dfs.pop_back();
-            bool has_kids = !p->children.empty();
-            bool collapsed_flag = has_kids && p->collapsed;
-            /* Push children in reverse-sorted order (lowest tgid comes out first). */
-            if (!collapsed_flag && has_kids) {
-                auto sorted_ch = p->children;
+            bool has_kids = item->hasChildren();
+            /* Push children in reverse-sorted order (lowest sortKey comes out first). */
+            if (has_kids && !item->collapsed) {
+                auto sorted_ch = item->children;
                 if (sorted_ch.size() > 1)
                     std::sort(sorted_ch.begin(), sorted_ch.end(),
-                        [](Item *a, Item *b) { return static_cast<process_t*>(a)->tgid < static_cast<process_t*>(b)->tgid; });
+                        [](Item *a, Item *b) { return a->sortKey() < b->sortKey(); });
                 for (int i = static_cast<int>(sorted_ch.size()) - 1; i >= 0; i--) {
-                    auto *cp = static_cast<process_t*>(sorted_ch[i]);
-                    if (proc_should_show(cp->tgid))
-                        dfs.push_back({cp, depth + 1});
+                    if (sorted_ch[i]->shouldShow())
+                        dfs.push_back({sorted_ch[i], depth + 1});
                 }
             }
-            return make_proc_tree_row(p, depth);
+            return item->makeRow(depth);
         }
         case 1: { /* proc flat */
             int tgid = g_proc_flat_iter.tgids[g_proc_flat_iter.idx++];
@@ -1374,19 +1394,19 @@ static void set_cursor_to_search_hit(int dir) {
         for (int i = start + 1; ; i++) {
             auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
-            if (r->style == "search") { g_state.cursor_id = r->id; return; }
+            if (r->style == RowStyle::Search) { g_state.cursor_id = r->id; return; }
         }
         for (int i = 0; i < start; i++) {
             auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
-            if (r->style == "search") { g_state.cursor_id = r->id; return; }
+            if (r->style == RowStyle::Search) { g_state.cursor_id = r->id; return; }
         }
     } else {
         /* Backward: scan from start-1 down to 0, then wrap from end to start+1. */
         for (int i = start - 1; i >= 0; i--) {
             auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
-            if (r->style == "search") { g_state.cursor_id = r->id; return; }
+            if (r->style == RowStyle::Search) { g_state.cursor_id = r->id; return; }
         }
         /* Find the end by scanning forward, then scan backward from there. */
         int last = start;
@@ -1394,7 +1414,7 @@ static void set_cursor_to_search_hit(int dir) {
         for (int i = last; i > start; i--) {
             auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
-            if (r->style == "search") { g_state.cursor_id = r->id; return; }
+            if (r->style == RowStyle::Search) { g_state.cursor_id = r->id; return; }
         }
     }
 }
@@ -1407,7 +1427,7 @@ static void apply_search(const std::string &q) {
     for (int i = 0; ; i++) {
         auto *r = g_tui ? g_tui->get_cached_row(g_lpane, i) : nullptr;
         if (!r) break;
-        if (r->style == "search") {
+        if (r->style == RowStyle::Search) {
             g_state.cursor_id = r->id;
             break;
         }
@@ -1448,24 +1468,31 @@ static void expand_subtree(int expand) {
     int cur = g_tui ? g_tui->get_cursor(g_lpane) : -1;
     auto *row = g_tui ? g_tui->get_cached_row(g_lpane, cur) : nullptr;
     if (!row || !row->has_children) return;
-    if (g_state.mode == 0) {
-        auto *p = find_process(std::atoi(row->id.c_str()));
-        if (p) p->setCollapsedRecursive(!expand);
-    } else if (g_state.mode == 1) {
-        PathItem *pi = find_path_item(row->id);
-        if (pi) pi->setCollapsedRecursive(!expand);
-    } else {
-        set_collapsed(row->id, !expand);
-    }
+    set_collapsed(row->id, !expand);
 }
 
 /* ── Diagnostics ───────────────────────────────────────────────────── */
+
+static const char *row_style_name(RowStyle s) {
+    switch (s) {
+    case RowStyle::Error:   return "error";
+    case RowStyle::Search:  return "search";
+    case RowStyle::Heading: return "heading";
+    case RowStyle::Green:   return "green";
+    case RowStyle::Dim:     return "dim";
+    case RowStyle::Bold:    return "bold";
+    case RowStyle::Cyan:    return "cyan";
+    case RowStyle::CyanBold:return "cyan_bold";
+    case RowStyle::Yellow:  return "yellow";
+    default:                return "normal";
+    }
+}
 
 static void dump_lpane(FILE *out) {
     if (!g_tui) return;
     std::fprintf(out, "=== LPANE ===\n");
     g_tui->dump_panel(g_lpane, out, [](FILE *f, int i, const RowData &r) {
-        std::fprintf(f, "%d|%s|%s|%s|%s\n", i, r.style.c_str(), r.id.c_str(),
+        std::fprintf(f, "%d|%s|%s|%s|%s\n", i, row_style_name(r.style), r.id.c_str(),
                      r.parent_id.c_str(), r.cols.empty() ? "" : r.cols[0].c_str());
     });
     std::fprintf(out, "=== END LPANE ===\n");
@@ -1475,7 +1502,7 @@ static void dump_rpane(FILE *out) {
     if (!g_tui) return;
     std::fprintf(out, "=== RPANE ===\n");
     g_tui->dump_panel(g_rpane, out, [](FILE *f, int i, const RowData &r) {
-        std::fprintf(f, "%d|%s|%s|%d|%s\n", i, r.style.c_str(),
+        std::fprintf(f, "%d|%s|%s|%d|%s\n", i, row_style_name(r.style),
                      r.cols.empty() ? "" : r.cols[0].c_str(),
                      r.link_mode, r.link_id.c_str());
     });

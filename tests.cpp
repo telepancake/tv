@@ -108,12 +108,12 @@ static int count_id(int panel, const std::string &id) {
     return n;
 }
 
-static bool style_at(int panel, int idx, const std::string &style) {
+static bool style_at(int panel, int idx, RowStyle style) {
     auto *r = tv_test_tui()->get_cached_row(panel, idx);
     return r && r->style == style;
 }
 
-static bool any_row_style_col(int panel, const std::string &style, const std::string &text) {
+static bool any_row_style_col(int panel, RowStyle style, const std::string &text) {
     for (int i = 0; ; i++) {
         auto *r = tv_test_tui()->get_cached_row(panel, i);
         if (!r) return false;
@@ -299,11 +299,11 @@ static bool test_proc_tree_child_count() {
 static bool test_proc_tree_error_styles() {
     setup();
     int lp = tv_test_lpane();
-    ASSERT(style_at(lp, 0, "error"), "row 0 not error style");
-    ASSERT(style_at(lp, 3, "error"), "row 3 not error style");
-    ASSERT(style_at(lp, 8, "error"), "row 8 not error style");
-    ASSERT(style_at(lp, 1, "normal"), "row 1 not normal style");
-    ASSERT(style_at(lp, 5, "normal"), "row 5 not normal style");
+    ASSERT(style_at(lp, 0, RowStyle::Error), "row 0 not error style");
+    ASSERT(style_at(lp, 3, RowStyle::Error), "row 3 not error style");
+    ASSERT(style_at(lp, 8, RowStyle::Error), "row 8 not error style");
+    ASSERT(style_at(lp, 1, RowStyle::Normal), "row 1 not normal style");
+    ASSERT(style_at(lp, 5, RowStyle::Normal), "row 5 not normal style");
     return true;
 }
 
@@ -316,7 +316,7 @@ static bool test_proc_detail_normal_exit() {
     ASSERT(rpane_col_contains("exited code=0"), "missing exit status");
     // Check Exit line has green style
     int rp = tv_test_rpane();
-    ASSERT(any_row_style_col(rp, "green", "Exit:"), "Exit: not green styled");
+    ASSERT(any_row_style_col(rp, RowStyle::Green, "Exit:"), "Exit: not green styled");
     return true;
 }
 
@@ -329,7 +329,7 @@ static bool test_proc_detail_interesting_failure() {
     ASSERT(rpane_col_contains("broken.c"), "missing broken.c");
     ASSERT(rpane_col_contains("STDERR"), "missing STDERR");
     int rp = tv_test_rpane();
-    ASSERT(any_row_style_col(rp, "error", "Exit:"), "Exit: not error styled");
+    ASSERT(any_row_style_col(rp, RowStyle::Error, "Exit:"), "Exit: not error styled");
     return true;
 }
 
@@ -351,7 +351,7 @@ static bool test_proc_detail_signal_death() {
     ASSERT(rpane_col_contains("signal 11"), "missing signal 11");
     ASSERT(rpane_col_contains("segfault"), "missing segfault");
     int rp = tv_test_rpane();
-    ASSERT(any_row_style_col(rp, "error", "Exit:"), "Exit: not error styled");
+    ASSERT(any_row_style_col(rp, RowStyle::Error, "Exit:"), "Exit: not error styled");
     return true;
 }
 
@@ -543,7 +543,7 @@ static bool test_file_view_error_files() {
         auto *r = tv_test_tui()->get_cached_row(lp, i);
         if (!r) break;
         if (r->id == "/nonexistent") {
-            ASSERT(r->style == "error", "/nonexistent not error style");
+            ASSERT(r->style == RowStyle::Error, "/nonexistent not error style");
             return true;
         }
     }
@@ -614,7 +614,7 @@ static bool test_file_detail_error_file() {
     ASSERT(rpane_col_contains("Errors: 1"), "missing Errors: 1");
     ASSERT(rpane_col_contains("PID 1004"), "missing PID 1004");
     int rp = tv_test_rpane();
-    ASSERT(any_row_style_col(rp, "error", "err=2"), "err=2 not error styled");
+    ASSERT(any_row_style_col(rp, RowStyle::Error, "err=2"), "err=2 not error styled");
     return true;
 }
 
@@ -699,7 +699,7 @@ static bool test_output_view_stderr_styled() {
     setup();
     send(R"({"input":"key","name":"3"})");
     int lp = tv_test_lpane();
-    ASSERT(any_row_style_col(lp, "error", "STDERR"), "STDERR not error styled");
+    ASSERT(any_row_style_col(lp, RowStyle::Error, "STDERR"), "STDERR not error styled");
     return true;
 }
 
@@ -825,7 +825,7 @@ static bool test_search_matches_process() {
     for (int i = 0; ; i++) {
         auto *r = tv_test_tui()->get_cached_row(lp, i);
         if (!r) break;
-        if (r->style == "search" && r->id == "1003") found = true;
+        if (r->style == RowStyle::Search && r->id == "1003") found = true;
     }
     ASSERT(found, "1003 not search-styled");
     ASSERT(std::string(tv_test_search()) == "broken", "search term not 'broken'");
@@ -852,7 +852,7 @@ static bool test_search_matches_file() {
     for (int i = 0; ; i++) {
         auto *r = tv_test_tui()->get_cached_row(lp, i);
         if (!r) break;
-        if (r->style == "search") {
+        if (r->style == RowStyle::Search) {
             for (auto &c : r->cols)
                 if (c.find("foo") != std::string::npos) { found = true; break; }
         }
