@@ -54,8 +54,8 @@ gen_sql_h: gen_sql_h.c
 tv_sql.h: tv.sql gen_sql_h
 	./gen_sql_h tv.sql tv_sql.h
 
-tv: main.cpp engine.cpp engine.h uproctrace.cpp tests.cpp
-	g++ $(CXXFLAGS) -o tv main.cpp engine.cpp uproctrace.cpp tests.cpp -static $(TV_LIBS)
+tv: main.cpp engine.cpp engine.h json.cpp json.h uproctrace.cpp tests.cpp
+	g++ $(CXXFLAGS) -o tv main.cpp engine.cpp json.cpp uproctrace.cpp tests.cpp -static $(TV_LIBS)
 
 fv: fv.cpp engine.cpp engine.h
 	g++ $(CXXFLAGS) -o fv fv.cpp engine.cpp
