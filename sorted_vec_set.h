@@ -61,7 +61,7 @@ public:
     }
 
     void clear() { v_.clear(); sorted_ = true; }
-    bool empty() { ensure_sorted(); return v_.empty(); }
+    bool empty() const { return v_.empty(); }
     std::size_t size() { ensure_sorted(); return v_.size(); }
 
     auto begin() { ensure_sorted(); return v_.begin(); }

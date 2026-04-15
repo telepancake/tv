@@ -552,7 +552,8 @@ static void default_nav(Tui::Impl *m, int k) {
     case TUI_K_PGUP:           p.cursor -= pg; break;
     case TUI_K_PGDN:           p.cursor += pg; break;
     case TUI_K_HOME: case 'g': p.cursor = 0; break;
-    case TUI_K_END:            p_ensure_complete(m, &p); p.cursor = p.row_count > 0 ? p.row_count - 1 : 0; break;
+    case TUI_K_END:            /* Must materialise all rows to find the last one. */
+                               p_ensure_complete(m, &p); p.cursor = p.row_count > 0 ? p.row_count - 1 : 0; break;
     default: return;
     }
     p_clamp(m, &p);
