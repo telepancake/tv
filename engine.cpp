@@ -195,18 +195,15 @@ static void tty_size(Tui::Impl *m) {
     }
 }
 
-static Panel *pfind(Tui::Impl *m, const char *nm) {
-    if (!nm) return nullptr;
-    for (auto &p : m->panels)
-        if (std::strcmp(p.def.name, nm) == 0) return &p;
-    return nullptr;
+
+static Panel *pget(Tui::Impl *m, int idx) {
+    if (idx < 0 || idx >= static_cast<int>(m->panels.size())) return nullptr;
+    return &m->panels[idx];
 }
 
-static int pfind_idx(Tui::Impl *m, const char *nm) {
-    if (!nm) return -1;
-    for (int i = 0; i < static_cast<int>(m->panels.size()); i++)
-        if (std::strcmp(m->panels[i].def.name, nm) == 0) return i;
-    return -1;
+static int pidx(Tui::Impl *m, Panel *p) {
+    if (!p) return -1;
+    return static_cast<int>(p - m->panels.data());
 }
 
 /* Open the data-source iterator for this panel (if not already open). */
@@ -223,20 +220,21 @@ static void p_ensure_iter(Tui::Impl *m, Panel *p) {
     p->complete = false;
     p->row_count = 0;
     if (m->source.row_begin)
-        m->source.row_begin(p->def.name);
+        m->source.row_begin(pidx(m, p));
     p->iter_open = true;
 }
 
 /* Read from the data source until we have at least `need` rows, or exhausted. */
 static void p_ensure_rows(Tui::Impl *m, Panel *p, int need) {
+    int pi = pidx(m, p);
     p_ensure_iter(m, p);
     if (p->complete) return;
     while (p->row_count < need &&
-           m->source.row_has_more && m->source.row_has_more(p->def.name)) {
-        p->rows.push_back(m->source.row_next(p->def.name));
+           m->source.row_has_more && m->source.row_has_more(pi)) {
+        p->rows.push_back(m->source.row_next(pi));
         p->row_count = static_cast<int>(p->rows.size());
     }
-    if (!m->source.row_has_more || !m->source.row_has_more(p->def.name)) {
+    if (!m->source.row_has_more || !m->source.row_has_more(pi)) {
         p->complete = true;
         p->row_count = static_cast<int>(p->rows.size());
     }
@@ -272,6 +270,7 @@ static void p_sync_id(Tui::Impl *m, Panel *p) {
 
 static void p_resolve_id(Tui::Impl *m, Panel *p) {
     if (!p->cursor_id[0]) { p->cursor = 0; return; }
+    int pi = pidx(m, p);
     p_ensure_iter(m, p);
     /* First check already-loaded rows. */
     for (int i = 0; i < p->row_count; i++) {
@@ -281,15 +280,15 @@ static void p_resolve_id(Tui::Impl *m, Panel *p) {
         }
     }
     /* Incrementally load more rows until found or exhausted. */
-    while (!p->complete && m->source.row_has_more && m->source.row_has_more(p->def.name)) {
-        p->rows.push_back(m->source.row_next(p->def.name));
+    while (!p->complete && m->source.row_has_more && m->source.row_has_more(pi)) {
+        p->rows.push_back(m->source.row_next(pi));
         p->row_count = static_cast<int>(p->rows.size());
         if (p->rows.back().id == p->cursor_id) {
             p->cursor = p->row_count - 1;
             return;
         }
     }
-    if (!m->source.row_has_more || !m->source.row_has_more(p->def.name))
+    if (!m->source.row_has_more || !m->source.row_has_more(pi))
         p->complete = true;
     /* ID not found — keep current position (will be clamped). */
 }
@@ -299,8 +298,7 @@ static void p_resolve_id(Tui::Impl *m, Panel *p) {
 static int box_contains_focus(Tui::Impl *m, Box *b) {
     if (!b) return 0;
     if (b->type == TUI_BOX_PANEL) {
-        if (m->focus < 0 || m->focus >= static_cast<int>(m->panels.size())) return 0;
-        return b->def && std::strcmp(b->def->name, m->panels[m->focus].def.name) == 0;
+        return b->panel == m->focus;
     }
     for (auto *child : b->children)
         if (box_contains_focus(m, child)) return 1;
@@ -310,7 +308,7 @@ static int box_contains_focus(Tui::Impl *m, Box *b) {
 static void resolve_box(Tui::Impl *m, Box *b, int x, int y, int w, int h) {
     if (!b) return;
     if (b->type == TUI_BOX_PANEL) {
-        auto *p = pfind(m, b->def->name);
+        auto *p = pget(m, b->panel);
         if (p) { p->x = x; p->y = y; p->w = std::max(w, 1); p->h = std::max(h, 1); }
         return;
     }
@@ -562,10 +560,11 @@ static void default_nav(Tui::Impl *m, int k) {
     case TUI_K_PGDN:           p.cursor += pg; break;
     case TUI_K_HOME: case 'g': p.cursor = 0; break;
     case TUI_K_END:            /* Read all remaining rows inline to find last. */
-                               { p_ensure_iter(m, &p);
+                               { int pi = pidx(m, &p);
+                                 p_ensure_iter(m, &p);
                                  while (!p.complete && m->source.row_has_more &&
-                                        m->source.row_has_more(p.def.name)) {
-                                     p.rows.push_back(m->source.row_next(p.def.name));
+                                        m->source.row_has_more(pi)) {
+                                     p.rows.push_back(m->source.row_next(pi));
                                      p.row_count = static_cast<int>(p.rows.size());
                                  }
                                  p.complete = true;
@@ -580,13 +579,13 @@ static void default_nav(Tui::Impl *m, int k) {
 /* fire TUI_K_NONE to notify app that navigation happened */
 static void fire_key_none(Tui &tui, Tui::Impl *m) {
     if (!m->key_cb) return;
-    const char *fp = "";
+    int fp = -1;
     const char *fid = "";
     int fc = 0;
     int npanels = static_cast<int>(m->panels.size());
     if (m->focus >= 0 && m->focus < npanels) {
         auto &f = m->panels[m->focus];
-        fp = f.def.name; fc = f.cursor; fid = f.cursor_id;
+        fp = m->focus; fc = f.cursor; fid = f.cursor_id;
     }
     m->key_cb(tui, TUI_K_NONE, fp, fc, fid);
 }
@@ -637,54 +636,45 @@ std::unique_ptr<Tui> Tui::open_headless(DataSource src, int rows, int cols) {
     return t;
 }
 
-void Tui::set_layout(Box *root) {
+int Tui::add_panel(PanelDef def) {
     auto *m = impl_.get();
-    m->layout_root = root;
-    struct Frame { Box *b; };
-    std::vector<Frame> stack;
-    stack.push_back({root});
-    while (!stack.empty()) {
-        auto *b = stack.back().b;
-        stack.pop_back();
-        if (!b) continue;
-        if (b->type == TUI_BOX_PANEL) {
-            if (!pfind(m, b->def->name)) {
-                m->panels.emplace_back();
-                auto &p = m->panels.back();
-                p.def   = *b->def;
-                p.dirty = true;
-                if (m->focus < 0 && (b->def->flags & TUI_PANEL_CURSOR))
-                    m->focus = static_cast<int>(m->panels.size()) - 1;
-            }
-        } else {
-            for (auto it = b->children.rbegin(); it != b->children.rend(); ++it)
-                stack.push_back({*it});
-        }
-    }
+    int idx = static_cast<int>(m->panels.size());
+    m->panels.emplace_back();
+    auto &p = m->panels.back();
+    p.def   = def;
+    p.dirty = true;
+    if (m->focus < 0 && (def.flags & TUI_PANEL_CURSOR))
+        m->focus = idx;
+    return idx;
 }
 
-void Tui::dirty(const char *panel) {
+int Tui::panel_count() const {
+    return static_cast<int>(impl_->panels.size());
+}
+
+void Tui::set_layout(Box *root) {
+    impl_->layout_root = root;
+}
+
+void Tui::dirty(int panel) {
     auto *m = impl_.get();
-    if (!panel) { for (auto &p : m->panels) p.dirty = true; return; }
-    auto *p = pfind(m, panel);
+    if (panel == TUI_ALL_PANELS) { for (auto &p : m->panels) p.dirty = true; return; }
+    auto *p = pget(m, panel);
     if (p) p->dirty = true;
 }
 
-void Tui::focus(const char *panel) {
-    int i = pfind_idx(impl_.get(), panel);
-    if (i >= 0) impl_->focus = i;
+void Tui::focus(int panel) {
+    if (panel >= 0 && panel < static_cast<int>(impl_->panels.size()))
+        impl_->focus = panel;
 }
 
-const char *Tui::get_focus() const {
-    auto *m = impl_.get();
-    int np = static_cast<int>(m->panels.size());
-    if (m->focus < 0 || m->focus >= np) return "";
-    return m->panels[m->focus].def.name;
+int Tui::get_focus() const {
+    return impl_->focus;
 }
 
-void Tui::set_cursor(const char *panel, const char *id) {
+void Tui::set_cursor(int panel, const char *id) {
     auto *m = impl_.get();
-    auto *p = pfind(m, panel);
+    auto *p = pget(m, panel);
     if (!p) return;
     if (!id) { p->cursor = 0; p->cursor_id[0] = '\0'; return; }
     std::snprintf(p->cursor_id, sizeof p->cursor_id, "%s", id);
@@ -699,9 +689,9 @@ void Tui::set_cursor(const char *panel, const char *id) {
     p_clamp(m, p);
 }
 
-void Tui::set_cursor_idx(const char *panel, int idx) {
+void Tui::set_cursor_idx(int panel, int idx) {
     auto *m = impl_.get();
-    auto *p = pfind(m, panel);
+    auto *p = pget(m, panel);
     if (!p) return;
     if (p->dirty) {
         p->iter_open = false;
@@ -716,24 +706,24 @@ void Tui::set_cursor_idx(const char *panel, int idx) {
     p_sync_id(m, p);
 }
 
-int Tui::get_cursor(const char *panel) const {
-    auto *p = pfind(impl_.get(), panel);
+int Tui::get_cursor(int panel) const {
+    auto *p = pget(impl_.get(), panel);
     return p ? p->cursor : -1;
 }
 
-int Tui::get_scroll(const char *panel) const {
-    auto *p = pfind(impl_.get(), panel);
+int Tui::get_scroll(int panel) const {
+    auto *p = pget(impl_.get(), panel);
     return p ? p->scroll : 0;
 }
 
-const char *Tui::get_cursor_id(const char *panel) const {
-    auto *p = pfind(impl_.get(), panel);
+const char *Tui::get_cursor_id(int panel) const {
+    auto *p = pget(impl_.get(), panel);
     return (p && p->cursor_id[0]) ? p->cursor_id : "";
 }
 
-const RowData *Tui::get_cached_row(const char *panel, int idx) {
+const RowData *Tui::get_cached_row(int panel, int idx) {
     auto *m = impl_.get();
-    auto *p = pfind(m, panel);
+    auto *p = pget(m, panel);
     if (!p || idx < 0) return nullptr;
     p_ensure_rows(m, p, idx + 1);
     if (idx >= p->row_count) return nullptr;
@@ -857,12 +847,13 @@ void Tui::run() {
                     fire_key_none(*this, m);
                     continue;
                 }
-                const char *fp = "", *fid = "";
+                int fp = -1;
+                const char *fid = "";
                 int fc = 0;
                 int npanels = static_cast<int>(m->panels.size());
                 if (m->focus >= 0 && m->focus < npanels) {
                     auto &f = m->panels[m->focus];
-                    fp = f.def.name; fc = f.cursor; fid = f.cursor_id;
+                    fp = m->focus; fc = f.cursor; fid = f.cursor_id;
                 }
                 int res = TUI_DEFAULT;
                 if (m->key_cb)
@@ -940,12 +931,13 @@ void Tui::input_key(int key) {
         fire_key_none(*this, m);
         return;
     }
-    const char *fp = "", *fid = "";
+    int fp = -1;
+    const char *fid = "";
     int fc = 0;
     int npanels = static_cast<int>(m->panels.size());
     if (m->focus >= 0 && m->focus < npanels) {
         auto &f = m->panels[m->focus];
-        fp = f.def.name; fc = f.cursor; fid = f.cursor_id;
+        fp = m->focus; fc = f.cursor; fid = f.cursor_id;
     }
     int res = TUI_DEFAULT;
     if (m->key_cb) res = m->key_cb(*this, key, fp, fc, fid);

@@ -248,6 +248,7 @@ static std::vector<input_cmd_t> g_inputs;
 static app_state_t g_state;
 static std::unique_ptr<Tui> g_tui;
 static int g_headless;
+static int g_lpane = -1, g_rpane = -1;
 static double g_base_ts;
 /* Single collapsed-ID set shared across all modes.  IDs are unique:
    process tgids are numeric strings, directory paths start with "/",
@@ -1323,13 +1324,13 @@ static int on_detail_update_timer(Tui &tui) {
     g_detail_timer_id = -1;
     if (!g_detail_update_pending) return 0;
     g_detail_update_pending = 0;
-    if (g_tui) g_tui->dirty("rpane");
+    if (g_tui) g_tui->dirty(g_rpane);
     return 0;
 }
 
 static void schedule_detail_update() {
     if (!g_tui || g_headless) {
-        if (g_tui) g_tui->dirty("rpane");
+        if (g_tui) g_tui->dirty(g_rpane);
         update_status();
         return;
     }
@@ -1395,8 +1396,8 @@ static void build_lpane_nonprocess(std::vector<RowData> &rows) {
     }
 }
 
-static void ds_row_begin(const char *panel) {
-    if (std::strcmp(panel, "lpane") == 0) {
+static void ds_row_begin(int panel) {
+    if (panel == g_lpane) {
         if (g_state.mode == 0) {
             if (g_state.grouped)
                 lpane_begin_proc_tree();
@@ -1415,8 +1416,8 @@ static void ds_row_begin(const char *panel) {
     }
 }
 
-static bool ds_row_has_more(const char *panel) {
-    if (std::strcmp(panel, "lpane") == 0) {
+static bool ds_row_has_more(int panel) {
+    if (panel == g_lpane) {
         switch (g_lp_mode) {
         case 0: return !g_proc_tree_iter.dfs.empty();
         case 1: return g_proc_flat_iter.idx < g_proc_flat_iter.tgids.size();
@@ -1427,8 +1428,8 @@ static bool ds_row_has_more(const char *panel) {
     return g_rp_iter.idx < g_rp_iter.rows.size();
 }
 
-static RowData ds_row_next(const char *panel) {
-    if (std::strcmp(panel, "lpane") == 0) {
+static RowData ds_row_next(int panel) {
+    if (panel == g_lpane) {
         switch (g_lp_mode) {
         case 0: { /* proc tree DFS */
             auto &dfs = g_proc_tree_iter.dfs;
@@ -1467,7 +1468,7 @@ static RowData ds_row_next(const char *panel) {
 static void update_status() {
     static const char *mn[] = {"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};
     static const char *tsl[] = {"abs","rel","Δ"};
-    int cur = g_tui ? g_tui->get_cursor("lpane") : 0;
+    int cur = g_tui ? g_tui->get_cursor(g_lpane) : 0;
     std::string s = sfmt(" %s%s | row %d | TS:%s", mn[g_state.mode], g_state.grouped ? " tree" : "",
                          cur + 1, tsl[g_state.ts_mode]);
     if (!g_state.evfilt.empty()) s += sfmt(" | F:%s", g_state.evfilt.c_str());
@@ -1481,45 +1482,45 @@ static void update_status() {
 
 /* ── Layout ────────────────────────────────────────────────────────── */
 
-static const ColDef g_text_col[] = {{"text", -1, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE}};
-static const PanelDef g_lpane_def = {"lpane", nullptr, g_text_col, 1, TUI_PANEL_CURSOR};
-static const PanelDef g_rpane_def = {"rpane", nullptr, g_text_col, 1, TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
+static const ColDef g_text_col[] = {{-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE}};
+static const PanelDef g_lpane_def = {nullptr, g_text_col, 1, TUI_PANEL_CURSOR};
+static const PanelDef g_rpane_def = {nullptr, g_text_col, 1, TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
 
 /* ── Navigation ────────────────────────────────────────────────────── */
 
 static void reset_mode_selection() {
     g_state.cursor_id.clear();
     g_state.dcursor_id.clear();
-    if (g_tui) g_tui->focus("lpane");
+    if (g_tui) g_tui->focus(g_lpane);
 }
 
 static void set_cursor_to_search_hit(int dir) {
     if (!g_tui) return;
-    int start = g_tui->get_cursor("lpane");
+    int start = g_tui->get_cursor(g_lpane);
     if (dir > 0) {
         /* Forward: scan from start+1 to end, then wrap from 0 to start-1. */
         for (int i = start + 1; ; i++) {
-            auto *r = g_tui->get_cached_row("lpane", i);
+            auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
             if (r->style == "search") { g_state.cursor_id = r->id; return; }
         }
         for (int i = 0; i < start; i++) {
-            auto *r = g_tui->get_cached_row("lpane", i);
+            auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
             if (r->style == "search") { g_state.cursor_id = r->id; return; }
         }
     } else {
         /* Backward: scan from start-1 down to 0, then wrap from end to start+1. */
         for (int i = start - 1; i >= 0; i--) {
-            auto *r = g_tui->get_cached_row("lpane", i);
+            auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
             if (r->style == "search") { g_state.cursor_id = r->id; return; }
         }
         /* Find the end by scanning forward, then scan backward from there. */
         int last = start;
-        while (g_tui->get_cached_row("lpane", last + 1)) last++;
+        while (g_tui->get_cached_row(g_lpane, last + 1)) last++;
         for (int i = last; i > start; i--) {
-            auto *r = g_tui->get_cached_row("lpane", i);
+            auto *r = g_tui->get_cached_row(g_lpane, i);
             if (!r) break;
             if (r->style == "search") { g_state.cursor_id = r->id; return; }
         }
@@ -1529,10 +1530,10 @@ static void set_cursor_to_search_hit(int dir) {
 static void apply_search(const std::string &q) {
     g_state.search = q;
     /* Dirty lpane so the engine re-reads with search highlighting. */
-    if (g_tui) g_tui->dirty("lpane");
+    if (g_tui) g_tui->dirty(g_lpane);
     /* Scan lazily to find the first hit. */
     for (int i = 0; ; i++) {
-        auto *r = g_tui ? g_tui->get_cached_row("lpane", i) : nullptr;
+        auto *r = g_tui ? g_tui->get_cached_row(g_lpane, i) : nullptr;
         if (!r) break;
         if (r->style == "search") {
             g_state.cursor_id = r->id;
@@ -1542,9 +1543,9 @@ static void apply_search(const std::string &q) {
 }
 
 static void collapse_or_back() {
-    if (g_tui && std::strcmp(g_tui->get_focus(), "rpane") == 0) { g_tui->focus("lpane"); return; }
-    int cur = g_tui ? g_tui->get_cursor("lpane") : -1;
-    auto *row = g_tui ? g_tui->get_cached_row("lpane", cur) : nullptr;
+    if (g_tui && g_tui->get_focus() == g_rpane) { g_tui->focus(g_lpane); return; }
+    int cur = g_tui ? g_tui->get_cursor(g_lpane) : -1;
+    auto *row = g_tui ? g_tui->get_cached_row(g_lpane, cur) : nullptr;
     if (!row) return;
     if (row->has_children && !is_collapsed(row->id)) {
         g_collapsed.insert(row->id);
@@ -1553,9 +1554,9 @@ static void collapse_or_back() {
 }
 
 static void expand_or_detail() {
-    bool in_rpane = g_tui && std::strcmp(g_tui->get_focus(), "rpane") == 0;
-    int cur = g_tui ? g_tui->get_cursor(in_rpane ? "rpane" : "lpane") : -1;
-    auto *row = g_tui ? g_tui->get_cached_row(in_rpane ? "rpane" : "lpane", cur) : nullptr;
+    bool in_rpane = g_tui && g_tui->get_focus() == g_rpane;
+    int cur = g_tui ? g_tui->get_cursor(in_rpane ? g_rpane : g_lpane) : -1;
+    auto *row = g_tui ? g_tui->get_cached_row(in_rpane ? g_rpane : g_lpane, cur) : nullptr;
     if (!row) return;
     if (in_rpane) {
         if (row->link_mode >= 0 && !row->link_id.empty()) {
@@ -1568,7 +1569,7 @@ static void expand_or_detail() {
     if (row->has_children && is_collapsed(row->id)) {
         g_collapsed.erase(row->id);
     }
-    else if (g_tui) g_tui->focus("rpane");
+    else if (g_tui) g_tui->focus(g_rpane);
 }
 
 /* Expand/collapse all descendants of the current node by walking the model. */
@@ -1584,8 +1585,8 @@ static void expand_subtree_proc(int tgid, int expand) {
 }
 
 static void expand_subtree(int expand) {
-    int cur = g_tui ? g_tui->get_cursor("lpane") : -1;
-    auto *row = g_tui ? g_tui->get_cached_row("lpane", cur) : nullptr;
+    int cur = g_tui ? g_tui->get_cursor(g_lpane) : -1;
+    auto *row = g_tui ? g_tui->get_cached_row(g_lpane, cur) : nullptr;
     if (!row || !row->has_children) return;
     if (g_state.mode == 0) {
         /* Process view: walk process tree directly. */
@@ -1603,7 +1604,7 @@ static void expand_subtree(int expand) {
 static void dump_lpane(FILE *out) {
     std::fprintf(out, "=== LPANE ===\n");
     for (int i = 0; ; i++) {
-        auto *r = g_tui ? g_tui->get_cached_row("lpane", i) : nullptr;
+        auto *r = g_tui ? g_tui->get_cached_row(g_lpane, i) : nullptr;
         if (!r) break;
         std::fprintf(out, "%d|%s|%s|%s|%s\n", i, r->style.c_str(), r->id.c_str(),
                      r->parent_id.c_str(), r->cols.empty() ? "" : r->cols[0].c_str());
@@ -1614,7 +1615,7 @@ static void dump_lpane(FILE *out) {
 static void dump_rpane(FILE *out) {
     std::fprintf(out, "=== RPANE ===\n");
     for (int i = 0; ; i++) {
-        auto *r = g_tui ? g_tui->get_cached_row("rpane", i) : nullptr;
+        auto *r = g_tui ? g_tui->get_cached_row(g_rpane, i) : nullptr;
         if (!r) break;
         std::fprintf(out, "%d|%s|%s|%d|%s\n", i, r->style.c_str(),
                      r->cols.empty() ? "" : r->cols[0].c_str(),
@@ -1624,11 +1625,11 @@ static void dump_rpane(FILE *out) {
 }
 
 static void dump_state(FILE *out) {
-    int cursor = g_tui ? g_tui->get_cursor("lpane") : 0;
-    int scroll = g_tui ? g_tui->get_scroll("lpane") : 0;
-    int focus_r = g_tui && std::strcmp(g_tui->get_focus(), "rpane") == 0 ? 1 : 0;
-    int dcursor = g_tui ? g_tui->get_cursor("rpane") : 0;
-    int dscroll = g_tui ? g_tui->get_scroll("rpane") : 0;
+    int cursor = g_tui ? g_tui->get_cursor(g_lpane) : 0;
+    int scroll = g_tui ? g_tui->get_scroll(g_lpane) : 0;
+    int focus_r = g_tui && g_tui->get_focus() == g_rpane ? 1 : 0;
+    int dcursor = g_tui ? g_tui->get_cursor(g_rpane) : 0;
+    int dscroll = g_tui ? g_tui->get_scroll(g_rpane) : 0;
     int rows = g_tui ? g_tui->rows() : 24;
     int cols = g_tui ? g_tui->cols() : 80;
     std::fprintf(out, "=== STATE ===\n");
@@ -1652,19 +1653,19 @@ static void process_print(const std::string &what) {
 static void apply_state_change() {
     cancel_detail_update();
     if (g_tui) {
-        g_tui->dirty(nullptr);
+        g_tui->dirty();
         if (!g_state.cursor_id.empty())
-            g_tui->set_cursor("lpane", g_state.cursor_id.c_str());
+            g_tui->set_cursor(g_lpane, g_state.cursor_id.c_str());
         if (!g_state.dcursor_id.empty())
-            g_tui->set_cursor("rpane", g_state.dcursor_id.c_str());
+            g_tui->set_cursor(g_rpane, g_state.dcursor_id.c_str());
     }
     update_status();
 }
 
-static int on_key_cb(Tui &tui, int key, const char *panel, int cursor, const char *row_id) {
+static int on_key_cb(Tui &tui, int key, int panel, int cursor, const char *row_id) {
     (void)cursor;
     if (key == TUI_K_NONE) {
-        if (std::strcmp(panel ? panel : "", "lpane") == 0) {
+        if (panel == g_lpane) {
             g_state.cursor_id = row_id ? row_id : "";
             schedule_detail_update();
         } else {
@@ -1938,13 +1939,15 @@ int main(int argc, char **argv) {
     }
 
     {
-        static Box lbox = {TUI_BOX_PANEL, 1, 0, 0, &g_lpane_def, {}};
-        static Box rbox = {TUI_BOX_PANEL, 1, 0, 0, &g_rpane_def, {}};
-        static Box hbox = {TUI_BOX_HBOX, 1, 0, 0, nullptr, {&lbox, &rbox}};
+        g_lpane = g_tui->add_panel(g_lpane_def);
+        g_rpane = g_tui->add_panel(g_rpane_def);
+        static Box lbox = {TUI_BOX_PANEL, 1, 0, 0, g_lpane, {}};
+        static Box rbox = {TUI_BOX_PANEL, 1, 0, 0, g_rpane, {}};
+        static Box hbox = {TUI_BOX_HBOX, 1, 0, 0, -1, {&lbox, &rbox}};
         g_tui->set_layout(&hbox);
     }
     g_tui->on_key(on_key_cb);
-    g_tui->dirty(nullptr);
+    g_tui->dirty();
     update_status();
 
     for (const auto &cmd_i : g_inputs) process_input_cmd(cmd_i);
