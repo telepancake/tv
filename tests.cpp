@@ -1,4 +1,4 @@
-// tests.cpp — C++ test suite for tv (converted from tests/run_tests.sh)
+// tests.cpp — C++ test suite for tv
 #include "engine.h"
 
 #include <cstdio>
