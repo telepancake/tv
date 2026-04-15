@@ -953,3 +953,12 @@ void Tui::resize(int rows, int cols) {
     if (cols > 0) m->term_cols = cols;
     for (auto &p : m->panels) p.dirty = true;
 }
+
+void Tui::dump_panel(int panel, FILE *out,
+                     std::function<void(FILE *out, int idx, const RowData &row)> fmt) {
+    for (int i = 0; ; i++) {
+        auto *r = get_cached_row(panel, i);
+        if (!r) break;
+        fmt(out, i, *r);
+    }
+}
