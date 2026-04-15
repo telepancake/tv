@@ -73,7 +73,7 @@ sudtrace: sud32 sud64
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv
-	bash tests/run_tests.sh
+	./tv --test
 
 clean-bins:
 	rm -f tv fv gen_sql_h

@@ -16,12 +16,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
 #include <memory>
-#include <cassert>
 
 #include <zstd.h>
 
@@ -248,8 +246,7 @@ struct trace_event_t {
 
 struct process_t : Item {
     int tgid = 0, pid = 0, ppid = 0, nspid = 0, nstgid = 0;
-    bool parent_set = false;            /* true once ppid has been assigned */
-    std::vector<int> child_tgids;       /* tgids of children (for sorting) */
+    bool parent_set = false;
     double start_ts = 0, end_ts = 0;
     int has_start = 0, has_end = 0;
     std::string exe;
@@ -284,7 +281,6 @@ struct process_t : Item {
         return cached_key_;
     }
     std::string printLine(int /*depth*/) const override { return cached_display_name; }
-    bool hasChildren() const override { return !child_tgids.empty(); }
 };
 
 struct app_state_t {
@@ -317,7 +313,7 @@ enum {
 
 static std::vector<trace_event_t> g_events;
 static int g_next_event_id = 1;
-static std::unordered_map<int, process_t> g_proc_map;
+static std::unordered_map<int, std::unique_ptr<process_t>> g_proc_map;
 static FILE *g_save_fp = nullptr;       /* temp file for raw trace lines */
 static std::vector<std::string> g_input_lines;  /* buffered input commands (raw JSON) */
 static app_state_t g_state;
@@ -581,13 +577,13 @@ static void emit_row(std::vector<RowData> &v, const std::string &id,
 
 static process_t *find_process(int tgid) {
     auto it = g_proc_map.find(tgid);
-    return it != g_proc_map.end() ? &it->second : nullptr;
+    return it != g_proc_map.end() ? it->second.get() : nullptr;
 }
 
 static process_t &get_process(int tgid) {
     auto [it, inserted] = g_proc_map.try_emplace(tgid);
-    if (inserted) { it->second.tgid = tgid; }
-    return it->second;
+    if (inserted) { it->second = std::make_unique<process_t>(); it->second->tgid = tgid; }
+    return *it->second;
 }
 
 /* ── Trace ingestion ───────────────────────────────────────────────── */
@@ -683,7 +679,7 @@ static void ingest_trace_line(const char *line) {
         proc.parent_set = true;
         auto pit = g_proc_map.find(proc.ppid);
         if (pit != g_proc_map.end())
-            pit->second.child_tgids.push_back(ev.tgid);
+            pit->second->children.push_back(&proc);
     }
 
     switch (ev.kind) {
@@ -855,7 +851,7 @@ static bool proc_is_interesting_failure(const process_t &p) {
     if (p.exit_status.empty()) return false;
     if (p.exit_status == "signaled") return true;
     if (p.exit_status == "exited" && p.exit_code != 0)
-        return p.has_write_open || !p.child_tgids.empty() || p.has_stdout;
+        return p.has_write_open || !p.children.empty() || p.has_stdout;
     return false;
 }
 
@@ -870,7 +866,8 @@ static bool proc_should_show(int tgid) {
     if (!p) return false;
     if (g_state.lp_filter == 0) return true;
     if (proc_matches_filter(*p)) return true;
-    for (int ct : p->child_tgids) if (proc_should_show(ct)) return true;
+    for (auto *ch : p->children)
+        if (proc_should_show(static_cast<process_t*>(ch)->tgid)) return true;
     return false;
 }
 
@@ -892,7 +889,7 @@ static const char *proc_style(const process_t &p) {
 static RowData make_proc_tree_row(process_t *p, int depth) {
     int tgid = p->tgid;
     std::string id_str = std::to_string(tgid);
-    bool has_kids = !p->child_tgids.empty();
+    bool has_kids = !p->children.empty();
     bool collapsed = has_kids && p->collapsed;
     const auto &name = p->display_name();
     std::string marker;
@@ -901,7 +898,7 @@ static RowData make_proc_tree_row(process_t *p, int depth) {
     else if (p->exit_status == "signaled")
         marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
     std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
-    int nchildren = static_cast<int>(p->child_tgids.size());
+    int nchildren = static_cast<int>(p->children.size());
     std::string prefix = sfmt("%*s%s", depth * 4, "",
         !has_kids ? "  " : (collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "));
     std::string extra = nchildren > 0 ? sfmt(" (%d)", nchildren) : std::string();
@@ -1217,14 +1214,16 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
                  (p->exit_status == "exited" && p->exit_code == 0) ? "green" : "error",
                  "", text, -1, "", false);
     }
-    int nchildren = static_cast<int>(p->child_tgids.size());
+    int nchildren = static_cast<int>(p->children.size());
     if (nchildren > 0) {
         emit_row(rows, "kids_hdr", "heading", "", sfmt("Children (%d)", nchildren), -1, "", false);
-        auto sorted_ch = p->child_tgids;
-        if (sorted_ch.size() > 1) std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
-        for (int ct : sorted_ch) {
-            auto *c = find_process(ct);
-            if (!c) continue;
+        auto sorted_ch = p->children;
+        if (sorted_ch.size() > 1)
+            std::sort(sorted_ch.begin(), sorted_ch.end(),
+                [](Item *a, Item *b) { return static_cast<process_t*>(a)->tgid < static_cast<process_t*>(b)->tgid; });
+        for (auto *item : sorted_ch) {
+            auto *c = static_cast<process_t*>(item);
+            int ct = c->tgid;
             std::string cid = sfmt("child_%d", ct);
             std::string text = sfmt("[%d] %s", ct, c->display_name().c_str());
             emit_row(rows, cid, "normal", "", text, 0, std::to_string(ct), false);
@@ -1351,7 +1350,7 @@ static void schedule_detail_update() {
 
 /* Process tree DFS iterator (mode 0, grouped) — yields one row at a time. */
 static struct {
-    std::vector<std::pair<int,int>> dfs; /* (tgid, depth) stack */
+    std::vector<std::pair<process_t*,int>> dfs; /* (process, depth) stack */
 } g_proc_tree_iter;
 
 /* Process flat iterator (mode 0, not grouped). */
@@ -1371,12 +1370,13 @@ static int g_lp_mode = -1; /* which lpane sub-iterator is active: 0=proc_tree 1=
 static void lpane_begin_proc_tree() {
     g_lp_mode = 0;
     g_proc_tree_iter.dfs.clear();
-    std::vector<int> roots;
+    std::vector<process_t*> roots;
     for (auto &[tgid, p] : g_proc_map)
-        if ((p.ppid == 0 || !find_process(p.ppid)) && proc_should_show(tgid))
-            roots.push_back(tgid);
-    if (roots.size() > 1) std::sort(roots.begin(), roots.end(), cmp_proc_tgid);
-    /* Push in reverse so first root is on top of stack. */
+        if ((p->ppid == 0 || !find_process(p->ppid)) && proc_should_show(tgid))
+            roots.push_back(p.get());
+    if (roots.size() > 1)
+        std::sort(roots.begin(), roots.end(),
+            [](process_t *a, process_t *b) { return a->tgid < b->tgid; });
     for (int i = static_cast<int>(roots.size()) - 1; i >= 0; i--)
         g_proc_tree_iter.dfs.push_back({roots[i], 0});
 }
@@ -1440,21 +1440,21 @@ static RowData ds_row_next(int panel) {
         switch (g_lp_mode) {
         case 0: { /* proc tree DFS */
             auto &dfs = g_proc_tree_iter.dfs;
-            auto [tgid, depth] = dfs.back();
+            auto [p, depth] = dfs.back();
             dfs.pop_back();
-            auto *p = find_process(tgid);
-            if (!p) return {};
-            std::string id_str = std::to_string(tgid);
-            bool has_kids = !p->child_tgids.empty();
+            bool has_kids = !p->children.empty();
             bool collapsed_flag = has_kids && p->collapsed;
-            /* Push children if not collapsed. */
+            /* Push children in reverse-sorted order (lowest tgid comes out first). */
             if (!collapsed_flag && has_kids) {
-                auto sorted_ch = p->child_tgids;
+                auto sorted_ch = p->children;
                 if (sorted_ch.size() > 1)
-                    std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
-                for (int i = static_cast<int>(sorted_ch.size()) - 1; i >= 0; i--)
-                    if (proc_should_show(sorted_ch[i]))
-                        dfs.push_back({sorted_ch[i], depth + 1});
+                    std::sort(sorted_ch.begin(), sorted_ch.end(),
+                        [](Item *a, Item *b) { return static_cast<process_t*>(a)->tgid < static_cast<process_t*>(b)->tgid; });
+                for (int i = static_cast<int>(sorted_ch.size()) - 1; i >= 0; i--) {
+                    auto *cp = static_cast<process_t*>(sorted_ch[i]);
+                    if (proc_should_show(cp->tgid))
+                        dfs.push_back({cp, depth + 1});
+                }
             }
             return make_proc_tree_row(p, depth);
         }
@@ -1579,28 +1579,17 @@ static void expand_or_detail() {
     else if (g_tui) g_tui->focus(g_rpane);
 }
 
-/* Expand/collapse all descendants of the current node using Item::setCollapsedRecursive. */
-/* Helper: recursively set collapsed flag on process tree via child_tgids. */
-static void proc_set_collapsed_rec(int tgid, bool c) {
-    auto *p = find_process(tgid);
-    if (!p) return;
-    if (!p->child_tgids.empty()) p->collapsed = c;
-    for (int ct : p->child_tgids) proc_set_collapsed_rec(ct, c);
-}
-
 static void expand_subtree(int expand) {
     int cur = g_tui ? g_tui->get_cursor(g_lpane) : -1;
     auto *row = g_tui ? g_tui->get_cached_row(g_lpane, cur) : nullptr;
     if (!row || !row->has_children) return;
     if (g_state.mode == 0) {
-        /* Process view: walk child_tgids recursively. */
-        proc_set_collapsed_rec(std::atoi(row->id.c_str()), !expand);
+        auto *p = find_process(std::atoi(row->id.c_str()));
+        if (p) p->setCollapsedRecursive(!expand);
     } else if (g_state.mode == 1) {
-        /* File tree view: find the PathItem and recurse. */
         PathItem *pi = find_path_item(row->id);
         if (pi) pi->setCollapsedRecursive(!expand);
     } else {
-        /* Output/other: just toggle this node. */
         set_collapsed(row->id, !expand);
     }
 }
