@@ -2584,11 +2584,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
          *   a1 = pointer to wstatus in traced program's memory */
         int wstatus = 0;
         if (a1) wstatus = *(int *)a1;
-        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
-            pid_t child_pid = (pid_t)ret;
-            pid_t child_tgid = child_pid;  /* reaped pid is the tgid */
-            emit_exit_event(child_pid, wstatus);
-        }
+        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus))
+            emit_exit_event((pid_t)ret, wstatus);
     }
 #endif
 #ifdef SYS_waitid
