@@ -26,101 +26,7 @@
 #include <zstd.h>
 
 #include "engine.h"
-
-/* ── sorted_vec_set<T> ─────────────────────────────────────────────── */
-
-template<typename T, typename Cmp = std::less<T>>
-class sorted_vec_set {
-    std::vector<T> v_;
-    bool sorted_ = true;
-    Cmp cmp_;
-
-    /* Two values are equivalent under the comparator when neither is less than the other. */
-    bool equiv(const T &a, const T &b) const { return !cmp_(a,b) && !cmp_(b,a); }
-
-    void ensure_sorted() {
-        if (sorted_) return;
-        std::sort(v_.begin(), v_.end(), cmp_);
-        v_.erase(std::unique(v_.begin(), v_.end(),
-                     [this](const T &a, const T &b){ return equiv(a,b); }),
-                 v_.end());
-        sorted_ = true;
-    }
-public:
-    sorted_vec_set() = default;
-
-    void insert(const T &val) {
-        if (!v_.empty() && !cmp_(v_.back(), val)) {
-            if (equiv(val, v_.back())) return;   /* duplicate of last */
-            sorted_ = false;
-        }
-        v_.push_back(val);
-    }
-    void insert(T &&val) {
-        if (!v_.empty() && !cmp_(v_.back(), val)) {
-            if (equiv(val, v_.back())) return;
-            sorted_ = false;
-        }
-        v_.push_back(std::move(val));
-    }
-
-    bool contains(const T &val) {
-        ensure_sorted();
-        return std::binary_search(v_.begin(), v_.end(), val, cmp_);
-    }
-
-    void erase(const T &val) {
-        ensure_sorted();
-        auto it = std::lower_bound(v_.begin(), v_.end(), val, cmp_);
-        if (it != v_.end() && !cmp_(val, *it)) v_.erase(it);
-    }
-
-    void clear() { v_.clear(); sorted_ = true; }
-    bool empty() { ensure_sorted(); return v_.empty(); }
-    std::size_t size() { ensure_sorted(); return v_.size(); }
-
-    /* iterators – ensure sorted before use */
-    auto begin() { ensure_sorted(); return v_.begin(); }
-    auto end()   { ensure_sorted(); return v_.end(); }
-    /* const iterators: caller must have called a non-const method first to ensure sorted */
-    auto begin() const { assert(sorted_); return v_.begin(); }
-    auto end()   const { assert(sorted_); return v_.end(); }
-
-    /* pair<iterator,bool> emplace for unordered_set compatibility */
-    std::pair<typename std::vector<T>::iterator, bool> emplace(const T &val) {
-        ensure_sorted();
-        auto it = std::lower_bound(v_.begin(), v_.end(), val, cmp_);
-        if (it != v_.end() && !cmp_(val, *it)) return {it, false};
-        return {v_.insert(it, val), true};
-    }
-
-    /* set-theoretic operations – return new sorted_vec_set */
-    sorted_vec_set set_union(sorted_vec_set &other) {
-        ensure_sorted(); other.ensure_sorted();
-        sorted_vec_set out;
-        out.v_.reserve(v_.size() + other.v_.size());
-        std::set_union(v_.begin(), v_.end(), other.v_.begin(), other.v_.end(),
-                       std::back_inserter(out.v_), cmp_);
-        out.sorted_ = true;
-        return out;
-    }
-    sorted_vec_set set_intersection(sorted_vec_set &other) {
-        ensure_sorted(); other.ensure_sorted();
-        sorted_vec_set out;
-        std::set_intersection(v_.begin(), v_.end(), other.v_.begin(), other.v_.end(),
-                              std::back_inserter(out.v_), cmp_);
-        out.sorted_ = true;
-        return out;
-    }
-    sorted_vec_set set_difference(sorted_vec_set &other) {
-        ensure_sorted(); other.ensure_sorted();
-        sorted_vec_set out;
-        std::set_difference(v_.begin(), v_.end(), other.v_.begin(), other.v_.end(),
-                            std::back_inserter(out.v_), cmp_);
-        out.sorted_ = true;
-        return out;
-    }
-};
+#include "sorted_vec_set.h"
 
 /* ── abs_path_t — interned absolute path token ─────────────────────── */
 
@@ -133,6 +39,9 @@ struct abs_path_data {
     mutable std::unordered_set<int> proc_tgids;
     mutable std::vector<int> event_indices;     /* OPEN events into g_events */
     mutable std::vector<int> path_event_indices; /* all events for this path */
+    /* Bidirectional proc ↔ file edges (tgids that read/wrote this path). */
+    mutable sorted_vec_set<int> read_procs;     /* processes that read this path */
+    mutable sorted_vec_set<int> write_procs;    /* processes that wrote this path */
 };
 
 struct abs_path_cmp {
@@ -266,6 +175,7 @@ struct process_t {
     sorted_vec_set<abs_path_t> write_paths;
     std::vector<int> event_indices;     /* indices into g_events */
     std::string cached_display_name;    /* pre-computed basename */
+    std::vector<int> pid_path;          /* ancestry: [root, ..., ppid, tgid] */
 
     void update_display_name() {
         std::string_view s;
@@ -312,11 +222,6 @@ struct dir_stat_t {
     int procs = 0;
     int errs = 0;
     int has_children = 0;
-};
-
-struct file_edge_t {
-    abs_path_t src;
-    abs_path_t dst;
 };
 
 enum {
@@ -562,7 +467,7 @@ static void emit_row(std::vector<RowData> &v, const std::string &id,
     RowData d;
     d.id = id;
     d.style = style ? style : "normal";
-    d.cols[0] = text;
+    d.cols = {text};
     d.parent_id = parent_id;
     d.link_mode = link_mode;
     d.link_id = link_id;
@@ -619,6 +524,23 @@ static std::string join_with_pipe(const std::vector<std::string> &arr) {
     return out;
 }
 
+static int key_name_to_code(const std::string &name) {
+    if (name.size() == 1) return static_cast<unsigned char>(name[0]);
+    if (name == "up") return TUI_K_UP;
+    if (name == "down") return TUI_K_DOWN;
+    if (name == "left") return TUI_K_LEFT;
+    if (name == "right") return TUI_K_RIGHT;
+    if (name == "pgup") return TUI_K_PGUP;
+    if (name == "pgdn") return TUI_K_PGDN;
+    if (name == "home") return TUI_K_HOME;
+    if (name == "end") return TUI_K_END;
+    if (name == "tab") return TUI_K_TAB;
+    if (name == "enter") return TUI_K_ENTER;
+    if (name == "esc") return TUI_K_ESC;
+    if (name == "bs") return TUI_K_BS;
+    return TUI_K_NONE;
+}
+
 static void ingest_input_line(const char *line) {
     std::string_view sp;
     if (!json_get(line, "input", sp)) return;
@@ -627,7 +549,9 @@ static void ingest_input_line(const char *line) {
     input_cmd_t cmd;
     if (kind == "key") {
         cmd.kind = INPUT_KEY;
-        if (json_get(line, "key", sp))
+        if (json_get(line, "name", sp))
+            cmd.key = key_name_to_code(json_decode_string(sp));
+        else if (json_get(line, "key", sp))
             cmd.key = span_to_int(sp, TUI_K_NONE);
         else
             cmd.key = TUI_K_NONE;
@@ -721,8 +645,8 @@ static void ingest_trace_line(const char *line) {
         if (is_write_open(ev)) proc.has_write_open = 1;
         if (!ev.resolved_path.empty()) {
             abs_path_t ap = get_abs_path(ev.resolved_path);
-            if (is_read_open(ev)) proc.read_paths.insert(ap);
-            if (is_write_open(ev)) proc.write_paths.insert(ap);
+            if (is_read_open(ev)) { proc.read_paths.insert(ap); ap.ptr->read_procs.insert(ev.tgid); }
+            if (is_write_open(ev)) { proc.write_paths.insert(ap); ap.ptr->write_procs.insert(ev.tgid); }
             /* Incremental file stats stored in abs_path_data */
             const abs_path_data *fs = intern_path(ev.resolved_path);
             fs->opens++;
@@ -853,18 +777,35 @@ static int compute_descendants(int tgid) {
 }
 
 /*
- * Rebuild parent→child links from ppid.  Since parent is set exactly once
- * and never changed, this is only needed when processes arrive out-of-order
- * (child seen before parent exists in the map).  A simple O(n) pass.
+ * Rebuild parent→child links from ppid and compute pid_path for each process.
+ * pid_path is the ancestry chain from root to self: [root, ..., ppid, tgid].
+ * Since parent is set exactly once and never changed, this is only needed when
+ * processes arrive out-of-order.  A simple O(n) pass + DFS for paths.
  */
-static void rebuild_children() {
-    for (auto &[tgid, p] : g_proc_map) p.children.clear();
+static void rebuild_tree() {
+    for (auto &[tgid, p] : g_proc_map) { p.children.clear(); p.pid_path.clear(); }
     for (auto &[tgid, p] : g_proc_map) {
         if (p.ppid > 0 && p.ppid != tgid) {
             auto pit = g_proc_map.find(p.ppid);
             if (pit != g_proc_map.end())
                 pit->second.children.push_back(tgid);
         }
+    }
+    /* Compute pid_path via iterative walk up the parent chain. */
+    for (auto &[tgid, p] : g_proc_map) {
+        if (!p.pid_path.empty()) continue;
+        /* Walk up to root, collecting ancestors. */
+        std::vector<int> chain;
+        int cur = tgid;
+        while (true) {
+            chain.push_back(cur);
+            auto *cp = find_process(cur);
+            if (!cp || cp->ppid == 0 || cp->ppid == cur || !find_process(cp->ppid)) break;
+            cur = cp->ppid;
+        }
+        /* chain is [tgid, ppid, ..., root]. Reverse to get [root, ..., ppid, tgid]. */
+        std::reverse(chain.begin(), chain.end());
+        p.pid_path = chain;
     }
 }
 /* ── View building ─────────────────────────────────────────────────── */
@@ -951,7 +892,7 @@ static void build_proc_rows_rec(std::vector<RowData> &rows, int tgid, int depth)
 }
 
 static void build_lpane_process(std::vector<RowData> &rows) {
-    rebuild_children();
+    rebuild_tree();
     std::vector<int> roots;
     for (auto &[tgid, p] : g_proc_map)
         if ((p.ppid == 0 || !find_process(p.ppid)) && proc_should_show(tgid))
@@ -1190,47 +1131,51 @@ static void build_lpane_output(std::vector<RowData> &rows) {
 
 /* ── Deps view ─────────────────────────────────────────────────────── */
 
-static std::vector<file_edge_t> build_file_edges() {
-    /* Use sorted_vec_set of (src, dst) pairs for dedup */
-    struct Edge { abs_path_t src, dst;
-        bool operator<(const Edge &o) const {
-            if (src < o.src) return true;
-            if (o.src < src) return false;
-            return dst < o.dst;
-        }
-    };
-    sorted_vec_set<Edge> seen;
-    std::vector<file_edge_t> edges;
-    for (auto &[tgid, p] : g_proc_map) {
-        for (const auto &rp : p.read_paths) {
-            for (const auto &wp : p.write_paths) {
-                Edge e{rp, wp};
-                if (seen.emplace(e).second)
-                    edges.push_back({rp, wp});
+/* BFS traversal of file dependency graph using bidirectional proc↔file edges.
+ *
+ * Edge definition: (read_file → write_file) exists when some proc reads R and writes W.
+ *
+ * reverse=1 (DEPS):  from file X, find dependencies (what was read to produce X).
+ *   X.write_procs → for each proc P, P.read_paths → queue those.
+ *
+ * reverse=0 (RDEPS): from file X, find dependents (what was produced from X).
+ *   X.read_procs  → for each proc P, P.write_paths → queue those.
+ */
+static void collect_dep_files(const std::string &start, int reverse,
+                              sorted_vec_set<std::string> &seen) {
+    std::vector<std::string> queue;
+    int qh = 0;
+    queue.push_back(start);
+    while (qh < static_cast<int>(queue.size())) {
+        std::string cur = queue[qh++];
+        if (!seen.emplace(cur).second) continue;
+        const abs_path_data *pd = find_path(cur);
+        if (!pd) continue;
+        if (reverse) {
+            /* deps: procs that wrote cur → files they read */
+            for (int tgid : pd->write_procs) {
+                auto *p = find_process(tgid);
+                if (!p) continue;
+                for (const auto &rp : p->read_paths)
+                    if (!seen.contains(rp.str())) queue.push_back(rp.str());
+            }
+        } else {
+            /* rdeps: procs that read cur → files they wrote */
+            for (int tgid : pd->read_procs) {
+                auto *p = find_process(tgid);
+                if (!p) continue;
+                for (const auto &wp : p->write_paths)
+                    if (!seen.contains(wp.str())) queue.push_back(wp.str());
             }
         }
     }
-    return edges;
 }
 
 static void build_lpane_deps(std::vector<RowData> &rows, int reverse) {
     const std::string &start = g_state.cursor_id;
     if (start.empty()) return;
-    auto edges = build_file_edges();
-    std::vector<std::string> queue;
     sorted_vec_set<std::string> seen;
-    int qh = 0;
-    queue.push_back(start);
-    while (qh < static_cast<int>(queue.size())) {
-        const std::string &cur = queue[qh++];
-        if (!seen.emplace(cur).second) continue;
-        for (const auto &e : edges) {
-            if (reverse && e.dst == cur && !seen.contains(e.src.str()))
-                queue.push_back(e.src.str());
-            else if (!reverse && e.src == cur && !seen.contains(e.dst.str()))
-                queue.push_back(e.dst.str());
-        }
-    }
+    collect_dep_files(start, reverse, seen);
     for (const auto &s : seen) {
         int mode = reverse ? 4 : 3;
         emit_row(rows, s, file_matches_search(s) ? "search" : "normal", "", s, mode, s, false);
@@ -1240,37 +1185,23 @@ static void build_lpane_deps(std::vector<RowData> &rows, int reverse) {
 static void build_lpane_dep_cmds(std::vector<RowData> &rows, int reverse) {
     const std::string &start = g_state.cursor_id;
     if (start.empty()) return;
-    auto edges = build_file_edges();
-    std::vector<std::string> queue;
     sorted_vec_set<std::string> seen;
-    int qh = 0;
-    queue.push_back(start);
-    while (qh < static_cast<int>(queue.size())) {
-        const std::string &cur = queue[qh++];
-        if (!seen.emplace(cur).second) continue;
-        for (const auto &e : edges) {
-            if (reverse && e.dst == cur && !seen.contains(e.src.str()))
-                queue.push_back(e.src.str());
-            else if (!reverse && e.src == cur && !seen.contains(e.dst.str()))
-                queue.push_back(e.dst.str());
-        }
-    }
+    collect_dep_files(start, reverse, seen);
     /* Collect processes that touched any file in the chain */
-    std::vector<int> ptgids;
-    for (auto &[tgid, p] : g_proc_map) {
-        bool involved = false;
-        for (const auto &rp : p.read_paths)
-            if (!involved && seen.contains(rp.str())) involved = true;
-        for (const auto &wp : p.write_paths)
-            if (!involved && seen.contains(wp.str())) involved = true;
-        if (involved) ptgids.push_back(tgid);
+    sorted_vec_set<int> ptgids;
+    for (const auto &s : seen) {
+        const abs_path_data *pd = find_path(s);
+        if (!pd) continue;
+        for (int t : pd->read_procs) ptgids.insert(t);
+        for (int t : pd->write_procs) ptgids.insert(t);
     }
-    std::sort(ptgids.begin(), ptgids.end(), [](int a, int b) {
+    std::vector<int> sorted_ptgids(ptgids.begin(), ptgids.end());
+    std::sort(sorted_ptgids.begin(), sorted_ptgids.end(), [](int a, int b) {
         auto *pa = find_process(a), *pb = find_process(b);
         if (!pa || !pb) return a < b;
         return pa->end_ts > pb->end_ts;
     });
-    for (int pt : ptgids) {
+    for (int pt : sorted_ptgids) {
         auto *p = find_process(pt);
         if (!p) continue;
         std::string id_str = std::to_string(pt);
@@ -1313,7 +1244,7 @@ static bool event_allowed(const trace_event_t &ev) {
 static void build_rpane_process(std::vector<RowData> &rows, const std::string &id) {
     auto *p = find_process(id.empty() ? 0 : std::atoi(id.c_str()));
     if (!p) return;
-    rebuild_children();
+    rebuild_tree();
     emit_row(rows, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
     emit_row(rows, "tgid", "normal", "", sfmt("TGID:  %d", p->tgid), -1, "", false);
     emit_row(rows, "ppid", "normal", "", sfmt("PPID:  %d", p->ppid), -1, "", false);
@@ -1648,7 +1579,7 @@ static void dump_lpane(FILE *out) {
         auto *r = g_tui->get_cached_row("lpane", i);
         if (!r) continue;
         std::fprintf(out, "%d|%s|%s|%s|%s\n", i, r->style.c_str(), r->id.c_str(),
-                     r->parent_id.c_str(), r->cols[0].c_str());
+                     r->parent_id.c_str(), r->cols.empty() ? "" : r->cols[0].c_str());
     }
     std::fprintf(out, "=== END LPANE ===\n");
 }
@@ -1659,7 +1590,8 @@ static void dump_rpane(FILE *out) {
     for (int i = 0; i < n; i++) {
         auto *r = g_tui->get_cached_row("rpane", i);
         if (!r) continue;
-        std::fprintf(out, "%d|%s|%s|%d|%s\n", i, r->style.c_str(), r->cols[0].c_str(),
+        std::fprintf(out, "%d|%s|%s|%d|%s\n", i, r->style.c_str(),
+                     r->cols.empty() ? "" : r->cols[0].c_str(),
                      r->link_mode, r->link_id.c_str());
     }
     std::fprintf(out, "=== END RPANE ===\n");
