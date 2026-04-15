@@ -1810,6 +1810,61 @@ static void free_all() {
     g_collapsed.clear();
 }
 
+/* ── Test API (non-static, called from tests.cpp) ─────────────────── */
+
+extern int run_tests();  /* defined in tests.cpp */
+
+void tv_test_reset() {
+    g_tui.reset();
+    free_all();
+    g_state = {};
+    g_lpane = -1;
+    g_rpane = -1;
+    g_headless = 0;
+}
+
+void tv_test_load(const char *path) { ingest_file(path); }
+
+void tv_test_load_string(const char *data) {
+    char tmp[] = "/tmp/tv_test_XXXXXX";
+    int fd = mkstemp(tmp);
+    if (fd < 0) return;
+    (void)write(fd, data, std::strlen(data));
+    close(fd);
+    ingest_file(tmp);
+    unlink(tmp);
+}
+
+void tv_test_create(int rows, int cols) {
+    DataSource src{ds_row_begin, ds_row_has_more, ds_row_next};
+    g_tui = Tui::open_headless(std::move(src), rows, cols);
+    if (!g_tui) return;
+    g_lpane = g_tui->add_panel(g_lpane_def);
+    g_rpane = g_tui->add_panel(g_rpane_def);
+    static Box lbox, rbox, hbox;
+    lbox = {TUI_BOX_PANEL, 1, 0, 0, g_lpane, {}};
+    rbox = {TUI_BOX_PANEL, 1, 0, 0, g_rpane, {}};
+    hbox = {TUI_BOX_HBOX, 1, 0, 0, -1, {&lbox, &rbox}};
+    g_tui->set_layout(&hbox);
+    g_tui->on_key(on_key_cb);
+    g_tui->dirty();
+    g_headless = 1;
+    update_status();
+}
+
+void tv_test_input(const char *line) { process_input_line(line); }
+int  tv_test_lpane() { return g_lpane; }
+int  tv_test_rpane() { return g_rpane; }
+Tui *tv_test_tui()   { return g_tui.get(); }
+int  tv_test_mode()       { return g_state.mode; }
+int  tv_test_grouped()    { return g_state.grouped; }
+int  tv_test_sort_key()   { return g_state.sort_key; }
+int  tv_test_ts_mode()    { return g_state.ts_mode; }
+int  tv_test_lp_filter()  { return g_state.lp_filter; }
+int  tv_test_dep_filter() { return g_state.dep_filter; }
+const char *tv_test_search() { return g_state.search.c_str(); }
+const char *tv_test_evfilt() { return g_state.evfilt.c_str(); }
+
 /* ── Main ──────────────────────────────────────────────────────────── */
 
 enum live_trace_backend {
@@ -1826,6 +1881,7 @@ int main(int argc, char **argv) {
     char load_file[256] = "", trace_file[256] = "", save_file[256] = "";
     char **cmd = nullptr;
     if (argc >= 2 && std::strcmp(argv[1], "--uproctrace") == 0) return uproctrace_main(argc - 1, argv + 1);
+    if (argc >= 2 && std::strcmp(argv[1], "--test") == 0) return run_tests();
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--load") == 0 && i + 1 < argc) { load_mode = 1; std::snprintf(load_file, sizeof load_file, "%s", argv[++i]); }
         else if (std::strcmp(argv[i], "--trace") == 0 && i + 1 < argc) std::snprintf(trace_file, sizeof trace_file, "%s", argv[++i]);
