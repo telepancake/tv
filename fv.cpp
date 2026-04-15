@@ -422,6 +422,25 @@ static int on_key(Tui &tui, int key, int panel,
         tui.dirty(g.content_panel);
         return TUI_HANDLED;
     }
+    if (key == TUI_K_TAB) {
+        if (in_content) {
+            tui.focus(g.dir_panels[0]);
+        } else if (d >= 0) {
+            /* Advance to the next populated dir column, or content panel. */
+            bool found = false;
+            for (int i = d + 1; i < g.depth_count; i++) {
+                if (!g.entries[i].empty()) {
+                    tui.focus(g.dir_panels[i]);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                tui.focus(g.content_panel);
+        }
+        update_status();
+        return TUI_HANDLED;
+    }
     if (key == TUI_K_LEFT || key == 'h') {
         if (in_content) {
             /* Return to last populated dir column. */
