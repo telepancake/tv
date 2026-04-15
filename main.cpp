@@ -175,7 +175,6 @@ struct process_t {
     sorted_vec_set<abs_path_t> write_paths;
     std::vector<int> event_indices;     /* indices into g_events */
     std::string cached_display_name;    /* pre-computed basename */
-    std::vector<int> pid_path;          /* ancestry: [root, ..., ppid, tgid] */
 
     void update_display_name() {
         std::string_view s;
@@ -768,46 +767,7 @@ static bool cmp_proc_tgid(int a, int b) {
     return a < b;
 }
 
-static int compute_descendants(int tgid) {
-    auto *p = find_process(tgid);
-    if (!p) return 0;
-    int total = 0;
-    for (int ct : p->children) total += 1 + compute_descendants(ct);
-    return total;
-}
 
-/*
- * Rebuild parent→child links from ppid and compute pid_path for each process.
- * pid_path is the ancestry chain from root to self: [root, ..., ppid, tgid].
- * Since parent is set exactly once and never changed, this is only needed when
- * processes arrive out-of-order.  A simple O(n) pass + DFS for paths.
- */
-static void rebuild_tree() {
-    for (auto &[tgid, p] : g_proc_map) { p.children.clear(); p.pid_path.clear(); }
-    for (auto &[tgid, p] : g_proc_map) {
-        if (p.ppid > 0 && p.ppid != tgid) {
-            auto pit = g_proc_map.find(p.ppid);
-            if (pit != g_proc_map.end())
-                pit->second.children.push_back(tgid);
-        }
-    }
-    /* Compute pid_path via iterative walk up the parent chain. */
-    for (auto &[tgid, p] : g_proc_map) {
-        if (!p.pid_path.empty()) continue;
-        /* Walk up to root, collecting ancestors. */
-        std::vector<int> chain;
-        int cur = tgid;
-        while (true) {
-            chain.push_back(cur);
-            auto *cp = find_process(cur);
-            if (!cp || cp->ppid == 0 || cp->ppid == cur || !find_process(cp->ppid)) break;
-            cur = cp->ppid;
-        }
-        /* chain is [tgid, ppid, ..., root]. Reverse to get [root, ..., ppid, tgid]. */
-        std::reverse(chain.begin(), chain.end());
-        p.pid_path = chain;
-    }
-}
 /* ── View building ─────────────────────────────────────────────────── */
 
 static bool proc_matches_search(const process_t &p) {
@@ -861,9 +821,9 @@ static const char *proc_style(const process_t &p) {
     return "normal";
 }
 
-static void build_proc_rows_rec(std::vector<RowData> &rows, int tgid, int depth) {
-    auto *p = find_process(tgid);
-    if (!p) return;
+/* Build a single RowData for a process in tree mode. */
+static RowData make_proc_tree_row(process_t *p, int depth) {
+    int tgid = p->tgid;
     std::string id_str = std::to_string(tgid);
     bool has_kids = !p->children.empty();
     bool collapsed = has_kids && is_collapsed(id_str);
@@ -874,52 +834,45 @@ static void build_proc_rows_rec(std::vector<RowData> &rows, int tgid, int depth)
     else if (p->exit_status == "signaled")
         marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
     std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
-    int desc_count = compute_descendants(tgid);
-    std::string prefix = g_state.grouped
-        ? sfmt("%*s%s", depth * 4, "", !has_kids ? "  " : (collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "))
-        : std::string();
-    std::string extra = desc_count > 0 ? sfmt(" (%d)", desc_count) : std::string();
+    int nchildren = static_cast<int>(p->children.size());
+    std::string prefix = sfmt("%*s%s", depth * 4, "",
+        !has_kids ? "  " : (collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "));
+    std::string extra = nchildren > 0 ? sfmt(" (%d)", nchildren) : std::string();
     std::string text = sfmt("%s[%d] %s%s%s%s%s", prefix.c_str(), tgid, name.c_str(),
                             marker.c_str(), extra.c_str(), dur.empty() ? "" : "  ", dur.c_str());
     std::string parent_id = (p->ppid > 0 && find_process(p->ppid)) ? std::to_string(p->ppid) : std::string();
-    emit_row(rows, id_str, proc_style(*p), parent_id, text, 0, id_str, has_kids);
-    if (g_state.grouped && collapsed) return;
-    auto sorted_children = p->children;
-    if (sorted_children.size() > 1) std::sort(sorted_children.begin(), sorted_children.end(), cmp_proc_tgid);
-    for (int ct : sorted_children)
-        if (proc_should_show(ct))
-            build_proc_rows_rec(rows, ct, g_state.grouped ? depth + 1 : 0);
+    RowData d;
+    d.id = id_str;
+    d.style = proc_style(*p);
+    d.cols = {text};
+    d.parent_id = parent_id;
+    d.link_mode = 0;
+    d.link_id = id_str;
+    d.has_children = has_kids;
+    return d;
 }
 
-static void build_lpane_process(std::vector<RowData> &rows) {
-    rebuild_tree();
-    std::vector<int> roots;
-    for (auto &[tgid, p] : g_proc_map)
-        if ((p.ppid == 0 || !find_process(p.ppid)) && proc_should_show(tgid))
-            roots.push_back(tgid);
-    if (roots.size() > 1) std::sort(roots.begin(), roots.end(), cmp_proc_tgid);
-    if (g_state.grouped) {
-        for (int rt : roots) build_proc_rows_rec(rows, rt, 0);
-    } else {
-        std::vector<int> all;
-        for (auto &[tgid, p] : g_proc_map)
-            if (proc_should_show(tgid)) all.push_back(tgid);
-        if (all.size() > 1) std::sort(all.begin(), all.end(), cmp_proc_tgid);
-        for (int at : all) {
-            auto *p = find_process(at);
-            if (!p) continue;
-            std::string id_str = std::to_string(at);
-            auto name = p->display_name();
-            std::string marker;
-            if (p->exit_status == "exited")
-                marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-            else if (p->exit_status == "signaled")
-                marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
-            std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
-            std::string text = sfmt("[%d] %s%s%s%s", at, name.c_str(), marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
-            emit_row(rows, id_str, proc_style(*p), "", text, 0, id_str, false);
-        }
-    }
+/* Build a single RowData for a process in flat mode. */
+static RowData make_proc_flat_row(process_t *p) {
+    int tgid = p->tgid;
+    std::string id_str = std::to_string(tgid);
+    const auto &name = p->display_name();
+    std::string marker;
+    if (p->exit_status == "exited")
+        marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
+    else if (p->exit_status == "signaled")
+        marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
+    std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
+    std::string text = sfmt("[%d] %s%s%s%s", tgid, name.c_str(), marker.c_str(),
+                            dur.empty() ? "" : "  ", dur.c_str());
+    RowData d;
+    d.id = id_str;
+    d.style = proc_style(*p);
+    d.cols = {text};
+    d.link_mode = 0;
+    d.link_id = id_str;
+    d.has_children = false;
+    return d;
 }
 
 /* ── File view ─────────────────────────────────────────────────────── */
@@ -1244,7 +1197,6 @@ static bool event_allowed(const trace_event_t &ev) {
 static void build_rpane_process(std::vector<RowData> &rows, const std::string &id) {
     auto *p = find_process(id.empty() ? 0 : std::atoi(id.c_str()));
     if (!p) return;
-    rebuild_tree();
     emit_row(rows, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
     emit_row(rows, "tgid", "normal", "", sfmt("TGID:  %d", p->tgid), -1, "", false);
     emit_row(rows, "ppid", "normal", "", sfmt("PPID:  %d", p->ppid), -1, "", false);
@@ -1257,9 +1209,9 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
                  (p->exit_status == "exited" && p->exit_code == 0) ? "green" : "error",
                  "", text, -1, "", false);
     }
-    int desc_count = compute_descendants(p->tgid);
-    if (desc_count > 0) {
-        emit_row(rows, "kids_hdr", "heading", "", sfmt("Children (%d)", desc_count), -1, "", false);
+    int nchildren = static_cast<int>(p->children.size());
+    if (nchildren > 0) {
+        emit_row(rows, "kids_hdr", "heading", "", sfmt("Children (%d)", nchildren), -1, "", false);
         auto sorted_ch = p->children;
         if (sorted_ch.size() > 1) std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
         for (int ct : sorted_ch) {
@@ -1387,31 +1339,75 @@ static void schedule_detail_update() {
     g_detail_timer_id = g_tui->add_timer(DETAIL_UPDATE_DELAY_MS, on_detail_update_timer);
 }
 
-/* ── Iterator-based DataSource ─────────────────────────────────────── */
+/* ── Lazy DataSource ────────────────────────────────────────────────── */
 
+/* Process tree DFS iterator (mode 0, grouped) — yields one row at a time. */
+static struct {
+    std::vector<std::pair<int,int>> dfs; /* (tgid, depth) stack */
+} g_proc_tree_iter;
+
+/* Process flat iterator (mode 0, not grouped). */
+static struct {
+    std::vector<int> tgids;
+    size_t idx = 0;
+} g_proc_flat_iter;
+
+/* Prebuilt rows for non-process modes (file, output, deps, rpane). */
 static struct {
     std::vector<RowData> rows;
-    int idx = 0;
-} g_lp_iter, g_rp_iter;
+    size_t idx = 0;
+} g_prebuilt_iter, g_rp_iter;
 
-static void build_lpane(std::vector<RowData> &rows) {
+static int g_lp_mode = -1; /* which lpane sub-iterator is active: 0=proc_tree 1=proc_flat 2=prebuilt */
+
+static void lpane_begin_proc_tree() {
+    g_lp_mode = 0;
+    g_proc_tree_iter.dfs.clear();
+    std::vector<int> roots;
+    for (auto &[tgid, p] : g_proc_map)
+        if ((p.ppid == 0 || !find_process(p.ppid)) && proc_should_show(tgid))
+            roots.push_back(tgid);
+    if (roots.size() > 1) std::sort(roots.begin(), roots.end(), cmp_proc_tgid);
+    /* Push in reverse so first root is on top of stack. */
+    for (int i = static_cast<int>(roots.size()) - 1; i >= 0; i--)
+        g_proc_tree_iter.dfs.push_back({roots[i], 0});
+}
+
+static void lpane_begin_proc_flat() {
+    g_lp_mode = 1;
+    g_proc_flat_iter.tgids.clear();
+    g_proc_flat_iter.idx = 0;
+    for (auto &[tgid, p] : g_proc_map)
+        if (proc_should_show(tgid)) g_proc_flat_iter.tgids.push_back(tgid);
+    if (g_proc_flat_iter.tgids.size() > 1)
+        std::sort(g_proc_flat_iter.tgids.begin(), g_proc_flat_iter.tgids.end(), cmp_proc_tgid);
+}
+
+static void build_lpane_nonprocess(std::vector<RowData> &rows) {
     switch (g_state.mode) {
-    case 0: build_lpane_process(rows); break;
     case 1: build_lpane_files(rows); break;
     case 2: build_lpane_output(rows); break;
     case 3: build_lpane_deps(rows, 1); break;
     case 4: build_lpane_deps(rows, 0); break;
     case 5: build_lpane_dep_cmds(rows, 1); break;
     case 6: build_lpane_dep_cmds(rows, 0); break;
-    default: build_lpane_process(rows); break;
+    default: break;
     }
 }
 
 static void ds_row_begin(const char *panel) {
     if (std::strcmp(panel, "lpane") == 0) {
-        g_lp_iter.rows.clear();
-        g_lp_iter.idx = 0;
-        build_lpane(g_lp_iter.rows);
+        if (g_state.mode == 0) {
+            if (g_state.grouped)
+                lpane_begin_proc_tree();
+            else
+                lpane_begin_proc_flat();
+        } else {
+            g_lp_mode = 2;
+            g_prebuilt_iter.rows.clear();
+            g_prebuilt_iter.idx = 0;
+            build_lpane_nonprocess(g_prebuilt_iter.rows);
+        }
     } else {
         g_rp_iter.rows.clear();
         g_rp_iter.idx = 0;
@@ -1420,34 +1416,62 @@ static void ds_row_begin(const char *panel) {
 }
 
 static bool ds_row_has_more(const char *panel) {
-    auto &it = (std::strcmp(panel, "lpane") == 0) ? g_lp_iter : g_rp_iter;
-    return it.idx < static_cast<int>(it.rows.size());
+    if (std::strcmp(panel, "lpane") == 0) {
+        switch (g_lp_mode) {
+        case 0: return !g_proc_tree_iter.dfs.empty();
+        case 1: return g_proc_flat_iter.idx < g_proc_flat_iter.tgids.size();
+        case 2: return g_prebuilt_iter.idx < g_prebuilt_iter.rows.size();
+        }
+        return false;
+    }
+    return g_rp_iter.idx < g_rp_iter.rows.size();
 }
 
 static RowData ds_row_next(const char *panel) {
-    auto &it = (std::strcmp(panel, "lpane") == 0) ? g_lp_iter : g_rp_iter;
-    return std::move(it.rows[it.idx++]);
-}
-
-static int search_hit_count() {
-    int n = g_tui ? g_tui->row_count("lpane") : 0;
-    int hits = 0;
-    for (int i = 0; i < n; i++) {
-        auto *r = g_tui->get_cached_row("lpane", i);
-        if (r && r->style == "search") hits++;
+    if (std::strcmp(panel, "lpane") == 0) {
+        switch (g_lp_mode) {
+        case 0: { /* proc tree DFS */
+            auto &dfs = g_proc_tree_iter.dfs;
+            auto [tgid, depth] = dfs.back();
+            dfs.pop_back();
+            auto *p = find_process(tgid);
+            if (!p) return {};
+            std::string id_str = std::to_string(tgid);
+            bool has_kids = !p->children.empty();
+            bool collapsed = has_kids && is_collapsed(id_str);
+            /* Push children if not collapsed. */
+            if (!collapsed && has_kids) {
+                auto sorted_ch = p->children;
+                if (sorted_ch.size() > 1)
+                    std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
+                for (int i = static_cast<int>(sorted_ch.size()) - 1; i >= 0; i--)
+                    if (proc_should_show(sorted_ch[i]))
+                        dfs.push_back({sorted_ch[i], depth + 1});
+            }
+            return make_proc_tree_row(p, depth);
+        }
+        case 1: { /* proc flat */
+            int tgid = g_proc_flat_iter.tgids[g_proc_flat_iter.idx++];
+            auto *p = find_process(tgid);
+            if (!p) return {};
+            return make_proc_flat_row(p);
+        }
+        case 2: /* prebuilt */
+            return std::move(g_prebuilt_iter.rows[g_prebuilt_iter.idx++]);
+        }
+        return {};
     }
-    return hits;
+    return std::move(g_rp_iter.rows[g_rp_iter.idx++]);
 }
 
 static void update_status() {
     static const char *mn[] = {"PROCS","FILES","OUTPUT","DEPS","RDEPS","DEP-CMDS","RDEP-CMDS"};
     static const char *tsl[] = {"abs","rel","Δ"};
     int cur = g_tui ? g_tui->get_cursor("lpane") : 0;
-    int total = g_tui ? g_tui->row_count("lpane") : 0;
-    std::string s = sfmt(" %s%s | %d/%d | TS:%s", mn[g_state.mode], g_state.grouped ? " tree" : "",
-                         cur + 1, total, tsl[g_state.ts_mode]);
+    std::string s = sfmt(" %s%s | row %d | TS:%s", mn[g_state.mode], g_state.grouped ? " tree" : "",
+                         cur + 1, tsl[g_state.ts_mode]);
     if (!g_state.evfilt.empty()) s += sfmt(" | F:%s", g_state.evfilt.c_str());
-    if (!g_state.search.empty()) s += sfmt(" | /%s[%d]", g_state.search.c_str(), search_hit_count());
+    if (!g_state.search.empty()) s += sfmt(" | /%s", g_state.search.c_str());
     if (g_state.lp_filter == 1) s += " | V:failed";
     else if (g_state.lp_filter == 2) s += " | V:running";
     if (g_state.mode >= 3 && g_state.mode <= 6) s += sfmt(" | D:%s", g_state.dep_filter ? "written" : "all");
@@ -1470,15 +1494,34 @@ static void reset_mode_selection() {
 }
 
 static void set_cursor_to_search_hit(int dir) {
-    int count = g_tui ? g_tui->row_count("lpane") : 0;
-    if (count == 0) return;
-    int start = g_tui ? g_tui->get_cursor("lpane") : 0;
-    for (int step = 1; step <= count; step++) {
-        int idx = (start + dir * step + count) % count;
-        auto *r = g_tui->get_cached_row("lpane", idx);
-        if (r && r->style == "search") {
-            g_state.cursor_id = r->id;
-            return;
+    if (!g_tui) return;
+    int start = g_tui->get_cursor("lpane");
+    if (dir > 0) {
+        /* Forward: scan from start+1 to end, then wrap from 0 to start-1. */
+        for (int i = start + 1; ; i++) {
+            auto *r = g_tui->get_cached_row("lpane", i);
+            if (!r) break;
+            if (r->style == "search") { g_state.cursor_id = r->id; return; }
+        }
+        for (int i = 0; i < start; i++) {
+            auto *r = g_tui->get_cached_row("lpane", i);
+            if (!r) break;
+            if (r->style == "search") { g_state.cursor_id = r->id; return; }
+        }
+    } else {
+        /* Backward: scan from start-1 down to 0, then wrap from end to start+1. */
+        for (int i = start - 1; i >= 0; i--) {
+            auto *r = g_tui->get_cached_row("lpane", i);
+            if (!r) break;
+            if (r->style == "search") { g_state.cursor_id = r->id; return; }
+        }
+        /* Find the end by scanning forward, then scan backward from there. */
+        int last = start;
+        while (g_tui->get_cached_row("lpane", last + 1)) last++;
+        for (int i = last; i > start; i--) {
+            auto *r = g_tui->get_cached_row("lpane", i);
+            if (!r) break;
+            if (r->style == "search") { g_state.cursor_id = r->id; return; }
         }
     }
 }
@@ -1487,11 +1530,11 @@ static void apply_search(const std::string &q) {
     g_state.search = q;
     /* Dirty lpane so the engine re-reads with search highlighting. */
     if (g_tui) g_tui->dirty("lpane");
-    /* Force read so we can find the first hit. */
-    int n = g_tui ? g_tui->row_count("lpane") : 0;
-    for (int i = 0; i < n; i++) {
-        auto *r = g_tui->get_cached_row("lpane", i);
-        if (r && r->style == "search") {
+    /* Scan lazily to find the first hit. */
+    for (int i = 0; ; i++) {
+        auto *r = g_tui ? g_tui->get_cached_row("lpane", i) : nullptr;
+        if (!r) break;
+        if (r->style == "search") {
             g_state.cursor_id = r->id;
             break;
         }
@@ -1528,45 +1571,30 @@ static void expand_or_detail() {
     else if (g_tui) g_tui->focus("rpane");
 }
 
-/* Expand/collapse all descendants of the current node. */
+/* Expand/collapse all descendants of the current node by walking the model. */
+static void expand_subtree_proc(int tgid, int expand) {
+    auto *p = find_process(tgid);
+    if (!p) return;
+    std::string id = std::to_string(tgid);
+    if (!p->children.empty()) {
+        if (expand) g_collapsed.erase(id);
+        else g_collapsed.insert(id);
+    }
+    for (int ct : p->children) expand_subtree_proc(ct, expand);
+}
+
 static void expand_subtree(int expand) {
     int cur = g_tui ? g_tui->get_cursor("lpane") : -1;
     auto *row = g_tui ? g_tui->get_cached_row("lpane", cur) : nullptr;
-    if (!row) return;
-    std::string root_id = row->id;
-
-    /* Build a parent_id → row index map for O(n) ancestor lookup. */
-    int n = g_tui->row_count("lpane");
-    std::unordered_map<std::string, int> id_to_idx;
-    for (int i = 0; i < n; i++) {
-        auto *r = g_tui->get_cached_row("lpane", i);
-        if (r) id_to_idx[r->id] = i;
-    }
-
-    /* Walk the cached lpane rows to find descendants via parent chain. */
-    for (int i = 0; i < n; i++) {
-        auto *r = g_tui->get_cached_row("lpane", i);
-        if (!r) continue;
-        /* Check if r is a descendant of root_id. */
-        std::string pid = r->parent_id;
-        bool is_desc = false;
-        while (!pid.empty()) {
-            if (pid == root_id) { is_desc = true; break; }
-            auto it = id_to_idx.find(pid);
-            if (it == id_to_idx.end()) break;
-            auto *pr = g_tui->get_cached_row("lpane", it->second);
-            if (!pr) break;
-            pid = pr->parent_id;
-        }
-        if (is_desc && r->has_children) {
-            if (expand) g_collapsed.erase(r->id);
-            else g_collapsed.insert(r->id);
-        }
-    }
-    /* Collapse/expand the root itself. */
-    if (row->has_children) {
-        if (expand) g_collapsed.erase(root_id);
-        else g_collapsed.insert(root_id);
+    if (!row || !row->has_children) return;
+    if (g_state.mode == 0) {
+        /* Process view: walk process tree directly. */
+        int tgid = std::atoi(row->id.c_str());
+        expand_subtree_proc(tgid, expand);
+    } else {
+        /* File/output views: toggle current node only. */
+        if (expand) g_collapsed.erase(row->id);
+        else g_collapsed.insert(row->id);
     }
 }
 
@@ -1574,10 +1602,9 @@ static void expand_subtree(int expand) {
 
 static void dump_lpane(FILE *out) {
     std::fprintf(out, "=== LPANE ===\n");
-    int n = g_tui ? g_tui->row_count("lpane") : 0;
-    for (int i = 0; i < n; i++) {
-        auto *r = g_tui->get_cached_row("lpane", i);
-        if (!r) continue;
+    for (int i = 0; ; i++) {
+        auto *r = g_tui ? g_tui->get_cached_row("lpane", i) : nullptr;
+        if (!r) break;
         std::fprintf(out, "%d|%s|%s|%s|%s\n", i, r->style.c_str(), r->id.c_str(),
                      r->parent_id.c_str(), r->cols.empty() ? "" : r->cols[0].c_str());
     }
@@ -1586,10 +1613,9 @@ static void dump_lpane(FILE *out) {
 
 static void dump_rpane(FILE *out) {
     std::fprintf(out, "=== RPANE ===\n");
-    int n = g_tui ? g_tui->row_count("rpane") : 0;
-    for (int i = 0; i < n; i++) {
-        auto *r = g_tui->get_cached_row("rpane", i);
-        if (!r) continue;
+    for (int i = 0; ; i++) {
+        auto *r = g_tui ? g_tui->get_cached_row("rpane", i) : nullptr;
+        if (!r) break;
         std::fprintf(out, "%d|%s|%s|%d|%s\n", i, r->style.c_str(),
                      r->cols.empty() ? "" : r->cols[0].c_str(),
                      r->link_mode, r->link_id.c_str());

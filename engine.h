@@ -114,7 +114,6 @@ public:
     int         get_cursor(const char *panel) const;
     int         get_scroll(const char *panel) const;
     const char *get_cursor_id(const char *panel) const;
-    int         row_count(const char *panel);
     const RowData *get_cached_row(const char *panel, int idx);
 
     /* Callbacks */
