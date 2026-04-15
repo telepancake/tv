@@ -2570,13 +2570,57 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
         }
     }
 
+    /* Intercept wait4/waitid to emit EXIT events for reaped children.
+     *
+     * Without this, child EXIT events would only be emitted from
+     * the wrapper / normal-mode parent wait loops.  Now that wrapper
+     * mode no longer forks a dedicated wait-loop process, the SIGSYS
+     * handler must emit EXIT events when the traced program reaps
+     * its children. */
+#ifdef SYS_wait4
+    if (nr == SYS_wait4 && ret > 0) {
+        /* wait4(pid, wstatus_ptr, options, rusage):
+         *   ret > 0 → a child was reaped, ret = child pid
+         *   a1 = pointer to wstatus in traced program's memory */
+        int wstatus = 0;
+        if (a1) wstatus = *(int *)a1;
+        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
+            pid_t child_pid = (pid_t)ret;
+            pid_t child_tgid = child_pid;  /* reaped pid is the tgid */
+            emit_exit_event(child_pid, wstatus);
+        }
+    }
+#endif
+#ifdef SYS_waitid
+    if (nr == SYS_waitid && ret == 0) {
+        /* waitid(idtype, id, siginfo_ptr, options):
+         *   ret == 0 → success; siginfo at a2 has child info */
+        if (a2) {
+            siginfo_t *si = (siginfo_t *)a2;
+            if (si->si_pid > 0 &&
+                (si->si_code == CLD_EXITED || si->si_code == CLD_KILLED ||
+                 si->si_code == CLD_DUMPED)) {
+                int wstatus;
+                if (si->si_code == CLD_EXITED)
+                    wstatus = si->si_status << 8;
+                else {
+                    wstatus = si->si_status & 0x7f;
+                    if (si->si_code == CLD_DUMPED)
+                        wstatus |= 0x80;
+                }
+                emit_exit_event(si->si_pid, wstatus);
+            }
+        }
+    }
+#endif
+
     UC_SET_RET(uc, ret);
 }
 
 /* ================================================================
  * ELF loader — load a statically linked ELF and jump to it.
  *
- * Called in wrapper mode (child process after fork).  Steps:
+ * Called directly in wrapper mode (no fork).  Steps:
  * 1. Parse ELF program headers
  * 2. mmap each PT_LOAD segment at the specified vaddr
  * 3. Allocate a new stack near our high address
@@ -2946,31 +2990,22 @@ static int run_wrapper_mode(int argc, char **argv)
         return 127;
     }
 
-    pid_t child = fork();
-    if (child < 0) { perror("sudtrace: fork"); return 127; }
-
-    if (child == 0) {
-        load_and_run_elf(resolved, argc - argi, argv + argi);
-    }
-
-    for (;;) {
-        int wstatus;
-        pid_t wpid = waitpid(-1, &wstatus, __WALL);
-        if (wpid < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-
-        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
-            pid_t tgid = get_tgid(wpid);
-            if (wpid == tgid || wpid == child)
-                emit_exit_event(wpid, wstatus);
-
-            if (wpid == child) break;
-        }
-    }
-
-    return 0;
+    /* Run the ELF directly in this process — no fork.
+     *
+     * The old code forked a child and ran load_and_run_elf() in the
+     * child, with the wrapper sitting in a wait loop to emit EXIT
+     * events.  That extra fork created an invisible intermediate PID
+     * that broke the parent–child chain:
+     *
+     *   Original parent → wrapper PID → forked child PID (actual binary)
+     *
+     * By calling load_and_run_elf() directly, the wrapper PID *is*
+     * the traced process and its ppid correctly points to the original
+     * parent.  EXIT events for any children of the loaded binary are
+     * now emitted from the SIGSYS handler's wait4/waitid interception
+     * instead of a dedicated wait loop. */
+    load_and_run_elf(resolved, argc - argi, argv + argi);
+    /* load_and_run_elf never returns */
 }
 
 /* ================================================================
