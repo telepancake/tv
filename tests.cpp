@@ -260,7 +260,7 @@ static bool test_proc_tree_exit_markers() {
     ASSERT(col_contains(lp, "make \xe2\x9c\x97"), "missing 'make ✗'");
     ASSERT(col_contains(lp, "[1001] gcc \xe2\x9c\x93"), "missing '[1001] gcc ✓'");
     ASSERT(col_contains(lp, "[1003] gcc \xe2\x9c\x97"), "missing '[1003] gcc ✗'");
-    ASSERT(col_contains(lp, "segfault \xe2\x9a\xa111"), "missing 'segfault ⚡11'");
+    ASSERT(col_contains(lp, "segfault \xe2\x9a\xa1" "11"), "missing 'segfault ⚡11'");
     ASSERT(col_not_contains(lp, "[1005] ld \xe2\x9c\x93"), "unexpected '[1005] ld ✓'");
     ASSERT(col_not_contains(lp, "[1005] ld \xe2\x9c\x97"), "unexpected '[1005] ld ✗'");
     return true;
