@@ -28,79 +28,171 @@
 #include "engine.h"
 #include "sorted_vec_set.h"
 
-/* ── abs_path_t — interned absolute path token ─────────────────────── */
+/* ── Item — abstract base for hierarchical items ───────────────────── */
 
-struct abs_path_data {
-    std::string path;           /* key - never modified after insertion */
-    /* file stats, aggregated incrementally.  Mutable because they are
-       non-key fields that must be updated while the object lives in std::set. */
-    mutable int opens = 0;
-    mutable int errs  = 0;
-    mutable std::unordered_set<int> proc_tgids;
-    mutable std::vector<int> event_indices;     /* OPEN events into g_events */
-    mutable std::vector<int> path_event_indices; /* all events for this path */
-    /* Bidirectional proc ↔ file edges (tgids that read/wrote this path). */
-    mutable sorted_vec_set<int> read_procs;     /* processes that read this path */
-    mutable sorted_vec_set<int> write_procs;    /* processes that wrote this path */
+struct Item {
+    std::vector<Item*>        children;
+    bool                      collapsed = false;
+    sorted_vec_set<Item*>     deps;
+    sorted_vec_set<Item*>     rdeps;
+    sorted_vec_set<int>       events;     /* indices into g_events */
+
+    virtual ~Item() = default;
+    virtual std::string_view getKey() const = 0;
+    virtual std::string printLine(int depth) const = 0;
+    virtual const char *style() const { return "normal"; }
+    virtual bool hasChildren() const { return !children.empty(); }
+
+    /* Set collapsed flag recursively on this subtree. */
+    void setCollapsedRecursive(bool c) {
+        if (!children.empty()) collapsed = c;
+        for (auto *ch : children) ch->setCollapsedRecursive(c);
+    }
 };
 
-struct abs_path_cmp {
-    using is_transparent = void;
-    bool operator()(const abs_path_data &a, const abs_path_data &b) const { return a.path < b.path; }
-    bool operator()(const abs_path_data &a, const std::string &b) const { return a.path < b; }
-    bool operator()(const std::string &a, const abs_path_data &b) const { return a < b.path; }
-};
+/* ── PathItem — hierarchical filesystem path node ──────────────────── */
 
-/* The intern pool.  Every unique absolute path string gets exactly one
-   abs_path_data allocated here; pointers are stable (std::set). */
-static std::set<abs_path_data, abs_path_cmp> g_path_pool;
+struct PathItem : Item {
+    std::string         name;       /* single path component (e.g. "foo.c") */
+    PathItem           *parent = nullptr;
+    bool                is_dir = false;
 
-/* A lightweight handle: just a pointer into the pool. */
-struct abs_path_t {
-    const abs_path_data *ptr = nullptr;
+    /* file stats, aggregated incrementally */
+    int opens = 0;
+    int errs  = 0;
+    std::unordered_set<int> proc_tgids;
+    std::vector<int> open_event_indices;    /* OPEN events into g_events */
+    sorted_vec_set<int> read_procs;         /* processes that read this path */
+    sorted_vec_set<int> write_procs;        /* processes that wrote this path */
 
-    abs_path_t() = default;
-    explicit abs_path_t(const abs_path_data *p) : ptr(p) {}
-
-    bool operator==(const abs_path_t &o) const { return ptr == o.ptr; }
-    bool operator!=(const abs_path_t &o) const { return ptr != o.ptr; }
-    bool operator< (const abs_path_t &o) const {
-        if (!ptr || !o.ptr) return ptr < o.ptr;
-        return ptr->path < o.ptr->path;
+    /* Build full path by traversing parent chain. */
+    std::string fullPath() const {
+        if (!parent) return "/";
+        std::string p = parent->fullPath();
+        if (p != "/") p += '/';
+        p += name;
+        return p;
     }
 
-    /* compare with string */
-    bool operator==(const std::string &s) const { return ptr && ptr->path == s; }
+    std::string_view getKey() const override {
+        /* For engine row IDs — use full path.  Cached on first call. */
+        if (cached_key_.empty()) cached_key_ = fullPath();
+        return cached_key_;
+    }
 
-    bool empty()       const { return !ptr; }
-    const std::string &str() const { static const std::string e; return ptr ? ptr->path : e; }
-    const char *c_str() const { return ptr ? ptr->path.c_str() : ""; }
+    std::string printLine(int /*depth*/) const override {
+        /* Placeholder — actual line formatting is done by view builders. */
+        return name;
+    }
 
+    /* Find or create a child directory/file by name. */
+    PathItem *getOrCreateChild(const std::string &child_name, bool dir) {
+        for (auto *c : children) {
+            auto *pc = static_cast<PathItem*>(c);
+            if (pc->name == child_name) return pc;
+        }
+        auto *nc = new PathItem();
+        nc->name = child_name;
+        nc->parent = this;
+        nc->is_dir = dir;
+        children.push_back(nc);
+        return nc;
+    }
+
+private:
+    mutable std::string cached_key_;
+};
+
+/* Root of the file tree — represents "/" */
+static PathItem g_path_root;
+static std::vector<PathItem*> g_nonabs_paths;   /* paths like "pipe:[12345]" that don't start with "/" */
+
+/* Intern a path into the PathItem hierarchy.  Returns the leaf node. */
+static PathItem *intern_path_item(const std::string &path) {
+    if (path.empty()) return nullptr;
+    if (path[0] != '/') {
+        /* Non-absolute path (pipe, etc.) — keep as flat item */
+        for (auto *p : g_nonabs_paths)
+            if (p->name == path) return p;
+        auto *np = new PathItem();
+        np->name = path;
+        np->is_dir = false;
+        g_nonabs_paths.push_back(np);
+        return np;
+    }
+    /* Traverse/create hierarchy for absolute path. */
+    PathItem *cur = &g_path_root;
+    cur->is_dir = true;
+    size_t i = 1; /* skip leading '/' */
+    while (i < path.size()) {
+        auto sl = path.find('/', i);
+        std::string seg = (sl == std::string::npos) ? path.substr(i) : path.substr(i, sl - i);
+        if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
+        bool is_last = (sl == std::string::npos);
+        cur = cur->getOrCreateChild(seg, !is_last);
+        i = is_last ? path.size() : sl + 1;
+    }
+    return cur;
+}
+
+/* Lookup without creating. */
+static PathItem *find_path_item(const std::string &path) {
+    if (path.empty()) return nullptr;
+    if (path[0] != '/') {
+        for (auto *p : g_nonabs_paths)
+            if (p->name == path) return p;
+        return nullptr;
+    }
+    PathItem *cur = &g_path_root;
+    size_t i = 1;
+    while (i < path.size()) {
+        auto sl = path.find('/', i);
+        std::string seg = (sl == std::string::npos) ? path.substr(i) : path.substr(i, sl - i);
+        if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
+        PathItem *found = nullptr;
+        for (auto *c : cur->children) {
+            auto *pc = static_cast<PathItem*>(c);
+            if (pc->name == seg) { found = pc; break; }
+        }
+        if (!found) return nullptr;
+        cur = found;
+        i = (sl == std::string::npos) ? path.size() : sl + 1;
+    }
+    return cur;
+}
+
+/* Free all PathItems allocated with new. */
+static void free_path_tree(PathItem *node) {
+    for (auto *c : node->children) free_path_tree(static_cast<PathItem*>(c));
+    if (node != &g_path_root) delete node;
+    else { node->children.clear(); node->collapsed = false; node->opens = 0; node->errs = 0;
+           node->proc_tgids.clear(); node->open_event_indices.clear();
+           node->read_procs.clear(); node->write_procs.clear(); node->events.clear();
+           node->deps.clear(); node->rdeps.clear(); }
+}
+
+static void free_nonabs_paths() {
+    for (auto *p : g_nonabs_paths) delete p;
+    g_nonabs_paths.clear();
+}
+
+/* ── Backward-compatible abs_path_t — now wraps PathItem* ─────────── */
+
+struct abs_path_t {
+    PathItem *ptr = nullptr;
+    abs_path_t() = default;
+    explicit abs_path_t(PathItem *p) : ptr(p) {}
+    bool operator==(const abs_path_t &o) const { return ptr == o.ptr; }
+    bool operator!=(const abs_path_t &o) const { return ptr != o.ptr; }
+    bool operator< (const abs_path_t &o) const { return ptr < o.ptr; }
+    bool empty() const { return !ptr; }
+    std::string str() const { return ptr ? ptr->fullPath() : std::string(); }
+    const char *c_str() const { return ptr ? ptr->fullPath().c_str() : ""; }
     explicit operator bool() const { return ptr != nullptr; }
 };
 
-/* Get-or-create interned path.  Returns const pointer; mutable fields
-   allow updating stats without casting away constness. */
-static const abs_path_data *intern_path(const std::string &path) {
-    if (path.empty()) return nullptr;
-    auto it = g_path_pool.find(path);
-    if (it != g_path_pool.end()) return &*it;
-    abs_path_data d;
-    d.path = path;
-    auto [nit, _] = g_path_pool.insert(std::move(d));
-    return &*nit;
-}
-
-/* Immutable lookup (returns nullptr if not found). */
-static const abs_path_data *find_path(const std::string &path) {
-    auto it = g_path_pool.find(path);
-    return it != g_path_pool.end() ? &*it : nullptr;
-}
-
-/* Get abs_path_t handle for a path string (interning). */
 static abs_path_t get_abs_path(const std::string &path) {
-    auto *d = intern_path(path);
-    return abs_path_t(d);
+    return abs_path_t(intern_path_item(path));
 }
 
 extern int uproctrace_main(int argc, char **argv);
@@ -154,10 +246,10 @@ struct trace_event_t {
     int raw = 0;
 };
 
-struct process_t {
+struct process_t : Item {
     int tgid = 0, pid = 0, ppid = 0, nspid = 0, nstgid = 0;
     bool parent_set = false;            /* true once ppid has been assigned */
-    std::vector<int> children;          /* tgids */
+    std::vector<int> child_tgids;       /* tgids of children (for sorting) */
     double start_ts = 0, end_ts = 0;
     int has_start = 0, has_end = 0;
     std::string exe;
@@ -175,6 +267,7 @@ struct process_t {
     sorted_vec_set<abs_path_t> write_paths;
     std::vector<int> event_indices;     /* indices into g_events */
     std::string cached_display_name;    /* pre-computed basename */
+    mutable std::string cached_key_;
 
     void update_display_name() {
         std::string_view s;
@@ -185,6 +278,13 @@ struct process_t {
         cached_display_name = std::string(pos != std::string_view::npos ? s.substr(pos + 1) : s);
     }
     const std::string &display_name() const { return cached_display_name; }
+
+    std::string_view getKey() const override {
+        if (cached_key_.empty()) cached_key_ = std::to_string(tgid);
+        return cached_key_;
+    }
+    std::string printLine(int /*depth*/) const override { return cached_display_name; }
+    bool hasChildren() const override { return !child_tgids.empty(); }
 };
 
 struct app_state_t {
@@ -204,16 +304,7 @@ struct output_group_t {
     int tgid = 0;
     std::string name;
     std::vector<int> event_indices;
-};
-
-struct dir_stat_t {
-    std::string path;
-    std::string parent;
-    std::string name;
-    int opens = 0;
-    int procs = 0;
-    int errs = 0;
-    int has_children = 0;
+    bool collapsed = false;
 };
 
 enum {
@@ -234,10 +325,6 @@ static std::unique_ptr<Tui> g_tui;
 static int g_headless;
 static int g_lpane = -1, g_rpane = -1;
 static double g_base_ts;
-/* Single collapsed-ID set shared across all modes.  IDs are unique:
-   process tgids are numeric strings, directory paths start with "/",
-   output group ids start with "io_". */
-static std::unordered_set<std::string> g_collapsed;
 
 static char t_rbuf[MAX_JSON_LINE];
 static int t_rbuf_len = 0;
@@ -439,8 +526,39 @@ static std::string resolve_path_dup(const std::string &raw, const std::string &c
 
 /* ── View helpers ──────────────────────────────────────────────────── */
 
+/* Forward declare for is_collapsed/set_collapsed. */
+static process_t *find_process(int tgid);
+
+/* Output group collapsed state — stored in a persistent map since output groups
+   are rebuilt each time. */
+static std::unordered_map<std::string, bool> g_output_collapsed;
+
 static bool is_collapsed(const std::string &id) {
-    return g_collapsed.contains(id);
+    /* Process? */
+    if (!id.empty() && id[0] >= '0' && id[0] <= '9') {
+        auto *p = find_process(std::atoi(id.c_str()));
+        if (p) return p->collapsed;
+    }
+    /* Path? */
+    PathItem *pi = find_path_item(id);
+    if (pi) return pi->collapsed;
+    /* Output group? */
+    auto it = g_output_collapsed.find(id);
+    if (it != g_output_collapsed.end()) return it->second;
+    return false;
+}
+
+static void set_collapsed(const std::string &id, bool c) {
+    /* Process? */
+    if (!id.empty() && id[0] >= '0' && id[0] <= '9') {
+        auto *p = find_process(std::atoi(id.c_str()));
+        if (p) { p->collapsed = c; return; }
+    }
+    /* Path? */
+    PathItem *pi = find_path_item(id);
+    if (pi) { pi->collapsed = c; return; }
+    /* Output group */
+    g_output_collapsed[id] = c;
 }
 
 /* Emit one row into a RowData vector. */
@@ -525,10 +643,6 @@ static int key_name_to_code(const std::string &name) {
     return TUI_K_NONE;
 }
 
-static void ingest_input_line(const char *line) {
-    g_input_lines.emplace_back(line);
-}
-
 static void ingest_trace_line(const char *line) {
     std::string_view sp;
     if (!json_get(line, "event", sp)) return;
@@ -569,7 +683,7 @@ static void ingest_trace_line(const char *line) {
         proc.parent_set = true;
         auto pit = g_proc_map.find(proc.ppid);
         if (pit != g_proc_map.end())
-            pit->second.children.push_back(ev.tgid);
+            pit->second.child_tgids.push_back(ev.tgid);
     }
 
     switch (ev.kind) {
@@ -599,13 +713,13 @@ static void ingest_trace_line(const char *line) {
             abs_path_t ap = get_abs_path(ev.resolved_path);
             if (is_read_open(ev)) { proc.read_paths.insert(ap); ap.ptr->read_procs.insert(ev.tgid); }
             if (is_write_open(ev)) { proc.write_paths.insert(ap); ap.ptr->write_procs.insert(ev.tgid); }
-            /* Incremental file stats stored in abs_path_data */
-            const abs_path_data *fs = intern_path(ev.resolved_path);
+            /* Incremental file stats stored in PathItem */
+            PathItem *fs = ap.ptr;
             fs->opens++;
             if (ev.err) fs->errs++;
             fs->proc_tgids.insert(ev.tgid);
-            fs->event_indices.push_back(event_idx);
-            fs->path_event_indices.push_back(event_idx);
+            fs->open_event_indices.push_back(event_idx);
+            fs->events.insert(event_idx);
         }
         break;
     }
@@ -636,7 +750,7 @@ static void ingest_trace_line(const char *line) {
 static void ingest_line(const char *line) {
     std::string_view sp;
     if (!line || !line[0] || line[0] != '{') return;
-    if (json_get(line, "input", sp)) ingest_input_line(line);
+    if (json_get(line, "input", sp)) g_input_lines.emplace_back(line);
     else ingest_trace_line(line);
 }
 
@@ -741,7 +855,7 @@ static bool proc_is_interesting_failure(const process_t &p) {
     if (p.exit_status.empty()) return false;
     if (p.exit_status == "signaled") return true;
     if (p.exit_status == "exited" && p.exit_code != 0)
-        return p.has_write_open || !p.children.empty() || p.has_stdout;
+        return p.has_write_open || !p.child_tgids.empty() || p.has_stdout;
     return false;
 }
 
@@ -756,7 +870,7 @@ static bool proc_should_show(int tgid) {
     if (!p) return false;
     if (g_state.lp_filter == 0) return true;
     if (proc_matches_filter(*p)) return true;
-    for (int ct : p->children) if (proc_should_show(ct)) return true;
+    for (int ct : p->child_tgids) if (proc_should_show(ct)) return true;
     return false;
 }
 
@@ -778,8 +892,8 @@ static const char *proc_style(const process_t &p) {
 static RowData make_proc_tree_row(process_t *p, int depth) {
     int tgid = p->tgid;
     std::string id_str = std::to_string(tgid);
-    bool has_kids = !p->children.empty();
-    bool collapsed = has_kids && is_collapsed(id_str);
+    bool has_kids = !p->child_tgids.empty();
+    bool collapsed = has_kids && p->collapsed;
     const auto &name = p->display_name();
     std::string marker;
     if (p->exit_status == "exited")
@@ -787,7 +901,7 @@ static RowData make_proc_tree_row(process_t *p, int depth) {
     else if (p->exit_status == "signaled")
         marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
     std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
-    int nchildren = static_cast<int>(p->children.size());
+    int nchildren = static_cast<int>(p->child_tgids.size());
     std::string prefix = sfmt("%*s%s", depth * 4, "",
         !has_kids ? "  " : (collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "));
     std::string extra = nchildren > 0 ? sfmt(" (%d)", nchildren) : std::string();
@@ -830,152 +944,93 @@ static RowData make_proc_flat_row(process_t *p) {
 
 /* ── File view ─────────────────────────────────────────────────────── */
 
-/* Lightweight view of abs_path_data for file-view building */
-struct file_stat_view {
-    std::string path;
-    int opens = 0;
-    int errs = 0;
-    int nprocs = 0;
-};
-
-static std::vector<file_stat_view> build_file_stats() {
-    std::vector<file_stat_view> fs;
-    fs.reserve(g_path_pool.size());
-    for (const auto &pd : g_path_pool) {
-        if (pd.opens == 0) continue;
-        file_stat_view f;
-        f.path = pd.path;
-        f.opens = pd.opens;
-        f.errs = pd.errs;
-        f.nprocs = static_cast<int>(pd.proc_tgids.size());
-        fs.push_back(std::move(f));
-    }
-    return fs;
-}
-
-static const char *path_leaf(const char *path) {
-    const char *s = std::strrchr(path, '/');
-    return s ? s + 1 : path;
-}
-
 static bool file_matches_search(const std::string &path) {
     return !g_state.search.empty() && path.find(g_state.search) != std::string::npos;
 }
 
-static std::vector<dir_stat_t> build_dir_stats(const std::vector<file_stat_view> &fs) {
-    std::vector<dir_stat_t> dirs;
-    for (const auto &f : fs) {
-        if (f.path.empty() || f.path[0] != '/') continue;
-        size_t pos = 0;
-        while ((pos = f.path.find('/', pos + 1)) != std::string::npos) {
-            std::string dirpath = f.path.substr(0, pos);
-            bool found = false;
-            for (const auto &d : dirs) if (d.path == dirpath) { found = true; break; }
-            if (!found) {
-                dir_stat_t nd;
-                nd.path = dirpath;
-                auto slash = dirpath.rfind('/');
-                nd.parent = (slash == 0) ? "/" : dirpath.substr(0, slash);
-                if (nd.path == "/") nd.parent.clear();
-                nd.name = path_leaf(dirpath.c_str());
-                dirs.push_back(std::move(nd));
-            }
-        }
+/* Recursive DFS on PathItem tree → emit rows for file tree view. */
+static void add_file_tree_rec(std::vector<RowData> &rows, PathItem *node, int depth) {
+    /* Separate dirs and files among children. */
+    std::vector<PathItem*> dirs, files;
+    for (auto *c : node->children) {
+        auto *pc = static_cast<PathItem*>(c);
+        if (pc->opens == 0 && pc->children.empty()) continue;
+        if (pc->is_dir || !pc->children.empty()) dirs.push_back(pc);
+        else files.push_back(pc);
     }
-    for (auto &d : dirs) {
-        for (const auto &f : fs) {
-            size_t m = d.path.size();
-            if (f.path.compare(0, m, d.path) == 0 && ((f.path.size() > m && f.path[m] == '/') || (m == 1 && f.path[0] == '/'))) {
-                d.opens += f.opens;
-                d.procs += f.nprocs;
-                d.errs += f.errs;
-            }
-        }
-        for (const auto &d2 : dirs) if (d2.parent == d.path) d.has_children = 1;
-        for (const auto &f : fs) {
-            auto slash = f.path.rfind('/');
-            if (slash == std::string::npos) continue;
-            std::string parent = (slash == 0) ? "/" : f.path.substr(0, slash);
-            if (parent == d.path) d.has_children = 1;
-        }
-    }
-    return dirs;
-}
+    std::sort(dirs.begin(), dirs.end(), [](PathItem *a, PathItem *b) { return a->name < b->name; });
+    std::sort(files.begin(), files.end(), [](PathItem *a, PathItem *b) { return a->name < b->name; });
 
-static void add_file_tree_rec(std::vector<RowData> &rows, const std::string &dir,
-                              std::vector<dir_stat_t> &dirs,
-                              std::vector<file_stat_view> &fs, int depth) {
-    std::vector<std::string> children_dirs, children_files;
-    for (const auto &d : dirs) if (d.parent == dir) children_dirs.push_back(d.path);
-    for (const auto &f : fs) {
-        auto slash = f.path.rfind('/');
-        if (slash == std::string::npos) continue;
-        std::string parent = (slash == 0) ? "/" : f.path.substr(0, slash);
-        if (parent == dir) children_files.push_back(f.path);
-    }
-    std::sort(children_dirs.begin(), children_dirs.end());
-    std::sort(children_files.begin(), children_files.end());
-
-    for (const auto &cd : children_dirs) {
-        dir_stat_t *d = nullptr;
-        for (auto &dd : dirs) if (dd.path == cd) { d = &dd; break; }
-        if (!d) continue;
-        bool collapsed_flag = is_collapsed(d->path);
+    for (auto *d : dirs) {
+        std::string fullp = d->fullPath();
+        std::string parent_fullp = d->parent ? d->parent->fullPath() : std::string();
+        int nprocs = static_cast<int>(d->proc_tgids.size());
         std::string errs_text = d->errs ? sfmt(", %d errs", d->errs) : std::string();
         std::string text = sfmt("%*s%s%s/  [%d opens, %d procs%s]", depth * 2, "",
-                                collapsed_flag ? "▶ " : "▼ ", d->name.c_str(),
-                                d->opens, d->procs, errs_text.c_str());
-        emit_row(rows, d->path,
-                 file_matches_search(d->path) ? "search" : (d->errs ? "error" : "normal"),
-                 d->parent, text, 1, d->path, true);
-        if (!collapsed_flag) add_file_tree_rec(rows, d->path, dirs, fs, depth + 1);
+                                d->collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc ",
+                                d->name.c_str(), d->opens, nprocs, errs_text.c_str());
+        bool has_kids = !d->children.empty();
+        emit_row(rows, fullp,
+                 file_matches_search(fullp) ? "search" : (d->errs ? "error" : "normal"),
+                 parent_fullp, text, 1, fullp, has_kids);
+        if (!d->collapsed) add_file_tree_rec(rows, d, depth + 1);
     }
-    for (const auto &cf : children_files) {
-        file_stat_view *fp = nullptr;
-        for (auto &ff : fs) if (ff.path == cf) { fp = &ff; break; }
-        if (!fp) continue;
-        std::string errs_text = fp->errs ? sfmt(", %d errs", fp->errs) : std::string();
+    for (auto *f : files) {
+        if (f->opens == 0) continue;
+        std::string fullp = f->fullPath();
+        std::string parent_fullp = f->parent ? f->parent->fullPath() : std::string();
+        int nprocs = static_cast<int>(f->proc_tgids.size());
+        std::string errs_text = f->errs ? sfmt(", %d errs", f->errs) : std::string();
         std::string text = sfmt("%*s%s  [%d opens, %d procs%s]", depth * 2, "",
-                                fp->path[0] == '/' ? path_leaf(fp->path.c_str()) : fp->path.c_str(),
-                                fp->opens, fp->nprocs, errs_text.c_str());
-        auto slash = fp->path.rfind('/');
-        std::string parent;
-        if (slash != std::string::npos)
-            parent = (slash == 0) ? "/" : fp->path.substr(0, slash);
-        emit_row(rows, fp->path,
-                 file_matches_search(fp->path) ? "search" : (fp->errs ? "error" : "normal"),
-                 parent, text, 1, fp->path, false);
+                                f->name.c_str(), f->opens, nprocs, errs_text.c_str());
+        emit_row(rows, fullp,
+                 file_matches_search(fullp) ? "search" : (f->errs ? "error" : "normal"),
+                 parent_fullp, text, 1, fullp, false);
     }
+}
+
+/* Collect all leaf PathItems (files with opens > 0) recursively. */
+static void collect_file_leaves(PathItem *node, std::vector<PathItem*> &out) {
+    if (node->opens > 0 && node->children.empty())
+        out.push_back(node);
+    for (auto *c : node->children)
+        collect_file_leaves(static_cast<PathItem*>(c), out);
 }
 
 static void build_lpane_files(std::vector<RowData> &rows) {
-    auto fs = build_file_stats();
     if (!g_state.grouped) {
-        std::vector<std::string> paths;
-        for (const auto &f : fs) paths.push_back(f.path);
-        std::sort(paths.begin(), paths.end());
-        for (const auto &path : paths) {
-            file_stat_view *fp = nullptr;
-            for (auto &f : fs) if (f.path == path) { fp = &f; break; }
-            if (!fp) continue;
+        /* Flat mode: collect all leaf files, sort by full path. */
+        std::vector<PathItem*> leaves;
+        collect_file_leaves(&g_path_root, leaves);
+        for (auto *np : g_nonabs_paths)
+            if (np->opens > 0) leaves.push_back(np);
+        std::sort(leaves.begin(), leaves.end(), [](PathItem *a, PathItem *b) {
+            return a->fullPath() < b->fullPath();
+        });
+        for (auto *fp : leaves) {
+            std::string path = fp->fullPath();
+            int nprocs = static_cast<int>(fp->proc_tgids.size());
             std::string errs_text = fp->errs ? sfmt(", %d errs", fp->errs) : std::string();
-            std::string text = sfmt("%s  [%d opens, %d procs%s]", fp->path.c_str(),
-                                    fp->opens, fp->nprocs, errs_text.c_str());
-            emit_row(rows, fp->path,
-                     file_matches_search(fp->path) ? "search" : (fp->errs ? "error" : "normal"),
-                     "", text, 1, fp->path, false);
+            std::string text = sfmt("%s  [%d opens, %d procs%s]", path.c_str(),
+                                    fp->opens, nprocs, errs_text.c_str());
+            emit_row(rows, path,
+                     file_matches_search(path) ? "search" : (fp->errs ? "error" : "normal"),
+                     "", text, 1, path, false);
         }
     } else {
-        auto dirs = build_dir_stats(fs);
-        add_file_tree_rec(rows, "/", dirs, fs, 0);
-        for (auto &f : fs) {
-            if (!f.path.empty() && f.path[0] == '/') continue;
-            std::string errs_text = f.errs ? sfmt(", %d errs", f.errs) : std::string();
-            std::string text = sfmt("  %s  [%d opens, %d procs%s]", f.path.c_str(),
-                                    f.opens, f.nprocs, errs_text.c_str());
-            emit_row(rows, f.path,
-                     file_matches_search(f.path) ? "search" : (f.errs ? "error" : "normal"),
-                     "", text, 1, f.path, false);
+        /* Tree mode: DFS on PathItem hierarchy starting from root children. */
+        add_file_tree_rec(rows, &g_path_root, 0);
+        /* Non-absolute paths (pipes etc.) at the end. */
+        for (auto *np : g_nonabs_paths) {
+            if (np->opens == 0) continue;
+            std::string path = np->name;
+            int nprocs = static_cast<int>(np->proc_tgids.size());
+            std::string errs_text = np->errs ? sfmt(", %d errs", np->errs) : std::string();
+            std::string text = sfmt("  %s  [%d opens, %d procs%s]", path.c_str(),
+                                    np->opens, nprocs, errs_text.c_str());
+            emit_row(rows, path,
+                     file_matches_search(path) ? "search" : (np->errs ? "error" : "normal"),
+                     "", text, 1, path, false);
         }
     }
 }
@@ -1055,7 +1110,7 @@ static void collect_dep_files(const std::string &start, int reverse,
     while (qh < static_cast<int>(queue.size())) {
         std::string cur = queue[qh++];
         if (!seen.emplace(cur).second) continue;
-        const abs_path_data *pd = find_path(cur);
+        PathItem *pd = find_path_item(cur);
         if (!pd) continue;
         if (reverse) {
             /* deps: procs that wrote cur → files they read */
@@ -1096,7 +1151,7 @@ static void build_lpane_dep_cmds(std::vector<RowData> &rows, int reverse) {
     /* Collect processes that touched any file in the chain */
     sorted_vec_set<int> ptgids;
     for (const auto &s : seen) {
-        const abs_path_data *pd = find_path(s);
+        PathItem *pd = find_path_item(s);
         if (!pd) continue;
         for (int t : pd->read_procs) ptgids.insert(t);
         for (int t : pd->write_procs) ptgids.insert(t);
@@ -1162,10 +1217,10 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
                  (p->exit_status == "exited" && p->exit_code == 0) ? "green" : "error",
                  "", text, -1, "", false);
     }
-    int nchildren = static_cast<int>(p->children.size());
+    int nchildren = static_cast<int>(p->child_tgids.size());
     if (nchildren > 0) {
         emit_row(rows, "kids_hdr", "heading", "", sfmt("Children (%d)", nchildren), -1, "", false);
-        auto sorted_ch = p->children;
+        auto sorted_ch = p->child_tgids;
         if (sorted_ch.size() > 1) std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
         for (int ct : sorted_ch) {
             auto *c = find_process(ct);
@@ -1214,7 +1269,7 @@ static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) 
     if (id.empty()) return;
     emit_row(rows, "hdr", "heading", "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 File \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
     emit_row(rows, "path", "normal", "", id, -1, "", false);
-    const abs_path_data *pd = find_path(id);
+    PathItem *pd = find_path_item(id);
     int opens = pd ? pd->opens : 0;
     int errs  = pd ? pd->errs  : 0;
     int nprocs = pd ? static_cast<int>(pd->proc_tgids.size()) : 0;
@@ -1222,7 +1277,7 @@ static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) 
     emit_row(rows, "procs", "normal", "", sfmt("Procs: %d", nprocs), -1, "", false);
     emit_row(rows, "errs", errs ? "error" : "normal", "", sfmt("Errors: %d", errs), -1, "", false);
     if (pd) {
-        for (int ei : pd->path_event_indices) {
+        for (int ei : pd->open_event_indices) {
             auto &ev = g_events[ei];
             auto *p = find_process(ev.tgid);
             std::string err_text = ev.err ? sfmt(" err=%d", ev.err) : std::string();
@@ -1390,11 +1445,11 @@ static RowData ds_row_next(int panel) {
             auto *p = find_process(tgid);
             if (!p) return {};
             std::string id_str = std::to_string(tgid);
-            bool has_kids = !p->children.empty();
-            bool collapsed = has_kids && is_collapsed(id_str);
+            bool has_kids = !p->child_tgids.empty();
+            bool collapsed_flag = has_kids && p->collapsed;
             /* Push children if not collapsed. */
-            if (!collapsed && has_kids) {
-                auto sorted_ch = p->children;
+            if (!collapsed_flag && has_kids) {
+                auto sorted_ch = p->child_tgids;
                 if (sorted_ch.size() > 1)
                     std::sort(sorted_ch.begin(), sorted_ch.end(), cmp_proc_tgid);
                 for (int i = static_cast<int>(sorted_ch.size()) - 1; i >= 0; i--)
@@ -1500,7 +1555,7 @@ static void collapse_or_back() {
     auto *row = g_tui ? g_tui->get_cached_row(g_lpane, cur) : nullptr;
     if (!row) return;
     if (row->has_children && !is_collapsed(row->id)) {
-        g_collapsed.insert(row->id);
+        set_collapsed(row->id, true);
     }
     else if (!row->parent_id.empty()) g_state.cursor_id = row->parent_id;
 }
@@ -1519,21 +1574,18 @@ static void expand_or_detail() {
         return;
     }
     if (row->has_children && is_collapsed(row->id)) {
-        g_collapsed.erase(row->id);
+        set_collapsed(row->id, false);
     }
     else if (g_tui) g_tui->focus(g_rpane);
 }
 
-/* Expand/collapse all descendants of the current node by walking the model. */
-static void expand_subtree_proc(int tgid, int expand) {
+/* Expand/collapse all descendants of the current node using Item::setCollapsedRecursive. */
+/* Helper: recursively set collapsed flag on process tree via child_tgids. */
+static void proc_set_collapsed_rec(int tgid, bool c) {
     auto *p = find_process(tgid);
     if (!p) return;
-    std::string id = std::to_string(tgid);
-    if (!p->children.empty()) {
-        if (expand) g_collapsed.erase(id);
-        else g_collapsed.insert(id);
-    }
-    for (int ct : p->children) expand_subtree_proc(ct, expand);
+    if (!p->child_tgids.empty()) p->collapsed = c;
+    for (int ct : p->child_tgids) proc_set_collapsed_rec(ct, c);
 }
 
 static void expand_subtree(int expand) {
@@ -1541,13 +1593,15 @@ static void expand_subtree(int expand) {
     auto *row = g_tui ? g_tui->get_cached_row(g_lpane, cur) : nullptr;
     if (!row || !row->has_children) return;
     if (g_state.mode == 0) {
-        /* Process view: walk process tree directly. */
-        int tgid = std::atoi(row->id.c_str());
-        expand_subtree_proc(tgid, expand);
+        /* Process view: walk child_tgids recursively. */
+        proc_set_collapsed_rec(std::atoi(row->id.c_str()), !expand);
+    } else if (g_state.mode == 1) {
+        /* File tree view: find the PathItem and recurse. */
+        PathItem *pi = find_path_item(row->id);
+        if (pi) pi->setCollapsedRecursive(!expand);
     } else {
-        /* File/output views: toggle current node only. */
-        if (expand) g_collapsed.erase(row->id);
-        else g_collapsed.insert(row->id);
+        /* Output/other: just toggle this node. */
+        set_collapsed(row->id, !expand);
     }
 }
 
@@ -1804,10 +1858,11 @@ static void on_trace_fd_cb(Tui &tui, int fd) {
 static void free_all() {
     g_events.clear();
     g_proc_map.clear();
-    g_path_pool.clear();
+    free_path_tree(&g_path_root);
+    free_nonabs_paths();
     if (g_save_fp) { std::fclose(g_save_fp); g_save_fp = nullptr; }
     g_input_lines.clear();
-    g_collapsed.clear();
+    g_output_collapsed.clear();
 }
 
 /* ── Test API (non-static, called from tests.cpp) ─────────────────── */
