@@ -490,7 +490,8 @@ static bool test_file_view_all_files_present() {
     ASSERT(col_contains(lp, "bar.o"), "missing bar.o");
     ASSERT(col_contains(lp, "Makefile"), "missing Makefile");
     ASSERT(col_contains(lp, "app"), "missing app");
-    ASSERT(col_contains(lp, "/nonexistent"), "missing /nonexistent");
+    /* /nonexistent is a leaf under root — check by row id (full path). */
+    ASSERT(row_exists(lp, "/nonexistent"), "missing /nonexistent");
     return true;
 }
 
@@ -498,8 +499,9 @@ static bool test_file_view_path_resolution_relative() {
     setup();
     send(R"({"input":"key","name":"2"})");
     int lp = tv_test_lpane();
-    ASSERT(col_contains(lp, "/home/user/project/foo.c"), "missing /home/user/project/foo.c");
-    ASSERT(col_contains(lp, "/home/user/project/sub/deep.c"), "missing /home/user/project/sub/deep.c");
+    /* In tree mode, leaf names shown; check by row id for full path resolution. */
+    ASSERT(row_exists(lp, "/home/user/project/foo.c"), "missing /home/user/project/foo.c");
+    ASSERT(row_exists(lp, "/home/user/project/sub/deep.c"), "missing /home/user/project/sub/deep.c");
     return true;
 }
 
@@ -507,8 +509,9 @@ static bool test_file_view_path_resolution_dotdot() {
     setup();
     send(R"({"input":"key","name":"2"})");
     int lp = tv_test_lpane();
-    ASSERT(col_contains(lp, "/home/user/include/foo.h"), "missing /home/user/include/foo.h");
-    ASSERT(col_contains(lp, "/home/user/project/common.h"), "missing /home/user/project/common.h");
+    /* Check by row id for full resolved paths. */
+    ASSERT(row_exists(lp, "/home/user/include/foo.h"), "missing /home/user/include/foo.h");
+    ASSERT(row_exists(lp, "/home/user/project/common.h"), "missing /home/user/project/common.h");
     return true;
 }
 
@@ -533,17 +536,15 @@ static bool test_file_view_error_files() {
     setup();
     send(R"({"input":"key","name":"2"})");
     int lp = tv_test_lpane();
-    ASSERT(col_contains(lp, "/nonexistent"), "missing /nonexistent");
+    ASSERT(row_exists(lp, "/nonexistent"), "missing /nonexistent");
     ASSERT(col_contains(lp, "1 errs"), "missing '1 errs'");
     // Check /nonexistent row has error style
     for (int i = 0; ; i++) {
         auto *r = tv_test_tui()->get_cached_row(lp, i);
         if (!r) break;
-        for (auto &c : r->cols) {
-            if (c.find("/nonexistent") != std::string::npos) {
-                ASSERT(r->style == "error", "/nonexistent not error style");
-                return true;
-            }
+        if (r->id == "/nonexistent") {
+            ASSERT(r->style == "error", "/nonexistent not error style");
+            return true;
         }
     }
     FAIL("/nonexistent row not found for style check");
@@ -561,19 +562,17 @@ static bool test_file_view_collapsed_dirs() {
     setup();
     send(R"({"input":"key","name":"2"})");
     int lp = tv_test_lpane();
-    // Check that include and project dirs are nested under /home/user
+    // Check that include and project dirs exist with /home/user as ancestor
     bool include_found = false, project_found = false;
     for (int i = 0; ; i++) {
         auto *r = tv_test_tui()->get_cached_row(lp, i);
         if (!r) break;
-        for (auto &c : r->cols) {
-            if (c.find("/home/user/include") != std::string::npos &&
-                r->parent_id.find("/home/user") != std::string::npos)
-                include_found = true;
-            if (c.find("/home/user/project") != std::string::npos &&
-                r->parent_id.find("/home/user") != std::string::npos)
-                project_found = true;
-        }
+        if (r->id == "/home/user/include" &&
+            r->parent_id.find("/home/user") != std::string::npos)
+            include_found = true;
+        if (r->id == "/home/user/project" &&
+            r->parent_id.find("/home/user") != std::string::npos)
+            project_found = true;
     }
     ASSERT(include_found, "include not nested under /home/user");
     ASSERT(project_found, "project not nested under /home/user");
@@ -938,6 +937,7 @@ static bool test_follow_link_file_to_process() {
     send(R"({"input":"key","name":"2"}
 {"input":"select","id":"/home/user/project/foo.o"}
 {"input":"key","name":"tab"}
+{"input":"key","name":"j"}
 {"input":"key","name":"j"}
 {"input":"key","name":"j"}
 {"input":"key","name":"j"}

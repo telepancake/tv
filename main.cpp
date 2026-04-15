@@ -1873,6 +1873,8 @@ void tv_test_reset() {
     g_tui.reset();
     free_all();
     g_state = {};
+    g_next_event_id = 1;
+    g_base_ts = 0.0;
     g_lpane = -1;
     g_rpane = -1;
     g_headless = 0;
