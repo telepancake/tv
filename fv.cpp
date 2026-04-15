@@ -66,6 +66,7 @@ struct FvState {
 
     int dir_panels[FV_MAX_DEPTH]{};   /* panel indices assigned by add_panel() */
     int content_panel{-1};
+    int last_dir_panel{0};            /* dir panel to return to when Tab leaves content */
 };
 
 static FvState g;
@@ -424,19 +425,12 @@ static int on_key(Tui &tui, int key, int panel,
     }
     if (key == TUI_K_TAB) {
         if (in_content) {
-            tui.focus(g.dir_panels[0]);
+            /* Return to whichever dir panel was last active. */
+            tui.focus(g.dir_panels[g.last_dir_panel]);
         } else if (d >= 0) {
-            /* Advance to the next populated dir column, or content panel. */
-            bool found = false;
-            for (int i = d + 1; i < g.depth_count; i++) {
-                if (!g.entries[i].empty()) {
-                    tui.focus(g.dir_panels[i]);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found)
-                tui.focus(g.content_panel);
+            /* Switch to the content panel, remembering this dir panel. */
+            g.last_dir_panel = d;
+            tui.focus(g.content_panel);
         }
         update_status();
         return TUI_HANDLED;
