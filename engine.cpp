@@ -211,6 +211,13 @@ static int pfind_idx(Tui::Impl *m, const char *nm) {
 
 /* Open the data-source iterator for this panel (if not already open). */
 static void p_ensure_iter(Tui::Impl *m, Panel *p) {
+    if (p->dirty) {
+        p->iter_open = false;
+        p->rows.clear();
+        p->complete = false;
+        p->row_count = 0;
+        p->dirty = false;
+    }
     if (p->iter_open) return;
     p->rows.clear();
     p->complete = false;
@@ -235,15 +242,6 @@ static void p_ensure_rows(Tui::Impl *m, Panel *p, int need) {
     }
 }
 
-/* Read all remaining rows from the data source. */
-static void p_ensure_complete(Tui::Impl *m, Panel *p) {
-    p_ensure_iter(m, p);
-    if (p->complete) return;
-    while (m->source.row_has_more && m->source.row_has_more(p->def.name))
-        p->rows.push_back(m->source.row_next(p->def.name));
-    p->complete = true;
-    p->row_count = static_cast<int>(p->rows.size());
-}
 
 static void p_clamp(Tui::Impl *m, Panel *p) {
     /* Ensure we have enough rows for the cursor position. */
@@ -274,14 +272,25 @@ static void p_sync_id(Tui::Impl *m, Panel *p) {
 
 static void p_resolve_id(Tui::Impl *m, Panel *p) {
     if (!p->cursor_id[0]) { p->cursor = 0; return; }
-    /* Need to scan all rows to find the id. */
-    p_ensure_complete(m, p);
+    p_ensure_iter(m, p);
+    /* First check already-loaded rows. */
     for (int i = 0; i < p->row_count; i++) {
         if (p->rows[i].id == p->cursor_id) {
             p->cursor = i;
             return;
         }
     }
+    /* Incrementally load more rows until found or exhausted. */
+    while (!p->complete && m->source.row_has_more && m->source.row_has_more(p->def.name)) {
+        p->rows.push_back(m->source.row_next(p->def.name));
+        p->row_count = static_cast<int>(p->rows.size());
+        if (p->rows.back().id == p->cursor_id) {
+            p->cursor = p->row_count - 1;
+            return;
+        }
+    }
+    if (!m->source.row_has_more || !m->source.row_has_more(p->def.name))
+        p->complete = true;
     /* ID not found — keep current position (will be clamped). */
 }
 
@@ -552,8 +561,16 @@ static void default_nav(Tui::Impl *m, int k) {
     case TUI_K_PGUP:           p.cursor -= pg; break;
     case TUI_K_PGDN:           p.cursor += pg; break;
     case TUI_K_HOME: case 'g': p.cursor = 0; break;
-    case TUI_K_END:            /* Must materialise all rows to find the last one. */
-                               p_ensure_complete(m, &p); p.cursor = p.row_count > 0 ? p.row_count - 1 : 0; break;
+    case TUI_K_END:            /* Read all remaining rows inline to find last. */
+                               { p_ensure_iter(m, &p);
+                                 while (!p.complete && m->source.row_has_more &&
+                                        m->source.row_has_more(p.def.name)) {
+                                     p.rows.push_back(m->source.row_next(p.def.name));
+                                     p.row_count = static_cast<int>(p.rows.size());
+                                 }
+                                 p.complete = true;
+                                 p.cursor = p.row_count > 0 ? p.row_count - 1 : 0;
+                               } break;
     default: return;
     }
     p_clamp(m, &p);
@@ -712,24 +729,6 @@ int Tui::get_scroll(const char *panel) const {
 const char *Tui::get_cursor_id(const char *panel) const {
     auto *p = pfind(impl_.get(), panel);
     return (p && p->cursor_id[0]) ? p->cursor_id : "";
-}
-
-int Tui::row_count(const char *panel) {
-    auto *m = impl_.get();
-    auto *p = pfind(m, panel);
-    if (!p) return 0;
-    if (p->dirty) {
-        p->iter_open = false;
-        p->rows.clear();
-        p->complete = false;
-        p->row_count = 0;
-        p->dirty = false;
-    }
-    p_ensure_complete(m, p);
-    p_resolve_id(m, p);
-    p_clamp(m, p);
-    p_sync_id(m, p);
-    return p->row_count;
 }
 
 const RowData *Tui::get_cached_row(const char *panel, int idx) {
