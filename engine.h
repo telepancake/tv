@@ -24,6 +24,19 @@ inline constexpr int TUI_QUIT    = -1;
 enum { TUI_ALIGN_LEFT = 0, TUI_ALIGN_RIGHT, TUI_ALIGN_CENTER };
 enum { TUI_OVERFLOW_TRUNCATE = 0, TUI_OVERFLOW_ELLIPSIS };
 
+enum class RowStyle {
+    Normal,
+    Error,
+    Search,
+    Heading,
+    Green,
+    Dim,
+    Bold,
+    Cyan,
+    CyanBold,
+    Yellow,
+};
+
 inline constexpr int TUI_PANEL_CURSOR = 0x01;
 inline constexpr int TUI_PANEL_BORDER = 0x02;
 
@@ -63,7 +76,7 @@ struct Box {
 
 struct RowData {
     std::string id;
-    std::string style;
+    RowStyle    style = RowStyle::Normal;
     std::vector<std::string> cols;
 
     /* App-level metadata (engine ignores; carried through for app use) */
