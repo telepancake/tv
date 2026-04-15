@@ -245,7 +245,7 @@ static RowData fv_row_next(const char *panel)
         std::snprintf(idbuf, sizeof idbuf, "%d", rownum);
         d.id      = idbuf;
         d.style   = "";
-        d.cols[0] = g.lines[static_cast<size_t>(rownum)];
+        d.cols = {g.lines[static_cast<size_t>(rownum)]};
         return d;
     }
 
@@ -260,7 +260,7 @@ static RowData fv_row_next(const char *panel)
     char namebuf[258];
     if (e.is_dir) std::snprintf(namebuf, sizeof namebuf, "%s/", e.name);
     else          std::snprintf(namebuf, sizeof namebuf, "%s",  e.name);
-    d.cols[0] = namebuf;
+    d.cols = {namebuf};
     return d;
 }
 

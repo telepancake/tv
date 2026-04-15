@@ -42,8 +42,10 @@ struct Panel {
     bool dirty = true;
     char cursor_id[4096]{};
 
-    /* Full cache — every row for this panel, read once per refresh. */
+    /* Lazy cache — rows are read progressively from the data source. */
     std::vector<RowData> rows;
+    bool complete = false; /* true when all rows have been read */
+    bool iter_open = false; /* true when row_begin has been called for current refresh */
 };
 
 struct FdWatch {
@@ -207,19 +209,53 @@ static int pfind_idx(Tui::Impl *m, const char *nm) {
     return -1;
 }
 
-/* Read every row from the data source iterator into the panel cache. */
-static void p_read_all(Tui::Impl *m, Panel *p) {
+/* Open the data-source iterator for this panel (if not already open). */
+static void p_ensure_iter(Tui::Impl *m, Panel *p) {
+    if (p->iter_open) return;
     p->rows.clear();
-    if (!m->source.row_begin) return;
-    m->source.row_begin(p->def.name);
+    p->complete = false;
+    p->row_count = 0;
+    if (m->source.row_begin)
+        m->source.row_begin(p->def.name);
+    p->iter_open = true;
+}
+
+/* Read from the data source until we have at least `need` rows, or exhausted. */
+static void p_ensure_rows(Tui::Impl *m, Panel *p, int need) {
+    p_ensure_iter(m, p);
+    if (p->complete) return;
+    while (p->row_count < need &&
+           m->source.row_has_more && m->source.row_has_more(p->def.name)) {
+        p->rows.push_back(m->source.row_next(p->def.name));
+        p->row_count = static_cast<int>(p->rows.size());
+    }
+    if (!m->source.row_has_more || !m->source.row_has_more(p->def.name)) {
+        p->complete = true;
+        p->row_count = static_cast<int>(p->rows.size());
+    }
+}
+
+/* Read all remaining rows from the data source. */
+static void p_ensure_complete(Tui::Impl *m, Panel *p) {
+    p_ensure_iter(m, p);
+    if (p->complete) return;
     while (m->source.row_has_more && m->source.row_has_more(p->def.name))
         p->rows.push_back(m->source.row_next(p->def.name));
+    p->complete = true;
     p->row_count = static_cast<int>(p->rows.size());
 }
 
-static void p_clamp(Panel *p) {
+static void p_clamp(Tui::Impl *m, Panel *p) {
+    /* Ensure we have enough rows for the cursor position. */
+    if (p->cursor > 0)
+        p_ensure_rows(m, p, p->cursor + 1);
+    if (p->row_count == 0 && !p->complete)
+        p_ensure_rows(m, p, 1);
     if (p->row_count == 0) { p->cursor = 0; p->scroll = 0; return; }
-    if (p->cursor >= p->row_count) p->cursor = p->row_count - 1;
+    if (p->cursor >= p->row_count) {
+        if (!p->complete) p_ensure_rows(m, p, p->cursor + 1);
+        if (p->cursor >= p->row_count) p->cursor = p->row_count - 1;
+    }
     if (p->cursor < 0) p->cursor = 0;
     int vh = p->h - (p->def.title ? 1 : 0);
     if (vh < 1) vh = 1;
@@ -228,15 +264,18 @@ static void p_clamp(Panel *p) {
     if (p->scroll < 0) p->scroll = 0;
 }
 
-static void p_sync_id(Panel *p) {
+static void p_sync_id(Tui::Impl *m, Panel *p) {
     p->cursor_id[0] = '\0';
+    p_ensure_rows(m, p, p->cursor + 1);
     if (p->cursor >= 0 && p->cursor < p->row_count)
         std::snprintf(p->cursor_id, sizeof p->cursor_id, "%s",
                       p->rows[p->cursor].id.c_str());
 }
 
-static void p_resolve_id(Panel *p) {
+static void p_resolve_id(Tui::Impl *m, Panel *p) {
     if (!p->cursor_id[0]) { p->cursor = 0; return; }
+    /* Need to scan all rows to find the id. */
+    p_ensure_complete(m, p);
     for (int i = 0; i < p->row_count; i++) {
         if (p->rows[i].id == p->cursor_id) {
             p->cursor = i;
@@ -419,8 +458,10 @@ static void render_panel(Tui::Impl *m, Panel *p) {
         if (is_cur && focused) sp(m, "\x1b[1;7m");
         else if (is_cur) sp(m, "\x1b[7m");
         else sp(m, style_ansi(r.style.c_str()));
-        for (int c = 0; c < nc; c++)
-            sput_field(m, r.cols[c].c_str(), cw[c], d->cols[c].align, d->cols[c].overflow);
+        for (int c = 0; c < nc; c++) {
+            const char *cell = (c < static_cast<int>(r.cols.size())) ? r.cols[c].c_str() : "";
+            sput_field(m, cell, cw[c], d->cols[c].align, d->cols[c].overflow);
+        }
         sp(m, "\x1b[0m");
     }
     if (d->flags & TUI_PANEL_BORDER) {
@@ -441,12 +482,19 @@ static void render_all(Tui::Impl *m) {
     sp(m, "\x1b[H");
     for (auto &p : m->panels) {
         if (p.dirty) {
-            p_read_all(m, &p);
-            p_resolve_id(&p);
-            p_clamp(&p);
-            p_sync_id(&p);
+            p.iter_open = false; /* reset iterator for fresh data */
+            p.rows.clear();
+            p.complete = false;
+            p.row_count = 0;
+            p_resolve_id(m, &p);
+            p_clamp(m, &p);
+            p_sync_id(m, &p);
             p.dirty = false;
         }
+        /* Ensure enough rows are cached for the visible viewport. */
+        int vh = p.h - (p.def.title ? 1 : 0);
+        if (vh < 1) vh = 1;
+        p_ensure_rows(m, &p, p.scroll + vh);
         render_panel(m, &p);
     }
     render_status(m);
@@ -479,10 +527,13 @@ static void default_nav(Tui::Impl *m, int k) {
                 m->focus = idx;
                 auto &pp = m->panels[idx];
                 if (pp.dirty) {
-                    p_read_all(m, &pp);
-                    p_resolve_id(&pp);
-                    p_clamp(&pp);
-                    p_sync_id(&pp);
+                    pp.iter_open = false;
+                    pp.rows.clear();
+                    pp.complete = false;
+                    pp.row_count = 0;
+                    p_resolve_id(m, &pp);
+                    p_clamp(m, &pp);
+                    p_sync_id(m, &pp);
                     pp.dirty = false;
                 }
                 return;
@@ -501,11 +552,11 @@ static void default_nav(Tui::Impl *m, int k) {
     case TUI_K_PGUP:           p.cursor -= pg; break;
     case TUI_K_PGDN:           p.cursor += pg; break;
     case TUI_K_HOME: case 'g': p.cursor = 0; break;
-    case TUI_K_END:            p.cursor = p.row_count > 0 ? p.row_count - 1 : 0; break;
+    case TUI_K_END:            p_ensure_complete(m, &p); p.cursor = p.row_count > 0 ? p.row_count - 1 : 0; break;
     default: return;
     }
-    p_clamp(&p);
-    p_sync_id(&p);
+    p_clamp(m, &p);
+    p_sync_id(m, &p);
 }
 
 /* fire TUI_K_NONE to notify app that navigation happened */
@@ -620,11 +671,14 @@ void Tui::set_cursor(const char *panel, const char *id) {
     if (!id) { p->cursor = 0; p->cursor_id[0] = '\0'; return; }
     std::snprintf(p->cursor_id, sizeof p->cursor_id, "%s", id);
     if (p->dirty) {
-        p_read_all(m, p);
+        p->iter_open = false;
+        p->rows.clear();
+        p->complete = false;
+        p->row_count = 0;
         p->dirty = false;
     }
-    p_resolve_id(p);
-    p_clamp(p);
+    p_resolve_id(m, p);
+    p_clamp(m, p);
 }
 
 void Tui::set_cursor_idx(const char *panel, int idx) {
@@ -632,12 +686,16 @@ void Tui::set_cursor_idx(const char *panel, int idx) {
     auto *p = pfind(m, panel);
     if (!p) return;
     if (p->dirty) {
-        p_read_all(m, p);
+        p->iter_open = false;
+        p->rows.clear();
+        p->complete = false;
+        p->row_count = 0;
         p->dirty = false;
     }
     p->cursor = idx;
-    p_clamp(p);
-    p_sync_id(p);
+    p_ensure_rows(m, p, idx + 1);
+    p_clamp(m, p);
+    p_sync_id(m, p);
 }
 
 int Tui::get_cursor(const char *panel) const {
@@ -660,18 +718,25 @@ int Tui::row_count(const char *panel) {
     auto *p = pfind(m, panel);
     if (!p) return 0;
     if (p->dirty) {
-        p_read_all(m, p);
-        p_resolve_id(p);
-        p_clamp(p);
-        p_sync_id(p);
+        p->iter_open = false;
+        p->rows.clear();
+        p->complete = false;
+        p->row_count = 0;
         p->dirty = false;
     }
+    p_ensure_complete(m, p);
+    p_resolve_id(m, p);
+    p_clamp(m, p);
+    p_sync_id(m, p);
     return p->row_count;
 }
 
-const RowData *Tui::get_cached_row(const char *panel, int idx) const {
-    auto *p = pfind(impl_.get(), panel);
-    if (!p || idx < 0 || idx >= p->row_count) return nullptr;
+const RowData *Tui::get_cached_row(const char *panel, int idx) {
+    auto *m = impl_.get();
+    auto *p = pfind(m, panel);
+    if (!p || idx < 0) return nullptr;
+    p_ensure_rows(m, p, idx + 1);
+    if (idx >= p->row_count) return nullptr;
     return &p->rows[idx];
 }
 
@@ -860,10 +925,13 @@ void Tui::input_key(int key) {
     auto *m = impl_.get();
     for (auto &p : m->panels) {
         if (p.dirty) {
-            p_read_all(m, &p);
-            p_resolve_id(&p);
-            p_clamp(&p);
-            p_sync_id(&p);
+            p.iter_open = false;
+            p.rows.clear();
+            p.complete = false;
+            p.row_count = 0;
+            p_resolve_id(m, &p);
+            p_clamp(m, &p);
+            p_sync_id(m, &p);
             p.dirty = false;
         }
     }

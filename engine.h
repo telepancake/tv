@@ -63,7 +63,7 @@ struct Box {
 struct RowData {
     std::string id;
     std::string style;
-    std::string cols[32];
+    std::vector<std::string> cols;
 
     /* App-level metadata (engine ignores; carried through for app use) */
     std::string parent_id;
@@ -115,7 +115,7 @@ public:
     int         get_scroll(const char *panel) const;
     const char *get_cursor_id(const char *panel) const;
     int         row_count(const char *panel);
-    const RowData *get_cached_row(const char *panel, int idx) const;
+    const RowData *get_cached_row(const char *panel, int idx);
 
     /* Callbacks */
     void on_key(KeyCallback cb);
