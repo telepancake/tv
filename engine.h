@@ -137,6 +137,8 @@ public:
     /* Headless / test helpers */
     void input_key(int key);
     void resize(int rows, int cols);
+    void dump_panel(int panel, FILE *out,
+                    std::function<void(FILE *out, int idx, const RowData &row)> fmt);
 
     /* Interactive prompts (only work with a real terminal) */
     int  line_edit(const char *prompt, char *buf, int bsz);

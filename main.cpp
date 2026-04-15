@@ -187,13 +187,6 @@ struct process_t {
     const std::string &display_name() const { return cached_display_name; }
 };
 
-struct input_cmd_t {
-    int kind = 0;
-    int key = 0;
-    int rows = 0, cols = 0;
-    std::string text;
-};
-
 struct app_state_t {
     int mode = 0;
     int grouped = 1;
@@ -224,15 +217,6 @@ struct dir_stat_t {
 };
 
 enum {
-    INPUT_KEY,
-    INPUT_RESIZE,
-    INPUT_SELECT,
-    INPUT_SEARCH,
-    INPUT_EVFILT,
-    INPUT_PRINT
-};
-
-enum {
     LIVE_TRACE_BATCH_ROWS = 256,
     LIVE_TRACE_BATCH_MS = 50,
     DETAIL_UPDATE_DELAY_MS = 120,
@@ -244,7 +228,7 @@ static std::vector<trace_event_t> g_events;
 static int g_next_event_id = 1;
 static std::unordered_map<int, process_t> g_proc_map;
 static FILE *g_save_fp = nullptr;       /* temp file for raw trace lines */
-static std::vector<input_cmd_t> g_inputs;
+static std::vector<std::string> g_input_lines;  /* buffered input commands (raw JSON) */
 static app_state_t g_state;
 static std::unique_ptr<Tui> g_tui;
 static int g_headless;
@@ -542,39 +526,7 @@ static int key_name_to_code(const std::string &name) {
 }
 
 static void ingest_input_line(const char *line) {
-    std::string_view sp;
-    if (!json_get(line, "input", sp)) return;
-    std::string kind = json_decode_string(sp);
-    if (kind.empty()) return;
-    input_cmd_t cmd;
-    if (kind == "key") {
-        cmd.kind = INPUT_KEY;
-        if (json_get(line, "name", sp))
-            cmd.key = key_name_to_code(json_decode_string(sp));
-        else if (json_get(line, "key", sp))
-            cmd.key = span_to_int(sp, TUI_K_NONE);
-        else
-            cmd.key = TUI_K_NONE;
-    } else if (kind == "resize") {
-        cmd.kind = INPUT_RESIZE;
-        if (json_get(line, "rows", sp)) cmd.rows = span_to_int(sp, 0);
-        if (json_get(line, "cols", sp)) cmd.cols = span_to_int(sp, 0);
-    } else if (kind == "select") {
-        cmd.kind = INPUT_SELECT;
-        if (json_get(line, "id", sp)) cmd.text = json_decode_string(sp);
-    } else if (kind == "search") {
-        cmd.kind = INPUT_SEARCH;
-        if (json_get(line, "q", sp)) cmd.text = json_decode_string(sp);
-    } else if (kind == "evfilt") {
-        cmd.kind = INPUT_EVFILT;
-        if (json_get(line, "q", sp)) cmd.text = json_decode_string(sp);
-    } else if (kind == "print") {
-        cmd.kind = INPUT_PRINT;
-        if (json_get(line, "what", sp)) cmd.text = json_decode_string(sp);
-    } else {
-        return;
-    }
-    g_inputs.push_back(std::move(cmd));
+    g_input_lines.emplace_back(line);
 }
 
 static void ingest_trace_line(const char *line) {
@@ -1602,25 +1554,23 @@ static void expand_subtree(int expand) {
 /* ── Diagnostics ───────────────────────────────────────────────────── */
 
 static void dump_lpane(FILE *out) {
+    if (!g_tui) return;
     std::fprintf(out, "=== LPANE ===\n");
-    for (int i = 0; ; i++) {
-        auto *r = g_tui ? g_tui->get_cached_row(g_lpane, i) : nullptr;
-        if (!r) break;
-        std::fprintf(out, "%d|%s|%s|%s|%s\n", i, r->style.c_str(), r->id.c_str(),
-                     r->parent_id.c_str(), r->cols.empty() ? "" : r->cols[0].c_str());
-    }
+    g_tui->dump_panel(g_lpane, out, [](FILE *f, int i, const RowData &r) {
+        std::fprintf(f, "%d|%s|%s|%s|%s\n", i, r.style.c_str(), r.id.c_str(),
+                     r.parent_id.c_str(), r.cols.empty() ? "" : r.cols[0].c_str());
+    });
     std::fprintf(out, "=== END LPANE ===\n");
 }
 
 static void dump_rpane(FILE *out) {
+    if (!g_tui) return;
     std::fprintf(out, "=== RPANE ===\n");
-    for (int i = 0; ; i++) {
-        auto *r = g_tui ? g_tui->get_cached_row(g_rpane, i) : nullptr;
-        if (!r) break;
-        std::fprintf(out, "%d|%s|%s|%d|%s\n", i, r->style.c_str(),
-                     r->cols.empty() ? "" : r->cols[0].c_str(),
-                     r->link_mode, r->link_id.c_str());
-    }
+    g_tui->dump_panel(g_rpane, out, [](FILE *f, int i, const RowData &r) {
+        std::fprintf(f, "%d|%s|%s|%d|%s\n", i, r.style.c_str(),
+                     r.cols.empty() ? "" : r.cols[0].c_str(),
+                     r.link_mode, r.link_id.c_str());
+    });
     std::fprintf(out, "=== END RPANE ===\n");
 }
 
@@ -1755,32 +1705,38 @@ static int on_key_cb(Tui &tui, int key, int panel, int cursor, const char *row_i
 
 /* ── Input processing ──────────────────────────────────────────────── */
 
-static void process_input_cmd(const input_cmd_t &cmd) {
-    switch (cmd.kind) {
-    case INPUT_KEY:
-        if (cmd.key != TUI_K_NONE) g_tui->input_key(cmd.key);
-        break;
-    case INPUT_RESIZE:
-        g_tui->resize(cmd.rows, cmd.cols);
+static void process_input_line(const char *line) {
+    std::string_view sp;
+    if (!json_get(line, "input", sp)) return;
+    std::string kind = json_decode_string(sp);
+    if (kind == "key") {
+        int key = TUI_K_NONE;
+        if (json_get(line, "name", sp)) key = key_name_to_code(json_decode_string(sp));
+        else if (json_get(line, "key", sp)) key = span_to_int(sp, TUI_K_NONE);
+        if (key != TUI_K_NONE) g_tui->input_key(key);
+    } else if (kind == "resize") {
+        int r = 0, c = 0;
+        if (json_get(line, "rows", sp)) r = span_to_int(sp, 0);
+        if (json_get(line, "cols", sp)) c = span_to_int(sp, 0);
+        g_tui->resize(r, c);
         update_status();
-        break;
-    case INPUT_SELECT:
+    } else if (kind == "select") {
         reset_mode_selection();
-        g_state.cursor_id = cmd.text;
+        if (json_get(line, "id", sp)) g_state.cursor_id = json_decode_string(sp);
         apply_state_change();
-        break;
-    case INPUT_SEARCH:
-        apply_search(cmd.text);
+    } else if (kind == "search") {
+        std::string q;
+        if (json_get(line, "q", sp)) q = json_decode_string(sp);
+        apply_search(q);
         apply_state_change();
-        break;
-    case INPUT_EVFILT:
-        g_state.evfilt = cmd.text;
+    } else if (kind == "evfilt") {
+        if (json_get(line, "q", sp)) g_state.evfilt = json_decode_string(sp);
         for (auto &c : g_state.evfilt) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         apply_state_change();
-        break;
-    case INPUT_PRINT:
-        process_print(cmd.text);
-        break;
+    } else if (kind == "print") {
+        std::string what;
+        if (json_get(line, "what", sp)) what = json_decode_string(sp);
+        process_print(what);
     }
 }
 
@@ -1850,7 +1806,7 @@ static void free_all() {
     g_proc_map.clear();
     g_path_pool.clear();
     if (g_save_fp) { std::fclose(g_save_fp); g_save_fp = nullptr; }
-    g_inputs.clear();
+    g_input_lines.clear();
     g_collapsed.clear();
 }
 
@@ -1924,7 +1880,7 @@ int main(int argc, char **argv) {
         g_state.lp_filter = 2;
     }
 
-    int headless_mode = (!g_inputs.empty()) ||
+    int headless_mode = (!g_input_lines.empty()) ||
                         (trace_file[0] && !cmd && !isatty(STDIN_FILENO)) ||
                         (save_file[0] && !cmd);
 
@@ -1950,7 +1906,7 @@ int main(int argc, char **argv) {
     g_tui->dirty();
     update_status();
 
-    for (const auto &cmd_i : g_inputs) process_input_cmd(cmd_i);
+    for (const auto &line : g_input_lines) process_input_line(line.c_str());
     if (g_headless || (save_file[0] && !cmd)) {
         g_tui.reset();
         free_all();
