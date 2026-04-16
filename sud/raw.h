@@ -492,7 +492,7 @@ static inline int raw_fstatat(int dirfd, const char *path, struct stat *st,
     int ret = (int)raw_syscall6(SYS_fstatat64, dirfd, (long)path, (long)buf,
                                 flags, 0, 0);
     if (ret == 0)
-        __builtin_memcpy(st, buf, sizeof(*st));
+        __builtin_memcpy(st, buf, 88); /* sizeof(struct stat) == 88 on i386 */
     return ret;
 #endif
 }
