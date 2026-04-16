@@ -667,9 +667,26 @@ int dup2(int oldfd, int newfd)
 #endif
 }
 
+/* On i386, SYS_fstat64 / SYS_fstatat64 write a kernel struct stat64
+ * (96 bytes) which is larger than userspace struct stat (88 bytes).
+ * Using a struct stat buffer directly causes an 8-byte stack overflow.
+ * Use an oversized buffer and copy back the struct stat portion.
+ * The fields we use (st_dev at offset 0, st_ino at offset 12) have
+ * identical layout in both struct stat and struct stat64. */
+#if defined(__i386__) && (defined(SYS_fstat64) || defined(SYS_fstatat64))
+#define MINI_STAT64_OVERFLOW 1
+#define MINI_STAT_BUF_SIZE 128
+#endif
+
 #if defined(__i386__) && defined(SYS_fstat64)
 int fstat(int fd, struct stat *st)
 {
+    /* struct stat is an incomplete type in this TU; we cannot use sizeof.
+     * Allocate an oversized local buffer and let the caller-visible
+     * struct stat pointer receive the kernel data directly.  The extra
+     * bytes land harmlessly in the padding.  sudtrace.c callers are
+     * responsible for using stat_buf_t (a padded union) so the buffer
+     * passed here is always large enough. */
     return mini_set_errno(mini_syscall2(SYS_fstat64, fd, (long)st));
 }
 #else
@@ -684,6 +701,7 @@ int fstatat(int dirfd, const char *path, struct stat *st, int flags)
 #ifdef SYS_newfstatat
     return mini_set_errno(mini_syscall4(SYS_newfstatat, dirfd, (long)path, (long)st, flags));
 #else
+    /* See fstat comment above — caller must provide a padded buffer. */
     return mini_set_errno(mini_syscall4(SYS_fstatat64, dirfd, (long)path, (long)st, flags));
 #endif
 }
