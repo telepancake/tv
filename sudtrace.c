@@ -3383,14 +3383,24 @@ static int run_wrapper_mode(int argc, char **argv)
         return 127;
     }
 
+    /* Make independent copies of the args that load_and_run_elf needs,
+     * because the cmdline rewrite below overwrites the original string
+     * data that these argv pointers reference. */
+    int run_argc = argc - argi;
+    char **run_argv = malloc((run_argc + 1) * sizeof(char *));
+    if (!run_argv) { perror("sudtrace: malloc"); return 127; }
+    for (int i = 0; i < run_argc; i++)
+        run_argv[i] = strdup(argv[argi + i]);
+    run_argv[run_argc] = NULL;
+
     /* Rewrite /proc/self/cmdline to show only the visible argv.
      * The kernel's cmdline area (mm->arg_start..arg_end) points at the
      * original argv strings from the last execve, which include the
      * sudtrace wrapper prefix.  Overwrite that area with the clean
      * argv so that /proc/self/cmdline matches what the process sees. */
     {
-        int vis_argc = argc - argi - drop_count;
-        char **vis_argv = argv + argi + drop_count;
+        int vis_argc = run_argc - drop_count;
+        char **vis_argv = run_argv + drop_count;
         if (vis_argc > 0 && vis_argv && argv[0]) {
             /* Calculate total visible argv content */
             size_t total_vis = 0;
@@ -3402,22 +3412,16 @@ static int run_wrapper_mode(int argc, char **argv)
             char *area_end = argv[argc - 1] + strlen(argv[argc - 1]) + 1;
             size_t area_size = area_end - area_start;
 
-            /* Copy visible argv to a temp buffer (source/dest may overlap) */
-            char *tmp = malloc(total_vis);
-            if (tmp) {
-                size_t off = 0;
-                for (int i = 0; i < vis_argc; i++) {
-                    size_t len = strlen(vis_argv[i]) + 1;
-                    memcpy(tmp + off, vis_argv[i], len);
-                    off += len;
-                }
-                /* Write into the original area */
-                size_t copy_size = total_vis < area_size ? total_vis : area_size;
-                memcpy(area_start, tmp, copy_size);
-                if (copy_size < area_size)
-                    memset(area_start + copy_size, 0, area_size - copy_size);
-                free(tmp);
+            /* Write visible argv into the original area */
+            size_t off = 0;
+            for (int i = 0; i < vis_argc && off < area_size; i++) {
+                size_t len = strlen(vis_argv[i]) + 1;
+                if (off + len > area_size) len = area_size - off;
+                memcpy(area_start + off, vis_argv[i], len);
+                off += len;
             }
+            if (off < area_size)
+                memset(area_start + off, 0, area_size - off);
         }
     }
 
@@ -3435,7 +3439,7 @@ static int run_wrapper_mode(int argc, char **argv)
      * parent.  EXIT events for any children of the loaded binary are
      * now emitted from the SIGSYS handler's wait4/waitid interception
      * instead of a dedicated wait loop. */
-    load_and_run_elf(resolved, argc - argi, argv + argi, drop_count);
+    load_and_run_elf(resolved, run_argc, run_argv, drop_count);
     /* load_and_run_elf never returns */
 }
 
