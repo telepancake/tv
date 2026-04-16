@@ -41,8 +41,11 @@ install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
-CXXFLAGS := -std=c++23 -O2
-TV_LIBS := -lm -pthread -lzstd
+ZSTD_DIR  := deps/zstd/lib
+ZSTD_LIB  := $(ZSTD_DIR)/libzstd.a
+
+CXXFLAGS := -std=c++23 -O2 -I$(ZSTD_DIR)
+TV_LIBS := -lm -pthread $(ZSTD_LIB)
 SUD_COMMON_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer
 SUD_COMMON_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
 SUD_COMMON_SRCS := sudtrace.c sudmini.c
@@ -54,7 +57,10 @@ gen_sql_h: gen_sql_h.c
 tv_sql.h: tv.sql gen_sql_h
 	./gen_sql_h tv.sql tv_sql.h
 
-tv: main.cpp engine.cpp engine.h json.cpp json.h uproctrace.cpp tests.cpp
+$(ZSTD_LIB):
+	$(MAKE) -C $(ZSTD_DIR) libzstd.a
+
+tv: main.cpp engine.cpp engine.h json.cpp json.h uproctrace.cpp tests.cpp $(ZSTD_LIB)
 	g++ $(CXXFLAGS) -o tv main.cpp engine.cpp json.cpp uproctrace.cpp tests.cpp -static $(TV_LIBS)
 
 fv: fv.cpp engine.cpp engine.h
@@ -77,3 +83,4 @@ test: tv
 
 clean-bins:
 	rm -f tv fv gen_sql_h
+	$(MAKE) -C $(ZSTD_DIR) clean
