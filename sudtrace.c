@@ -876,6 +876,7 @@ static int g_creator_stdout_valid;
 static char g_self_exe[PATH_MAX];   /* path to sudtrace binary itself */
 static char g_self_exe32[PATH_MAX];
 static char g_self_exe64[PATH_MAX];
+static char g_target_exe[PATH_MAX]; /* resolved path of the actual target program */
 static char g_path_env[4096];       /* cached before entering SUD handler */
 static int g_trace_exec_env = 1;
 
@@ -2694,6 +2695,59 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     }
 #endif
 
+#ifdef SYS_readlinkat
+    /* Intercept readlinkat to mask /proc/self/exe and /proc/<pid>/exe.
+     *
+     * When the traced program reads the /proc/self/exe symlink (or the
+     * /proc/<pid>/exe variant with its own PID), the kernel returns the
+     * path to sudtrace (sud64/sud32).  This confuses programs like Perl
+     * that use /proc/self/exe to determine $^X.
+     *
+     * readlinkat(dirfd=a0, pathname=a1, buf=a2, bufsz=a3)
+     *
+     * We intercept the syscall and, if it targets a "self/exe" path,
+     * copy g_target_exe into the caller's buffer instead. */
+    if (nr == SYS_readlinkat && g_target_exe[0]) {
+        const char *rpath = (const char *)a1;
+        if (rpath) {
+            /* Check for /proc/self/exe or /proc/<pid>/exe */
+            int is_self_exe = 0;
+            const char *p = rpath;
+            if (p[0] == '/' && p[1] == 'p' && p[2] == 'r' &&
+                p[3] == 'o' && p[4] == 'c' && p[5] == '/') {
+                p += 6;
+                if (p[0] == 's' && p[1] == 'e' && p[2] == 'l' &&
+                    p[3] == 'f' && p[4] == '/') {
+                    p += 5;
+                    if (p[0] == 'e' && p[1] == 'x' && p[2] == 'e' &&
+                        p[3] == '\0')
+                        is_self_exe = 1;
+                } else {
+                    /* /proc/<digits>/exe — check if digits match our PID */
+                    pid_t mypid = (pid_t)raw_syscall6(SYS_getpid,
+                                                      0, 0, 0, 0, 0, 0);
+                    pid_t parsed = 0;
+                    const char *d = p;
+                    while (*d >= '0' && *d <= '9')
+                        parsed = parsed * 10 + (*d++ - '0');
+                    if (d > p && *d == '/' && d[1] == 'e' && d[2] == 'x' &&
+                        d[3] == 'e' && d[4] == '\0' && parsed == mypid)
+                        is_self_exe = 1;
+                }
+            }
+            if (is_self_exe) {
+                size_t tlen = strlen(g_target_exe);
+                char *obuf = (char *)a2;
+                size_t obsz = (size_t)a3;
+                if (tlen > obsz) tlen = obsz;
+                memcpy(obuf, g_target_exe, tlen);
+                UC_SET_RET(uc, (long)tlen);
+                return;
+            }
+        }
+    }
+#endif
+
 #ifdef SYS_rt_sigaction
     if (nr == SYS_rt_sigaction) {
         struct kernel_sigaction {
@@ -2856,6 +2910,19 @@ static void load_and_run_elf(const char *path, int argc, char **argv,
     int vis_argc = argc - drop_count;
     char **vis_argv = argv + drop_count;
     if (vis_argc < 0) vis_argc = 0;
+
+    /* Record the target program's resolved path so the SIGSYS handler can
+     * mask /proc/self/exe and other identity queries.  Use vis_argv[0] if
+     * available (the actual command the user asked to run), otherwise the
+     * raw path (which is the ELF we're loading — often ld-linux). */
+    {
+        const char *tgt = (vis_argc > 0 && vis_argv[0]) ? vis_argv[0] : path;
+        char tgt_resolved[PATH_MAX];
+        if (resolve_path(tgt, tgt_resolved, sizeof(tgt_resolved)))
+            snprintf(g_target_exe, sizeof(g_target_exe), "%s", tgt_resolved);
+        else
+            snprintf(g_target_exe, sizeof(g_target_exe), "%s", tgt);
+    }
 
     pid_t self = raw_gettid();
     const char *event_exe = (vis_argc > 0 && vis_argv[0]) ? vis_argv[0] : path;
@@ -3136,6 +3203,15 @@ static void load_and_run_elf(const char *path, int argc, char **argv,
         _exit(127);
     }
 
+    /* Set the process name (comm) to the target program's basename so
+     * /proc/self/comm and ps show the target name, not "sud64". */
+    if (g_target_exe[0]) {
+        const char *bn = g_target_exe;
+        const char *sl = g_target_exe;
+        while (*sl) { if (*sl == '/') bn = sl + 1; sl++; }
+        prctl(PR_SET_NAME, (unsigned long)bn, 0, 0, 0);
+    }
+
     /* Build the new stack — use the visible argv (drop_count entries
      * stripped) so the target process sees only its own args. */
     size_t stack_size = 8 * 1024 * 1024;
@@ -3243,6 +3319,13 @@ static void load_and_run_elf(const char *path, int argc, char **argv,
                         case AT_BASE:
                             avbuf[i].a_un.a_val = load_base;
                             break;
+#ifdef AT_EXECFN
+                        case AT_EXECFN:
+                            if (g_target_exe[0])
+                                avbuf[i].a_un.a_val =
+                                    (unsigned long)g_target_exe;
+                            break;
+#endif
                         }
                     } else {
                         /* Direct/static mode: auxv describes the loaded ELF,
@@ -3263,6 +3346,13 @@ static void load_and_run_elf(const char *path, int argc, char **argv,
                         case AT_BASE:
                             avbuf[i].a_un.a_val = 0;
                             break;
+#ifdef AT_EXECFN
+                        case AT_EXECFN:
+                            if (g_target_exe[0])
+                                avbuf[i].a_un.a_val =
+                                    (unsigned long)g_target_exe;
+                            break;
+#endif
                         }
                     }
 
