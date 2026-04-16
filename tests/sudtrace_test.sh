@@ -89,6 +89,226 @@ else
     echo "  SKIP  static32 toolchain unavailable"
 fi
 
+# ── Compile seccomp test programs ──────────────────────────────────────
+
+# Test: program that installs a seccomp BPF filter via seccomp() syscall
+# and then makes syscalls.  Without the fix, this crashes with SIGSYS
+# because the filter blocks sudtrace's handler-internal syscalls.
+cat > "$TMPDIR/seccomp_filter.c" << 'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <stddef.h>
+
+/* A very restrictive BPF filter that only allows:
+ *   read, write, exit, exit_group, rt_sigreturn, brk, mmap, close, fstat
+ * This would break sudtrace's handler which needs openat, clock_gettime, etc.
+ */
+static struct sock_filter filter[] = {
+    /* Load syscall number */
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    /* Allow basic syscalls */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_read,  7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_write, 6, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit,  5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit_group, 4, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rt_sigreturn, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_brk,   2, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_close, 1, 0),
+    /* Kill on anything else */
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+    /* Allow */
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+
+static struct sock_fprog prog = {
+    .len = sizeof(filter) / sizeof(filter[0]),
+    .filter = filter,
+};
+
+int main(void) {
+    /* PR_SET_NO_NEW_PRIVS is required for non-root seccomp */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+        perror("PR_SET_NO_NEW_PRIVS");
+        return 1;
+    }
+
+    /* Install seccomp filter via seccomp() syscall */
+    long r = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+    if (r < 0) {
+        perror("seccomp(SET_MODE_FILTER)");
+        return 1;
+    }
+
+    /* These should work — write is in the filter allowlist,
+     * but under sudtrace, the handler also needs openat/clock_gettime/etc.
+     * which would be blocked without the fix. */
+    write(2, "seccomp-filter-ok\n", 18);
+    return 0;
+}
+EOF
+HAVE_SECCOMP_FILTER=0
+if gcc -o "$TMPDIR/seccomp_filter" "$TMPDIR/seccomp_filter.c" 2>/dev/null; then
+    HAVE_SECCOMP_FILTER=1
+else
+    echo "  SKIP  seccomp filter test: compilation failed"
+fi
+
+# Test: program that enters seccomp strict mode via prctl().
+# In strict mode only read/write/_exit/sigreturn are allowed.
+cat > "$TMPDIR/seccomp_strict.c" << 'EOF'
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <linux/seccomp.h>
+
+int main(void) {
+    /* First do the output that needs non-strict syscalls */
+    write(2, "before-strict\n", 14);
+
+    /* Enter strict seccomp mode */
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) < 0) {
+        write(2, "strict-failed\n", 14);
+        _exit(1);
+    }
+
+    /* In strict mode, only read/write/_exit/sigreturn are allowed.
+     * Under sudtrace without the fix, the handler's internal syscalls
+     * (openat, clock_gettime) would be blocked by seccomp → crash. */
+    write(2, "seccomp-strict-ok\n", 18);
+    _exit(0);
+}
+EOF
+HAVE_SECCOMP_STRICT=0
+if gcc -o "$TMPDIR/seccomp_strict" "$TMPDIR/seccomp_strict.c" 2>/dev/null; then
+    HAVE_SECCOMP_STRICT=1
+else
+    echo "  SKIP  seccomp strict test: compilation failed"
+fi
+
+# Test: program that installs seccomp via prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)
+cat > "$TMPDIR/seccomp_prctl.c" << 'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <stddef.h>
+
+/* Filter that kills on most syscalls */
+static struct sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_read,  5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_write, 4, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit,  3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit_group, 2, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rt_sigreturn, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+
+static struct sock_fprog prog = {
+    .len = sizeof(filter) / sizeof(filter[0]),
+    .filter = filter,
+};
+
+int main(void) {
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+    /* Install via prctl instead of seccomp() syscall */
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) < 0) {
+        write(2, "prctl-seccomp-failed\n", 21);
+        _exit(1);
+    }
+
+    write(2, "seccomp-prctl-ok\n", 17);
+    _exit(0);
+}
+EOF
+HAVE_SECCOMP_PRCTL=0
+if gcc -o "$TMPDIR/seccomp_prctl" "$TMPDIR/seccomp_prctl.c" 2>/dev/null; then
+    HAVE_SECCOMP_PRCTL=1
+else
+    echo "  SKIP  seccomp prctl test: compilation failed"
+fi
+
+# Test: program with seccomp that forks children (simulates complex build)
+cat > "$TMPDIR/seccomp_build.c" << 'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <stddef.h>
+#include <string.h>
+
+/* Restrictive filter — only allows a handful of syscalls */
+static struct sock_filter filter[] = {
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_read, 8, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_write, 7, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit, 6, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_exit_group, 5, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_rt_sigreturn, 4, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 3, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_wait4, 2, 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_close, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+
+static struct sock_fprog prog = {
+    .len = sizeof(filter) / sizeof(filter[0]),
+    .filter = filter,
+};
+
+int main(void) {
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+    if (syscall(SYS_seccomp, 1 /* SET_MODE_FILTER */, 0, &prog) < 0) {
+        write(2, "seccomp-setup-failed\n", 21);
+        _exit(1);
+    }
+
+    /* Fork a child — simulates build subprocess creation.
+     * Both parent and child inherit seccomp filters, and both
+     * should work under sudtrace despite the restrictive filter. */
+    pid_t pid = fork();
+    if (pid < 0) {
+        write(2, "fork-failed\n", 12);
+        _exit(1);
+    }
+    if (pid == 0) {
+        write(2, "child-ok\n", 9);
+        _exit(0);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    write(2, "seccomp-build-ok\n", 17);
+    _exit(0);
+}
+EOF
+HAVE_SECCOMP_BUILD=0
+if gcc -o "$TMPDIR/seccomp_build" "$TMPDIR/seccomp_build.c" 2>/dev/null; then
+    HAVE_SECCOMP_BUILD=1
+else
+    echo "  SKIP  seccomp build test: compilation failed"
+fi
+
 # ── Test: basic single-threaded tracing ────────────────────────────────
 
 if [ -x "$SUDTRACE" ]; then
@@ -123,6 +343,51 @@ run_test "make: external command traced without SIGSYS crash" \
     'grep -q "\"event\":\"EXEC\"" "$TMPDIR/make.jsonl"' \
     'grep -q "\"status\":\"exited\"" "$TMPDIR/make.jsonl"' \
     '! grep -q "\"signal\"" "$TMPDIR/make.jsonl"'
+
+# ── Test: seccomp filter via seccomp() syscall ────────────────────────
+
+if [ "$HAVE_SECCOMP_FILTER" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_filter.jsonl" -- "$TMPDIR/seccomp_filter" 2>&1)
+run_test "seccomp: filter via seccomp() syscall doesn't crash" \
+    'printf "%s\n" "$OUT" | grep -q "seccomp-filter-ok"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_filter.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_filter.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/seccomp_filter.jsonl"'
+fi
+
+# ── Test: seccomp strict mode via prctl() ─────────────────────────────
+
+if [ "$HAVE_SECCOMP_STRICT" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_strict.jsonl" -- "$TMPDIR/seccomp_strict" 2>&1)
+run_test "seccomp: strict mode via prctl doesn't crash" \
+    'printf "%s\n" "$OUT" | grep -q "seccomp-strict-ok"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_strict.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_strict.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/seccomp_strict.jsonl"'
+fi
+
+# ── Test: seccomp filter via prctl(PR_SET_SECCOMP) ────────────────────
+
+if [ "$HAVE_SECCOMP_PRCTL" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_prctl.jsonl" -- "$TMPDIR/seccomp_prctl" 2>&1)
+run_test "seccomp: filter via prctl(PR_SET_SECCOMP) doesn't crash" \
+    'printf "%s\n" "$OUT" | grep -q "seccomp-prctl-ok"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_prctl.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_prctl.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/seccomp_prctl.jsonl"'
+fi
+
+# ── Test: seccomp with fork (simulates complex build) ─────────────────
+
+if [ "$HAVE_SECCOMP_BUILD" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_build.jsonl" -- "$TMPDIR/seccomp_build" 2>&1)
+run_test "seccomp: filter + fork (complex build simulation) works" \
+    'printf "%s\n" "$OUT" | grep -q "seccomp-build-ok"' \
+    'printf "%s\n" "$OUT" | grep -q "child-ok"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_build.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_build.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/seccomp_build.jsonl"'
+fi
 
 if [ "$HAVE_STATIC32" -eq 1 ]; then
 OUT=$("$SUDTRACE" -o "$TMPDIR/static32.jsonl" -- "$TMPDIR/static32" 2>&1)
