@@ -182,7 +182,6 @@ struct abs_path_t {
     bool operator< (const abs_path_t &o) const { return ptr < o.ptr; }
     bool empty() const { return !ptr; }
     std::string str() const { return ptr ? ptr->fullPath() : std::string(); }
-    const char *c_str() const { return ptr ? ptr->fullPath().c_str() : ""; }
     explicit operator bool() const { return ptr != nullptr; }
 };
 

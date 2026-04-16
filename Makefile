@@ -41,7 +41,7 @@ install:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 	depmod -a
 
-CXXFLAGS := -std=c++23 -O2 -flto=auto
+CXXFLAGS := -std=c++23 -O2
 TV_LIBS := -lm -pthread -lzstd
 SUD_COMMON_CFLAGS := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer
 SUD_COMMON_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
