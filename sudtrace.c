@@ -3375,8 +3375,10 @@ static int run_wrapper_mode(int argc, char **argv)
     }
     if (argi + 1 < argc && argv[argi] && strcmp(argv[argi], "--drop-argv") == 0) {
         drop_count = parse_int(argv[argi + 1]);
+        if (drop_count < 0) drop_count = 0;
         argi += 2;
     }
+    if (drop_count > argc - argi) drop_count = 0;
     char resolved[PATH_MAX];
     if (!resolve_path(argv[argi], resolved, sizeof(resolved))) {
         fprintf(stderr, "sudtrace: cannot find '%s'\n", argv[argi]);
@@ -3401,7 +3403,7 @@ static int run_wrapper_mode(int argc, char **argv)
     {
         int vis_argc = run_argc - drop_count;
         char **vis_argv = run_argv + drop_count;
-        if (vis_argc > 0 && vis_argv && argv[0]) {
+        if (vis_argc > 0 && vis_argv && argv) {
             /* Calculate total visible argv content */
             size_t total_vis = 0;
             for (int i = 0; i < vis_argc; i++)
@@ -3416,7 +3418,14 @@ static int run_wrapper_mode(int argc, char **argv)
             size_t off = 0;
             for (int i = 0; i < vis_argc && off < area_size; i++) {
                 size_t len = strlen(vis_argv[i]) + 1;
-                if (off + len > area_size) len = area_size - off;
+                if (off + len > area_size) {
+                    /* Truncated: copy what fits and null-terminate */
+                    size_t fit = area_size - off;
+                    memcpy(area_start + off, vis_argv[i], fit);
+                    area_start[area_size - 1] = '\0';
+                    off = area_size;
+                    break;
+                }
                 memcpy(area_start + off, vis_argv[i], len);
                 off += len;
             }
