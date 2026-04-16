@@ -1,3 +1,6 @@
 [submodule "deps/zstd"]
 	path = deps/zstd
 	url = https://github.com/facebook/zstd
+[submodule "deps/printf"]
+	path = deps/printf
+	url = https://github.com/mpaland/printf
