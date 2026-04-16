@@ -1,30 +1,149 @@
-#define _GNU_SOURCE
+/*
+ * sudmini.c — Minimal freestanding libc replacement for sudtrace.
+ *
+ * Provides just enough libc functionality to build sudtrace as a fully
+ * standalone static binary (-nostdlib -ffreestanding).  NO libc headers
+ * are included; only compiler-provided freestanding headers and the
+ * Linux UAPI syscall-number header are used, so there is no risk of
+ * colliding with glibc macros (_Generic wrappers for memchr, etc.).
+ */
+
+/* ---- Compiler-provided freestanding headers (no libc) ---- */
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <time.h>
-#include <dirent.h>
-#include <limits.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <sys/wait.h>
-#include <sys/syscall.h>
-#include <linux/prctl.h>
 
-#ifndef SA_RESTORER
-#define SA_RESTORER 0x04000000
+/* ---- Linux UAPI header for syscall numbers ---- */
+#include <asm/unistd.h>
+
+/* ---- SYS_xxx aliases for __NR_xxx ---- */
+#define SYS_read           __NR_read
+#define SYS_write          __NR_write
+#define SYS_openat         __NR_openat
+#define SYS_close          __NR_close
+#define SYS_pread64        __NR_pread64
+#define SYS_readlinkat     __NR_readlinkat
+#define SYS_faccessat      __NR_faccessat
+#define SYS_dup3           __NR_dup3
+#define SYS_getcwd         __NR_getcwd
+#define SYS_munmap         __NR_munmap
+#define SYS_mprotect       __NR_mprotect
+#define SYS_prctl          __NR_prctl
+#define SYS_rt_sigaction   __NR_rt_sigaction
+#define SYS_nanosleep      __NR_nanosleep
+#define SYS_clone          __NR_clone
+#define SYS_execve         __NR_execve
+#define SYS_wait4          __NR_wait4
+#define SYS_exit           __NR_exit
+#ifdef __NR_exit_group
+#define SYS_exit_group     __NR_exit_group
 #endif
-#ifndef ENAMETOOLONG
-#define ENAMETOOLONG 36
+#ifdef __NR_dup2
+#define SYS_dup2           __NR_dup2
 #endif
+#ifdef __NR_fork
+#define SYS_fork           __NR_fork
+#endif
+#ifdef __NR_mmap
+#define SYS_mmap           __NR_mmap
+#endif
+#ifdef __NR_mmap2
+#define SYS_mmap2          __NR_mmap2
+#endif
+#ifdef __NR_fstat
+#define SYS_fstat          __NR_fstat
+#endif
+#ifdef __NR_fstat64
+#define SYS_fstat64        __NR_fstat64
+#endif
+#ifdef __NR_newfstatat
+#define SYS_newfstatat     __NR_newfstatat
+#endif
+#ifdef __NR_fstatat64
+#define SYS_fstatat64      __NR_fstatat64
+#endif
+#ifdef __NR_getdents64
+#define SYS_getdents64     __NR_getdents64
+#endif
+#ifdef __NR_getdents
+#define SYS_getdents       __NR_getdents
+#endif
+
+/* ---- POSIX-like types ---- */
+typedef long            ssize_t;
+typedef int             pid_t;
+typedef long            off_t;
+typedef unsigned int    useconds_t;
+typedef void            FILE;
+
+/* ---- sigset_t (matches glibc: 1024 bits = 128 bytes) ---- */
+#define _MINI_SIGSET_NWORDS (1024 / (8 * sizeof(unsigned long)))
+typedef struct { unsigned long __val[_MINI_SIGSET_NWORDS]; } sigset_t;
+
+/*
+ * struct sigaction — layout must match glibc so that callers compiled
+ * against <signal.h> pass compatible objects.
+ */
+struct sigaction {
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, void *, void *);
+    } __sigaction_handler;
+    sigset_t sa_mask;
+    int      sa_flags;
+    void   (*sa_restorer)(void);
+};
+#define sa_handler __sigaction_handler.sa_handler
+
+struct timespec {
+    long tv_sec;
+    long tv_nsec;
+};
+
+/* Forward-declare struct stat (only used as opaque pointer in syscall wrappers) */
+struct stat;
+
+struct dirent {
+    unsigned long  d_ino;
+    long           d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[256];
+};
+
+typedef struct __dirstream DIR;
+
+/* ---- Error numbers ---- */
+#define EPERM           1
+#define ENOENT          2
+#define EBADF           9
+#define ENOMEM         12
+#define EACCES         13
+#define EINVAL         22
+#define ENAMETOOLONG   36
+#define ENOSYS         38
+
+/* ---- Open/fcntl constants ---- */
+#define O_RDONLY        0
+#define O_WRONLY        1
+#define O_RDWR          2
+#define O_CREAT         0100
+#define O_DIRECTORY     0200000
+#define AT_FDCWD        (-100)
+
+/* ---- Memory mapping ---- */
+#define PROT_READ       0x1
+#define PROT_WRITE      0x2
+#define MAP_PRIVATE     0x02
+#define MAP_ANONYMOUS   0x20
+#define MAP_FAILED      ((void *)-1)
+
+/* ---- Signals ---- */
+#define SIGCHLD         17
+#define SA_RESTORER     0x04000000
+
+/* ---- Limits ---- */
+#define PATH_MAX        4096
 
 #define MINI_MMAP2_SHIFT 12
 
