@@ -2317,7 +2317,10 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * signal, which would kill the process.
      *
      * For any non-SUD SIGSYS that does reach us, return -ENOSYS so
-     * the program sees a clean error instead of crashing. */
+     * the program sees a clean error instead of crashing.
+     *
+     * The null check on info is defensive: SA_SIGINFO guarantees it,
+     * but some kernel versions or signal delivery paths may not. */
     if (info && info->si_code != SYS_USER_DISPATCH) {
         UC_SET_RET(uc, -ENOSYS);
         return;
@@ -2387,6 +2390,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 #ifdef SYS_seccomp
     if (nr == SYS_seccomp) {
         if (a0 == SECCOMP_SET_MODE_STRICT || a0 == SECCOMP_SET_MODE_FILTER) {
+            /* Safe: sudtrace already intercepts every syscall, making
+             * seccomp restrictions redundant for the traced process. */
             UC_SET_RET(uc, 0);
             return;
         }
