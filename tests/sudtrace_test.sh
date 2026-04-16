@@ -492,6 +492,8 @@ for attempt in 1 2 3; do
     OUT=$("$SUDTRACE" -o "$TMPDIR/nested_signal_${attempt}.jsonl" -- "$TMPDIR/nested_signal" 2>&1)
     run_test "nested signal attempt $attempt: no Bad system call" \
         'printf "%s\n" "$OUT" | grep -q "nested-signal-ok"' \
+        'printf "%s\n" "$OUT" | grep -q "alarms="' \
+        '! printf "%s\n" "$OUT" | grep -q "alarms=0)"' \
         'grep -q "\"event\":\"EXEC\"" "$TMPDIR/nested_signal_${attempt}.jsonl"' \
         'grep -q "\"status\":\"exited\"" "$TMPDIR/nested_signal_${attempt}.jsonl"' \
         '! grep -q "\"signal\"" "$TMPDIR/nested_signal_${attempt}.jsonl"'

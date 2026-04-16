@@ -2268,8 +2268,9 @@ static void install_sigsys_handler_raw(void)
  * it so the child runs with a clean signal state.
  *
  * For children created via fork (non-CLONE_VM), they DO go through
- * rt_sigreturn which restores the pre-handler mask, so this reset is
- * harmlessly overwritten.
+ * rt_sigreturn after the handler returns — rt_sigreturn restores the
+ * pre-handler signal mask from the saved ucontext, so this reset is
+ * harmlessly overwritten before the child executes user code.
  */
 static void reset_sigmask_raw(void)
 {
@@ -2352,11 +2353,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * signal, which would kill the process.
      *
      * For any non-SUD SIGSYS that does reach us, return -ENOSYS so
-     * the program sees a clean error instead of crashing.
-     *
-     * The null check on info is defensive: SA_SIGINFO guarantees it,
-     * but some kernel versions or signal delivery paths may not. */
-    if (info && info->si_code != SYS_USER_DISPATCH) {
+     * the program sees a clean error instead of crashing. */
+    if (info->si_code != SYS_USER_DISPATCH) {
         UC_SET_RET(uc, -ENOSYS);
         return;
     }
