@@ -2230,17 +2230,52 @@ static void install_sigsys_handler_raw(void)
     sa.handler = (void (*)(int))sigsys_handler;
     sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER;
     sa.restorer = sud_rt_sigreturn_restorer;
-    sa.mask = 0;
+    /*
+     * Block ALL signals while the SIGSYS handler is active.
+     *
+     * Without this, other signals (SIGCHLD, SIGALRM, SIGPIPE, etc.)
+     * can be delivered during the SIGSYS handler.  Those signal
+     * handlers run in the traced program's code (outside the SUD
+     * allowed IP range).  If the interrupted handler makes a syscall,
+     * the kernel tries to deliver a nested SIGSYS.  But SIGSYS is
+     * already blocked (auto-masked during the handler), so the kernel
+     * uses force_sig_fault(SIGSYS) which overrides the mask and
+     * disposition, killing the process with "Bad system call".
+     *
+     * By blocking all signals in sa_mask, no signal handler from the
+     * traced program can run during our handler.  Pending signals are
+     * delivered after the handler returns (via rt_sigreturn) and the
+     * original signal mask is restored.
+     *
+     * This is the root cause of failures in complex builds (LTO,
+     * distrobox, etc.) where SIGCHLD from child process termination
+     * interrupts the handler at high frequency.
+     */
+    sa.mask = ~(sud_sigset_word_t)0;
     raw_syscall6(SYS_rt_sigaction, SIGSYS, (long)&sa, 0,
                  sizeof(sa.mask), 0, 0);
 #endif
 }
 
-static void unblock_sigsys_raw(void)
+/*
+ * Reset the signal mask to unblock all signals.
+ *
+ * Called from prepare_child_sud() for children created via clone_raw /
+ * clone3_raw.  Those children do NOT go through rt_sigreturn (which would
+ * normally restore the pre-handler mask).  Instead they jump directly to
+ * the program's RIP.  Their signal mask is inherited from the parent at
+ * clone time, which is the handler's mask (all blocked).  We must reset
+ * it so the child runs with a clean signal state.
+ *
+ * For children created via fork (non-CLONE_VM), they DO go through
+ * rt_sigreturn which restores the pre-handler mask, so this reset is
+ * harmlessly overwritten.
+ */
+static void reset_sigmask_raw(void)
 {
 #ifdef SYS_rt_sigprocmask
-    sud_sigset_word_t mask = (sud_sigset_word_t)1 << (SIGSYS - 1);
-    raw_syscall6(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&mask, 0,
+    sud_sigset_word_t mask = 0;
+    raw_syscall6(SYS_rt_sigprocmask, SIG_SETMASK, (long)&mask, 0,
                  sizeof(mask), 0, 0);
 #endif
 }
@@ -2260,7 +2295,7 @@ void prepare_child_sud(void)
 void prepare_child_sud(void)
 {
     install_sigsys_handler_raw();
-    unblock_sigsys_raw();
+    reset_sigmask_raw();
     reenable_sud_in_child();
 }
 
@@ -2902,10 +2937,12 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     *sel = SYSCALL_DISPATCH_FILTER_BLOCK;
     g_sud_selector_ptr = sel;
 
-    /* Wrapper-mode execs can inherit a blocked SIGSYS mask from traced
-     * vfork/clone children.  Unblock it before enabling SUD so the
-     * handler actually runs in this freshly exec'd sudtrace instance. */
-    unblock_sigsys_raw();
+    /* Wrapper-mode execs can inherit a blocked signal mask from traced
+     * vfork/clone children (which were inside the SIGSYS handler when
+     * they called exec, inheriting the handler's all-blocked mask).
+     * Reset to a clean mask so signals are delivered normally in this
+     * freshly exec'd sudtrace instance. */
+    reset_sigmask_raw();
 
     /* Enable SUD */
     unsigned long off = (unsigned long)__sud_begin;

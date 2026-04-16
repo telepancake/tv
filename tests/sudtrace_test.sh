@@ -309,6 +309,100 @@ else
     echo "  SKIP  seccomp build test: compilation failed"
 fi
 
+# ── Compile nested signal test programs ────────────────────────────────
+
+# Test: trigger nested SIGSYS by having a SIGALRM handler make syscalls
+# while the SIGSYS handler is active.  This is the root cause of "Bad
+# system call" failures in complex builds (LTO, distrobox) where SIGCHLD
+# from parallel child termination interrupts the SIGSYS handler.
+cat > "$TMPDIR/nested_signal.c" << 'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <string.h>
+#include <fcntl.h>
+
+static volatile int alarm_count = 0;
+
+static void alarm_handler(int sig)
+{
+    (void)sig;
+    alarm_count++;
+    /* This write() is from traced code (outside SUD allowed range).
+     * If SIGSYS is blocked (auto-masked in the handler) and signals
+     * aren't blocked, the kernel force_sig(SIGSYS) kills the process. */
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "a%d\n", alarm_count);
+    write(STDERR_FILENO, buf, n);
+}
+
+int main(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = alarm_handler;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, NULL);
+
+    /* 1ms timer — high frequency to maximize chance of interrupting
+     * the SIGSYS handler during a syscall. */
+    struct itimerval it;
+    it.it_interval.tv_sec = 0;
+    it.it_interval.tv_usec = 1000;
+    it.it_value.tv_sec = 0;
+    it.it_value.tv_usec = 1000;
+    setitimer(ITIMER_REAL, &it, NULL);
+
+    int fd = open("/dev/null", O_WRONLY);
+    for (int i = 0; i < 100000 && fd >= 0; i++)
+        write(fd, "x", 1);
+
+    memset(&it, 0, sizeof(it));
+    setitimer(ITIMER_REAL, &it, NULL);
+    if (fd >= 0) close(fd);
+
+    char msg[64];
+    int len = snprintf(msg, sizeof(msg),
+                       "nested-signal-ok (alarms=%d)\n", alarm_count);
+    write(STDERR_FILENO, msg, len);
+    return 0;
+}
+EOF
+HAVE_NESTED_SIGNAL=0
+if gcc -O2 -o "$TMPDIR/nested_signal" "$TMPDIR/nested_signal.c" 2>/dev/null; then
+    HAVE_NESTED_SIGNAL=1
+else
+    echo "  SKIP  nested signal test: compilation failed"
+fi
+
+# ── Compile LTO test programs ─────────────────────────────────────────
+
+# Test: multi-file C++ build with -flto=auto, simulating the exact
+# scenario reported in the bug (LTO linker spawns parallel lto1 workers
+# that signal SIGCHLD to the parent while the parent is in the SIGSYS
+# handler).
+cat > "$TMPDIR/lto_main.cpp" << 'EOF'
+#include <cstdio>
+extern int lto_helper(int x);
+int main() {
+    int r = lto_helper(21);
+    fprintf(stderr, "lto-result=%d\n", r);
+    return 0;
+}
+EOF
+cat > "$TMPDIR/lto_helper.cpp" << 'EOF'
+int lto_helper(int x) { return x * 2; }
+EOF
+HAVE_LTO=0
+if g++ -std=c++17 -O2 -flto=auto -o "$TMPDIR/lto_test" \
+       "$TMPDIR/lto_main.cpp" "$TMPDIR/lto_helper.cpp" 2>/dev/null; then
+    HAVE_LTO=1
+else
+    echo "  SKIP  LTO test: g++ -flto=auto unavailable"
+fi
+
 # ── Test: basic single-threaded tracing ────────────────────────────────
 
 if [ -x "$SUDTRACE" ]; then
@@ -387,6 +481,37 @@ run_test "seccomp: filter + fork (complex build simulation) works" \
     'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_build.jsonl"' \
     'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_build.jsonl"' \
     '! grep -q "\"signal\"" "$TMPDIR/seccomp_build.jsonl"'
+fi
+
+# ── Test: nested signal (root cause of LTO/distrobox crashes) ─────────
+
+if [ "$HAVE_NESTED_SIGNAL" -eq 1 ]; then
+# Run 3 times — the crash is timing-dependent (signal must interrupt
+# the SIGSYS handler while it's executing a syscall).
+for attempt in 1 2 3; do
+    OUT=$("$SUDTRACE" -o "$TMPDIR/nested_signal_${attempt}.jsonl" -- "$TMPDIR/nested_signal" 2>&1)
+    run_test "nested signal attempt $attempt: no Bad system call" \
+        'printf "%s\n" "$OUT" | grep -q "nested-signal-ok"' \
+        'grep -q "\"event\":\"EXEC\"" "$TMPDIR/nested_signal_${attempt}.jsonl"' \
+        'grep -q "\"status\":\"exited\"" "$TMPDIR/nested_signal_${attempt}.jsonl"' \
+        '! grep -q "\"signal\"" "$TMPDIR/nested_signal_${attempt}.jsonl"'
+done
+fi
+
+# ── Test: LTO build under sudtrace ────────────────────────────────────
+
+if [ "$HAVE_LTO" -eq 1 ]; then
+# Build the LTO test program UNDER sudtrace — this exercises the exact
+# codepath that triggers SIGCHLD during the SIGSYS handler (parallel
+# lto1/cc1plus workers terminate and signal the parent).
+OUT=$("$SUDTRACE" -o "$TMPDIR/lto_build.jsonl" -- \
+    g++ -std=c++17 -O2 -flto=auto -o "$TMPDIR/lto_build_out" \
+        "$TMPDIR/lto_main.cpp" "$TMPDIR/lto_helper.cpp" 2>&1)
+run_test "LTO build: g++ -flto=auto under sudtrace doesn't crash" \
+    'test -x "$TMPDIR/lto_build_out"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/lto_build.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/lto_build.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/lto_build.jsonl"'
 fi
 
 if [ "$HAVE_STATIC32" -eq 1 ]; then
