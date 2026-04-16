@@ -279,7 +279,7 @@ static struct sock_fprog prog = {
 int main(void) {
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
-    if (syscall(SYS_seccomp, 1 /* SET_MODE_FILTER */, 0, &prog) < 0) {
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) < 0) {
         write(2, "seccomp-setup-failed\n", 21);
         _exit(1);
     }
