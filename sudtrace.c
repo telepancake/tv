@@ -987,24 +987,9 @@ static int json_argv_array_vec(char *dst, int dstsize, char *const *argv, int ar
     return di;
 }
 
-static int is_ld_linux_basename(const char *path)
-{
-    if (!path) return 0;
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    return strncmp(base, "ld-linux", 8) == 0;
-}
-
-static void visible_exec_args(const char *path, int argc, char **argv,
-                              const char **exe_out, int *argc_out, char ***argv_out)
-{
-    int skip = 0;
-    if (argc > 1 && argv && is_ld_linux_basename(argv[0]))
-        skip = 1;
-    if (exe_out) *exe_out = (argc > skip && argv) ? argv[skip] : path;
-    if (argc_out) *argc_out = argc > skip ? argc - skip : 0;
-    if (argv_out) *argv_out = (argc > skip && argv) ? argv + skip : NULL;
-}
+/* is_ld_linux_basename and visible_exec_args are no longer needed since
+ * load_and_run_elf now uses drop_count to determine the visible argv
+ * directly. */
 
 static int json_env_object(char *dst, int dstsize, const char *raw, int rawlen)
 {
@@ -2026,7 +2011,7 @@ static const char *self_exe_for_class(int elf_class)
  */
 static char **build_exec_argv(int orig_argc, char **orig_argv)
 {
-    int max_args = orig_argc + 9;
+    int max_args = orig_argc + 12;
     char **args = calloc(max_args + 1, sizeof(char *));
     if (!args) return NULL;
 
@@ -2034,6 +2019,8 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
     for (int i = 0; i < orig_argc; i++)
         args[nargs++] = strdup(orig_argv[i]);
     args[nargs] = NULL;
+
+    int drop_count = 0; /* entries prepended that should be invisible */
 
     for (int depth = 0; depth < 16; depth++) {
         char resolved[PATH_MAX];
@@ -2074,6 +2061,7 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
             memmove(args + 1, args, (nargs + 1) * sizeof(char *));
             args[0] = strdup(elf_interp);
             nargs++;
+            drop_count++;
             continue;
         }
 
@@ -2099,6 +2087,23 @@ static char **build_exec_argv(int orig_argc, char **orig_argv)
                 args[1] = strdup("--no-env");
                 nargs++;
             }
+            /* Insert --drop-argv N after sudtrace's own flags */
+            if (drop_count > 0) {
+                int insert_pos = g_trace_exec_env ? 1 : 2;
+                if (nargs + 2 >= max_args) {
+                    max_args = nargs + 8;
+                    char **new_args = realloc(args, (max_args + 1) * sizeof(char *));
+                    if (!new_args) return NULL;
+                    args = new_args;
+                }
+                memmove(args + insert_pos + 2, args + insert_pos,
+                        (nargs - insert_pos + 1) * sizeof(char *));
+                args[insert_pos] = strdup("--drop-argv");
+                char drop_buf[16];
+                snprintf(drop_buf, sizeof(drop_buf), "%d", drop_count);
+                args[insert_pos + 1] = strdup(drop_buf);
+                nargs += 2;
+            }
             break;
         }
 
@@ -2123,7 +2128,7 @@ static void free_exec_argv(char **args)
  */
 static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
 {
-    int max_args = orig_argc + 17;
+    int max_args = orig_argc + 20;
     char **args = arena_alloc((max_args + 1) * sizeof(char *));
     if (!args) return NULL;
 
@@ -2131,6 +2136,8 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
     for (int i = 0; i < orig_argc; i++)
         args[nargs++] = arena_strdup(orig_argv[i]);
     args[nargs] = NULL;
+
+    int drop_count = 0; /* entries prepended that should be invisible */
 
     for (int depth = 0; depth < 16; depth++) {
         char resolved[PATH_MAX];
@@ -2175,6 +2182,7 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
             memmove(args + 1, args, (nargs + 1) * sizeof(char *));
             args[0] = arena_strdup(elf_interp);
             nargs++;
+            drop_count++;
             continue;
         }
 
@@ -2203,6 +2211,24 @@ static char **build_exec_argv_raw(int orig_argc, char **orig_argv)
                 memmove(args + 2, args + 1, nargs * sizeof(char *));
                 args[1] = arena_strdup("--no-env");
                 nargs++;
+            }
+            /* Insert --drop-argv N after sudtrace's own flags */
+            if (drop_count > 0) {
+                int insert_pos = g_trace_exec_env ? 1 : 2;
+                if (nargs + 2 >= max_args) {
+                    max_args = nargs + 8;
+                    char **new_args = arena_alloc((max_args + 1) * sizeof(char *));
+                    if (!new_args) return NULL;
+                    memcpy(new_args, args, (nargs + 1) * sizeof(char *));
+                    args = new_args;
+                }
+                memmove(args + insert_pos + 2, args + insert_pos,
+                        (nargs - insert_pos + 1) * sizeof(char *));
+                args[insert_pos] = arena_strdup("--drop-argv");
+                char drop_buf[16];
+                snprintf(drop_buf, sizeof(drop_buf), "%d", drop_count);
+                args[insert_pos + 1] = arena_strdup(drop_buf);
+                nargs += 2;
             }
             break;
         }
@@ -2819,18 +2845,22 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
  * 6. Jump to the entry point
  * ================================================================ */
 
-static void load_and_run_elf(const char *path, int argc, char **argv)
+static void load_and_run_elf(const char *path, int argc, char **argv,
+                            int drop_count)
     __attribute__((noreturn));
 
-static void load_and_run_elf(const char *path, int argc, char **argv)
+static void load_and_run_elf(const char *path, int argc, char **argv,
+                             int drop_count)
 {
+    /* Compute the visible argv (what the target process should see) */
+    int vis_argc = argc - drop_count;
+    char **vis_argv = argv + drop_count;
+    if (vis_argc < 0) vis_argc = 0;
+
     pid_t self = raw_gettid();
-    const char *event_exe = path;
-    char **event_argv = argv;
-    int event_argc = argc;
-    visible_exec_args(path, argc, argv, &event_exe, &event_argc, &event_argv);
+    const char *event_exe = (vis_argc > 0 && vis_argv[0]) ? vis_argv[0] : path;
     emit_cwd_event(self);
-    emit_exec_event(self, event_exe, event_argc, event_argv);
+    emit_exec_event(self, event_exe, vis_argc, vis_argv);
     emit_inherited_open_events(self);
 
     int fd = open(path, O_RDONLY);
@@ -2931,6 +2961,132 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         mprotect(mapped, map_size, prot);
     }
 
+    /* If drop_count > 0, the primary ELF is an intermediate loader
+     * (ld-linux) and we also need to load the target program.  Set up
+     * auxv so ld-linux runs in interpreter mode rather than direct
+     * invocation mode, allowing us to present a clean argv without
+     * the ld-linux entry. */
+    unsigned long target_load_base = 0;
+    sud_elf_ehdr_t target_ehdr;
+    unsigned long target_phdr_addr = 0;
+    int target_fd = -1;
+    memset(&target_ehdr, 0, sizeof(target_ehdr));
+
+    if (drop_count > 0 && vis_argc > 0 && vis_argv[0]) {
+        char target_resolved[PATH_MAX];
+        const char *target_name = vis_argv[0];
+        if (!resolve_path(target_name, target_resolved, sizeof(target_resolved))) {
+            /* Fall back to the path as-is */
+            snprintf(target_resolved, sizeof(target_resolved), "%s", target_name);
+        }
+
+        target_fd = open(target_resolved, O_RDONLY);
+        if (target_fd >= 0) {
+            if (read(target_fd, &target_ehdr, sizeof(target_ehdr)) == sizeof(target_ehdr) &&
+                memcmp(target_ehdr.e_ident, ELFMAG, SELFMAG) == 0 &&
+                target_ehdr.e_ident[EI_CLASS] == SUD_NATIVE_ELF_CLASS) {
+
+                /* Determine target load base */
+                if (target_ehdr.e_type == ET_DYN) {
+                    unsigned long lo = ~0UL, hi = 0;
+                    for (int i = 0; i < target_ehdr.e_phnum; i++) {
+                        sud_elf_phdr_t phdr;
+                        if (pread(target_fd, &phdr, sizeof(phdr),
+                                  target_ehdr.e_phoff + i * target_ehdr.e_phentsize) != sizeof(phdr))
+                            continue;
+                        if (phdr.p_type != PT_LOAD) continue;
+                        unsigned long seg_lo = phdr.p_vaddr & ~0xfffUL;
+                        unsigned long seg_hi = (phdr.p_vaddr + phdr.p_memsz + 0xfff)
+                                                & ~0xfffUL;
+                        if (seg_lo < lo) lo = seg_lo;
+                        if (seg_hi > hi) hi = seg_hi;
+                    }
+                    if (hi > lo) {
+                        void *hint = mmap(NULL, hi - lo, PROT_NONE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                        if (hint != MAP_FAILED) {
+                            target_load_base = (unsigned long)hint - lo;
+                            munmap(hint, hi - lo);
+                        }
+                    }
+                }
+
+                /* Load target PT_LOAD segments */
+                for (int i = 0; i < target_ehdr.e_phnum; i++) {
+                    sud_elf_phdr_t phdr;
+                    if (pread(target_fd, &phdr, sizeof(phdr),
+                              target_ehdr.e_phoff + i * target_ehdr.e_phentsize) != sizeof(phdr))
+                        continue;
+                    if (phdr.p_type != PT_LOAD) continue;
+
+                    unsigned long vaddr = target_load_base + phdr.p_vaddr;
+                    unsigned long page_offset = vaddr & 0xfff;
+                    unsigned long map_addr = vaddr - page_offset;
+                    unsigned long map_size = phdr.p_memsz + page_offset;
+                    map_size = (map_size + 0xfff) & ~0xfffUL;
+
+                    int prot = 0;
+                    if (phdr.p_flags & PF_R) prot |= PROT_READ;
+                    if (phdr.p_flags & PF_W) prot |= PROT_WRITE;
+                    if (phdr.p_flags & PF_X) prot |= PROT_EXEC;
+
+                    void *mapped = mmap((void *)map_addr, map_size,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                       -1, 0);
+                    if (mapped == MAP_FAILED) continue;
+
+                    if (phdr.p_filesz > 0) {
+                        pread(target_fd, (char *)mapped + page_offset,
+                              phdr.p_filesz, phdr.p_offset);
+                    }
+                    mprotect(mapped, map_size, prot);
+                }
+
+                /* Find target's phdr address in memory */
+                for (int i = 0; i < target_ehdr.e_phnum; i++) {
+                    sud_elf_phdr_t phdr;
+                    if (pread(target_fd, &phdr, sizeof(phdr),
+                              target_ehdr.e_phoff + i * target_ehdr.e_phentsize) != sizeof(phdr))
+                        continue;
+                    if (phdr.p_type == PT_PHDR) {
+                        target_phdr_addr = target_load_base + phdr.p_vaddr;
+                        break;
+                    }
+                }
+                if (!target_phdr_addr) {
+                    for (int i = 0; i < target_ehdr.e_phnum; i++) {
+                        sud_elf_phdr_t phdr;
+                        if (pread(target_fd, &phdr, sizeof(phdr),
+                                  target_ehdr.e_phoff + i * target_ehdr.e_phentsize) != sizeof(phdr))
+                            continue;
+                        if (phdr.p_type == PT_LOAD &&
+                            target_ehdr.e_phoff >= phdr.p_offset &&
+                            target_ehdr.e_phoff < phdr.p_offset + phdr.p_filesz) {
+                            target_phdr_addr = target_load_base + phdr.p_vaddr +
+                                               (target_ehdr.e_phoff - phdr.p_offset);
+                            break;
+                        }
+                    }
+                }
+                if (!target_phdr_addr)
+                    target_phdr_addr = target_load_base + target_ehdr.e_phoff;
+            } else {
+                /* Target is not a valid ELF — fall back to no-drop mode */
+                close(target_fd);
+                target_fd = -1;
+                drop_count = 0;
+                vis_argc = argc;
+                vis_argv = argv;
+            }
+        } else {
+            /* Cannot open target — fall back to no-drop mode */
+            drop_count = 0;
+            vis_argc = argc;
+            vis_argv = argv;
+        }
+    }
+
     /* Install SIGSYS handler.
      *
      * We deliberately do NOT use SA_ONSTACK.  The handler runs on the
@@ -2980,7 +3136,8 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         _exit(127);
     }
 
-    /* Build the new stack */
+    /* Build the new stack — use the visible argv (drop_count entries
+     * stripped) so the target process sees only its own args. */
     size_t stack_size = 8 * 1024 * 1024;
     void *stack_base = mmap(NULL, stack_size,
                            PROT_READ | PROT_WRITE,
@@ -2998,24 +3155,32 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     if (environ)
         while (environ[envc]) envc++;
 
-    int total_slots = 1 + argc + 1 + envc + 1 + 128;
+    int total_slots = 1 + vis_argc + 1 + envc + 1 + 128;
     sp -= total_slots;
     sp = (unsigned long *)((unsigned long)sp & ~0xfUL);
 
     int idx = 0;
-    sp[idx++] = argc;
-    for (int i = 0; i < argc; i++)
-        sp[idx++] = (unsigned long)argv[i];
+    sp[idx++] = vis_argc;
+    for (int i = 0; i < vis_argc; i++)
+        sp[idx++] = (unsigned long)vis_argv[i];
     sp[idx++] = 0;
     for (int i = 0; i < envc; i++)
         sp[idx++] = (unsigned long)environ[i];
     sp[idx++] = 0;
 
-    /* Copy auxv, patching relevant entries for the loaded ELF.
-     * ld.so needs AT_PHDR pointing at its own program headers in memory,
-     * and AT_BASE = 0 (it IS the interpreter, there is no separate one). */
+    /* Copy auxv, patching relevant entries.
+     *
+     * When drop_count > 0 and the target ELF was loaded successfully,
+     * we set up "interpreter mode": auxv entries describe the target
+     * program (AT_PHDR, AT_ENTRY, AT_PHNUM, AT_PHENT) while AT_BASE
+     * points to the dynamic linker's load base.  This way ld-linux
+     * processes the target's dependencies without needing itself in argv.
+     *
+     * When drop_count == 0 (static binary or no target loaded), use
+     * "direct invocation mode": auxv describes the loaded ELF itself
+     * and AT_BASE = 0. */
     {
-        /* Find where phdr table sits in memory */
+        /* Find where primary ELF's phdr table sits in memory */
         unsigned long phdr_addr = 0;
         for (int i = 0; i < ehdr.e_phnum; i++) {
             sud_elf_phdr_t phdr;
@@ -3048,6 +3213,8 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
         if (!phdr_addr)
             phdr_addr = load_base + ehdr.e_phoff;
 
+        int use_interp_mode = (drop_count > 0 && target_fd >= 0);
+
         int aux_fd2 = open("/proc/self/auxv", O_RDONLY);
         if (aux_fd2 >= 0) {
             sud_auxv_t avbuf[64];
@@ -3056,22 +3223,47 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
             if (n > 0) {
                 int auxc = n / sizeof(sud_auxv_t);
                 for (int i = 0; i < auxc; i++) {
-                    switch (avbuf[i].a_type) {
-                    case AT_ENTRY:
-                        avbuf[i].a_un.a_val = load_base + ehdr.e_entry;
-                        break;
-                    case AT_PHDR:
-                        avbuf[i].a_un.a_val = phdr_addr;
-                        break;
-                    case AT_PHNUM:
-                        avbuf[i].a_un.a_val = ehdr.e_phnum;
-                        break;
-                    case AT_PHENT:
-                        avbuf[i].a_un.a_val = ehdr.e_phentsize;
-                        break;
-                    case AT_BASE:
-                        avbuf[i].a_un.a_val = 0;
-                        break;
+                    if (use_interp_mode) {
+                        /* Interpreter mode: auxv describes target program,
+                         * AT_BASE points to ld-linux's load address */
+                        switch (avbuf[i].a_type) {
+                        case AT_ENTRY:
+                            avbuf[i].a_un.a_val = target_load_base +
+                                                  target_ehdr.e_entry;
+                            break;
+                        case AT_PHDR:
+                            avbuf[i].a_un.a_val = target_phdr_addr;
+                            break;
+                        case AT_PHNUM:
+                            avbuf[i].a_un.a_val = target_ehdr.e_phnum;
+                            break;
+                        case AT_PHENT:
+                            avbuf[i].a_un.a_val = target_ehdr.e_phentsize;
+                            break;
+                        case AT_BASE:
+                            avbuf[i].a_un.a_val = load_base;
+                            break;
+                        }
+                    } else {
+                        /* Direct/static mode: auxv describes the loaded ELF,
+                         * AT_BASE = 0 (no separate interpreter) */
+                        switch (avbuf[i].a_type) {
+                        case AT_ENTRY:
+                            avbuf[i].a_un.a_val = load_base + ehdr.e_entry;
+                            break;
+                        case AT_PHDR:
+                            avbuf[i].a_un.a_val = phdr_addr;
+                            break;
+                        case AT_PHNUM:
+                            avbuf[i].a_un.a_val = ehdr.e_phnum;
+                            break;
+                        case AT_PHENT:
+                            avbuf[i].a_un.a_val = ehdr.e_phentsize;
+                            break;
+                        case AT_BASE:
+                            avbuf[i].a_un.a_val = 0;
+                            break;
+                        }
                     }
 
                     sp[idx++] = avbuf[i].a_type;
@@ -3084,6 +3276,8 @@ static void load_and_run_elf(const char *path, int argc, char **argv)
     }
 
     close(fd);
+    if (target_fd >= 0)
+        close(target_fd);
 
     /* Jump to the entry point (adjusted for PIE load base) */
     unsigned long entry = load_base + ehdr.e_entry;
@@ -3165,6 +3359,8 @@ static int is_wrapper_mode(int argc, char **argv)
     int i = 1;
     if (i < argc && argv[i] && strcmp(argv[i], "--no-env") == 0)
         i++;
+    if (i + 1 < argc && argv[i] && strcmp(argv[i], "--drop-argv") == 0)
+        i += 2;
     if (i >= argc || !argv[i] || argv[i][0] == '-') return 0;
     return 1;
 }
@@ -3172,14 +3368,57 @@ static int is_wrapper_mode(int argc, char **argv)
 static int run_wrapper_mode(int argc, char **argv)
 {
     int argi = 1;
+    int drop_count = 0;
     if (argi < argc && argv[argi] && strcmp(argv[argi], "--no-env") == 0) {
         argi++;
         g_trace_exec_env = 0;
+    }
+    if (argi + 1 < argc && argv[argi] && strcmp(argv[argi], "--drop-argv") == 0) {
+        drop_count = parse_int(argv[argi + 1]);
+        argi += 2;
     }
     char resolved[PATH_MAX];
     if (!resolve_path(argv[argi], resolved, sizeof(resolved))) {
         fprintf(stderr, "sudtrace: cannot find '%s'\n", argv[argi]);
         return 127;
+    }
+
+    /* Rewrite /proc/self/cmdline to show only the visible argv.
+     * The kernel's cmdline area (mm->arg_start..arg_end) points at the
+     * original argv strings from the last execve, which include the
+     * sudtrace wrapper prefix.  Overwrite that area with the clean
+     * argv so that /proc/self/cmdline matches what the process sees. */
+    {
+        int vis_argc = argc - argi - drop_count;
+        char **vis_argv = argv + argi + drop_count;
+        if (vis_argc > 0 && vis_argv && argv[0]) {
+            /* Calculate total visible argv content */
+            size_t total_vis = 0;
+            for (int i = 0; i < vis_argc; i++)
+                total_vis += strlen(vis_argv[i]) + 1;
+
+            /* Find the original argv area boundaries */
+            char *area_start = argv[0];
+            char *area_end = argv[argc - 1] + strlen(argv[argc - 1]) + 1;
+            size_t area_size = area_end - area_start;
+
+            /* Copy visible argv to a temp buffer (source/dest may overlap) */
+            char *tmp = malloc(total_vis);
+            if (tmp) {
+                size_t off = 0;
+                for (int i = 0; i < vis_argc; i++) {
+                    size_t len = strlen(vis_argv[i]) + 1;
+                    memcpy(tmp + off, vis_argv[i], len);
+                    off += len;
+                }
+                /* Write into the original area */
+                size_t copy_size = total_vis < area_size ? total_vis : area_size;
+                memcpy(area_start, tmp, copy_size);
+                if (copy_size < area_size)
+                    memset(area_start + copy_size, 0, area_size - copy_size);
+                free(tmp);
+            }
+        }
     }
 
     /* Run the ELF directly in this process — no fork.
@@ -3196,7 +3435,7 @@ static int run_wrapper_mode(int argc, char **argv)
      * parent.  EXIT events for any children of the loaded binary are
      * now emitted from the SIGSYS handler's wait4/waitid interception
      * instead of a dedicated wait loop. */
-    load_and_run_elf(resolved, argc - argi, argv + argi);
+    load_and_run_elf(resolved, argc - argi, argv + argi, drop_count);
     /* load_and_run_elf never returns */
 }
 
