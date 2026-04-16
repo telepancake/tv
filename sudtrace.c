@@ -2701,8 +2701,34 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * returns -1 on error (setting errno).  The traced program expects the
      * raw kernel return value in RAX (e.g. -ENOSYS, -EPERM).  Using the
      * wrapper would map every error to -1, which breaks glibc internals
-     * in the traced program (e.g. clone3→clone fallback in pthread_create). */
-    ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+     * in the traced program (e.g. clone3→clone fallback in pthread_create).
+     *
+     * Restore the program's original signal mask for the duration of the
+     * syscall.  The SIGSYS handler's sa_mask blocks ALL signals, which
+     * prevents SIGCHLD from interrupting blocking syscalls.  Programs
+     * like GNU make rely on SIGCHLD to interrupt blocking reads on the
+     * jobserver pipe; without this, the build deadlocks: make is stuck
+     * in read() waiting for a job token, but can't reap the finished
+     * child (whose token it needs) because SIGCHLD never interrupts the
+     * read.
+     *
+     * Restoring the pre-handler mask (from uc->uc_sigmask) allows signals
+     * to be delivered during the syscall.  If a signal handler (e.g. for
+     * SIGCHLD) makes a syscall, the kernel delivers a nested SIGSYS which
+     * re-enters this handler safely — the handler uses only local state
+     * and the write lock is not held at this point. */
+    {
+        sud_sigset_word_t saved_mask;
+        sud_sigset_word_t prog_mask;
+        memcpy(&prog_mask, &uc->uc_sigmask, sizeof(prog_mask));
+        raw_syscall6(SYS_rt_sigprocmask, SIG_SETMASK, (long)&prog_mask,
+                     (long)&saved_mask, sizeof(prog_mask), 0, 0);
+
+        ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+
+        raw_syscall6(SYS_rt_sigprocmask, SIG_SETMASK, (long)&saved_mask,
+                     0, sizeof(saved_mask), 0, 0);
+    }
 
     /* Post-syscall tracing */
 

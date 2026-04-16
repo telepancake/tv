@@ -75,6 +75,19 @@ all:
 	/bin/echo build-ok
 EOF
 
+# Parallel Makefile: exercises SIGCHLD + jobserver pipe interaction.
+# With -j4, GNU make blocks on the jobserver pipe between jobs and relies
+# on SIGCHLD to interrupt the blocking read so it can reap finished
+# children and release their job tokens.  Without the signal-mask fix,
+# the SIGSYS handler blocks SIGCHLD → make deadlocks.
+cat > "$TMPDIR/Makefile.parallel" << 'EOF'
+.PHONY: all t1 t2 t3 t4 t5 t6 t7 t8
+all: t1 t2 t3 t4 t5 t6 t7 t8
+	@/bin/echo parallel-build-ok
+t1 t2 t3 t4 t5 t6 t7 t8:
+	@/bin/echo $@-done
+EOF
+
 cat > "$TMPDIR/static32.c" << 'EOF'
 #include <unistd.h>
 int main(void) {
@@ -437,6 +450,16 @@ run_test "make: external command traced without SIGSYS crash" \
     'grep -q "\"event\":\"EXEC\"" "$TMPDIR/make.jsonl"' \
     'grep -q "\"status\":\"exited\"" "$TMPDIR/make.jsonl"' \
     '! grep -q "\"signal\"" "$TMPDIR/make.jsonl"'
+
+# ── Test: parallel make (SIGCHLD + jobserver pipe interaction) ─────────
+
+OUT=$(timeout 30 "$SUDTRACE" -o "$TMPDIR/pmake.jsonl" -- \
+    make -j4 -f "$TMPDIR/Makefile.parallel" 2>&1)
+run_test "make -j4: parallel build completes (SIGCHLD not blocked)" \
+    'printf "%s\n" "$OUT" | grep -q "parallel-build-ok"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/pmake.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/pmake.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/pmake.jsonl"'
 
 # ── Test: seccomp filter via seccomp() syscall ────────────────────────
 
