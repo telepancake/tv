@@ -3329,6 +3329,10 @@ static void load_and_run_elf(const char *path, int argc, char **argv,
                             break;
 #ifdef AT_EXECFN
                         case AT_EXECFN:
+                            /* Point to g_target_exe — a global in sudtrace's
+                             * BSS at 0x40000000+.  Safe because sudtrace's
+                             * memory stays mapped in the same address space
+                             * as the loaded target (no exec boundary). */
                             if (g_target_exe[0])
                                 avbuf[i].a_un.a_val =
                                     (unsigned long)g_target_exe;
@@ -3356,6 +3360,7 @@ static void load_and_run_elf(const char *path, int argc, char **argv,
                             break;
 #ifdef AT_EXECFN
                         case AT_EXECFN:
+                            /* Same as above — g_target_exe stays mapped. */
                             if (g_target_exe[0])
                                 avbuf[i].a_un.a_val =
                                     (unsigned long)g_target_exe;
