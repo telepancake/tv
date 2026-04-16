@@ -2362,6 +2362,31 @@ void prepare_child_sud(void)
  * access to its memory (no ptrace or /proc/mem needed for pointers).
  * ================================================================ */
 
+/* Check if a path is /proc/self/exe or /proc/<our-pid>/exe.
+ * Used by the SIGSYS handler to intercept readlink/readlinkat and return
+ * the target program's path instead of sudtrace's. */
+static int is_proc_self_exe(const char *rpath)
+{
+    if (!rpath) return 0;
+    const char *p = rpath;
+    if (p[0] != '/' || p[1] != 'p' || p[2] != 'r' ||
+        p[3] != 'o' || p[4] != 'c' || p[5] != '/') return 0;
+    p += 6;
+    if (p[0] == 's' && p[1] == 'e' && p[2] == 'l' &&
+        p[3] == 'f' && p[4] == '/') {
+        p += 5;
+        return (p[0] == 'e' && p[1] == 'x' && p[2] == 'e' && p[3] == '\0');
+    }
+    /* /proc/<digits>/exe — check if digits match our PID */
+    pid_t mypid = (pid_t)raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0);
+    pid_t parsed = 0;
+    const char *d = p;
+    while (*d >= '0' && *d <= '9')
+        parsed = parsed * 10 + (*d++ - '0');
+    return (d > p && *d == '/' && d[1] == 'e' && d[2] == 'x' &&
+            d[3] == 'e' && d[4] == '\0' && parsed == mypid);
+}
+
 static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 {
     ucontext_t *uc = (ucontext_t *)uctx_raw;
@@ -2703,48 +2728,31 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
      * path to sudtrace (sud64/sud32).  This confuses programs like Perl
      * that use /proc/self/exe to determine $^X.
      *
-     * readlinkat(dirfd=a0, pathname=a1, buf=a2, bufsz=a3)
-     *
-     * We intercept the syscall and, if it targets a "self/exe" path,
-     * copy g_target_exe into the caller's buffer instead. */
-    if (nr == SYS_readlinkat && g_target_exe[0]) {
-        const char *rpath = (const char *)a1;
-        if (rpath) {
-            /* Check for /proc/self/exe or /proc/<pid>/exe */
-            int is_self_exe = 0;
-            const char *p = rpath;
-            if (p[0] == '/' && p[1] == 'p' && p[2] == 'r' &&
-                p[3] == 'o' && p[4] == 'c' && p[5] == '/') {
-                p += 6;
-                if (p[0] == 's' && p[1] == 'e' && p[2] == 'l' &&
-                    p[3] == 'f' && p[4] == '/') {
-                    p += 5;
-                    if (p[0] == 'e' && p[1] == 'x' && p[2] == 'e' &&
-                        p[3] == '\0')
-                        is_self_exe = 1;
-                } else {
-                    /* /proc/<digits>/exe — check if digits match our PID */
-                    pid_t mypid = (pid_t)raw_syscall6(SYS_getpid,
-                                                      0, 0, 0, 0, 0, 0);
-                    pid_t parsed = 0;
-                    const char *d = p;
-                    while (*d >= '0' && *d <= '9')
-                        parsed = parsed * 10 + (*d++ - '0');
-                    if (d > p && *d == '/' && d[1] == 'e' && d[2] == 'x' &&
-                        d[3] == 'e' && d[4] == '\0' && parsed == mypid)
-                        is_self_exe = 1;
-                }
-            }
-            if (is_self_exe) {
-                size_t tlen = strlen(g_target_exe);
-                char *obuf = (char *)a2;
-                size_t obsz = (size_t)a3;
-                if (tlen > obsz) tlen = obsz;
-                memcpy(obuf, g_target_exe, tlen);
-                UC_SET_RET(uc, (long)tlen);
-                return;
-            }
-        }
+     * readlinkat(dirfd=a0, pathname=a1, buf=a2, bufsz=a3) */
+    if (nr == SYS_readlinkat && g_target_exe[0] &&
+        is_proc_self_exe((const char *)a1)) {
+        size_t tlen = strlen(g_target_exe);
+        char *obuf = (char *)a2;
+        size_t obsz = (size_t)a3;
+        if (tlen > obsz) tlen = obsz;
+        memcpy(obuf, g_target_exe, tlen);
+        UC_SET_RET(uc, (long)tlen);
+        return;
+    }
+#endif
+
+#ifdef SYS_readlink
+    /* Also intercept the legacy readlink(pathname=a0, buf=a1, bufsz=a2)
+     * syscall.  glibc's readlink() uses this on x86_64. */
+    if (nr == SYS_readlink && g_target_exe[0] &&
+        is_proc_self_exe((const char *)a0)) {
+        size_t tlen = strlen(g_target_exe);
+        char *obuf = (char *)a1;
+        size_t obsz = (size_t)a2;
+        if (tlen > obsz) tlen = obsz;
+        memcpy(obuf, g_target_exe, tlen);
+        UC_SET_RET(uc, (long)tlen);
+        return;
     }
 #endif
 

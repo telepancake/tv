@@ -416,6 +416,137 @@ else
     echo "  SKIP  LTO test: g++ -flto=auto unavailable"
 fi
 
+# ── Compile identity-masking test programs ─────────────────────────────
+
+# Test: program reads /proc/self/exe and checks it doesn't leak sudtrace path
+cat > "$TMPDIR/check_proc_exe.c" << 'EOF'
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+int main(void) {
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        fprintf(stderr, "FAIL: readlink(/proc/self/exe) failed\n");
+        return 1;
+    }
+    buf[n] = '\0';
+    fprintf(stderr, "proc_self_exe=%s\n", buf);
+    if (strstr(buf, "sud64") || strstr(buf, "sud32") ||
+        strstr(buf, "sudtrace")) {
+        fprintf(stderr, "FAIL: /proc/self/exe leaks sudtrace path\n");
+        return 1;
+    }
+    fprintf(stderr, "proc-exe-ok\n");
+    return 0;
+}
+EOF
+HAVE_CHECK_PROC_EXE=0
+if gcc -o "$TMPDIR/check_proc_exe" "$TMPDIR/check_proc_exe.c" 2>/dev/null; then
+    HAVE_CHECK_PROC_EXE=1
+else
+    echo "  SKIP  check_proc_exe test: compilation failed"
+fi
+
+# Test: program reads /proc/<pid>/exe (using getpid) and checks identity
+cat > "$TMPDIR/check_pid_exe.c" << 'EOF'
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+int main(void) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/exe", (int)getpid());
+    char buf[4096];
+    ssize_t n = readlink(path, buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        fprintf(stderr, "FAIL: readlink(%s) failed\n", path);
+        return 1;
+    }
+    buf[n] = '\0';
+    fprintf(stderr, "proc_pid_exe=%s\n", buf);
+    if (strstr(buf, "sud64") || strstr(buf, "sud32") ||
+        strstr(buf, "sudtrace")) {
+        fprintf(stderr, "FAIL: /proc/<pid>/exe leaks sudtrace path\n");
+        return 1;
+    }
+    fprintf(stderr, "pid-exe-ok\n");
+    return 0;
+}
+EOF
+HAVE_CHECK_PID_EXE=0
+if gcc -o "$TMPDIR/check_pid_exe" "$TMPDIR/check_pid_exe.c" 2>/dev/null; then
+    HAVE_CHECK_PID_EXE=1
+else
+    echo "  SKIP  check_pid_exe test: compilation failed"
+fi
+
+# Test: program reads AT_EXECFN from auxv and checks it doesn't leak
+cat > "$TMPDIR/check_execfn.c" << 'EOF'
+#include <stdio.h>
+#include <string.h>
+#include <sys/auxv.h>
+int main(void) {
+    const char *execfn = (const char *)getauxval(AT_EXECFN);
+    if (!execfn || !execfn[0]) {
+        fprintf(stderr, "SKIP: AT_EXECFN not available\n");
+        return 0;
+    }
+    fprintf(stderr, "at_execfn=%s\n", execfn);
+    if (strstr(execfn, "sud64") || strstr(execfn, "sud32") ||
+        strstr(execfn, "sudtrace")) {
+        fprintf(stderr, "FAIL: AT_EXECFN leaks sudtrace path\n");
+        return 1;
+    }
+    fprintf(stderr, "execfn-ok\n");
+    return 0;
+}
+EOF
+HAVE_CHECK_EXECFN=0
+if gcc -o "$TMPDIR/check_execfn" "$TMPDIR/check_execfn.c" 2>/dev/null; then
+    HAVE_CHECK_EXECFN=1
+else
+    echo "  SKIP  check_execfn test: compilation failed"
+fi
+
+# Test: program reads /proc/self/comm and checks it doesn't leak
+cat > "$TMPDIR/check_comm.c" << 'EOF'
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+int main(void) {
+    char buf[256] = {0};
+    int fd = open("/proc/self/comm", O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "FAIL: cannot open /proc/self/comm\n");
+        return 1;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        fprintf(stderr, "FAIL: cannot read /proc/self/comm\n");
+        return 1;
+    }
+    buf[n] = '\0';
+    /* Strip trailing newline */
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    fprintf(stderr, "comm=%s\n", buf);
+    if (strstr(buf, "sud64") || strstr(buf, "sud32")) {
+        fprintf(stderr, "FAIL: /proc/self/comm leaks sudtrace name\n");
+        return 1;
+    }
+    fprintf(stderr, "comm-ok\n");
+    return 0;
+}
+EOF
+HAVE_CHECK_COMM=0
+if gcc -o "$TMPDIR/check_comm" "$TMPDIR/check_comm.c" 2>/dev/null; then
+    HAVE_CHECK_COMM=1
+else
+    echo "  SKIP  check_comm test: compilation failed"
+fi
+
 # ── Test: basic single-threaded tracing ────────────────────────────────
 
 if [ -x "$SUDTRACE" ]; then
@@ -567,6 +698,50 @@ run_test "sud32: mixed-arch launch selects traceable wrapper" \
     'grep -q "\"STDERR\"" "$TMPDIR/sud32_hello.jsonl"' \
     'grep -q "hello world" "$TMPDIR/sud32_hello.jsonl"' \
     '! grep -q "\"signal\"" "$TMPDIR/sud32_hello.jsonl"'
+fi
+
+# ── Test: identity masking — /proc/self/exe ───────────────────────────
+
+if [ "$HAVE_CHECK_PROC_EXE" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/proc_exe.jsonl" -- "$TMPDIR/check_proc_exe" 2>&1)
+run_test "identity: /proc/self/exe doesn't leak sudtrace" \
+    'printf "%s\n" "$OUT" | grep -q "proc-exe-ok"' \
+    '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/proc_exe.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/proc_exe.jsonl"'
+fi
+
+# ── Test: identity masking — /proc/<pid>/exe ──────────────────────────
+
+if [ "$HAVE_CHECK_PID_EXE" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/pid_exe.jsonl" -- "$TMPDIR/check_pid_exe" 2>&1)
+run_test "identity: /proc/<pid>/exe doesn't leak sudtrace" \
+    'printf "%s\n" "$OUT" | grep -q "pid-exe-ok"' \
+    '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/pid_exe.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/pid_exe.jsonl"'
+fi
+
+# ── Test: identity masking — AT_EXECFN ────────────────────────────────
+
+if [ "$HAVE_CHECK_EXECFN" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/execfn.jsonl" -- "$TMPDIR/check_execfn" 2>&1)
+run_test "identity: AT_EXECFN doesn't leak sudtrace" \
+    'printf "%s\n" "$OUT" | grep -q "execfn-ok"' \
+    '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/execfn.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/execfn.jsonl"'
+fi
+
+# ── Test: identity masking — /proc/self/comm ──────────────────────────
+
+if [ "$HAVE_CHECK_COMM" -eq 1 ]; then
+OUT=$("$SUDTRACE" -o "$TMPDIR/comm.jsonl" -- "$TMPDIR/check_comm" 2>&1)
+run_test "identity: /proc/self/comm doesn't leak sudtrace" \
+    'printf "%s\n" "$OUT" | grep -q "comm-ok"' \
+    '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/comm.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/comm.jsonl"'
 fi
 
 else
