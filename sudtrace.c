@@ -95,6 +95,59 @@ typedef Elf32_auxv_t sud_auxv_t;
 #define SYS_rt_sigreturn 15
 #endif
 
+/* ================================================================
+ * Seccomp constants (may not be in older headers).
+ *
+ * Seccomp filters installed by the traced process apply to ALL
+ * subsequent syscalls in that process — including syscalls made by
+ * sudtrace's SIGSYS handler (raw_syscall6).  If a restrictive
+ * seccomp filter blocks handler-internal syscalls (openat, write,
+ * clock_gettime, etc.), the kernel generates SIGSYS (seccomp) or
+ * kills the process outright — producing the "Bad system call"
+ * failures seen with complex builds (LTO, distrobox, etc.).
+ *
+ * We intercept seccomp setup calls and emulate success without
+ * actually installing the filter.  This is safe for a tracer:
+ * we already intercept every syscall, so seccomp's restrictions
+ * are redundant.
+ * ================================================================ */
+
+#ifndef PR_SET_SECCOMP
+#define PR_SET_SECCOMP 22
+#endif
+#ifndef PR_GET_SECCOMP
+#define PR_GET_SECCOMP 21
+#endif
+#ifndef SECCOMP_MODE_DISABLED
+#define SECCOMP_MODE_DISABLED 0
+#endif
+#ifndef SECCOMP_MODE_STRICT
+#define SECCOMP_MODE_STRICT 1
+#endif
+#ifndef SECCOMP_MODE_FILTER
+#define SECCOMP_MODE_FILTER 2
+#endif
+#ifndef SECCOMP_SET_MODE_STRICT
+#define SECCOMP_SET_MODE_STRICT 0
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_GET_ACTION_AVAIL
+#define SECCOMP_GET_ACTION_AVAIL 2
+#endif
+#ifndef SECCOMP_GET_NOTIF_SIZES
+#define SECCOMP_GET_NOTIF_SIZES 3
+#endif
+
+/* si_code values for SIGSYS */
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+#ifndef SYS_USER_DISPATCH
+#define SYS_USER_DISPATCH 2
+#endif
+
 #define STR_VALUE(x) #x
 #define STR(x) STR_VALUE(x)
 
@@ -2250,7 +2303,25 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 {
     ucontext_t *uc = (ucontext_t *)uctx_raw;
     (void)sig;
-    (void)info;
+
+    /* Distinguish SUD-generated SIGSYS from seccomp-generated SIGSYS.
+     *
+     * SUD SIGSYS: si_code == SYS_USER_DISPATCH (2)
+     * seccomp SIGSYS: si_code == SYS_SECCOMP (1)
+     *
+     * If a seccomp filter was somehow installed (e.g. inherited from a
+     * parent before sudtrace started, or via a mechanism we didn't
+     * intercept), the handler's own raw_syscall6 calls can trigger
+     * seccomp SIGSYS.  Since SIGSYS is masked while we're in this
+     * handler (SA_NODEFER not set), the kernel force-delivers the
+     * signal, which would kill the process.
+     *
+     * For any non-SUD SIGSYS that does reach us, return -ENOSYS so
+     * the program sees a clean error instead of crashing. */
+    if (info && info->si_code != SYS_USER_DISPATCH) {
+        UC_SET_RET(uc, -ENOSYS);
+        return;
+    }
 
     /* No selector toggling needed: all syscalls made from within
      * sudtrace's code are in the allowed IP range [__sud_begin,
@@ -2294,6 +2365,64 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             return;
         }
         UC_SET_RET(uc, r);  /* raw kernel negative errno */
+        return;
+    }
+
+    /*
+     * seccomp() — the traced process is trying to install seccomp filters.
+     *
+     * Seccomp filters apply to ALL syscalls in this process, including
+     * the ones made by sudtrace's SIGSYS handler via raw_syscall6().
+     * If a restrictive filter is installed, handler-internal syscalls
+     * like openat, clock_gettime, readlinkat, write, etc. would be
+     * blocked — killing the process with "Bad system call" (SIGSYS
+     * from seccomp while SIGSYS is already masked in the handler).
+     *
+     * Emulate success for filter/strict installation without actually
+     * installing anything.  This is safe: sudtrace already intercepts
+     * every syscall, making seccomp restrictions redundant.  Query
+     * operations (GET_ACTION_AVAIL, GET_NOTIF_SIZES) pass through so
+     * programs that probe seccomp support see correct results.
+     */
+#ifdef SYS_seccomp
+    if (nr == SYS_seccomp) {
+        if (a0 == SECCOMP_SET_MODE_STRICT || a0 == SECCOMP_SET_MODE_FILTER) {
+            UC_SET_RET(uc, 0);
+            return;
+        }
+        /* Query operations: let the kernel answer */
+        ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+        UC_SET_RET(uc, ret);
+        return;
+    }
+#endif
+
+    /*
+     * prctl() — intercept operations that conflict with SUD tracing.
+     *
+     * PR_SET_SECCOMP: same issue as seccomp() above — installing a
+     *   seccomp filter would break the handler.  Emulate success.
+     *
+     * PR_SET_SYSCALL_USER_DISPATCH: the traced program could disable
+     *   or reconfigure SUD, which would break tracing entirely (the
+     *   handler would no longer be called, or worse, the new allowed
+     *   IP range wouldn't include sudtrace's code, causing recursive
+     *   SIGSYS when the handler makes syscalls).  Block silently.
+     *
+     * All other prctl operations pass through normally.
+     */
+    if (nr == SYS_prctl) {
+        if (a0 == PR_SET_SECCOMP) {
+            UC_SET_RET(uc, 0);
+            return;
+        }
+        if (a0 == PR_SET_SYSCALL_USER_DISPATCH) {
+            UC_SET_RET(uc, 0);
+            return;
+        }
+        /* All other prctl operations: pass through */
+        ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
+        UC_SET_RET(uc, ret);
         return;
     }
 
