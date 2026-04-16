@@ -164,7 +164,7 @@ typedef unsigned long sud_sigset_word_t;
  * (manifests as SIGSEGV at NULL after library loading). */
 #if defined(__i386__)
 _Static_assert(sizeof(struct stat) == 88,
-               "unexpected struct stat size on i386; stat64 overflow fix needs updating");
+               "struct stat size changed on i386; update stat_buf_t padding and MINI_STAT_BUF_SIZE");
 typedef union { struct stat st; char _pad[128]; } stat_buf_t;
 #else
 typedef union { struct stat st; } stat_buf_t;

@@ -681,12 +681,12 @@ int dup2(int oldfd, int newfd)
 #if defined(__i386__) && defined(SYS_fstat64)
 int fstat(int fd, struct stat *st)
 {
-    /* struct stat is an incomplete type in this TU; we cannot use sizeof.
-     * Allocate an oversized local buffer and let the caller-visible
-     * struct stat pointer receive the kernel data directly.  The extra
-     * bytes land harmlessly in the padding.  sudtrace.c callers are
-     * responsible for using stat_buf_t (a padded union) so the buffer
-     * passed here is always large enough. */
+    /* SYS_fstat64 writes a kernel struct stat64 (96 bytes) which is
+     * larger than userspace struct stat (88 bytes) on i386.  We cannot
+     * use a local buffer here because struct stat is an incomplete type
+     * in this TU (forward-declared only).  Instead, callers in
+     * sudtrace.c must use stat_buf_t (a padded union) so the buffer
+     * passed here is always large enough for the kernel write. */
     return mini_set_errno(mini_syscall2(SYS_fstat64, fd, (long)st));
 }
 #else
