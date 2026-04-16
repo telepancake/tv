@@ -157,6 +157,19 @@ typedef unsigned long long sud_sigset_word_t;
 typedef unsigned long sud_sigset_word_t;
 #endif
 
+/* On i386, the kernel's fstat64/fstatat64 syscalls write struct stat64
+ * (96 bytes) which is larger than struct stat (88 bytes).  All stat
+ * buffers must use this padded union to prevent an 8-byte stack/data
+ * overflow that can corrupt adjacent memory and crash the traced process
+ * (manifests as SIGSEGV at NULL after library loading). */
+#if defined(__i386__)
+_Static_assert(sizeof(struct stat) == 88,
+               "unexpected struct stat size on i386; stat64 overflow fix needs updating");
+typedef union { struct stat st; char _pad[128]; } stat_buf_t;
+#else
+typedef union { struct stat st; } stat_buf_t;
+#endif
+
 /* ================================================================
  * Linker-provided symbols marking sudtrace's own address range.
  * SUD is configured to allow syscalls only from this range.
@@ -681,8 +694,17 @@ static inline int raw_fstatat(int dirfd, const char *path, struct stat *st,
     return (int)raw_syscall6(SYS_newfstatat, dirfd, (long)path, (long)st,
                               flags, 0, 0);
 #else
-    return (int)raw_syscall6(SYS_fstatat64, dirfd, (long)path, (long)st,
-                              flags, 0, 0);
+    /* On i386, SYS_fstatat64 writes a kernel struct stat64 (96 bytes) which
+     * is larger than userspace struct stat (88 bytes).  Using a struct stat
+     * buffer directly causes an 8-byte stack overflow that can corrupt
+     * adjacent data and crash the traced process (SIGSEGV at NULL after
+     * library loading).  Use an oversized buffer and copy back. */
+    char buf[128] __attribute__((aligned(8)));
+    int ret = (int)raw_syscall6(SYS_fstatat64, dirfd, (long)path, (long)buf,
+                                flags, 0, 0);
+    if (ret == 0)
+        __builtin_memcpy(st, buf, sizeof(*st));
+    return ret;
 #endif
 }
 
@@ -871,7 +893,7 @@ static int fmt_proc_path(char *buf, int buflen, int pid, const char *name)
  * ================================================================ */
 
 static int g_out_fd = -1;           /* fd for JSONL output */
-static struct stat g_creator_stdout_st;
+static stat_buf_t g_creator_stdout_stbuf;
 static int g_creator_stdout_valid;
 static char g_self_exe[PATH_MAX];   /* path to sudtrace binary itself */
 static char g_self_exe32[PATH_MAX];
@@ -1404,9 +1426,9 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
     if (n <= 0) return;
     link_target[n] = '\0';
 
-    struct stat st;
-    if (fstatat(AT_FDCWD, link_path, &st, 0) < 0)
-        memset(&st, 0, sizeof(st));
+    stat_buf_t stbuf;
+    if (fstatat(AT_FDCWD, link_path, &stbuf.st, 0) < 0)
+        memset(&stbuf.st, 0, sizeof(stbuf.st));
 
     char fdinfo_path[256], fdinfo_buf[512];
     {
@@ -1443,11 +1465,11 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
     pos += fmt_str(line + pos, sizeof(line) - pos, ",\"fd\":");
     pos += fmt_int(line + pos, sizeof(line) - pos, fd_num);
     pos += fmt_str(line + pos, sizeof(line) - pos, ",\"ino\":");
-    pos += fmt_ulong(line + pos, sizeof(line) - pos, (unsigned long)st.st_ino);
+    pos += fmt_ulong(line + pos, sizeof(line) - pos, (unsigned long)stbuf.st.st_ino);
     pos += fmt_str(line + pos, sizeof(line) - pos, ",\"dev\":\"");
-    pos += fmt_ulong(line + pos, sizeof(line) - pos, major(st.st_dev));
+    pos += fmt_ulong(line + pos, sizeof(line) - pos, major(stbuf.st.st_dev));
     pos += fmt_ch(line + pos, sizeof(line) - pos, ':');
-    pos += fmt_ulong(line + pos, sizeof(line) - pos, minor(st.st_dev));
+    pos += fmt_ulong(line + pos, sizeof(line) - pos, minor(stbuf.st.st_dev));
     pos += fmt_str(line + pos, sizeof(line) - pos, "\",\"inherited\":true}\n");
     if (pos > 0) emit_raw(line, pos);
 }
@@ -1638,8 +1660,8 @@ static int fd1_is_creator_stdout(pid_t pid)
     pos += fmt_str(link_path + pos, sizeof(link_path) - pos, "/fd/1");
     int r = raw_fstatat(AT_FDCWD, link_path, &st, 0);
     if (r < 0) return 0;
-    return (st.st_dev == g_creator_stdout_st.st_dev &&
-            st.st_ino == g_creator_stdout_st.st_ino);
+    return (st.st_dev == g_creator_stdout_stbuf.st.st_dev &&
+            st.st_ino == g_creator_stdout_stbuf.st.st_ino);
 }
 
 /* ================================================================
@@ -3639,8 +3661,8 @@ int main(int argc, char **argv)
         if (g_out_fd < 0)
             g_out_fd = STDOUT_FILENO;
 
-        struct stat st;
-        if (fstat(SUD_OUTPUT_FD, &st) == 0)
+        stat_buf_t stbuf;
+        if (fstat(SUD_OUTPUT_FD, &stbuf.st) == 0)
             g_out_fd = SUD_OUTPUT_FD;
         else {
             const char *out_path = getenv(SUDTRACE_OUTFILE_ENV);
@@ -3652,7 +3674,7 @@ int main(int argc, char **argv)
         }
 
         g_creator_stdout_valid =
-            (fstat(STDOUT_FILENO, &g_creator_stdout_st) == 0);
+            (fstat(STDOUT_FILENO, &g_creator_stdout_stbuf.st) == 0);
         return run_wrapper_mode(argc, argv);
     }
 
@@ -3706,7 +3728,7 @@ int main(int argc, char **argv)
     }
 
     g_creator_stdout_valid =
-        (fstat(STDOUT_FILENO, &g_creator_stdout_st) == 0);
+        (fstat(STDOUT_FILENO, &g_creator_stdout_stbuf.st) == 0);
 
     /* Build exec argv */
     int cmd_argc = argc - cmd_start;
