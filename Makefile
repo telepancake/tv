@@ -83,4 +83,4 @@ test: tv
 
 clean-bins:
 	rm -f tv fv gen_sql_h
-	$(MAKE) -C $(ZSTD_DIR) clean
+	-$(MAKE) -C $(ZSTD_DIR) clean
