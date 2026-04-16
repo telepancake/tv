@@ -693,4 +693,36 @@ DIR           *opendir(const char *name);
 struct dirent *readdir(DIR *dirp);
 int            closedir(DIR *dirp);
 
+/* ---- Additional ELF / ABI constants ---- */
+#ifndef EI_CLASS
+#define EI_CLASS  4
+#endif
+#ifndef SELFMAG
+#define SELFMAG   4
+#endif
+#ifndef ET_DYN
+#define ET_DYN    3
+#endif
+#ifndef ET_EXEC
+#define ET_EXEC   2
+#endif
+#ifndef AT_BASE
+#define AT_BASE   7
+#endif
+#ifndef AT_EXECFN
+#define AT_EXECFN 31
+#endif
+#ifndef MAP_STACK
+#define MAP_STACK 0x20000
+#endif
+#ifndef PR_SET_NAME
+#define PR_SET_NAME 15
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+
 #endif /* SUD_LIBC_H */
