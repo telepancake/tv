@@ -37,8 +37,12 @@ static uint64_t fnv1a(const void *data, size_t len) {
 
 /* ── Constants ────────────────────────────────────────────────────── */
 
+/* Blobs smaller than this are stored inline (fast O(1) view()).
+   Larger blobs are ZSTD-compressed to save memory. */
 static constexpr size_t COMPRESS_THRESHOLD = 128;
-static constexpr int    ZSTD_LEVEL         = 1;   /* fast compression */
+
+/* Fast compression — minimize CPU overhead during live ingestion. */
+static constexpr int    ZSTD_LEVEL         = 1;
 
 /* ── Entry descriptor ─────────────────────────────────────────────── */
 
@@ -305,7 +309,7 @@ std::vector<std::string> Intern::get_argv(IID id) const {
     std::string flat = str(id);
     if (flat.empty()) return out;
     size_t pos = 0;
-    while (pos <= flat.size()) {
+    while (pos < flat.size()) {
         size_t next = flat.find('\0', pos);
         if (next == std::string::npos) {
             out.push_back(flat.substr(pos));

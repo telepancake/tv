@@ -6,11 +6,9 @@
 #include <cerrno>
 #include <csignal>
 #include <ctime>
-#include <cmath>
 
 #include <unistd.h>
 #include <sys/types.h>
-#include <sys/select.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 
@@ -208,10 +206,6 @@ struct abs_path_t {
     explicit operator bool() const { return ptr != nullptr; }
 };
 
-static abs_path_t get_abs_path(const std::string &path) {
-    return abs_path_t(intern_path_item(path));
-}
-
 extern int uproctrace_main(int argc, char **argv);
 
 static constexpr int MAX_JSON_LINE = 1 << 20;
@@ -248,75 +242,54 @@ enum event_kind_t : uint8_t {
 struct trace_event_t {
     int id = 0;
     event_kind_t kind = EV_CWD;
-    uint8_t inherited = 0;
     uint8_t core_dumped = 0;
-    uint8_t _pad = 0;
     double ts = 0;
-    int pid = 0, tgid = 0, ppid = 0, nspid = 0, nstgid = 0;
+    int tgid = 0, ppid = 0;
 
-    /* Path: PathItem* for resolved absolute path (CWD/OPEN/UNLINK). */
-    PathItem *path_item = nullptr;
+    PathItem *path_item = nullptr;     /* resolved path (CWD/OPEN/UNLINK) */
 
-    /* EXEC fields */
-    uint32_t exe_id = 0;          /* g_pool IID */
-    uint32_t argv_blob = 0;       /* g_pool IID (null-separated argv) */
+    uint32_t exe_id = 0;              /* EXEC: interned exe path */
+    uint32_t argv_blob = 0;           /* EXEC: interned argv */
 
-    /* OPEN fields */
-    uint32_t flags_id = 0;        /* g_pool IID (e.g. "O_RDONLY|O_CREAT") */
-    int mode = 0;                 /* raw open flags integer */
-    int fd = -1;
-    int err = 0;
+    uint32_t flags_id = 0;            /* OPEN: interned flag string */
+    int mode = 0;                     /* OPEN: raw open flags integer */
+    int err = 0;                      /* OPEN: errno if failed */
 
-    /* STDOUT/STDERR */
-    uint32_t data_blob = 0;       /* g_pool IID (output data) */
-    int len = 0;
+    uint32_t data_blob = 0;           /* STDOUT/STDERR: interned output */
 
-    /* EXIT */
-    uint32_t status_id = 0;       /* g_pool IID */
-    int code = 0;
-    int signal = 0;
-    int raw = 0;
+    uint32_t status_id = 0;           /* EXIT: interned status string */
+    int code = 0;                     /* EXIT: exit code */
+    int signal = 0;                   /* EXIT: signal number */
 
-    /* Accessor helpers — decode from compact representation on demand */
     std::string get_path() const { return path_item ? path_item->fullPath() : std::string(); }
     std::string get_exe() const { return g_pool.str(exe_id); }
-    std::vector<std::string> get_argv() const { return g_pool.get_argv(argv_blob); }
     std::string get_flags_text() const { return g_pool.str(flags_id); }
     std::string get_data() const { return g_pool.str(data_blob); }
-    std::string get_status() const { return g_pool.str(status_id); }
-    std::string_view get_status_sv() const { return g_pool.view(status_id); }
-    std::string_view get_exe_sv() const { return g_pool.view(exe_id); }
 };
 
 struct process_t : Item {
-    int tgid = 0, pid = 0, ppid = 0, nspid = 0, nstgid = 0;
+    int tgid = 0, ppid = 0;
     bool parent_set = false;
     double start_ts = 0, end_ts = 0;
     int has_start = 0, has_end = 0;
-    uint32_t exe_id = 0;          /* g_pool IID */
-    uint32_t argv_blob = 0;       /* g_pool IID */
-    PathItem *cwd_item = nullptr; /* interned path */
-    uint32_t exit_status_id = 0;  /* g_pool IID */
+    uint32_t exe_id = 0;
+    uint32_t argv_blob = 0;
+    PathItem *cwd_item = nullptr;
+    uint32_t exit_status_id = 0;
     int exit_code = 0;
     int exit_signal = 0;
     int core_dumped = 0;
-    int exit_raw = 0;
     int has_write_open = 0;
     int has_stdout = 0;
-    int has_stderr = 0;
     sorted_vec_set<abs_path_t> read_paths;
     sorted_vec_set<abs_path_t> write_paths;
-    sorted_vec_set<abs_path_t> unlink_paths;
-    std::vector<int> event_indices;     /* indices into g_events */
-    std::string cached_display_name;    /* pre-computed basename */
+    std::vector<int> event_indices;
+    std::string cached_display_name;
     mutable std::string cached_key_;
 
     std::string get_exe() const { return g_pool.str(exe_id); }
-    std::string_view get_exe_sv() const { return g_pool.view(exe_id); }
     std::vector<std::string> get_argv() const { return g_pool.get_argv(argv_blob); }
     std::string get_cwd() const { return cwd_item ? cwd_item->fullPath() : std::string(); }
-    std::string_view get_exit_status_sv() const { return g_pool.view(exit_status_id); }
-    std::string get_exit_status() const { return g_pool.str(exit_status_id); }
 
     void update_display_name() {
         std::string_view s = g_pool.view(exe_id);
@@ -518,13 +491,6 @@ static process_t &get_process(int tgid) {
 
 /* ── Trace ingestion ───────────────────────────────────────────────── */
 
-/* append_raw_trace removed — save functionality removed */
-
-static trace_event_t &append_event() {
-    auto &ev = g_events.emplace_back();
-    return ev;
-}
-
 static bool has_flag(const std::string &flags, const char *flag) {
     return !flags.empty() && flags.find(flag) != std::string::npos;
 }
@@ -586,35 +552,25 @@ struct preparsed_event_t {
     bool valid = false;
     bool is_input = false;
     double ts = 0;
-    int pid = 0, tgid = 0, ppid = 0, nspid = 0, nstgid = 0;
+    int tgid = 0, ppid = 0;
 
-    /* CWD/OPEN/UNLINK: raw path before resolution */
-    std::string raw_path;
+    std::string raw_path;          /* CWD/OPEN/UNLINK: before resolution */
 
-    /* EXEC: pre-interned exe, pre-compressed argv */
-    uint32_t exe_id = 0;
-    uint32_t argv_blob = 0;
+    uint32_t exe_id = 0;          /* EXEC */
+    uint32_t argv_blob = 0;       /* EXEC */
 
-    /* OPEN */
-    uint32_t flags_id = 0;
-    int mode = 0;
-    int fd = -1;
-    int err = 0;
-    uint8_t inherited = 0;
+    uint32_t flags_id = 0;        /* OPEN */
+    int mode = 0;                 /* OPEN */
+    int err = 0;                  /* OPEN */
 
-    /* EXIT */
-    uint32_t status_id = 0;
-    int code = 0;
-    int signal_ = 0;
-    uint8_t core_dumped = 0;
-    int raw = 0;
+    uint32_t status_id = 0;       /* EXIT */
+    int code = 0;                 /* EXIT */
+    int signal_ = 0;              /* EXIT */
+    uint8_t core_dumped = 0;      /* EXIT */
 
-    /* STDOUT/STDERR */
-    uint32_t data_blob = 0;
-    int len = 0;
+    uint32_t data_blob = 0;       /* STDOUT/STDERR */
 
-    /* Input command line (for "input" JSON) */
-    std::string input_line;
+    std::string input_line;        /* "input" JSON line */
 };
 
 /* Phase 1: Parse a single JSON line into a preparsed_event_t.
@@ -644,11 +600,8 @@ static preparsed_event_t preparse_line(const char *line) {
 
     pe.valid = true;
     if (json_get(line, "ts", sp)) pe.ts = span_to_double(sp, 0.0);
-    if (json_get(line, "pid", sp)) pe.pid = span_to_int(sp, 0);
     if (json_get(line, "tgid", sp)) pe.tgid = span_to_int(sp, 0);
     if (json_get(line, "ppid", sp)) pe.ppid = span_to_int(sp, 0);
-    if (json_get(line, "nspid", sp)) pe.nspid = span_to_int(sp, 0);
-    if (json_get(line, "nstgid", sp)) pe.nstgid = span_to_int(sp, 0);
 
     switch (pe.kind) {
     case EV_CWD:
@@ -665,26 +618,21 @@ static preparsed_event_t preparse_line(const char *line) {
           if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
           pe.flags_id = g_pool.put(join_with_pipe(flags)); }
         if (json_get(line, "mode", sp)) pe.mode = span_to_int(sp, 0);
-        if (json_get(line, "fd", sp)) pe.fd = span_to_int(sp, -1);
         if (json_get(line, "err", sp)) pe.err = span_to_int(sp, 0);
-        if (json_get(line, "inherited", sp)) pe.inherited = static_cast<uint8_t>(span_to_bool(sp, 0));
         break;
     case EV_UNLINK:
         if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
             pe.raw_path = json_decode_string(sp);
-        if (json_get(line, "ret", sp)) pe.fd = span_to_int(sp, 0);
         break;
     case EV_EXIT:
         if (json_get(line, "status", sp)) pe.status_id = g_pool.put(json_decode_string(sp));
         if (json_get(line, "code", sp)) pe.code = span_to_int(sp, 0);
         if (json_get(line, "signal", sp)) pe.signal_ = span_to_int(sp, 0);
         if (json_get(line, "core_dumped", sp)) pe.core_dumped = static_cast<uint8_t>(span_to_bool(sp, 0));
-        if (json_get(line, "raw", sp)) pe.raw = span_to_int(sp, 0);
         break;
     case EV_STDOUT:
     case EV_STDERR:
         if (json_get(line, "data", sp)) pe.data_blob = g_pool.put(json_decode_string(sp));
-        if (json_get(line, "len", sp)) pe.len = span_to_int(sp, 0);
         break;
     }
     return pe;
@@ -700,11 +648,8 @@ static void apply_preparsed(const preparsed_event_t &pe) {
     auto &ev = g_events.emplace_back();
     ev.kind = pe.kind;
     ev.ts = pe.ts;
-    ev.pid = pe.pid;
     ev.tgid = pe.tgid;
     ev.ppid = pe.ppid;
-    ev.nspid = pe.nspid;
-    ev.nstgid = pe.nstgid;
     ev.id = (ev.kind == EV_CWD) ? 0 : g_next_event_id++;
     int event_idx = static_cast<int>(g_events.size()) - 1;
     if (g_base_ts == 0.0 || ev.ts < g_base_ts) g_base_ts = ev.ts;
@@ -713,9 +658,6 @@ static void apply_preparsed(const preparsed_event_t &pe) {
     proc.event_indices.push_back(event_idx);
     if (!proc.has_start || ev.ts < proc.start_ts) { proc.start_ts = ev.ts; proc.has_start = 1; }
     if (!proc.has_end || ev.ts > proc.end_ts) { proc.end_ts = ev.ts; proc.has_end = 1; }
-    if (ev.pid > 0 || proc.pid == 0) proc.pid = ev.pid;
-    if (ev.nspid > 0 || proc.nspid == 0) proc.nspid = ev.nspid;
-    if (ev.nstgid > 0 || proc.nstgid == 0) proc.nstgid = ev.nstgid;
 
     if (!proc.parent_set && ev.ppid > 0 && ev.ppid != proc.tgid) {
         proc.ppid = ev.ppid;
@@ -742,9 +684,7 @@ static void apply_preparsed(const preparsed_event_t &pe) {
     case EV_OPEN: {
         ev.flags_id = pe.flags_id;
         ev.mode = pe.mode;
-        ev.fd = pe.fd;
         ev.err = pe.err;
-        ev.inherited = pe.inherited;
         std::string resolved = resolve_path_dup(pe.raw_path, proc.get_cwd());
         if (is_write_open(ev)) proc.has_write_open = 1;
         if (!resolved.empty()) {
@@ -765,7 +705,6 @@ static void apply_preparsed(const preparsed_event_t &pe) {
         break;
     }
     case EV_UNLINK: {
-        ev.fd = pe.fd;
         std::string resolved = resolve_path_dup(pe.raw_path, proc.get_cwd());
         if (!resolved.empty()) {
             PathItem *pi = intern_path_item(resolved);
@@ -777,7 +716,6 @@ static void apply_preparsed(const preparsed_event_t &pe) {
             pi->proc_tgids.insert(ev.tgid);
             pi->unlink_event_indices.push_back(event_idx);
             pi->events.insert(event_idx);
-            proc.unlink_paths.insert(ap);
         }
         break;
     }
@@ -786,21 +724,17 @@ static void apply_preparsed(const preparsed_event_t &pe) {
         ev.code = pe.code;
         ev.signal = pe.signal_;
         ev.core_dumped = pe.core_dumped;
-        ev.raw = pe.raw;
         proc.exit_status_id = ev.status_id;
         proc.exit_code = ev.code;
         proc.exit_signal = ev.signal;
         proc.core_dumped = ev.core_dumped;
-        proc.exit_raw = ev.raw;
         proc.end_ts = ev.ts;
         proc.has_end = 1;
         break;
     case EV_STDOUT:
     case EV_STDERR:
         ev.data_blob = pe.data_blob;
-        ev.len = pe.len;
         if (ev.kind == EV_STDOUT) proc.has_stdout = 1;
-        else proc.has_stderr = 1;
         break;
     }
 }
@@ -824,20 +758,14 @@ static void ingest_trace_line(const char *line) {
     int event_idx = static_cast<int>(g_events.size()) - 1;
 
     if (json_get(line, "ts", sp)) ev.ts = span_to_double(sp, 0.0);
-    if (json_get(line, "pid", sp)) ev.pid = span_to_int(sp, 0);
     if (json_get(line, "tgid", sp)) ev.tgid = span_to_int(sp, 0);
     if (json_get(line, "ppid", sp)) ev.ppid = span_to_int(sp, 0);
-    if (json_get(line, "nspid", sp)) ev.nspid = span_to_int(sp, 0);
-    if (json_get(line, "nstgid", sp)) ev.nstgid = span_to_int(sp, 0);
     if (g_base_ts == 0.0 || ev.ts < g_base_ts) g_base_ts = ev.ts;
 
     auto &proc = get_process(ev.tgid);
     proc.event_indices.push_back(event_idx);
     if (!proc.has_start || ev.ts < proc.start_ts) { proc.start_ts = ev.ts; proc.has_start = 1; }
     if (!proc.has_end || ev.ts > proc.end_ts) { proc.end_ts = ev.ts; proc.has_end = 1; }
-    if (ev.pid > 0 || proc.pid == 0) proc.pid = ev.pid;
-    if (ev.nspid > 0 || proc.nspid == 0) proc.nspid = ev.nspid;
-    if (ev.nstgid > 0 || proc.nstgid == 0) proc.nstgid = ev.nstgid;
 
     /* Parent-child linking: set parent exactly once; subsequent events
        with a different ppid are ignored to maintain tree consistency. */
@@ -881,9 +809,7 @@ static void ingest_trace_line(const char *line) {
         if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
         ev.flags_id = g_pool.put(join_with_pipe(flags));
         if (json_get(line, "mode", sp)) ev.mode = span_to_int(sp, 0);
-        if (json_get(line, "fd", sp)) ev.fd = span_to_int(sp, -1);
         if (json_get(line, "err", sp)) ev.err = span_to_int(sp, 0);
-        if (json_get(line, "inherited", sp)) ev.inherited = static_cast<uint8_t>(span_to_bool(sp, 0));
         std::string resolved = resolve_path_dup(raw_path, proc.get_cwd());
         if (is_write_open(ev)) proc.has_write_open = 1;
         if (!resolved.empty()) {
@@ -908,7 +834,6 @@ static void ingest_trace_line(const char *line) {
         if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
             raw_path = json_decode_string(sp);
         std::string resolved = resolve_path_dup(raw_path, proc.get_cwd());
-        if (json_get(line, "ret", sp)) ev.fd = span_to_int(sp, 0);
         if (!resolved.empty()) {
             PathItem *pi = intern_path_item(resolved);
             ev.path_item = pi;
@@ -919,7 +844,6 @@ static void ingest_trace_line(const char *line) {
             pi->proc_tgids.insert(ev.tgid);
             pi->unlink_event_indices.push_back(event_idx);
             pi->events.insert(event_idx);
-            proc.unlink_paths.insert(ap);
         }
         break;
     }
@@ -928,21 +852,17 @@ static void ingest_trace_line(const char *line) {
         if (json_get(line, "code", sp)) ev.code = span_to_int(sp, 0);
         if (json_get(line, "signal", sp)) ev.signal = span_to_int(sp, 0);
         if (json_get(line, "core_dumped", sp)) ev.core_dumped = static_cast<uint8_t>(span_to_bool(sp, 0));
-        if (json_get(line, "raw", sp)) ev.raw = span_to_int(sp, 0);
         proc.exit_status_id = ev.status_id;
         proc.exit_code = ev.code;
         proc.exit_signal = ev.signal;
         proc.core_dumped = ev.core_dumped;
-        proc.exit_raw = ev.raw;
         proc.end_ts = ev.ts;
         proc.has_end = 1;
         break;
     case EV_STDOUT:
     case EV_STDERR:
         if (json_get(line, "data", sp)) ev.data_blob = g_pool.put(json_decode_string(sp));
-        if (json_get(line, "len", sp)) ev.len = span_to_int(sp, 0);
         if (ev.kind == EV_STDOUT) proc.has_stdout = 1;
-        else proc.has_stderr = 1;
         break;
     }
 }
@@ -1019,7 +939,8 @@ static void ingest_zstd_file(const char *path) {
 
 #include <thread>
 
-static constexpr int BATCH_SIZE = 4096;
+static constexpr int MAX_PARSE_THREADS = 8;
+static constexpr int MIN_LINES_PER_THREAD = 64;
 
 static void parallel_ingest(std::vector<std::string> &lines) {
     if (lines.empty()) return;
@@ -1028,8 +949,8 @@ static void parallel_ingest(std::vector<std::string> &lines) {
     /* Pre-parse all lines in parallel. */
     std::vector<preparsed_event_t> parsed(nlines);
     int nthreads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-    if (nthreads > 8) nthreads = 8;
-    if (nlines < nthreads * 64) nthreads = 1;
+    if (nthreads > MAX_PARSE_THREADS) nthreads = MAX_PARSE_THREADS;
+    if (nlines < nthreads * MIN_LINES_PER_THREAD) nthreads = 1;
 
     auto worker = [&](int tid) {
         int chunk = (nlines + nthreads - 1) / nthreads;
@@ -2202,8 +2123,6 @@ static void process_input_line(const char *line) {
         process_print(what);
     }
 }
-
-/* save_to_file removed — save functionality removed */
 
 /* ── Live trace ────────────────────────────────────────────────────── */
 
