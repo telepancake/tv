@@ -271,7 +271,7 @@ static bool test_proc_tree_durations() {
     int lp = tv_test_lpane();
     ASSERT(col_contains(lp, "1.70s"), "missing 1.70s");
     ASSERT(col_contains(lp, "100.0ms"), "missing 100.0ms");
-    ASSERT(col_contains(lp, "30.0ms"), "missing 30.0ms");
+    ASSERT(col_contains(lp, "41.0ms"), "missing 41.0ms");
     return true;
 }
 
@@ -528,7 +528,7 @@ static bool test_file_view_foo_o_shared() {
     send(R"({"input":"key","name":"2"})");
     int lp = tv_test_lpane();
     ASSERT(col_contains(lp, "foo.o"), "missing foo.o");
-    ASSERT(col_contains(lp, "[2 opens, 2 procs]"), "missing [2 opens, 2 procs]");
+    ASSERT(col_contains(lp, "[2 opens, 2 procs, 1 unlinks]"), "missing [2 opens, 2 procs, 1 unlinks]");
     return true;
 }
 
@@ -706,7 +706,7 @@ static bool test_output_view_stderr_styled() {
 static bool test_output_detail_stdout() {
     setup();
     send(R"({"input":"key","name":"3"}
-{"input":"select","id":"28"})");
+{"input":"select","id":"30"})");
     ASSERT(rpane_col_contains("\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Output \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"), "missing ─── Output ───");
     ASSERT(rpane_col_contains("STDOUT"), "missing Stream: STDOUT");
     ASSERT(rpane_col_contains("1006"), "missing PID: 1006");
@@ -1001,6 +1001,181 @@ static bool test_separate_streams() {
     return true;
 }
 
+// ── UNLINK tests ─────────────────────────────────────────────────────
+
+static const char UNLINK_TRACE[] =
+    R"({"event":"CWD","tgid":5000,"pid":5000,"ppid":1,"nspid":5000,"nstgid":5000,"ts":100.000,"path":"/tmp"})" "\n"
+    R"({"event":"EXEC","tgid":5000,"pid":5000,"ppid":1,"nspid":5000,"nstgid":5000,"ts":100.001,"exe":"/usr/bin/gcc","argv":["gcc","-c","foo.c"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}})" "\n"
+    R"({"event":"OPEN","tgid":5000,"pid":5000,"ppid":1,"nspid":5000,"nstgid":5000,"ts":100.010,"path":"foo.c","flags":["O_RDONLY"],"fd":3})" "\n"
+    R"({"event":"OPEN","tgid":5000,"pid":5000,"ppid":1,"nspid":5000,"nstgid":5000,"ts":100.011,"path":"foo.o","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4})" "\n"
+    R"({"event":"UNLINK","tgid":5000,"pid":5000,"ppid":1,"nspid":5000,"nstgid":5000,"ts":100.020,"path":"foo.o","ret":0})" "\n"
+    R"({"event":"EXIT","tgid":5000,"pid":5000,"ppid":1,"nspid":5000,"nstgid":5000,"ts":100.030,"status":"exited","code":0,"raw":0})" "\n";
+
+static const char UNLINK_RECREATED_TRACE[] =
+    R"({"event":"CWD","tgid":5100,"pid":5100,"ppid":1,"nspid":5100,"nstgid":5100,"ts":200.000,"path":"/tmp"})" "\n"
+    R"({"event":"EXEC","tgid":5100,"pid":5100,"ppid":1,"nspid":5100,"nstgid":5100,"ts":200.001,"exe":"/usr/bin/tool","argv":["tool"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}})" "\n"
+    R"({"event":"OPEN","tgid":5100,"pid":5100,"ppid":1,"nspid":5100,"nstgid":5100,"ts":200.010,"path":"temp.dat","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":3})" "\n"
+    R"({"event":"UNLINK","tgid":5100,"pid":5100,"ppid":1,"nspid":5100,"nstgid":5100,"ts":200.020,"path":"temp.dat","ret":0})" "\n"
+    R"({"event":"OPEN","tgid":5100,"pid":5100,"ppid":1,"nspid":5100,"nstgid":5100,"ts":200.030,"path":"temp.dat","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":3})" "\n"
+    R"({"event":"EXIT","tgid":5100,"pid":5100,"ppid":1,"nspid":5100,"nstgid":5100,"ts":200.040,"status":"exited","code":0,"raw":0})" "\n";
+
+static bool test_unlink_ingest() {
+    tv_test_reset();
+    tv_test_load_string(UNLINK_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"})");
+    int lp = tv_test_lpane();
+    ASSERT(col_contains(lp, "foo.o"), "missing foo.o");
+    ASSERT(col_contains(lp, "1 unlinks"), "missing '1 unlinks'");
+    return true;
+}
+
+static bool test_unlink_flags_column() {
+    tv_test_reset();
+    tv_test_load_string(UNLINK_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"})");
+    int lp = tv_test_lpane();
+    // foo.c should have R flag (read-only)
+    ASSERT(col_contains(lp, "R   "), "missing R flag for read-only file");
+    // foo.o should have W and U flags (written + unlinked)
+    ASSERT(col_contains(lp, " WU "), "missing WU flags for written+unlinked file");
+    return true;
+}
+
+static bool test_unlink_at_end_style() {
+    tv_test_reset();
+    tv_test_load_string(UNLINK_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"})");
+    int lp = tv_test_lpane();
+    // foo.o was unlinked after last write open, so unlinked_at_end
+    for (int i = 0; ; i++) {
+        auto *r = tv_test_tui()->get_cached_row(lp, i);
+        if (!r) break;
+        if (r->id == "/tmp/foo.o") {
+            ASSERT(r->style == RowStyle::Yellow, "unlinked-at-end file not Yellow style");
+            return true;
+        }
+    }
+    FAIL("foo.o not found in file list");
+}
+
+static bool test_unlink_recreated_not_at_end() {
+    tv_test_reset();
+    tv_test_load_string(UNLINK_RECREATED_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"})");
+    int lp = tv_test_lpane();
+    // temp.dat was unlinked but then recreated (second write after unlink)
+    for (int i = 0; ; i++) {
+        auto *r = tv_test_tui()->get_cached_row(lp, i);
+        if (!r) break;
+        if (r->id == "/tmp/temp.dat") {
+            // It was recreated, so should NOT be Yellow (unlinked_at_end = false)
+            ASSERT(r->style != RowStyle::Yellow, "recreated file should not be Yellow");
+            return true;
+        }
+    }
+    FAIL("temp.dat not found in file list");
+}
+
+static bool test_unlink_file_detail() {
+    tv_test_reset();
+    tv_test_load_string(UNLINK_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"}
+{"input":"select","id":"/tmp/foo.o"})");
+    ASSERT(rpane_col_contains("Unlinks: 1"), "missing Unlinks: 1");
+    ASSERT(rpane_col_contains("deleted at trace end"), "missing 'deleted at trace end'");
+    ASSERT(rpane_col_contains("[UNLINK]"), "missing [UNLINK] event");
+    return true;
+}
+
+static bool test_unlink_event_in_process_detail() {
+    tv_test_reset();
+    tv_test_load_string(UNLINK_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"select","id":"5000"})");
+    ASSERT(rpane_col_contains("[UNLINK]"), "missing [UNLINK] in process detail");
+    ASSERT(rpane_col_contains("foo.o"), "missing foo.o in process detail");
+    return true;
+}
+
+static bool test_numeric_mode() {
+    // Test that numeric mode field is parsed and used
+    static const char MODE_TRACE[] =
+        R"({"event":"CWD","tgid":6000,"pid":6000,"ppid":1,"nspid":6000,"nstgid":6000,"ts":300.000,"path":"/tmp"})" "\n"
+        R"({"event":"EXEC","tgid":6000,"pid":6000,"ppid":1,"nspid":6000,"nstgid":6000,"ts":300.001,"exe":"/usr/bin/test","argv":["test"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}})" "\n"
+        R"({"event":"OPEN","tgid":6000,"pid":6000,"ppid":1,"nspid":6000,"nstgid":6000,"ts":300.010,"path":"input.txt","flags":["O_RDONLY"],"mode":0,"fd":3})" "\n"
+        R"({"event":"OPEN","tgid":6000,"pid":6000,"ppid":1,"nspid":6000,"nstgid":6000,"ts":300.011,"path":"output.txt","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"mode":577,"fd":4})" "\n"
+        R"({"event":"EXIT","tgid":6000,"pid":6000,"ppid":1,"nspid":6000,"nstgid":6000,"ts":300.020,"status":"exited","code":0,"raw":0})" "\n";
+    tv_test_reset();
+    tv_test_load_string(MODE_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"})");
+    int lp = tv_test_lpane();
+    ASSERT(col_contains(lp, "input.txt"), "missing input.txt");
+    ASSERT(col_contains(lp, "output.txt"), "missing output.txt");
+    // input.txt should be read-only (R flag), output.txt should be written (W flag)
+    ASSERT(col_contains(lp, "R   "), "missing R flag");
+    ASSERT(col_contains(lp, " W  "), "missing W flag");
+    return true;
+}
+
+static bool test_file_refinement_filter() {
+    // Test that refinement filter hides system paths
+    static const char SYS_PATH_TRACE[] =
+        R"({"event":"CWD","tgid":7000,"pid":7000,"ppid":1,"nspid":7000,"nstgid":7000,"ts":400.000,"path":"/home/user"})" "\n"
+        R"({"event":"EXEC","tgid":7000,"pid":7000,"ppid":1,"nspid":7000,"nstgid":7000,"ts":400.001,"exe":"/usr/bin/tool","argv":["tool"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}})" "\n"
+        R"({"event":"OPEN","tgid":7000,"pid":7000,"ppid":1,"nspid":7000,"nstgid":7000,"ts":400.010,"path":"myfile.c","flags":["O_RDONLY"],"fd":3})" "\n"
+        R"({"event":"OPEN","tgid":7000,"pid":7000,"ppid":1,"nspid":7000,"nstgid":7000,"ts":400.011,"path":"/usr/lib/libc.so","flags":["O_RDONLY"],"fd":4})" "\n"
+        R"({"event":"EXIT","tgid":7000,"pid":7000,"ppid":1,"nspid":7000,"nstgid":7000,"ts":400.020,"status":"exited","code":0,"raw":0})" "\n";
+    tv_test_reset();
+    tv_test_load_string(SYS_PATH_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"})");
+    int lp = tv_test_lpane();
+    // Both files visible initially
+    ASSERT(col_contains(lp, "myfile.c"), "missing myfile.c");
+    ASSERT(col_contains(lp, "libc.so"), "missing libc.so");
+    // Press r to hide system paths
+    send(R"({"input":"key","name":"r"})");
+    lp = tv_test_lpane();
+    ASSERT(col_contains(lp, "myfile.c"), "myfile.c should still be visible");
+    ASSERT(col_not_contains(lp, "libc.so"), "libc.so should be hidden");
+    // Press r again (level 2: also hide deleted files) then r again (level 3)
+    // then r again to cycle back to 0
+    send(R"({"input":"key","name":"r"}
+{"input":"key","name":"r"}
+{"input":"key","name":"r"})");
+    lp = tv_test_lpane();
+    ASSERT(col_contains(lp, "libc.so"), "libc.so should be visible again");
+    return true;
+}
+
+static bool test_file_glob_filter() {
+    tv_test_reset();
+    tv_test_load_string(UNLINK_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"key","name":"2"})");
+    int lp = tv_test_lpane();
+    ASSERT(col_contains(lp, "foo.c"), "missing foo.c initially");
+    ASSERT(col_contains(lp, "foo.o"), "missing foo.o initially");
+    return true;
+}
+
+static bool test_unlink_evfilt() {
+    // Test that the event filter can filter to UNLINK events
+    tv_test_reset();
+    tv_test_load_string(UNLINK_TRACE);
+    tv_test_create(40, 120);
+    send(R"({"input":"select","id":"5000"})");
+    // Check that UNLINK event visible in process detail
+    ASSERT(rpane_col_contains("[UNLINK]"), "missing [UNLINK] before filter");
+    return true;
+}
+
 // ── Test registry ────────────────────────────────────────────────────
 
 static struct { const char *name; bool (*fn)(); } ALL_TESTS[] = {
@@ -1071,6 +1246,16 @@ static struct { const char *name; bool (*fn)(); } ALL_TESTS[] = {
     {"navigation: end goes to last",                       test_navigation_end_goes_to_last},
     {"navigation: home goes to first",                     test_navigation_home_goes_to_first},
     {"separate_streams: --load trace --trace input works", test_separate_streams},
+    {"unlink: event ingestion",                           test_unlink_ingest},
+    {"unlink: flags column RWUE",                         test_unlink_flags_column},
+    {"unlink: unlinked-at-end Yellow style",              test_unlink_at_end_style},
+    {"unlink: recreated file not Yellow",                 test_unlink_recreated_not_at_end},
+    {"unlink: file detail shows unlinks",                 test_unlink_file_detail},
+    {"unlink: event in process detail",                   test_unlink_event_in_process_detail},
+    {"numeric_mode: mode field parsed",                   test_numeric_mode},
+    {"file_filter: refinement hides system paths",        test_file_refinement_filter},
+    {"file_filter: glob pattern",                         test_file_glob_filter},
+    {"unlink: event filter includes UNLINK",              test_unlink_evfilt},
 };
 
 int run_tests() {

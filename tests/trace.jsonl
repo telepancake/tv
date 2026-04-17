@@ -29,6 +29,8 @@
 {"event":"OPEN","tgid":1005,"pid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"ts":1000000.910,"path":"foo.o","flags":["O_RDONLY"],"fd":3}
 {"event":"OPEN","tgid":1005,"pid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"ts":1000000.920,"path":"bar.o","flags":["O_RDONLY"],"fd":4}
 {"event":"OPEN","tgid":1005,"pid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"ts":1000000.930,"path":"app","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":5}
+{"event":"UNLINK","tgid":1005,"pid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"ts":1000000.940,"path":"foo.o","ret":0}
+{"event":"UNLINK","tgid":1005,"pid":1005,"ppid":1000,"nspid":1005,"nstgid":1005,"ts":1000000.941,"path":"bar.o","ret":0}
 {"event":"CWD","tgid":1006,"pid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"ts":1000001.000,"path":"/home/user/project"}
 {"event":"EXEC","tgid":1006,"pid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"ts":1000001.001,"exe":"/usr/bin/cat","argv":["cat"],"env":{"HOME":"/home/user"},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}}
 {"event":"OPEN","tgid":1006,"pid":1006,"ppid":1000,"nspid":1006,"nstgid":1006,"ts":1000001.010,"path":"pipe:[12345]","flags":["O_RDONLY"],"fd":0}
