@@ -574,7 +574,7 @@ run_test "basic: shebang script keeps interpreter argv aligned" \
     'printf "%s\n" "$OUT" | grep -F -q -- "argv0:$TMPDIR/shebang_args.sh"' \
     'printf "%s\n" "$OUT" | grep -F -q -- "arg1:v045"' \
     'grep -q "\"event\":\"EXEC\"" "$TMPDIR/shebang_args.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/shebang_args.jsonl"' \
+    'grep -q "\"exit_code\":0" "$TMPDIR/shebang_args.jsonl"' \
     '! grep -q "\"signal\"" "$TMPDIR/shebang_args.jsonl"'
 
 # ── Test: multithreaded tracing ────────────────────────────────────────

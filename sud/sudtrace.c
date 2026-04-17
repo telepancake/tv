@@ -290,9 +290,9 @@ static char **build_wrapper_argv(int cmd_argc, char **cmd_argv,
         if (shebang_arg[0])
             extra_before[extra_count++] = shebang_arg;
         extra_before[extra_count++] = resolved;
-        /* Hide the prepended interpreter (and optional arg) from visible argv,
-         * but keep the script path visible — it is the process's argv[0]. */
-        drop_count = extra_count - 1;
+        /* Preserve the interpreter argv layout so the script executes with the
+         * same argv the kernel would synthesize for a shebang launch. */
+        drop_count = 0;
     } else {
         /* ELF binary — check if dynamic */
         int elf_class = 0;
