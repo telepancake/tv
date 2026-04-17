@@ -269,12 +269,17 @@ int main(int argc, char **argv)
             _exit(1);
         }
         new_run_argv[0] = strdup(elf_interp_buf);
+        if (!new_run_argv[0]) {
+            const char msg[] = "sud: out of memory for interp path\n";
+            raw_write(2, msg, sizeof(msg) - 1);
+            _exit(1);
+        }
         for (int i = 0; i < run_argc; i++)
             new_run_argv[i + 1] = run_argv[i];
         new_run_argv[new_run_argc] = NULL;
 
-        /* The old run_argv entries were moved into new_run_argv,
-         * so just free the old array shell. */
+        /* The old run_argv string pointers are reused in new_run_argv,
+         * so just free the old array shell (not the strings). */
         free(run_argv);
         run_argv = new_run_argv;
         run_argc = new_run_argc;
