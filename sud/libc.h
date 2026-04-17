@@ -277,6 +277,9 @@ typedef struct ucontext_t {
 #define ENAMETOOLONG   36
 #define ENOSYS         38
 
+extern int g_errno_value;
+#define errno g_errno_value
+
 /* ================================================================
  * Open/fcntl constants
  * ================================================================ */
@@ -300,6 +303,7 @@ typedef struct ucontext_t {
 /* ================================================================
  * Memory mapping
  * ================================================================ */
+#define PROT_NONE       0x0
 #define PROT_READ       0x1
 #define PROT_WRITE      0x2
 #define PROT_EXEC       0x4
