@@ -41,7 +41,8 @@ static uint64_t fnv1a(const void *data, size_t len) {
    Larger blobs are ZSTD-compressed to save memory. */
 static constexpr size_t COMPRESS_THRESHOLD = 128;
 
-/* Fast compression — minimize CPU overhead during live ingestion. */
+/* Fast compression — level 1 prioritizes speed over ratio, which
+   matters during live ingestion where latency must stay low. */
 static constexpr int    ZSTD_LEVEL         = 1;
 
 /* ── Entry descriptor ─────────────────────────────────────────────── */

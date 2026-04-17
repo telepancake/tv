@@ -226,6 +226,7 @@ static std::string sfmt(const char *f, ...) {
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
+/* 7 event kinds — fits in uint8_t (max 255). */
 enum event_kind_t : uint8_t {
     EV_CWD,
     EV_EXEC,
