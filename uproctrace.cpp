@@ -807,9 +807,9 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
     char line[PATH_MAX * 2 + 512];
     int pos = json_header(line, sizeof(line), "OPEN", pid, tgid, ppid, ts);
     pos += snprintf(line + pos, sizeof(line) - pos,
-        ",\"path\":%s,\"flags\":%s,\"fd\":%d,\"ino\":%lu,\"dev\":\"%u:%u\","
+        ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%d,\"ino\":%lu,\"dev\":\"%u:%u\","
         "\"inherited\":true}\n",
-        path_esc, flags_j, fd_num,
+        path_esc, flags_j, flags, fd_num,
         (unsigned long)st.st_ino,
         major(st.st_dev), minor(st.st_dev));
     if (pos > 0) emit_line(line, pos);
@@ -870,13 +870,33 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
 
     if (fd_or_err >= 0)
         pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"path\":%s,\"flags\":%s,\"fd\":%ld,\"ino\":%lu,\"dev\":\"%u:%u\"}\n",
-            path ? path_esc : "null", flags_j,
+            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%ld,\"ino\":%lu,\"dev\":\"%u:%u\"}\n",
+            path ? path_esc : "null", flags_j, flags,
             fd_or_err, ino_nr, dev_major, dev_minor);
     else
         pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"path\":%s,\"flags\":%s,\"err\":%ld}\n",
-            path ? path_esc : "null", flags_j, fd_or_err);
+            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"err\":%ld}\n",
+            path ? path_esc : "null", flags_j, flags, fd_or_err);
+
+    if (pos > 0) emit_line(line, pos);
+}
+
+static void emit_unlink_event(pid_t pid, const char *path, long ret)
+{
+    pid_t tgid, ppid;
+    struct timespec ts;
+    get_cached_ids(pid, &tgid, &ppid);
+    get_timestamp(&ts);
+
+    char path_esc[PATH_MAX * 2];
+    if (path)
+        json_escape(path_esc, sizeof(path_esc), path, static_cast<int>(std::strlen(path)));
+
+    char line[PATH_MAX * 2 + 256];
+    int pos = json_header(line, sizeof(line), "UNLINK", pid, tgid, ppid, &ts);
+    pos += snprintf(line + pos, sizeof(line) - pos,
+        ",\"path\":%s,\"ret\":%ld}\n",
+        path ? path_esc : "null", ret);
 
     if (pos > 0) emit_line(line, pos);
 }
@@ -1543,6 +1563,24 @@ static int handle_syscall_exit(pid_t pid, proc_state *ps)
             emit_cwd_event(pid);
         return 0;
     }
+
+    /* ---- unlinkat / unlink ---- */
+#ifdef SYS_unlinkat
+    if (syscall_nr == SYS_unlinkat && ret_val == 0) {
+        /* a0 = dirfd, a1 = pathname, a2 = flags */
+        auto path = read_tracee_string(pid, ps->arg1, PATH_MAX);
+        emit_unlink_event(pid, path ? path->c_str() : nullptr, ret_val);
+        return 0;
+    }
+#endif
+#ifdef SYS_unlink
+    if (syscall_nr == SYS_unlink && ret_val == 0) {
+        /* a0 = pathname */
+        auto path = read_tracee_string(pid, ps->arg0, PATH_MAX);
+        emit_unlink_event(pid, path ? path->c_str() : nullptr, ret_val);
+        return 0;
+    }
+#endif
 
     /* ---- write ---- */
     if (syscall_nr == SYS_write) {

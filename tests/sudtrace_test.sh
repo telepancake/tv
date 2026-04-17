@@ -744,6 +744,28 @@ run_test "identity: /proc/self/comm doesn't leak sudtrace" \
     'grep -q "\"status\":\"exited\"" "$TMPDIR/comm.jsonl"'
 fi
 
+# ── UNLINK event test ──────────────────────────────────────────────────
+
+cat > "$TMPDIR/unlink_test.c" << 'EOF'
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+int main(void) {
+    int fd = open("/tmp/sudtrace_unlink_test_$$", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd >= 0) {
+        write(fd, "hello", 5);
+        close(fd);
+        unlink("/tmp/sudtrace_unlink_test_$$");
+    }
+    return 0;
+}
+EOF
+if cc -static -o "$TMPDIR/unlink_test" "$TMPDIR/unlink_test.c" 2>/dev/null; then
+    OUT=$($SUDTRACE -o "$TMPDIR/unlink.jsonl" -- "$TMPDIR/unlink_test" 2>&1 || true)
+    run_test "unlink: UNLINK event emitted" \
+        'grep -q "\"event\":\"UNLINK\"" "$TMPDIR/unlink.jsonl"'
+fi
+
 else
     echo "  SKIP  sudtrace not built (run 'make sudtrace' first)"
 fi

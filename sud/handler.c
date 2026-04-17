@@ -602,6 +602,19 @@ void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     }
 #endif
 
+#ifdef SYS_unlinkat
+    if (nr == SYS_unlinkat && ret == 0) {
+        const char *path = (const char *)a1;
+        emit_unlink_event(tid, path, ret);
+    }
+#endif
+#ifdef SYS_unlink
+    if (nr == SYS_unlink && ret == 0) {
+        const char *path = (const char *)a0;
+        emit_unlink_event(tid, path, ret);
+    }
+#endif
+
 #ifdef SYS_chdir
     if (nr == SYS_chdir) {
         if (ret == 0)
