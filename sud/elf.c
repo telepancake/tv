@@ -161,7 +161,7 @@ int resolve_path(const char *cmd, char *out, int out_sz)
         return (raw_access(out, X_OK) == 0);
     }
 
-    const char *path_env = g_path_env[0] ? g_path_env : "/usr/bin:/bin";
+    const char *path_env = (g_path_env && g_path_env[0]) ? g_path_env : "/usr/bin:/bin";
 
     const char *p = path_env;
     while (*p) {
