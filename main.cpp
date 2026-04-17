@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <csignal>
 #include <ctime>
+#include <cmath>
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -22,12 +23,207 @@
 #include <unordered_map>
 #include <algorithm>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 
 #include <zstd.h>
 
 #include "engine.h"
 #include "sorted_vec_set.h"
 #include "json.h"
+
+/* ── String interning pool ─────────────────────────────────────────── */
+/* All strings go through this pool; duplicates share storage.
+   ID 0 is reserved for "empty string".  Thread-safe. */
+
+class StringPool {
+    std::vector<char> data_;
+    std::vector<uint32_t> offsets_;      /* offset[id] → start in data_ */
+    std::vector<uint32_t> lengths_;      /* length[id] */
+    struct Hasher {
+        const StringPool *pool;
+        size_t operator()(uint32_t id) const {
+            auto sv = pool->get(id);
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+    struct Equal {
+        const StringPool *pool;
+        bool operator()(uint32_t a, uint32_t b) const {
+            return pool->get(a) == pool->get(b);
+        }
+    };
+    std::unordered_set<uint32_t, Hasher, Equal> index_;
+    std::mutex mu_;
+public:
+    StringPool() : index_(16, Hasher{this}, Equal{this}) {
+        /* ID 0 = empty string */
+        offsets_.push_back(0);
+        lengths_.push_back(0);
+    }
+
+    uint32_t intern(std::string_view s) {
+        if (s.empty()) return 0;
+        std::lock_guard<std::mutex> lk(mu_);
+        /* Probe using a temporary entry */
+        uint32_t tmp_id = static_cast<uint32_t>(offsets_.size());
+        uint32_t off = static_cast<uint32_t>(data_.size());
+        data_.insert(data_.end(), s.begin(), s.end());
+        offsets_.push_back(off);
+        lengths_.push_back(static_cast<uint32_t>(s.size()));
+        auto [it, inserted] = index_.insert(tmp_id);
+        if (!inserted) {
+            /* Already exists — roll back */
+            data_.resize(off);
+            offsets_.pop_back();
+            lengths_.pop_back();
+            return *it;
+        }
+        return tmp_id;
+    }
+
+    std::string_view get(uint32_t id) const {
+        if (id == 0 || id >= offsets_.size()) return {};
+        return {data_.data() + offsets_[id], lengths_[id]};
+    }
+
+    std::string get_str(uint32_t id) const {
+        auto sv = get(id);
+        return std::string(sv);
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        data_.clear();
+        offsets_.clear();
+        lengths_.clear();
+        index_.clear();
+        offsets_.push_back(0);
+        lengths_.push_back(0);
+    }
+};
+
+static StringPool g_strings;
+
+/* ── Compressed blob pool (ZSTD dictionary mode) ───────────────────── */
+/* For large data: argv arrays, stdout/stderr content.
+   Each blob is individually ZSTD-compressed. ID 0 = empty. */
+
+class BlobPool {
+    /* Flat storage: each blob is [uint32_t orig_size][compressed data...] */
+    std::vector<char> data_;
+    std::vector<uint32_t> offsets_;   /* offset[id] → start in data_ */
+    std::vector<uint32_t> csizes_;    /* compressed size (including 4-byte header) */
+    ZSTD_CCtx *cctx_ = nullptr;
+    ZSTD_DCtx *dctx_ = nullptr;
+    std::mutex mu_;
+public:
+    BlobPool() {
+        offsets_.push_back(0);
+        csizes_.push_back(0);
+        cctx_ = ZSTD_createCCtx();
+        dctx_ = ZSTD_createDCtx();
+        /* Use fast compression for low latency during live trace */
+        ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, 1);
+    }
+    ~BlobPool() {
+        if (cctx_) ZSTD_freeCCtx(cctx_);
+        if (dctx_) ZSTD_freeDCtx(dctx_);
+    }
+
+    uint32_t store(std::string_view raw) {
+        if (raw.empty()) return 0;
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t bound = ZSTD_compressBound(raw.size());
+        size_t off = data_.size();
+        data_.resize(off + 4 + bound);
+        /* Store original size in first 4 bytes */
+        uint32_t orig = static_cast<uint32_t>(raw.size());
+        std::memcpy(data_.data() + off, &orig, 4);
+        size_t csz = ZSTD_compressCCtx(cctx_,
+            data_.data() + off + 4, bound,
+            raw.data(), raw.size(), 1);
+        if (ZSTD_isError(csz)) {
+            /* Fallback: store uncompressed */
+            data_.resize(off + 4 + raw.size());
+            std::memcpy(data_.data() + off + 4, raw.data(), raw.size());
+            csz = raw.size();
+        }
+        uint32_t total = static_cast<uint32_t>(4 + csz);
+        data_.resize(off + total);
+        uint32_t id = static_cast<uint32_t>(offsets_.size());
+        offsets_.push_back(static_cast<uint32_t>(off));
+        csizes_.push_back(total);
+        return id;
+    }
+
+    std::string decompress(uint32_t id) const {
+        if (id == 0 || id >= offsets_.size()) return {};
+        uint32_t off = offsets_[id];
+        uint32_t total = csizes_[id];
+        if (total < 4) return {};
+        uint32_t orig;
+        std::memcpy(&orig, data_.data() + off, 4);
+        const char *cdata = data_.data() + off + 4;
+        size_t csize = total - 4;
+        std::string out(orig, '\0');
+        size_t dsz = ZSTD_decompressDCtx(dctx_, out.data(), orig, cdata, csize);
+        if (ZSTD_isError(dsz)) {
+            /* Maybe it was stored uncompressed */
+            if (csize == orig) {
+                std::memcpy(out.data(), cdata, orig);
+                return out;
+            }
+            return {};
+        }
+        out.resize(dsz);
+        return out;
+    }
+
+    /* Store an argv-style vector as null-separated flat string, compressed. */
+    uint32_t store_argv(const std::vector<std::string> &argv) {
+        if (argv.empty()) return 0;
+        std::string flat;
+        for (size_t i = 0; i < argv.size(); i++) {
+            if (i) flat += '\0';
+            flat += argv[i];
+        }
+        return store(flat);
+    }
+
+    /* Decompress back to argv vector. */
+    std::vector<std::string> decompress_argv(uint32_t id) const {
+        std::vector<std::string> out;
+        if (id == 0) return out;
+        std::string flat = decompress(id);
+        if (flat.empty()) return out;
+        size_t pos = 0;
+        while (pos <= flat.size()) {
+            size_t next = flat.find('\0', pos);
+            if (next == std::string::npos) {
+                out.push_back(flat.substr(pos));
+                break;
+            }
+            out.push_back(flat.substr(pos, next - pos));
+            pos = next + 1;
+        }
+        return out;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        data_.clear();
+        offsets_.clear();
+        csizes_.clear();
+        offsets_.push_back(0);
+        csizes_.push_back(0);
+    }
+};
+
+static BlobPool g_blobs;
 
 /* ── Item — abstract base for hierarchical items ───────────────────── */
 
@@ -226,7 +422,7 @@ static std::string sfmt(const char *f, ...) {
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
-enum event_kind_t {
+enum event_kind_t : uint8_t {
     EV_CWD,
     EV_EXEC,
     EV_OPEN,
@@ -236,27 +432,50 @@ enum event_kind_t {
     EV_STDERR
 };
 
+/* Compact trace event — no std::string members.
+   All strings go through g_strings (interned) or g_blobs (compressed).
+   Paths use PathItem* from the interned file tree. */
 struct trace_event_t {
     int id = 0;
     event_kind_t kind = EV_CWD;
+    uint8_t inherited = 0;
+    uint8_t core_dumped = 0;
+    uint8_t _pad = 0;
     double ts = 0;
     int pid = 0, tgid = 0, ppid = 0, nspid = 0, nstgid = 0;
-    std::string path;
-    std::string resolved_path;
-    std::string exe;
-    std::vector<std::string> argv;
-    std::string flags_text;
-    int mode = 0;           /* raw open flags integer (O_RDONLY|O_WRONLY|...) */
+
+    /* Path: PathItem* for resolved absolute path (CWD/OPEN/UNLINK). */
+    PathItem *path_item = nullptr;
+
+    /* EXEC fields */
+    uint32_t exe_id = 0;          /* g_strings index */
+    uint32_t argv_blob = 0;       /* g_blobs index (compressed null-separated) */
+
+    /* OPEN fields */
+    uint32_t flags_id = 0;        /* g_strings index (e.g. "O_RDONLY|O_CREAT") */
+    int mode = 0;                 /* raw open flags integer */
     int fd = -1;
     int err = 0;
-    int inherited = 0;
-    std::string data;
+
+    /* STDOUT/STDERR */
+    uint32_t data_blob = 0;       /* g_blobs index (compressed output data) */
     int len = 0;
-    std::string status;
+
+    /* EXIT */
+    uint32_t status_id = 0;       /* g_strings index */
     int code = 0;
     int signal = 0;
-    int core_dumped = 0;
     int raw = 0;
+
+    /* Accessor helpers — decode from compact representation on demand */
+    std::string get_path() const { return path_item ? path_item->fullPath() : std::string(); }
+    std::string get_exe() const { return g_strings.get_str(exe_id); }
+    std::vector<std::string> get_argv() const { return g_blobs.decompress_argv(argv_blob); }
+    std::string get_flags_text() const { return g_strings.get_str(flags_id); }
+    std::string get_data() const { return g_blobs.decompress(data_blob); }
+    std::string get_status() const { return g_strings.get_str(status_id); }
+    std::string_view get_status_sv() const { return g_strings.get(status_id); }
+    std::string_view get_exe_sv() const { return g_strings.get(exe_id); }
 };
 
 struct process_t : Item {
@@ -264,10 +483,10 @@ struct process_t : Item {
     bool parent_set = false;
     double start_ts = 0, end_ts = 0;
     int has_start = 0, has_end = 0;
-    std::string exe;
-    std::vector<std::string> argv;
-    std::string cwd;
-    std::string exit_status;
+    uint32_t exe_id = 0;          /* g_strings index */
+    uint32_t argv_blob = 0;       /* g_blobs index */
+    PathItem *cwd_item = nullptr; /* interned path */
+    uint32_t exit_status_id = 0;  /* g_strings index */
     int exit_code = 0;
     int exit_signal = 0;
     int core_dumped = 0;
@@ -282,10 +501,19 @@ struct process_t : Item {
     std::string cached_display_name;    /* pre-computed basename */
     mutable std::string cached_key_;
 
+    std::string get_exe() const { return g_strings.get_str(exe_id); }
+    std::string_view get_exe_sv() const { return g_strings.get(exe_id); }
+    std::vector<std::string> get_argv() const { return g_blobs.decompress_argv(argv_blob); }
+    std::string get_cwd() const { return cwd_item ? cwd_item->fullPath() : std::string(); }
+    std::string_view get_exit_status_sv() const { return g_strings.get(exit_status_id); }
+    std::string get_exit_status() const { return g_strings.get_str(exit_status_id); }
+
     void update_display_name() {
-        std::string_view s;
-        if (!exe.empty()) s = exe;
-        else if (!argv.empty()) s = argv[0];
+        std::string_view s = get_exe_sv();
+        if (s.empty()) {
+            auto argv = get_argv();
+            if (!argv.empty()) s = argv[0];
+        }
         if (s.empty()) { cached_display_name.clear(); return; }
         auto pos = s.rfind('/');
         cached_display_name = std::string(pos != std::string_view::npos ? s.substr(pos + 1) : s);
@@ -338,7 +566,7 @@ enum {
 static std::vector<trace_event_t> g_events;
 static int g_next_event_id = 1;
 static std::unordered_map<int, std::unique_ptr<process_t>> g_proc_map;
-static FILE *g_save_fp = nullptr;       /* temp file for raw trace lines */
+/* Save-trace removed: users should run uproctrace/sudtrace directly. */
 static std::vector<std::string> g_input_lines;  /* buffered input commands (raw JSON) */
 static app_state_t g_state;
 static std::unique_ptr<Tui> g_tui;
@@ -368,7 +596,7 @@ static const char *HELP[] = {
     "  File filters (mode 2):  r  Cycle refinement (all→hide-sys→hide-deleted→hide-non-fail)",
     "    R  Toggle show Read files    D  Toggle show Write files",
     "    U  Toggle show Unlinked files    S/C  Set/Clear subtree root    p/P  Glob/Clear glob",
-    "  W  Save trace to file    x  SQL removed    q  Quit    ?  Help", "", "  Press any key.", nullptr
+    "  x  SQL removed    q  Quit    ?  Help", "", "  Press any key.", nullptr
 };
 
 /* ── Utility ───────────────────────────────────────────────────────── */
@@ -479,10 +707,7 @@ static process_t &get_process(int tgid) {
 
 /* ── Trace ingestion ───────────────────────────────────────────────── */
 
-static void append_raw_trace(const char *line) {
-    if (!g_save_fp) g_save_fp = std::tmpfile();
-    if (g_save_fp) { std::fputs(line, g_save_fp); std::fputc('\n', g_save_fp); }
-}
+/* append_raw_trace removed — save functionality removed */
 
 static trace_event_t &append_event() {
     auto &ev = g_events.emplace_back();
@@ -500,8 +725,9 @@ static bool is_write_open(const trace_event_t &ev) {
         return acc == O_WRONLY || acc == O_RDWR ||
                (ev.mode & O_CREAT) || (ev.mode & O_TRUNC);
     }
-    return has_flag(ev.flags_text, "O_WRONLY") || has_flag(ev.flags_text, "O_RDWR") ||
-         has_flag(ev.flags_text, "O_CREAT") || has_flag(ev.flags_text, "O_TRUNC");
+    std::string flags = ev.get_flags_text();
+    return has_flag(flags, "O_WRONLY") || has_flag(flags, "O_RDWR") ||
+         has_flag(flags, "O_CREAT") || has_flag(flags, "O_TRUNC");
 }
 
 static bool is_read_open(const trace_event_t &ev) {
@@ -510,7 +736,8 @@ static bool is_read_open(const trace_event_t &ev) {
         int acc = ev.mode & O_ACCMODE;
         return acc == O_RDONLY || acc == O_RDWR;
     }
-    return has_flag(ev.flags_text, "O_RDONLY") || has_flag(ev.flags_text, "O_RDWR");
+    std::string flags = ev.get_flags_text();
+    return has_flag(flags, "O_RDONLY") || has_flag(flags, "O_RDWR");
 }
 
 static std::string join_with_pipe(const std::vector<std::string> &arr) {
@@ -544,7 +771,6 @@ static void ingest_trace_line(const char *line) {
     if (!json_get(line, "event", sp)) return;
     std::string kind = json_decode_string(sp);
     if (kind.empty()) return;
-    append_raw_trace(line);
     auto &ev = g_events.emplace_back();
     if (kind == "CWD") ev.kind = EV_CWD;
     else if (kind == "EXEC") ev.kind = EV_EXEC;
@@ -584,71 +810,86 @@ static void ingest_trace_line(const char *line) {
     }
 
     switch (ev.kind) {
-    case EV_CWD:
-        if (json_get(line, "path", sp)) ev.path = json_decode_string(sp);
-        proc.cwd = ev.path;
+    case EV_CWD: {
+        std::string path;
+        if (json_get(line, "path", sp)) path = json_decode_string(sp);
+        if (!path.empty()) {
+            ev.path_item = intern_path_item(path);
+            proc.cwd_item = ev.path_item;
+        }
         break;
-    case EV_EXEC:
-        if (json_get(line, "exe", sp)) ev.exe = json_decode_string(sp);
-        if (json_get(line, "argv", sp)) ev.argv = json_array_of_strings(sp);
-        proc.exe = ev.exe;
-        proc.argv = ev.argv;
+    }
+    case EV_EXEC: {
+        if (json_get(line, "exe", sp)) {
+            std::string exe = json_decode_string(sp);
+            ev.exe_id = g_strings.intern(exe);
+        }
+        if (json_get(line, "argv", sp)) {
+            auto argv = json_array_of_strings(sp);
+            ev.argv_blob = g_blobs.store_argv(argv);
+        }
+        proc.exe_id = ev.exe_id;
+        proc.argv_blob = ev.argv_blob;
         proc.update_display_name();
         break;
+    }
     case EV_OPEN: {
+        std::string raw_path;
         if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
-            ev.path = json_decode_string(sp);
+            raw_path = json_decode_string(sp);
         std::vector<std::string> flags;
         if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
-        ev.flags_text = join_with_pipe(flags);
+        ev.flags_id = g_strings.intern(join_with_pipe(flags));
         if (json_get(line, "mode", sp)) ev.mode = span_to_int(sp, 0);
         if (json_get(line, "fd", sp)) ev.fd = span_to_int(sp, -1);
         if (json_get(line, "err", sp)) ev.err = span_to_int(sp, 0);
-        if (json_get(line, "inherited", sp)) ev.inherited = span_to_bool(sp, 0);
-        ev.resolved_path = resolve_path_dup(ev.path, proc.cwd);
+        if (json_get(line, "inherited", sp)) ev.inherited = static_cast<uint8_t>(span_to_bool(sp, 0));
+        std::string resolved = resolve_path_dup(raw_path, proc.get_cwd());
         if (is_write_open(ev)) proc.has_write_open = 1;
-        if (!ev.resolved_path.empty()) {
-            abs_path_t ap = get_abs_path(ev.resolved_path);
-            if (is_read_open(ev)) { proc.read_paths.insert(ap); ap.ptr->read_procs.insert(ev.tgid); }
-            if (is_write_open(ev)) { proc.write_paths.insert(ap); ap.ptr->write_procs.insert(ev.tgid); }
-            /* Incremental file stats stored in PathItem */
-            PathItem *fs = ap.ptr;
-            fs->opens++;
-            if (ev.err) fs->errs++;
-            fs->aggregated_mode |= ev.mode;
-            if (is_write_open(ev) && ev.ts > fs->last_open_write_ts)
-                fs->last_open_write_ts = ev.ts;
-            fs->proc_tgids.insert(ev.tgid);
-            fs->open_event_indices.push_back(event_idx);
-            fs->events.insert(event_idx);
+        if (!resolved.empty()) {
+            PathItem *pi = intern_path_item(resolved);
+            ev.path_item = pi;
+            abs_path_t ap(pi);
+            if (is_read_open(ev)) { proc.read_paths.insert(ap); pi->read_procs.insert(ev.tgid); }
+            if (is_write_open(ev)) { proc.write_paths.insert(ap); pi->write_procs.insert(ev.tgid); }
+            pi->opens++;
+            if (ev.err) pi->errs++;
+            pi->aggregated_mode |= ev.mode;
+            if (is_write_open(ev) && ev.ts > pi->last_open_write_ts)
+                pi->last_open_write_ts = ev.ts;
+            pi->proc_tgids.insert(ev.tgid);
+            pi->open_event_indices.push_back(event_idx);
+            pi->events.insert(event_idx);
         }
         break;
     }
     case EV_UNLINK: {
+        std::string raw_path;
         if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
-            ev.path = json_decode_string(sp);
-        ev.resolved_path = resolve_path_dup(ev.path, proc.cwd);
+            raw_path = json_decode_string(sp);
+        std::string resolved = resolve_path_dup(raw_path, proc.get_cwd());
         if (json_get(line, "ret", sp)) ev.fd = span_to_int(sp, 0);
-        if (!ev.resolved_path.empty()) {
-            abs_path_t ap = get_abs_path(ev.resolved_path);
-            PathItem *fs = ap.ptr;
-            fs->unlinks++;
-            if (ev.ts > fs->last_unlink_ts) fs->last_unlink_ts = ev.ts;
-            fs->unlink_procs.insert(ev.tgid);
-            fs->proc_tgids.insert(ev.tgid);
-            fs->unlink_event_indices.push_back(event_idx);
-            fs->events.insert(event_idx);
+        if (!resolved.empty()) {
+            PathItem *pi = intern_path_item(resolved);
+            ev.path_item = pi;
+            abs_path_t ap(pi);
+            pi->unlinks++;
+            if (ev.ts > pi->last_unlink_ts) pi->last_unlink_ts = ev.ts;
+            pi->unlink_procs.insert(ev.tgid);
+            pi->proc_tgids.insert(ev.tgid);
+            pi->unlink_event_indices.push_back(event_idx);
+            pi->events.insert(event_idx);
             proc.unlink_paths.insert(ap);
         }
         break;
     }
     case EV_EXIT:
-        if (json_get(line, "status", sp)) ev.status = json_decode_string(sp);
+        if (json_get(line, "status", sp)) ev.status_id = g_strings.intern(json_decode_string(sp));
         if (json_get(line, "code", sp)) ev.code = span_to_int(sp, 0);
         if (json_get(line, "signal", sp)) ev.signal = span_to_int(sp, 0);
-        if (json_get(line, "core_dumped", sp)) ev.core_dumped = span_to_bool(sp, 0);
+        if (json_get(line, "core_dumped", sp)) ev.core_dumped = static_cast<uint8_t>(span_to_bool(sp, 0));
         if (json_get(line, "raw", sp)) ev.raw = span_to_int(sp, 0);
-        proc.exit_status = ev.status;
+        proc.exit_status_id = ev.status_id;
         proc.exit_code = ev.code;
         proc.exit_signal = ev.signal;
         proc.core_dumped = ev.core_dumped;
@@ -658,7 +899,7 @@ static void ingest_trace_line(const char *line) {
         break;
     case EV_STDOUT:
     case EV_STDERR:
-        if (json_get(line, "data", sp)) ev.data = json_decode_string(sp);
+        if (json_get(line, "data", sp)) ev.data_blob = g_blobs.store(json_decode_string(sp));
         if (json_get(line, "len", sp)) ev.len = span_to_int(sp, 0);
         if (ev.kind == EV_STDOUT) proc.has_stdout = 1;
         else proc.has_stderr = 1;
@@ -759,28 +1000,33 @@ static bool cmp_proc_tgid(int a, int b) {
 static bool proc_matches_search(const process_t &p) {
     if (g_state.search.empty()) return false;
     if (std::to_string(p.tgid).find(g_state.search) != std::string::npos) return true;
-    if (!p.exe.empty() && p.exe.find(g_state.search) != std::string::npos) return true;
-    for (const auto &a : p.argv)
+    auto exe_sv = p.get_exe_sv();
+    if (!exe_sv.empty() && exe_sv.find(g_state.search) != std::string_view::npos) return true;
+    auto argv = p.get_argv();
+    for (const auto &a : argv)
         if (a.find(g_state.search) != std::string::npos) return true;
     for (int ei : p.event_indices) {
         auto &ev = g_events[ei];
-        if ((ev.kind == EV_STDOUT || ev.kind == EV_STDERR) &&
-            !ev.data.empty() && ev.data.find(g_state.search) != std::string::npos) return true;
+        if ((ev.kind == EV_STDOUT || ev.kind == EV_STDERR) && ev.data_blob != 0) {
+            std::string data = ev.get_data();
+            if (!data.empty() && data.find(g_state.search) != std::string::npos) return true;
+        }
     }
     return false;
 }
 
 static bool proc_is_interesting_failure(const process_t &p) {
-    if (p.exit_status.empty()) return false;
-    if (p.exit_status == "signaled") return true;
-    if (p.exit_status == "exited" && p.exit_code != 0)
+    auto status = p.get_exit_status_sv();
+    if (status.empty()) return false;
+    if (status == "signaled") return true;
+    if (status == "exited" && p.exit_code != 0)
         return p.has_write_open || !p.children.empty() || p.has_stdout;
     return false;
 }
 
 static bool proc_matches_filter(const process_t &p) {
     if (g_state.lp_filter == 1) return proc_is_interesting_failure(p);
-    if (g_state.lp_filter == 2) return p.exit_status.empty();
+    if (g_state.lp_filter == 2) return p.get_exit_status_sv().empty();
     return true;
 }
 
@@ -821,11 +1067,12 @@ RowData process_t::makeRow(int depth) const {
     bool has_kids = !children.empty();
     bool collapsed_flag = has_kids && collapsed;
     std::string marker;
-    if (exit_status == "exited")
+    auto status = get_exit_status_sv();
+    if (status == "exited")
         marker = exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-    else if (exit_status == "signaled")
+    else if (status == "signaled")
         marker = sfmt(" \xe2\x9a\xa1%d", exit_signal);
-    std::string dur = format_duration(start_ts, end_ts, exit_status.empty());
+    std::string dur = format_duration(start_ts, end_ts, status.empty());
     int nch = static_cast<int>(children.size());
     std::string prefix = sfmt("%*s%s", depth * 4, "",
         !has_kids ? "  " : (collapsed_flag ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "));
@@ -848,11 +1095,12 @@ RowData process_t::makeRow(int depth) const {
 static RowData make_proc_flat_row(process_t *p) {
     std::string id_str(p->getKey());
     std::string marker;
-    if (p->exit_status == "exited")
+    auto status = p->get_exit_status_sv();
+    if (status == "exited")
         marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-    else if (p->exit_status == "signaled")
+    else if (status == "signaled")
         marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
-    std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
+    std::string dur = format_duration(p->start_ts, p->end_ts, status.empty());
     std::string text = sfmt("[%d] %s%s%s%s", p->tgid, p->display_name().c_str(),
                             marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
     RowData d;
@@ -1099,10 +1347,11 @@ static void build_lpane_output(std::vector<RowData> &rows) {
             if (ev.kind != EV_STDOUT && ev.kind != EV_STDERR) continue;
             auto *p = find_process(ev.tgid);
             std::string id_str = std::to_string(ev.id);
+            std::string data = ev.get_data();
             std::string text = sfmt("[%s] PID %d %s: %s",
                 ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", ev.tgid,
                 p ? p->display_name().c_str() : "",
-                ev.data.c_str());
+                data.c_str());
             emit_row(rows, id_str, ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "", text, 2, id_str, false);
         }
     } else {
@@ -1115,7 +1364,8 @@ static void build_lpane_output(std::vector<RowData> &rows) {
                 for (int ei : og.event_indices) {
                     auto &ev = g_events[ei];
                     std::string id_str = std::to_string(ev.id);
-                    std::string row = sfmt("  [%s] %s", ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", ev.data.c_str());
+                    std::string data = ev.get_data();
+                    std::string row = sfmt("  [%s] %s", ev.kind == EV_STDOUT ? "STDOUT" : "STDERR", data.c_str());
                     emit_row(rows, id_str, ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, gid, row, 2, id_str, false);
                 }
             }
@@ -1201,11 +1451,12 @@ static void build_lpane_dep_cmds(std::vector<RowData> &rows, int reverse) {
         std::string id_str = std::to_string(pt);
         const auto &name = p->display_name();
         std::string marker;
-        if (p->exit_status == "exited")
+        auto pstatus = p->get_exit_status_sv();
+        if (pstatus == "exited")
             marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-        else if (p->exit_status == "signaled")
+        else if (pstatus == "signaled")
             marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
-        std::string dur = format_duration(p->start_ts, p->end_ts, p->exit_status.empty());
+        std::string dur = format_duration(p->start_ts, p->end_ts, pstatus.empty());
         std::string text = sfmt("[%d] %s%s%s%s", pt, name.c_str(), marker.c_str(),
                                 dur.empty() ? "" : "  ", dur.c_str());
         emit_row(rows, id_str, p->style(), "", text, 0, id_str, false);
@@ -1242,13 +1493,14 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
     emit_row(rows, "hdr", RowStyle::Heading, "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Process \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
     emit_row(rows, "tgid", RowStyle::Normal, "", sfmt("TGID:  %d", p->tgid), -1, "", false);
     emit_row(rows, "ppid", RowStyle::Normal, "", sfmt("PPID:  %d", p->ppid), -1, "", false);
-    emit_row(rows, "exe", RowStyle::Normal, "", sfmt("EXE:   %s", p->exe.c_str()), -1, "", false);
-    if (!p->exit_status.empty()) {
-        std::string text = p->exit_status == "signaled"
+    emit_row(rows, "exe", RowStyle::Normal, "", sfmt("EXE:   %s", p->get_exe().c_str()), -1, "", false);
+    auto exit_status = p->get_exit_status_sv();
+    if (!exit_status.empty()) {
+        std::string text = exit_status == "signaled"
             ? sfmt("Exit: signal %d%s", p->exit_signal, p->core_dumped ? " (core)" : "")
             : sfmt("Exit: exited code=%d", p->exit_code);
         emit_row(rows, "exit",
-                 (p->exit_status == "exited" && p->exit_code == 0) ? RowStyle::Green : RowStyle::Error,
+                 (exit_status == "exited" && p->exit_code == 0) ? RowStyle::Green : RowStyle::Error,
                  "", text, -1, "", false);
     }
     int nchildren = static_cast<int>(p->children.size());
@@ -1266,10 +1518,11 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
             emit_row(rows, cid, RowStyle::Normal, "", text, 0, std::to_string(ct), false);
         }
     }
-    if (!p->argv.empty()) {
+    auto argv = p->get_argv();
+    if (!argv.empty()) {
         emit_row(rows, "argv_hdr", RowStyle::Heading, "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Argv \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
-        for (int i = 0; i < static_cast<int>(p->argv.size()); i++)
-            emit_row(rows, sfmt("argv_%d", i), RowStyle::Normal, "", sfmt("[%d] %s", i, p->argv[i].c_str()), -1, "", false);
+        for (int i = 0; i < static_cast<int>(argv.size()); i++)
+            emit_row(rows, sfmt("argv_%d", i), RowStyle::Normal, "", sfmt("[%d] %s", i, argv[i].c_str()), -1, "", false);
     }
     emit_row(rows, "evt_hdr", RowStyle::Heading, "", "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80 Events \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", -1, "", false);
     double prev_ts = -1;
@@ -1281,24 +1534,24 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
         prev_ts = ev.ts;
         std::string text;
         switch (ev.kind) {
-        case EV_CWD: text = sfmt("%s [CWD] %s", tsbuf, ev.path.c_str()); break;
-        case EV_EXEC: text = sfmt("%s [EXEC] %s", tsbuf, ev.exe.c_str()); break;
+        case EV_CWD: text = sfmt("%s [CWD] %s", tsbuf, ev.get_path().c_str()); break;
+        case EV_EXEC: text = sfmt("%s [EXEC] %s", tsbuf, ev.get_exe().c_str()); break;
         case EV_OPEN: {
             std::string err_text = ev.err ? sfmt(" err=%d", ev.err) : std::string();
-            text = sfmt("%s [OPEN] %s [%s]%s", tsbuf, ev.resolved_path.c_str(),
-                        ev.flags_text.c_str(), err_text.c_str());
+            text = sfmt("%s [OPEN] %s [%s]%s", tsbuf, ev.get_path().c_str(),
+                        ev.get_flags_text().c_str(), err_text.c_str());
             break;
         }
         case EV_UNLINK:
-            text = sfmt("%s [UNLINK] %s", tsbuf, ev.resolved_path.c_str());
+            text = sfmt("%s [UNLINK] %s", tsbuf, ev.get_path().c_str());
             break;
         case EV_EXIT:
-            text = (ev.status == "signaled")
+            text = (ev.get_status_sv() == "signaled")
                 ? sfmt("%s [EXIT] signal %d%s", tsbuf, ev.signal, ev.core_dumped ? " (core)" : "")
                 : sfmt("%s [EXIT] exited code=%d", tsbuf, ev.code);
             break;
-        case EV_STDOUT: text = sfmt("%s [STDOUT] %s", tsbuf, ev.data.c_str()); break;
-        case EV_STDERR: text = sfmt("%s [STDERR] %s", tsbuf, ev.data.c_str()); break;
+        case EV_STDOUT: text = sfmt("%s [STDOUT] %s", tsbuf, ev.get_data().c_str()); break;
+        case EV_STDERR: text = sfmt("%s [STDERR] %s", tsbuf, ev.get_data().c_str()); break;
         }
         emit_row(rows, sfmt("ev_%d", ev.id), ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "", text, -1, "", false);
     }
@@ -1330,7 +1583,7 @@ static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) 
             std::string err_text = ev.err ? sfmt(" err=%d", ev.err) : std::string();
             std::string text = sfmt("PID %d %s [OPEN] [%s]%s", ev.tgid,
                 p ? p->display_name().c_str() : "",
-                ev.flags_text.c_str(), err_text.c_str());
+                ev.get_flags_text().c_str(), err_text.c_str());
             emit_row(rows, sfmt("open_%d", ev.id),
                      ev.err ? RowStyle::Error : (ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal),
                      "", text, 0, std::to_string(ev.tgid), false);
@@ -1360,7 +1613,7 @@ static void build_rpane_output(std::vector<RowData> &rows, const std::string &id
              sfmt("Proc: %s", p ? p->display_name().c_str() : ""),
              -1, "", false);
     emit_row(rows, "content_hdr", RowStyle::Heading, "", "─── Content ───", -1, "", false);
-    emit_row(rows, "content", ev->kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "", ev->data, -1, "", false);
+    emit_row(rows, "content", ev->kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "", ev->get_data(), -1, "", false);
 }
 
 static void build_rpane(std::vector<RowData> &rows) {
@@ -1813,22 +2066,7 @@ static int on_key_cb(Tui &tui, int key, int panel, int cursor, const char *row_i
     case 'P': if (g_state.mode == 1) { g_state.file_glob.clear(); reset_mode_selection(); } break;
     case TUI_K_LEFT: case 'h': collapse_or_back(); break;
     case TUI_K_RIGHT: case 'l': case TUI_K_ENTER: expand_or_detail(); break;
-    case 'W': {
-        char fname[256] = "trace.db";
-        if (tui.line_edit("Save to: ", fname, sizeof fname) && fname[0]) {
-            FILE *f = std::fopen(fname, "w");
-            if (f) {
-                if (g_save_fp) {
-                    std::rewind(g_save_fp);
-                    char cbuf[4096]; size_t nr;
-                    while ((nr = std::fread(cbuf, 1, sizeof cbuf, g_save_fp)) > 0)
-                        std::fwrite(cbuf, 1, nr, f);
-                }
-                std::fclose(f);
-            }
-        }
-        break;
-    }
+    case 'W': tui.set_status(" Save removed — use uproctrace/sudtrace to save traces"); break;
     case 'x': tui.set_status(" SQL prompt removed with SQLite"); break;
     default: return TUI_HANDLED;
     }
@@ -1873,16 +2111,7 @@ static void process_input_line(const char *line) {
     }
 }
 
-static void save_to_file(const char *path) {
-    if (!g_save_fp) return;
-    FILE *out = std::fopen(path, "w");
-    if (!out) { std::fprintf(stderr, "tv: cannot create %s\n", path); return; }
-    std::rewind(g_save_fp);
-    char buf[4096]; size_t nr;
-    while ((nr = std::fread(buf, 1, sizeof buf, g_save_fp)) > 0)
-        std::fwrite(buf, 1, nr, out);
-    std::fclose(out);
-}
+/* save_to_file removed — save functionality removed */
 
 /* ── Live trace ────────────────────────────────────────────────────── */
 
@@ -1939,9 +2168,10 @@ static void free_all() {
     g_proc_map.clear();
     free_path_tree(&g_path_root);
     free_nonabs_paths();
-    if (g_save_fp) { std::fclose(g_save_fp); g_save_fp = nullptr; }
     g_input_lines.clear();
     g_output_collapsed.clear();
+    g_strings.clear();
+    g_blobs.clear();
 }
 
 /* ── Test API (non-static, called from tests.cpp) ─────────────────── */
@@ -2016,14 +2246,13 @@ int main(int argc, char **argv) {
     int load_mode = 0;
     live_trace_backend live_backend = LIVE_TRACE_BACKEND_AUTO;
     int no_env = 0;
-    char load_file[256] = "", trace_file[256] = "", save_file[256] = "";
+    char load_file[256] = "", trace_file[256] = "";
     char **cmd = nullptr;
     if (argc >= 2 && std::strcmp(argv[1], "--uproctrace") == 0) return uproctrace_main(argc - 1, argv + 1);
     if (argc >= 2 && std::strcmp(argv[1], "--test") == 0) return run_tests();
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--load") == 0 && i + 1 < argc) { load_mode = 1; std::snprintf(load_file, sizeof load_file, "%s", argv[++i]); }
         else if (std::strcmp(argv[i], "--trace") == 0 && i + 1 < argc) std::snprintf(trace_file, sizeof trace_file, "%s", argv[++i]);
-        else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) std::snprintf(save_file, sizeof save_file, "%s", argv[++i]);
         else if (std::strcmp(argv[i], "--no-env") == 0) no_env = 1;
         else if (std::strcmp(argv[i], "--module") == 0) live_backend = LIVE_TRACE_BACKEND_MODULE;
         else if (std::strcmp(argv[i], "--sud") == 0) live_backend = LIVE_TRACE_BACKEND_SUD;
@@ -2034,7 +2263,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr,
             "Usage: tv [--module|--sud|--ptrace] -- <command> [args...]\n"
             "       tv --load <file.db>\n"
-            "       tv --trace <file.jsonl[.zst]> [--save <file.db>]\n"
+            "       tv --trace <file.jsonl[.zst]>\n"
             "       tv --load <file.db> --trace <input.jsonl[.zst]>\n"
             "       tv --uproctrace [-o FILE[.zst]] [--module|--sud|--ptrace] -- <command> [args...]\n");
         return 1;
@@ -2042,7 +2271,6 @@ int main(int argc, char **argv) {
 
     if (load_mode) ingest_file(load_file);
     if (trace_file[0]) ingest_file(trace_file);
-    if (save_file[0]) save_to_file(save_file);
 
     if (cmd) {
         int pipefd[2];
@@ -2075,8 +2303,7 @@ int main(int argc, char **argv) {
     }
 
     int headless_mode = (!g_input_lines.empty()) ||
-                        (trace_file[0] && !cmd && !isatty(STDIN_FILENO)) ||
-                        (save_file[0] && !cmd);
+                        (trace_file[0] && !cmd && !isatty(STDIN_FILENO));
 
     DataSource src{ds_row_begin, ds_row_has_more, ds_row_next};
 
@@ -2101,7 +2328,7 @@ int main(int argc, char **argv) {
     update_status();
 
     for (const auto &line : g_input_lines) process_input_line(line.c_str());
-    if (g_headless || (save_file[0] && !cmd)) {
+    if (g_headless) {
         g_tui.reset();
         free_all();
         return 0;
