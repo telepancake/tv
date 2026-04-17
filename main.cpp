@@ -959,6 +959,9 @@ static bool path_has_suffix(const char *path, const char *suffix) {
     return n >= m && std::strcmp(path + n - m, suffix) == 0;
 }
 
+static void parallel_ingest(std::vector<std::string> &lines);
+static void ingest_zstd_file(const char *path);
+
 static void ingest_zstd_file(const char *path) {
     FILE *f = std::fopen(path, "rb");
     if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
@@ -970,6 +973,9 @@ static void ingest_zstd_file(const char *path) {
     if (ZSTD_isError(ZSTD_initDStream(stream))) {
         std::fprintf(stderr, "tv: zstd init failed for %s\n", path); std::exit(1);
     }
+
+    /* Collect all decompressed lines, then parallel-ingest. */
+    std::vector<std::string> lines;
     for (;;) {
         size_t nread = std::fread(in_buf.data(), 1, in_cap, f);
         ZSTD_inBuffer input = { in_buf.data(), nread, 0 };
@@ -989,7 +995,7 @@ static void ingest_zstd_file(const char *path) {
                 pos += chunk;
                 if (nl) {
                     if (!line.empty() && line.back() == '\r') line.pop_back();
-                    ingest_line(line.c_str());
+                    if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
                     line.clear();
                     pos++;
                 }
@@ -999,24 +1005,77 @@ static void ingest_zstd_file(const char *path) {
     }
     if (!line.empty()) {
         if (line.back() == '\r') line.pop_back();
-        ingest_line(line.c_str());
+        if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
     }
     ZSTD_freeDStream(stream);
     std::fclose(f);
+    parallel_ingest(lines);
+}
+
+/* ── Parallel batch ingestion ──────────────────────────────────────── */
+/* Read all lines, pre-parse JSON in parallel threads (which also
+   interns strings and compresses blobs via thread-safe g_pool),
+   then apply events sequentially to global state. */
+
+#include <thread>
+
+static constexpr int BATCH_SIZE = 4096;
+
+static void parallel_ingest(std::vector<std::string> &lines) {
+    if (lines.empty()) return;
+    int nlines = static_cast<int>(lines.size());
+
+    /* Pre-parse all lines in parallel. */
+    std::vector<preparsed_event_t> parsed(nlines);
+    int nthreads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    if (nthreads > 8) nthreads = 8;
+    if (nlines < nthreads * 64) nthreads = 1;
+
+    auto worker = [&](int tid) {
+        int chunk = (nlines + nthreads - 1) / nthreads;
+        int lo = tid * chunk;
+        int hi = std::min(lo + chunk, nlines);
+        for (int i = lo; i < hi; i++)
+            parsed[i] = preparse_line(lines[i].c_str());
+    };
+
+    if (nthreads > 1) {
+        std::vector<std::thread> threads;
+        threads.reserve(nthreads);
+        for (int t = 0; t < nthreads; t++)
+            threads.emplace_back(worker, t);
+        for (auto &t : threads) t.join();
+    } else {
+        worker(0);
+    }
+
+    /* Free line storage as soon as possible. */
+    lines.clear();
+    lines.shrink_to_fit();
+
+    /* Apply sequentially — updates global state. */
+    g_events.reserve(g_events.size() + nlines);
+    for (int i = 0; i < nlines; i++) {
+        if (parsed[i].valid)
+            apply_preparsed(parsed[i]);
+    }
 }
 
 static void ingest_file(const char *path) {
     if (path_has_suffix(path, ".zst")) { ingest_zstd_file(path); return; }
     FILE *f = std::fopen(path, "r");
     if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
-    char line[MAX_JSON_LINE];
-    while (std::fgets(line, sizeof line, f)) {
-        char *nl = std::strchr(line, '\n');
+
+    std::vector<std::string> lines;
+    char buf[MAX_JSON_LINE];
+    while (std::fgets(buf, sizeof buf, f)) {
+        char *nl = std::strchr(buf, '\n');
         if (nl) *nl = 0;
-        if (nl && nl > line && nl[-1] == '\r') nl[-1] = 0;
-        ingest_line(line);
+        if (nl && nl > buf && nl[-1] == '\r') nl[-1] = 0;
+        if (buf[0] == '{') lines.emplace_back(buf);
     }
     std::fclose(f);
+    parallel_ingest(lines);
 }
 
 /* ── Process tree ──────────────────────────────────────────────────── */
