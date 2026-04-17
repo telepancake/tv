@@ -585,6 +585,8 @@ void emit_open_event(pid_t pid, const char *path, int flags,
     p = fmt_str(p, path ? path_esc : "null");
     p = fmt_str(p, ",\"flags\":");
     p = fmt_str(p, flags_j);
+    p = fmt_str(p, ",\"mode\":");
+    p = fmt_int(p, flags);
 
     if (fd_or_err >= 0) {
         p = fmt_str(p, ",\"fd\":");
@@ -601,6 +603,30 @@ void emit_open_event(pid_t pid, const char *path, int flags,
         p = fmt_long(p, fd_or_err);
         p = fmt_str(p, "}\n");
     }
+
+    emit_raw(line, (size_t)(p - line));
+}
+
+void emit_unlink_event(pid_t pid, const char *path, long ret)
+{
+    pid_t tgid = get_tgid(pid);
+    pid_t ppid = get_ppid(pid);
+    struct timespec ts;
+    get_timestamp_raw(&ts);
+
+    char path_esc[PATH_MAX * 2];
+    if (path)
+        json_escape(path_esc, sizeof(path_esc), path, strlen(path));
+
+    char line[PATH_MAX * 2 + 256];
+    int pos = json_header(line, sizeof(line), "UNLINK", pid, tgid, ppid, &ts);
+    char *p = line + pos;
+
+    p = fmt_str(p, ",\"path\":");
+    p = fmt_str(p, path ? path_esc : "null");
+    p = fmt_str(p, ",\"ret\":");
+    p = fmt_long(p, ret);
+    p = fmt_str(p, "}\n");
 
     emit_raw(line, (size_t)(p - line));
 }

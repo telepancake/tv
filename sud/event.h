@@ -69,6 +69,7 @@ void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
                                 struct timespec *ts, int fd_num);
 void emit_inherited_open_events(pid_t pid);
 void emit_open_event(pid_t pid, const char *path, int flags, long fd_or_err);
+void emit_unlink_event(pid_t pid, const char *path, long ret);
 void emit_write_event(pid_t pid, const char *stream,
                       const void *data_buf, size_t count);
 void emit_exit_event(pid_t pid, int status);

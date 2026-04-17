@@ -118,6 +118,9 @@ MODULE_DESCRIPTION("Log exec/exit/open/cwd/output for tagged process subtrees");
   #define OPEN_SYMBOL_FALLBACK  "do_sys_openat2"
 #endif
 
+#define UNLINK_SYMBOL_PRIMARY   "do_unlinkat"
+#define UNLINK_SYMBOL_FALLBACK  "vfs_unlink"
+
 /* ===============================================================
  * JSON string escaping (RFC 8259)
  * =============================================================== */
@@ -889,10 +892,11 @@ static void emit_inherited_open_for_fd(struct task_struct *task,
 
     pos = json_header(line, PATH_MAX*2+512, "OPEN", task, ts);
     pos += snprintf(line+pos, PATH_MAX*2+512-pos,
-        ",\"path\":%s,\"flags\":%s,\"fd\":%u,\"ino\":%lu,\"dev\":\"%u:%u\","
+        ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%u,\"ino\":%lu,\"dev\":\"%u:%u\","
         "\"inherited\":true}\n",
         (path && path_esc) ? path_esc : "null",
         flags_j ? flags_j : "[]",
+        file->f_flags,
         fd, ino_nr, MAJOR(dev), MINOR(dev));
 
     if (pos > 0) {
@@ -1114,13 +1118,13 @@ static int open_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     if(fd_or_err>=0)
         pos+=snprintf(line+pos,PATH_MAX*2+512-pos,
-            ",\"path\":%s,\"flags\":%s,\"fd\":%ld,\"ino\":%lu,\"dev\":\"%u:%u\"}\n",
+            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%ld,\"ino\":%lu,\"dev\":\"%u:%u\"}\n",
             path_esc?path_esc:"null", flags_j?flags_j:"[]",
-            fd_or_err, ino_nr, MAJOR(dev), MINOR(dev));
+            d->flags, fd_or_err, ino_nr, MAJOR(dev), MINOR(dev));
     else
         pos+=snprintf(line+pos,PATH_MAX*2+512-pos,
-            ",\"path\":%s,\"flags\":%s,\"err\":%ld}\n",
-            path_esc?path_esc:"null", flags_j?flags_j:"[]", fd_or_err);
+            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"err\":%ld}\n",
+            path_esc?path_esc:"null", flags_j?flags_j:"[]", d->flags, fd_or_err);
 
     if(pos>0){
         rcu_read_lock();
@@ -1156,6 +1160,68 @@ static int chdir_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static struct kretprobe chdir_kretprobe = {
     .handler=chdir_ret,.entry_handler=chdir_entry,.maxactive=32,
+};
+
+/* ---- 5b. Unlink ---- */
+
+struct unlink_probe_data { unsigned long filename_ptr; };
+
+static int unlink_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct unlink_probe_data *d=(void*)ri->data;
+    if(!tgid_in_any_session(current->tgid)){d->filename_ptr=0;return 1;}
+#if defined(CONFIG_X86_64)
+    d->filename_ptr=regs->si;  /* do_unlinkat(dfd, pathname) — pathname is arg1 */
+#elif defined(CONFIG_ARM64)
+    d->filename_ptr=regs->regs[1];
+#else
+    d->filename_ptr=0;
+#endif
+    return 0;
+}
+
+static int unlink_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct unlink_probe_data *d=(void*)ri->data;
+    struct trace_session *s;
+    struct task_struct *task=current;
+    pid_t tgid=task->tgid;
+    struct timespec64 ts;
+    long ret=(long)regs_return_value(regs);
+    char *upath=NULL,*path_esc=NULL,*line=NULL;
+    int pos; long n;
+
+    if(!d->filename_ptr||ret!=0||!tgid_in_any_session(tgid)) return 0;
+    ktime_get_real_ts64(&ts);
+
+    upath=kmalloc(PATH_MAX,GFP_ATOMIC); if(!upath) return 0;
+    n=strncpy_from_user(upath,(const char __user*)d->filename_ptr,PATH_MAX);
+    if(n<=0) goto out;
+
+    path_esc=kmalloc(PATH_MAX*2,GFP_ATOMIC);
+    if(path_esc) json_escape(path_esc,PATH_MAX*2,upath,n);
+
+    line=kmalloc(PATH_MAX*2+256,GFP_ATOMIC); if(!line) goto out;
+    pos=json_header(line,PATH_MAX*2+256,"UNLINK",task,&ts);
+    pos+=snprintf(line+pos,PATH_MAX*2+256-pos,
+        ",\"path\":%s,\"ret\":%ld}\n",
+        path_esc?path_esc:"null", ret);
+
+    if(pos>0){
+        rcu_read_lock();
+        list_for_each_entry_rcu(s,&sessions,list){
+            if(!s->dead&&session_is_tagged(s,tgid))
+                session_log_queue(s,line,(size_t)pos);
+        }
+        rcu_read_unlock();
+    }
+out: kfree(line);kfree(path_esc);kfree(upath);
+    return 0;
+}
+
+static struct kretprobe unlink_kretprobe = {
+    .handler=unlink_ret,.entry_handler=unlink_entry,
+    .data_size=sizeof(struct unlink_probe_data),.maxactive=64,
 };
 
 /* ---- 6a. ksys_write (fd-based) ---- */
@@ -1349,6 +1415,7 @@ static bool symbol_exists(const char *name)
 
 static const char *write_hook_name;
 static const char *chdir_sym;
+static const char *unlink_sym;
 
 static int __init proctrace_init(void)
 {
@@ -1384,6 +1451,11 @@ static int __init proctrace_init(void)
                 symbol_exists("sys_chdir")?"sys_chdir":NULL;
     if(chdir_sym) chdir_kretprobe.kp.symbol_name=chdir_sym;
 
+    /* unlink */
+    unlink_sym = symbol_exists(UNLINK_SYMBOL_PRIMARY)?UNLINK_SYMBOL_PRIMARY:
+                 symbol_exists(UNLINK_SYMBOL_FALLBACK)?UNLINK_SYMBOL_FALLBACK:NULL;
+    if(unlink_sym) unlink_kretprobe.kp.symbol_name=unlink_sym;
+
     have_ksys_write=false; write_hook_name=NULL;
     if(symbol_exists("ksys_write")){
         ksys_write_kretprobe.kp.symbol_name="ksys_write";
@@ -1404,14 +1476,17 @@ static int __init proctrace_init(void)
         if(ret){pr_warn("proctrace: open: %d\n",ret);open_sym=NULL;}}
     if(chdir_sym){ret=register_kretprobe(&chdir_kretprobe);
         if(ret){pr_warn("proctrace: chdir: %d\n",ret);chdir_sym=NULL;}}
+    if(unlink_sym){ret=register_kretprobe(&unlink_kretprobe);
+        if(ret){pr_warn("proctrace: unlink: %d\n",ret);unlink_sym=NULL;}}
     if(write_hook_name){
         ret=have_ksys_write?register_kretprobe(&ksys_write_kretprobe)
                            :register_kretprobe(&vfs_write_kretprobe);
         if(ret){pr_warn("proctrace: write: %d\n",ret);write_hook_name=NULL;have_ksys_write=false;}
     }
 
-    pr_info("proctrace: loaded (fork=%s exec=%s exit=do_exit open=%s chdir=%s write=%s ring=%zuKB)\n",
+    pr_info("proctrace: loaded (fork=%s exec=%s exit=do_exit open=%s chdir=%s unlink=%s write=%s ring=%zuKB)\n",
             fork_sym,exec_sym,open_sym?open_sym:"off",chdir_sym?chdir_sym:"off",
+            unlink_sym?unlink_sym:"off",
             write_hook_name?write_hook_name:"off", RING_BUF_SIZE/1024);
     return 0;
 
@@ -1429,6 +1504,7 @@ static void __exit proctrace_exit(void)
         if(have_ksys_write)unregister_kretprobe(&ksys_write_kretprobe);
         else unregister_kretprobe(&vfs_write_kretprobe);
     }
+    if(unlink_sym) unregister_kretprobe(&unlink_kretprobe);
     if(chdir_sym) unregister_kretprobe(&chdir_kretprobe);
     if(open_kretprobe.kp.symbol_name) unregister_kretprobe(&open_kretprobe);
     unregister_kprobe(&exit_kprobe);
