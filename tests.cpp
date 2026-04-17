@@ -942,6 +942,8 @@ static bool test_follow_link_file_to_process() {
 {"input":"key","name":"j"}
 {"input":"key","name":"j"}
 {"input":"key","name":"j"}
+{"input":"key","name":"j"}
+{"input":"key","name":"j"}
 {"input":"key","name":"enter"})");
     ASSERT(tv_test_mode() == 0, "mode not 0 after follow link");
     return true;

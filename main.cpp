@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 
+#include <fnmatch.h>
+
 #include <string>
 #include <string_view>
 #include <vector>
@@ -56,10 +58,21 @@ struct PathItem : Item {
     /* file stats, aggregated incrementally */
     int opens = 0;
     int errs  = 0;
+    int unlinks = 0;
+    int aggregated_mode = 0;        /* bitwise OR of all open mode values */
+    double last_open_write_ts = 0;  /* ts of last write-mode OPEN */
+    double last_unlink_ts = 0;      /* ts of last UNLINK */
     std::unordered_set<int> proc_tgids;
     std::vector<int> open_event_indices;    /* OPEN events into g_events */
+    std::vector<int> unlink_event_indices;  /* UNLINK events into g_events */
     sorted_vec_set<int> read_procs;         /* processes that read this path */
     sorted_vec_set<int> write_procs;        /* processes that wrote this path */
+    sorted_vec_set<int> unlink_procs;       /* processes that unlinked this path */
+
+    bool was_ever_read() const { return (aggregated_mode & O_ACCMODE) == O_RDONLY || (aggregated_mode & O_ACCMODE) == O_RDWR || !read_procs.empty(); }
+    bool was_ever_written() const { return !write_procs.empty(); }
+    bool was_ever_unlinked() const { return unlinks > 0; }
+    bool unlinked_at_end() const { return last_unlink_ts > 0 && last_unlink_ts > last_open_write_ts; }
 
     /* Build full path by traversing parent chain. */
     std::string fullPath() const {
@@ -161,8 +174,12 @@ static void free_path_tree(PathItem *node) {
     for (auto *c : node->children) free_path_tree(static_cast<PathItem*>(c));
     if (node != &g_path_root) delete node;
     else { node->children.clear(); node->collapsed = false; node->opens = 0; node->errs = 0;
+           node->unlinks = 0; node->aggregated_mode = 0;
+           node->last_open_write_ts = 0; node->last_unlink_ts = 0;
            node->proc_tgids.clear(); node->open_event_indices.clear();
-           node->read_procs.clear(); node->write_procs.clear(); node->events.clear();
+           node->unlink_event_indices.clear();
+           node->read_procs.clear(); node->write_procs.clear();
+           node->unlink_procs.clear(); node->events.clear();
            node->deps.clear(); node->rdeps.clear(); }
 }
 
@@ -213,6 +230,7 @@ enum event_kind_t {
     EV_CWD,
     EV_EXEC,
     EV_OPEN,
+    EV_UNLINK,
     EV_EXIT,
     EV_STDOUT,
     EV_STDERR
@@ -228,6 +246,7 @@ struct trace_event_t {
     std::string exe;
     std::vector<std::string> argv;
     std::string flags_text;
+    int mode = 0;           /* raw open flags integer (O_RDONLY|O_WRONLY|...) */
     int fd = -1;
     int err = 0;
     int inherited = 0;
@@ -258,6 +277,7 @@ struct process_t : Item {
     int has_stderr = 0;
     sorted_vec_set<abs_path_t> read_paths;
     sorted_vec_set<abs_path_t> write_paths;
+    sorted_vec_set<abs_path_t> unlink_paths;
     std::vector<int> event_indices;     /* indices into g_events */
     std::string cached_display_name;    /* pre-computed basename */
     mutable std::string cached_key_;
@@ -290,6 +310,10 @@ struct app_state_t {
     int sort_key = 0;
     int lp_filter = 0;
     int dep_filter = 0;
+    int file_refinement = 0;        /* 0=all, 1=hide sys, 2=+hide deleted, 3=+hide non-fail */
+    int file_mode_filter = 0x0F;    /* bit0=R, bit1=W, bit2=unlinked-ever, bit3=unlinked-at-end */
+    std::string subtree_root;       /* when non-empty, only show descendants of this path */
+    std::string file_glob;          /* glob pattern for file path filtering */
     std::string cursor_id;
     std::string dcursor_id;
     std::string search;
@@ -340,7 +364,10 @@ static const char *HELP[] = {
     "  1 Process  2 File  3 Output    G  Toggle tree/flat    s  Sort    t  Timestamps",
     "  4 Deps  5 Reverse-deps  6 Dep-cmds  7 Reverse-dep-cmds    d  Toggle dep filter",
     "  /  Search    n/N  Next/prev    f/F  Filter events/clear    e/E  Expand/collapse all",
-    "  v  Cycle proc filter (none→failed→running)    V  Clear proc filter",
+    "  v  Cycle proc filter (none→failed→running)    V  Clear proc filter", "",
+    "  File filters (mode 2):  r  Cycle refinement (all→hide-sys→hide-deleted→hide-non-fail)",
+    "    R  Toggle show Read files    D  Toggle show Write files",
+    "    U  Toggle show Unlinked files    S/C  Set/Clear subtree root    p/P  Glob/Clear glob",
     "  W  Save trace to file    x  SQL removed    q  Quit    ?  Help", "", "  Press any key.", nullptr
 };
 
@@ -467,14 +494,23 @@ static bool has_flag(const std::string &flags, const char *flag) {
 }
 
 static bool is_write_open(const trace_event_t &ev) {
-    return ev.kind == EV_OPEN &&
-        (has_flag(ev.flags_text, "O_WRONLY") || has_flag(ev.flags_text, "O_RDWR") ||
-         has_flag(ev.flags_text, "O_CREAT") || has_flag(ev.flags_text, "O_TRUNC"));
+    if (ev.kind != EV_OPEN) return false;
+    if (ev.mode != 0) {
+        int acc = ev.mode & O_ACCMODE;
+        return acc == O_WRONLY || acc == O_RDWR ||
+               (ev.mode & O_CREAT) || (ev.mode & O_TRUNC);
+    }
+    return has_flag(ev.flags_text, "O_WRONLY") || has_flag(ev.flags_text, "O_RDWR") ||
+         has_flag(ev.flags_text, "O_CREAT") || has_flag(ev.flags_text, "O_TRUNC");
 }
 
 static bool is_read_open(const trace_event_t &ev) {
-    return ev.kind == EV_OPEN &&
-        (has_flag(ev.flags_text, "O_RDONLY") || has_flag(ev.flags_text, "O_RDWR"));
+    if (ev.kind != EV_OPEN) return false;
+    if (ev.mode != 0) {
+        int acc = ev.mode & O_ACCMODE;
+        return acc == O_RDONLY || acc == O_RDWR;
+    }
+    return has_flag(ev.flags_text, "O_RDONLY") || has_flag(ev.flags_text, "O_RDWR");
 }
 
 static std::string join_with_pipe(const std::vector<std::string> &arr) {
@@ -513,6 +549,7 @@ static void ingest_trace_line(const char *line) {
     if (kind == "CWD") ev.kind = EV_CWD;
     else if (kind == "EXEC") ev.kind = EV_EXEC;
     else if (kind == "OPEN") ev.kind = EV_OPEN;
+    else if (kind == "UNLINK") ev.kind = EV_UNLINK;
     else if (kind == "EXIT") ev.kind = EV_EXIT;
     else if (kind == "STDOUT") ev.kind = EV_STDOUT;
     else if (kind == "STDERR") ev.kind = EV_STDERR;
@@ -564,6 +601,7 @@ static void ingest_trace_line(const char *line) {
         std::vector<std::string> flags;
         if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
         ev.flags_text = join_with_pipe(flags);
+        if (json_get(line, "mode", sp)) ev.mode = span_to_int(sp, 0);
         if (json_get(line, "fd", sp)) ev.fd = span_to_int(sp, -1);
         if (json_get(line, "err", sp)) ev.err = span_to_int(sp, 0);
         if (json_get(line, "inherited", sp)) ev.inherited = span_to_bool(sp, 0);
@@ -577,9 +615,30 @@ static void ingest_trace_line(const char *line) {
             PathItem *fs = ap.ptr;
             fs->opens++;
             if (ev.err) fs->errs++;
+            fs->aggregated_mode |= ev.mode;
+            if (is_write_open(ev) && ev.ts > fs->last_open_write_ts)
+                fs->last_open_write_ts = ev.ts;
             fs->proc_tgids.insert(ev.tgid);
             fs->open_event_indices.push_back(event_idx);
             fs->events.insert(event_idx);
+        }
+        break;
+    }
+    case EV_UNLINK: {
+        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
+            ev.path = json_decode_string(sp);
+        ev.resolved_path = resolve_path_dup(ev.path, proc.cwd);
+        if (json_get(line, "ret", sp)) ev.fd = span_to_int(sp, 0);
+        if (!ev.resolved_path.empty()) {
+            abs_path_t ap = get_abs_path(ev.resolved_path);
+            PathItem *fs = ap.ptr;
+            fs->unlinks++;
+            if (ev.ts > fs->last_unlink_ts) fs->last_unlink_ts = ev.ts;
+            fs->unlink_procs.insert(ev.tgid);
+            fs->proc_tgids.insert(ev.tgid);
+            fs->unlink_event_indices.push_back(event_idx);
+            fs->events.insert(event_idx);
+            proc.unlink_paths.insert(ap);
         }
         break;
     }
@@ -812,11 +871,88 @@ static bool file_matches_search(const std::string &path) {
     return !g_state.search.empty() && path.find(g_state.search) != std::string::npos;
 }
 
+/* Build fixed-width RWUE flags string for a PathItem. */
+static std::string path_flags_str(const PathItem *f) {
+    char buf[5];
+    buf[0] = !f->read_procs.empty() ? 'R' : ' ';
+    buf[1] = !f->write_procs.empty() ? 'W' : ' ';
+    buf[2] = f->unlinks > 0 ? 'U' : ' ';
+    buf[3] = f->errs > 0 ? 'E' : ' ';
+    buf[4] = '\0';
+    return std::string(buf, 4);
+}
+
+/* Check whether a path is a well-known system path. */
+static bool is_sys_path(const std::string &path) {
+    static const char *prefixes[] = {
+        "/lib", "/lib64", "/opt", "/usr", "/etc", "/proc", "/sys", "/dev",
+        "/run", "/snap", "/var/lib", nullptr
+    };
+    for (const char **p = prefixes; *p; p++)
+        if (path.compare(0, std::strlen(*p), *p) == 0 &&
+            (path.size() == std::strlen(*p) || path[std::strlen(*p)] == '/'))
+            return true;
+    return false;
+}
+
+/* Check whether a PathItem (leaf file) passes the current file filters. */
+static bool file_passes_filters(const PathItem *f, const std::string &fullpath) {
+    /* Subtree filter */
+    if (!g_state.subtree_root.empty()) {
+        if (fullpath.compare(0, g_state.subtree_root.size(), g_state.subtree_root) != 0)
+            return false;
+        if (fullpath.size() > g_state.subtree_root.size() &&
+            fullpath[g_state.subtree_root.size()] != '/')
+            return false;
+    }
+
+    /* Progressive refinement */
+    if (g_state.file_refinement >= 1 && is_sys_path(fullpath))
+        return false;
+    if (g_state.file_refinement >= 2 && f->unlinked_at_end())
+        return false;
+    if (g_state.file_refinement >= 3) {
+        /* Hide files from processes that did not fail interestingly */
+        bool any_interesting = false;
+        for (int tgid : f->proc_tgids) {
+            auto *p = find_process(tgid);
+            if (p && proc_is_interesting_failure(*p)) { any_interesting = true; break; }
+        }
+        if (!any_interesting) return false;
+    }
+
+    /* Mode toggles (bit0=R, bit1=W, bit2=unlinked-ever, bit3=unlinked-at-end) */
+    bool has_read = !f->read_procs.empty();
+    bool has_write = !f->write_procs.empty();
+    bool has_unlink = f->unlinks > 0;
+    bool is_unlinked_end = f->unlinked_at_end();
+    /* File must match at least one enabled access type */
+    bool any_mode_match = false;
+    if ((g_state.file_mode_filter & 0x01) && has_read) any_mode_match = true;
+    if ((g_state.file_mode_filter & 0x02) && has_write) any_mode_match = true;
+    if ((g_state.file_mode_filter & 0x04) && has_unlink) any_mode_match = true;
+    if ((g_state.file_mode_filter & 0x08) && is_unlinked_end) any_mode_match = true;
+    /* If file doesn't have unlink or write, it's read-only; show if R bit set */
+    if (!has_write && !has_unlink && !is_unlinked_end && (g_state.file_mode_filter & 0x01))
+        any_mode_match = true;
+    if (!any_mode_match) return false;
+
+    /* Glob filter */
+    if (!g_state.file_glob.empty()) {
+        if (fnmatch(g_state.file_glob.c_str(), fullpath.c_str(), FNM_PATHNAME) != 0)
+            return false;
+    }
+
+    return true;
+}
+
 /* ── PathItem virtual method implementations ────────────────────────── */
 
 RowStyle PathItem::style() const {
     if (file_matches_search(fullPath())) return RowStyle::Search;
     if (errs) return RowStyle::Error;
+    if (unlinked_at_end()) return RowStyle::Yellow;
+    if (!write_procs.empty()) return RowStyle::Bold;
     return RowStyle::Normal;
 }
 
@@ -828,15 +964,17 @@ RowData PathItem::makeRow(int depth) const {
     std::string fullp(getKey());
     int nprocs = static_cast<int>(proc_tgids.size());
     std::string errs_text = errs ? sfmt(", %d errs", errs) : std::string();
+    std::string unlinks_text = unlinks ? sfmt(", %d unlinks", unlinks) : std::string();
     bool has_kids = hasChildren();
+    std::string flags = path_flags_str(this);
     std::string text;
     if (has_kids) {
-        text = sfmt("%*s%s%s/  [%d opens, %d procs%s]", depth * 2, "",
+        text = sfmt("%s %*s%s%s/  [%d opens, %d procs%s%s]", flags.c_str(), depth * 2, "",
                     collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc ",
-                    name.c_str(), opens, nprocs, errs_text.c_str());
+                    name.c_str(), opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
     } else {
-        text = sfmt("%*s%s  [%d opens, %d procs%s]", depth * 2, "",
-                    name.c_str(), opens, nprocs, errs_text.c_str());
+        text = sfmt("%s %*s%s  [%d opens, %d procs%s%s]", flags.c_str(), depth * 2, "",
+                    name.c_str(), opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
     }
     RowData d;
     d.id = fullp;
@@ -855,7 +993,7 @@ static void add_file_tree_rec(std::vector<RowData> &rows, PathItem *node, int de
     std::vector<PathItem*> dirs, files;
     for (auto *c : node->children) {
         auto *pc = static_cast<PathItem*>(c);
-        if (pc->opens == 0 && pc->children.empty()) continue;
+        if (pc->opens == 0 && pc->unlinks == 0 && pc->children.empty()) continue;
         if (pc->is_dir || !pc->children.empty()) dirs.push_back(pc);
         else files.push_back(pc);
     }
@@ -863,18 +1001,26 @@ static void add_file_tree_rec(std::vector<RowData> &rows, PathItem *node, int de
     std::sort(files.begin(), files.end(), [](PathItem *a, PathItem *b) { return a->name < b->name; });
 
     for (auto *d : dirs) {
+        std::string dfp = d->fullPath();
+        if (!file_passes_filters(d, dfp)) {
+            /* Still recurse — child files may pass */
+            if (!d->collapsed) add_file_tree_rec(rows, d, depth);
+            continue;
+        }
         rows.push_back(d->makeRow(depth));
         if (!d->collapsed) add_file_tree_rec(rows, d, depth + 1);
     }
     for (auto *f : files) {
-        if (f->opens == 0) continue;
+        if (f->opens == 0 && f->unlinks == 0) continue;
+        std::string fp = f->fullPath();
+        if (!file_passes_filters(f, fp)) continue;
         rows.push_back(f->makeRow(depth));
     }
 }
 
-/* Collect all leaf PathItems (files with opens > 0) recursively. */
+/* Collect all leaf PathItems (files with opens > 0 or unlinks > 0) recursively. */
 static void collect_file_leaves(PathItem *node, std::vector<PathItem*> &out) {
-    if (node->opens > 0 && node->children.empty())
+    if ((node->opens > 0 || node->unlinks > 0) && node->children.empty())
         out.push_back(node);
     for (auto *c : node->children)
         collect_file_leaves(static_cast<PathItem*>(c), out);
@@ -886,18 +1032,20 @@ static void build_lpane_files(std::vector<RowData> &rows) {
         std::vector<PathItem*> leaves;
         collect_file_leaves(&g_path_root, leaves);
         for (auto *np : g_nonabs_paths)
-            if (np->opens > 0) leaves.push_back(np);
+            if (np->opens > 0 || np->unlinks > 0) leaves.push_back(np);
         std::sort(leaves.begin(), leaves.end(), [](PathItem *a, PathItem *b) {
             return a->fullPath() < b->fullPath();
         });
         for (auto *fp : leaves) {
             std::string path = fp->fullPath();
+            if (!file_passes_filters(fp, path)) continue;
             int nprocs = static_cast<int>(fp->proc_tgids.size());
             std::string errs_text = fp->errs ? sfmt(", %d errs", fp->errs) : std::string();
-            std::string text = sfmt("%s  [%d opens, %d procs%s]", path.c_str(),
-                                    fp->opens, nprocs, errs_text.c_str());
-            emit_row(rows, path,
-                     file_matches_search(path) ? RowStyle::Search : (fp->errs ? RowStyle::Error : RowStyle::Normal),
+            std::string unlinks_text = fp->unlinks ? sfmt(", %d unlinks", fp->unlinks) : std::string();
+            std::string flags = path_flags_str(fp);
+            std::string text = sfmt("%s %s  [%d opens, %d procs%s%s]", flags.c_str(), path.c_str(),
+                                    fp->opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
+            emit_row(rows, path, fp->style(),
                      "", text, 1, path, false);
         }
     } else {
@@ -905,14 +1053,16 @@ static void build_lpane_files(std::vector<RowData> &rows) {
         add_file_tree_rec(rows, &g_path_root, 0);
         /* Non-absolute paths (pipes etc.) at the end. */
         for (auto *np : g_nonabs_paths) {
-            if (np->opens == 0) continue;
+            if (np->opens == 0 && np->unlinks == 0) continue;
             std::string path = np->name;
+            if (!file_passes_filters(np, path)) continue;
             int nprocs = static_cast<int>(np->proc_tgids.size());
             std::string errs_text = np->errs ? sfmt(", %d errs", np->errs) : std::string();
-            std::string text = sfmt("  %s  [%d opens, %d procs%s]", path.c_str(),
-                                    np->opens, nprocs, errs_text.c_str());
-            emit_row(rows, path,
-                     file_matches_search(path) ? RowStyle::Search : (np->errs ? RowStyle::Error : RowStyle::Normal),
+            std::string unlinks_text = np->unlinks ? sfmt(", %d unlinks", np->unlinks) : std::string();
+            std::string flags = path_flags_str(np);
+            std::string text = sfmt("%s   %s  [%d opens, %d procs%s%s]", flags.c_str(), path.c_str(),
+                                    np->opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
+            emit_row(rows, path, np->style(),
                      "", text, 1, path, false);
         }
     }
@@ -1078,6 +1228,7 @@ static bool event_allowed(const trace_event_t &ev) {
     case EV_CWD: kind = "CWD"; break;
     case EV_EXEC: kind = "EXEC"; break;
     case EV_OPEN: kind = "OPEN"; break;
+    case EV_UNLINK: kind = "UNLINK"; break;
     case EV_EXIT: kind = "EXIT"; break;
     case EV_STDOUT: kind = "STDOUT"; break;
     case EV_STDERR: kind = "STDERR"; break;
@@ -1138,6 +1289,9 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
                         ev.flags_text.c_str(), err_text.c_str());
             break;
         }
+        case EV_UNLINK:
+            text = sfmt("%s [UNLINK] %s", tsbuf, ev.resolved_path.c_str());
+            break;
         case EV_EXIT:
             text = (ev.status == "signaled")
                 ? sfmt("%s [EXIT] signal %d%s", tsbuf, ev.signal, ev.core_dumped ? " (core)" : "")
@@ -1157,20 +1311,36 @@ static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) 
     PathItem *pd = find_path_item(id);
     int opens = pd ? pd->opens : 0;
     int errs  = pd ? pd->errs  : 0;
+    int unlinks = pd ? pd->unlinks : 0;
     int nprocs = pd ? static_cast<int>(pd->proc_tgids.size()) : 0;
+    if (pd) {
+        std::string flags = path_flags_str(pd);
+        emit_row(rows, "flags", RowStyle::Normal, "", sfmt("Flags: %s", flags.c_str()), -1, "", false);
+    }
     emit_row(rows, "opens", RowStyle::Normal, "", sfmt("Opens: %d", opens), -1, "", false);
     emit_row(rows, "procs", RowStyle::Normal, "", sfmt("Procs: %d", nprocs), -1, "", false);
     emit_row(rows, "errs", errs ? RowStyle::Error : RowStyle::Normal, "", sfmt("Errors: %d", errs), -1, "", false);
+    emit_row(rows, "unlinks", unlinks ? RowStyle::Yellow : RowStyle::Normal, "",
+             sfmt("Unlinks: %d%s", unlinks,
+                  (pd && pd->unlinked_at_end()) ? " (deleted at trace end)" : ""), -1, "", false);
     if (pd) {
         for (int ei : pd->open_event_indices) {
             auto &ev = g_events[ei];
             auto *p = find_process(ev.tgid);
             std::string err_text = ev.err ? sfmt(" err=%d", ev.err) : std::string();
-            std::string text = sfmt("PID %d %s [%s]%s", ev.tgid,
+            std::string text = sfmt("PID %d %s [OPEN] [%s]%s", ev.tgid,
                 p ? p->display_name().c_str() : "",
                 ev.flags_text.c_str(), err_text.c_str());
             emit_row(rows, sfmt("open_%d", ev.id),
                      ev.err ? RowStyle::Error : (ev.kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal),
+                     "", text, 0, std::to_string(ev.tgid), false);
+        }
+        for (int ei : pd->unlink_event_indices) {
+            auto &ev = g_events[ei];
+            auto *p = find_process(ev.tgid);
+            std::string text = sfmt("PID %d %s [UNLINK]", ev.tgid,
+                p ? p->display_name().c_str() : "");
+            emit_row(rows, sfmt("unlink_%d", ev.id), RowStyle::Yellow,
                      "", text, 0, std::to_string(ev.tgid), false);
         }
     }
@@ -1367,6 +1537,20 @@ static void update_status() {
     if (g_state.lp_filter == 1) s += " | V:failed";
     else if (g_state.lp_filter == 2) s += " | V:running";
     if (g_state.mode >= 3 && g_state.mode <= 6) s += sfmt(" | D:%s", g_state.dep_filter ? "written" : "all");
+    if (g_state.mode == 1) {
+        static const char *ref_labels[] = {"all","no-sys","no-del","fail-only"};
+        if (g_state.file_refinement > 0)
+            s += sfmt(" | ref:%s", ref_labels[g_state.file_refinement]);
+        if (g_state.file_mode_filter != 0x0F) {
+            s += " | mode:";
+            if (g_state.file_mode_filter & 0x01) s += "R";
+            if (g_state.file_mode_filter & 0x02) s += "W";
+            if (g_state.file_mode_filter & 0x04) s += "U";
+            if (g_state.file_mode_filter & 0x08) s += "D";
+        }
+        if (!g_state.subtree_root.empty()) s += " | sub:" + g_state.subtree_root;
+        if (!g_state.file_glob.empty()) s += " | glob:" + g_state.file_glob;
+    }
     s += " | 1:proc 2:file 3:out 4:dep 5:rdep 6:dcmd 7:rcmd ?:help";
     if (g_tui) g_tui->set_status(s.c_str());
 }
@@ -1612,6 +1796,21 @@ static int on_key_cb(Tui &tui, int key, int panel, int cursor, const char *row_i
     case 'N': set_cursor_to_search_hit(-1); break;
     case 'e': expand_subtree(1); break;
     case 'E': expand_subtree(0); break;
+    case 'r': if (g_state.mode == 1) { g_state.file_refinement = (g_state.file_refinement + 1) % 4; reset_mode_selection(); } break;
+    case 'R': if (g_state.mode == 1) { g_state.file_mode_filter ^= 0x01; reset_mode_selection(); } break;
+    case 'D': if (g_state.mode == 1) { g_state.file_mode_filter ^= 0x02; reset_mode_selection(); } break;
+    case 'U': if (g_state.mode == 1) { g_state.file_mode_filter ^= 0x04; reset_mode_selection(); } break;
+    case 'S': if (g_state.mode == 1) { g_state.subtree_root = g_state.cursor_id; reset_mode_selection(); } break;
+    case 'C': if (g_state.mode == 1) { g_state.subtree_root.clear(); g_state.file_glob.clear();
+                                        g_state.file_refinement = 0; g_state.file_mode_filter = 0x0F;
+                                        reset_mode_selection(); } break;
+    case 'p': if (g_state.mode == 1) {
+        char buf[256] = "";
+        if (tui.line_edit("Glob: ", buf, sizeof buf)) g_state.file_glob = buf;
+        reset_mode_selection();
+        break;
+    }
+    case 'P': if (g_state.mode == 1) { g_state.file_glob.clear(); reset_mode_selection(); } break;
     case TUI_K_LEFT: case 'h': collapse_or_back(); break;
     case TUI_K_RIGHT: case 'l': case TUI_K_ENTER: expand_or_detail(); break;
     case 'W': {
@@ -1799,6 +1998,8 @@ int  tv_test_sort_key()   { return g_state.sort_key; }
 int  tv_test_ts_mode()    { return g_state.ts_mode; }
 int  tv_test_lp_filter()  { return g_state.lp_filter; }
 int  tv_test_dep_filter() { return g_state.dep_filter; }
+int  tv_test_file_refinement() { return g_state.file_refinement; }
+int  tv_test_file_mode_filter() { return g_state.file_mode_filter; }
 const char *tv_test_search() { return g_state.search.c_str(); }
 const char *tv_test_evfilt() { return g_state.evfilt.c_str(); }
 
