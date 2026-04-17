@@ -23,207 +23,17 @@
 #include <unordered_map>
 #include <algorithm>
 #include <memory>
-#include <mutex>
-#include <thread>
-#include <atomic>
-#include <condition_variable>
-#include <deque>
 
 #include <zstd.h>
 
 #include "engine.h"
 #include "sorted_vec_set.h"
 #include "json.h"
+#include "intern.h"
 
-/* ── String interning pool ─────────────────────────────────────────── */
-/* All strings go through this pool; duplicates share storage.
-   ID 0 is reserved for "empty string".  Thread-safe. */
-
-class StringPool {
-    std::vector<char> data_;
-    std::vector<uint32_t> offsets_;      /* offset[id] → start in data_ */
-    std::vector<uint32_t> lengths_;      /* length[id] */
-    struct Hasher {
-        const StringPool *pool;
-        size_t operator()(uint32_t id) const {
-            auto sv = pool->get(id);
-            return std::hash<std::string_view>{}(sv);
-        }
-    };
-    struct Equal {
-        const StringPool *pool;
-        bool operator()(uint32_t a, uint32_t b) const {
-            return pool->get(a) == pool->get(b);
-        }
-    };
-    std::unordered_set<uint32_t, Hasher, Equal> index_;
-    std::mutex mu_;
-public:
-    StringPool() : index_(16, Hasher{this}, Equal{this}) {
-        /* ID 0 = empty string */
-        offsets_.push_back(0);
-        lengths_.push_back(0);
-    }
-
-    uint32_t intern(std::string_view s) {
-        if (s.empty()) return 0;
-        std::lock_guard<std::mutex> lk(mu_);
-        /* Probe using a temporary entry */
-        uint32_t tmp_id = static_cast<uint32_t>(offsets_.size());
-        uint32_t off = static_cast<uint32_t>(data_.size());
-        data_.insert(data_.end(), s.begin(), s.end());
-        offsets_.push_back(off);
-        lengths_.push_back(static_cast<uint32_t>(s.size()));
-        auto [it, inserted] = index_.insert(tmp_id);
-        if (!inserted) {
-            /* Already exists — roll back */
-            data_.resize(off);
-            offsets_.pop_back();
-            lengths_.pop_back();
-            return *it;
-        }
-        return tmp_id;
-    }
-
-    std::string_view get(uint32_t id) const {
-        if (id == 0 || id >= offsets_.size()) return {};
-        return {data_.data() + offsets_[id], lengths_[id]};
-    }
-
-    std::string get_str(uint32_t id) const {
-        auto sv = get(id);
-        return std::string(sv);
-    }
-
-    void clear() {
-        std::lock_guard<std::mutex> lk(mu_);
-        data_.clear();
-        offsets_.clear();
-        lengths_.clear();
-        index_.clear();
-        offsets_.push_back(0);
-        lengths_.push_back(0);
-    }
-};
-
-static StringPool g_strings;
-
-/* ── Compressed blob pool (ZSTD dictionary mode) ───────────────────── */
-/* For large data: argv arrays, stdout/stderr content.
-   Each blob is individually ZSTD-compressed. ID 0 = empty. */
-
-class BlobPool {
-    /* Flat storage: each blob is [uint32_t orig_size][compressed data...] */
-    std::vector<char> data_;
-    std::vector<uint32_t> offsets_;   /* offset[id] → start in data_ */
-    std::vector<uint32_t> csizes_;    /* compressed size (including 4-byte header) */
-    ZSTD_CCtx *cctx_ = nullptr;
-    ZSTD_DCtx *dctx_ = nullptr;
-    std::mutex mu_;
-public:
-    BlobPool() {
-        offsets_.push_back(0);
-        csizes_.push_back(0);
-        cctx_ = ZSTD_createCCtx();
-        dctx_ = ZSTD_createDCtx();
-        /* Use fast compression for low latency during live trace */
-        ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, 1);
-    }
-    ~BlobPool() {
-        if (cctx_) ZSTD_freeCCtx(cctx_);
-        if (dctx_) ZSTD_freeDCtx(dctx_);
-    }
-
-    uint32_t store(std::string_view raw) {
-        if (raw.empty()) return 0;
-        std::lock_guard<std::mutex> lk(mu_);
-        size_t bound = ZSTD_compressBound(raw.size());
-        size_t off = data_.size();
-        data_.resize(off + 4 + bound);
-        /* Store original size in first 4 bytes */
-        uint32_t orig = static_cast<uint32_t>(raw.size());
-        std::memcpy(data_.data() + off, &orig, 4);
-        size_t csz = ZSTD_compressCCtx(cctx_,
-            data_.data() + off + 4, bound,
-            raw.data(), raw.size(), 1);
-        if (ZSTD_isError(csz)) {
-            /* Fallback: store uncompressed */
-            data_.resize(off + 4 + raw.size());
-            std::memcpy(data_.data() + off + 4, raw.data(), raw.size());
-            csz = raw.size();
-        }
-        uint32_t total = static_cast<uint32_t>(4 + csz);
-        data_.resize(off + total);
-        uint32_t id = static_cast<uint32_t>(offsets_.size());
-        offsets_.push_back(static_cast<uint32_t>(off));
-        csizes_.push_back(total);
-        return id;
-    }
-
-    std::string decompress(uint32_t id) const {
-        if (id == 0 || id >= offsets_.size()) return {};
-        uint32_t off = offsets_[id];
-        uint32_t total = csizes_[id];
-        if (total < 4) return {};
-        uint32_t orig;
-        std::memcpy(&orig, data_.data() + off, 4);
-        const char *cdata = data_.data() + off + 4;
-        size_t csize = total - 4;
-        std::string out(orig, '\0');
-        size_t dsz = ZSTD_decompressDCtx(dctx_, out.data(), orig, cdata, csize);
-        if (ZSTD_isError(dsz)) {
-            /* Maybe it was stored uncompressed */
-            if (csize == orig) {
-                std::memcpy(out.data(), cdata, orig);
-                return out;
-            }
-            return {};
-        }
-        out.resize(dsz);
-        return out;
-    }
-
-    /* Store an argv-style vector as null-separated flat string, compressed. */
-    uint32_t store_argv(const std::vector<std::string> &argv) {
-        if (argv.empty()) return 0;
-        std::string flat;
-        for (size_t i = 0; i < argv.size(); i++) {
-            if (i) flat += '\0';
-            flat += argv[i];
-        }
-        return store(flat);
-    }
-
-    /* Decompress back to argv vector. */
-    std::vector<std::string> decompress_argv(uint32_t id) const {
-        std::vector<std::string> out;
-        if (id == 0) return out;
-        std::string flat = decompress(id);
-        if (flat.empty()) return out;
-        size_t pos = 0;
-        while (pos <= flat.size()) {
-            size_t next = flat.find('\0', pos);
-            if (next == std::string::npos) {
-                out.push_back(flat.substr(pos));
-                break;
-            }
-            out.push_back(flat.substr(pos, next - pos));
-            pos = next + 1;
-        }
-        return out;
-    }
-
-    void clear() {
-        std::lock_guard<std::mutex> lk(mu_);
-        data_.clear();
-        offsets_.clear();
-        csizes_.clear();
-        offsets_.push_back(0);
-        csizes_.push_back(0);
-    }
-};
-
-static BlobPool g_blobs;
+/* ── Global intern pool ────────────────────────────────────────────── */
+/* Single unified pool for all interned data (strings, argv, output). */
+static Intern g_pool;
 
 /* ── Item — abstract base for hierarchical items ───────────────────── */
 
@@ -433,7 +243,7 @@ enum event_kind_t : uint8_t {
 };
 
 /* Compact trace event — no std::string members.
-   All strings go through g_strings (interned) or g_blobs (compressed).
+   All strings go through g_pool (interned/compressed).
    Paths use PathItem* from the interned file tree. */
 struct trace_event_t {
     int id = 0;
@@ -448,34 +258,34 @@ struct trace_event_t {
     PathItem *path_item = nullptr;
 
     /* EXEC fields */
-    uint32_t exe_id = 0;          /* g_strings index */
-    uint32_t argv_blob = 0;       /* g_blobs index (compressed null-separated) */
+    uint32_t exe_id = 0;          /* g_pool IID */
+    uint32_t argv_blob = 0;       /* g_pool IID (null-separated argv) */
 
     /* OPEN fields */
-    uint32_t flags_id = 0;        /* g_strings index (e.g. "O_RDONLY|O_CREAT") */
+    uint32_t flags_id = 0;        /* g_pool IID (e.g. "O_RDONLY|O_CREAT") */
     int mode = 0;                 /* raw open flags integer */
     int fd = -1;
     int err = 0;
 
     /* STDOUT/STDERR */
-    uint32_t data_blob = 0;       /* g_blobs index (compressed output data) */
+    uint32_t data_blob = 0;       /* g_pool IID (output data) */
     int len = 0;
 
     /* EXIT */
-    uint32_t status_id = 0;       /* g_strings index */
+    uint32_t status_id = 0;       /* g_pool IID */
     int code = 0;
     int signal = 0;
     int raw = 0;
 
     /* Accessor helpers — decode from compact representation on demand */
     std::string get_path() const { return path_item ? path_item->fullPath() : std::string(); }
-    std::string get_exe() const { return g_strings.get_str(exe_id); }
-    std::vector<std::string> get_argv() const { return g_blobs.decompress_argv(argv_blob); }
-    std::string get_flags_text() const { return g_strings.get_str(flags_id); }
-    std::string get_data() const { return g_blobs.decompress(data_blob); }
-    std::string get_status() const { return g_strings.get_str(status_id); }
-    std::string_view get_status_sv() const { return g_strings.get(status_id); }
-    std::string_view get_exe_sv() const { return g_strings.get(exe_id); }
+    std::string get_exe() const { return g_pool.str(exe_id); }
+    std::vector<std::string> get_argv() const { return g_pool.get_argv(argv_blob); }
+    std::string get_flags_text() const { return g_pool.str(flags_id); }
+    std::string get_data() const { return g_pool.str(data_blob); }
+    std::string get_status() const { return g_pool.str(status_id); }
+    std::string_view get_status_sv() const { return g_pool.view(status_id); }
+    std::string_view get_exe_sv() const { return g_pool.view(exe_id); }
 };
 
 struct process_t : Item {
@@ -483,10 +293,10 @@ struct process_t : Item {
     bool parent_set = false;
     double start_ts = 0, end_ts = 0;
     int has_start = 0, has_end = 0;
-    uint32_t exe_id = 0;          /* g_strings index */
-    uint32_t argv_blob = 0;       /* g_blobs index */
+    uint32_t exe_id = 0;          /* g_pool IID */
+    uint32_t argv_blob = 0;       /* g_pool IID */
     PathItem *cwd_item = nullptr; /* interned path */
-    uint32_t exit_status_id = 0;  /* g_strings index */
+    uint32_t exit_status_id = 0;  /* g_pool IID */
     int exit_code = 0;
     int exit_signal = 0;
     int core_dumped = 0;
@@ -501,18 +311,19 @@ struct process_t : Item {
     std::string cached_display_name;    /* pre-computed basename */
     mutable std::string cached_key_;
 
-    std::string get_exe() const { return g_strings.get_str(exe_id); }
-    std::string_view get_exe_sv() const { return g_strings.get(exe_id); }
-    std::vector<std::string> get_argv() const { return g_blobs.decompress_argv(argv_blob); }
+    std::string get_exe() const { return g_pool.str(exe_id); }
+    std::string_view get_exe_sv() const { return g_pool.view(exe_id); }
+    std::vector<std::string> get_argv() const { return g_pool.get_argv(argv_blob); }
     std::string get_cwd() const { return cwd_item ? cwd_item->fullPath() : std::string(); }
-    std::string_view get_exit_status_sv() const { return g_strings.get(exit_status_id); }
-    std::string get_exit_status() const { return g_strings.get_str(exit_status_id); }
+    std::string_view get_exit_status_sv() const { return g_pool.view(exit_status_id); }
+    std::string get_exit_status() const { return g_pool.str(exit_status_id); }
 
     void update_display_name() {
-        std::string_view s = get_exe_sv();
+        std::string_view s = g_pool.view(exe_id);
+        std::string argv0;
         if (s.empty()) {
             auto argv = get_argv();
-            if (!argv.empty()) s = argv[0];
+            if (!argv.empty()) { argv0 = std::move(argv[0]); s = argv0; }
         }
         if (s.empty()) { cached_display_name.clear(); return; }
         auto pos = s.rfind('/');
@@ -807,7 +618,7 @@ struct preparsed_event_t {
 };
 
 /* Phase 1: Parse a single JSON line into a preparsed_event_t.
-   Thread-safe: only uses g_strings and g_blobs (which have mutexes). */
+   Thread-safe: only uses g_pool (which is thread-safe). */
 static preparsed_event_t preparse_line(const char *line) {
     preparsed_event_t pe;
     std::string_view sp;
@@ -844,15 +655,15 @@ static preparsed_event_t preparse_line(const char *line) {
         if (json_get(line, "path", sp)) pe.raw_path = json_decode_string(sp);
         break;
     case EV_EXEC:
-        if (json_get(line, "exe", sp)) pe.exe_id = g_strings.intern(json_decode_string(sp));
-        if (json_get(line, "argv", sp)) pe.argv_blob = g_blobs.store_argv(json_array_of_strings(sp));
+        if (json_get(line, "exe", sp)) pe.exe_id = g_pool.put(json_decode_string(sp));
+        if (json_get(line, "argv", sp)) pe.argv_blob = g_pool.put_argv(json_array_of_strings(sp));
         break;
     case EV_OPEN:
         if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
             pe.raw_path = json_decode_string(sp);
         { std::vector<std::string> flags;
           if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
-          pe.flags_id = g_strings.intern(join_with_pipe(flags)); }
+          pe.flags_id = g_pool.put(join_with_pipe(flags)); }
         if (json_get(line, "mode", sp)) pe.mode = span_to_int(sp, 0);
         if (json_get(line, "fd", sp)) pe.fd = span_to_int(sp, -1);
         if (json_get(line, "err", sp)) pe.err = span_to_int(sp, 0);
@@ -864,7 +675,7 @@ static preparsed_event_t preparse_line(const char *line) {
         if (json_get(line, "ret", sp)) pe.fd = span_to_int(sp, 0);
         break;
     case EV_EXIT:
-        if (json_get(line, "status", sp)) pe.status_id = g_strings.intern(json_decode_string(sp));
+        if (json_get(line, "status", sp)) pe.status_id = g_pool.put(json_decode_string(sp));
         if (json_get(line, "code", sp)) pe.code = span_to_int(sp, 0);
         if (json_get(line, "signal", sp)) pe.signal_ = span_to_int(sp, 0);
         if (json_get(line, "core_dumped", sp)) pe.core_dumped = static_cast<uint8_t>(span_to_bool(sp, 0));
@@ -872,7 +683,7 @@ static preparsed_event_t preparse_line(const char *line) {
         break;
     case EV_STDOUT:
     case EV_STDERR:
-        if (json_get(line, "data", sp)) pe.data_blob = g_blobs.store(json_decode_string(sp));
+        if (json_get(line, "data", sp)) pe.data_blob = g_pool.put(json_decode_string(sp));
         if (json_get(line, "len", sp)) pe.len = span_to_int(sp, 0);
         break;
     }
@@ -1051,11 +862,11 @@ static void ingest_trace_line(const char *line) {
     case EV_EXEC: {
         if (json_get(line, "exe", sp)) {
             std::string exe = json_decode_string(sp);
-            ev.exe_id = g_strings.intern(exe);
+            ev.exe_id = g_pool.put(exe);
         }
         if (json_get(line, "argv", sp)) {
             auto argv = json_array_of_strings(sp);
-            ev.argv_blob = g_blobs.store_argv(argv);
+            ev.argv_blob = g_pool.put_argv(argv);
         }
         proc.exe_id = ev.exe_id;
         proc.argv_blob = ev.argv_blob;
@@ -1068,7 +879,7 @@ static void ingest_trace_line(const char *line) {
             raw_path = json_decode_string(sp);
         std::vector<std::string> flags;
         if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
-        ev.flags_id = g_strings.intern(join_with_pipe(flags));
+        ev.flags_id = g_pool.put(join_with_pipe(flags));
         if (json_get(line, "mode", sp)) ev.mode = span_to_int(sp, 0);
         if (json_get(line, "fd", sp)) ev.fd = span_to_int(sp, -1);
         if (json_get(line, "err", sp)) ev.err = span_to_int(sp, 0);
@@ -1113,7 +924,7 @@ static void ingest_trace_line(const char *line) {
         break;
     }
     case EV_EXIT:
-        if (json_get(line, "status", sp)) ev.status_id = g_strings.intern(json_decode_string(sp));
+        if (json_get(line, "status", sp)) ev.status_id = g_pool.put(json_decode_string(sp));
         if (json_get(line, "code", sp)) ev.code = span_to_int(sp, 0);
         if (json_get(line, "signal", sp)) ev.signal = span_to_int(sp, 0);
         if (json_get(line, "core_dumped", sp)) ev.core_dumped = static_cast<uint8_t>(span_to_bool(sp, 0));
@@ -1128,7 +939,7 @@ static void ingest_trace_line(const char *line) {
         break;
     case EV_STDOUT:
     case EV_STDERR:
-        if (json_get(line, "data", sp)) ev.data_blob = g_blobs.store(json_decode_string(sp));
+        if (json_get(line, "data", sp)) ev.data_blob = g_pool.put(json_decode_string(sp));
         if (json_get(line, "len", sp)) ev.len = span_to_int(sp, 0);
         if (ev.kind == EV_STDOUT) proc.has_stdout = 1;
         else proc.has_stderr = 1;
@@ -1229,33 +1040,30 @@ static bool cmp_proc_tgid(int a, int b) {
 static bool proc_matches_search(const process_t &p) {
     if (g_state.search.empty()) return false;
     if (std::to_string(p.tgid).find(g_state.search) != std::string::npos) return true;
-    auto exe_sv = p.get_exe_sv();
-    if (!exe_sv.empty() && exe_sv.find(g_state.search) != std::string_view::npos) return true;
-    auto argv = p.get_argv();
-    for (const auto &a : argv)
-        if (a.find(g_state.search) != std::string::npos) return true;
+    /* Use pool contains() — avoids decompression for inline entries,
+       and avoids interning the search term. */
+    if (g_pool.contains(p.exe_id, g_state.search)) return true;
+    if (g_pool.contains(p.argv_blob, g_state.search)) return true;
     for (int ei : p.event_indices) {
         auto &ev = g_events[ei];
         if ((ev.kind == EV_STDOUT || ev.kind == EV_STDERR) && ev.data_blob != 0) {
-            std::string data = ev.get_data();
-            if (!data.empty() && data.find(g_state.search) != std::string::npos) return true;
+            if (g_pool.contains(ev.data_blob, g_state.search)) return true;
         }
     }
     return false;
 }
 
 static bool proc_is_interesting_failure(const process_t &p) {
-    auto status = p.get_exit_status_sv();
-    if (status.empty()) return false;
-    if (status == "signaled") return true;
-    if (status == "exited" && p.exit_code != 0)
+    if (g_pool.empty(p.exit_status_id)) return false;
+    if (g_pool.eq(p.exit_status_id, "signaled")) return true;
+    if (g_pool.eq(p.exit_status_id, "exited") && p.exit_code != 0)
         return p.has_write_open || !p.children.empty() || p.has_stdout;
     return false;
 }
 
 static bool proc_matches_filter(const process_t &p) {
     if (g_state.lp_filter == 1) return proc_is_interesting_failure(p);
-    if (g_state.lp_filter == 2) return p.get_exit_status_sv().empty();
+    if (g_state.lp_filter == 2) return g_pool.empty(p.exit_status_id);
     return true;
 }
 
@@ -1296,12 +1104,11 @@ RowData process_t::makeRow(int depth) const {
     bool has_kids = !children.empty();
     bool collapsed_flag = has_kids && collapsed;
     std::string marker;
-    auto status = get_exit_status_sv();
-    if (status == "exited")
+    if (g_pool.eq(exit_status_id, "exited"))
         marker = exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-    else if (status == "signaled")
+    else if (g_pool.eq(exit_status_id, "signaled"))
         marker = sfmt(" \xe2\x9a\xa1%d", exit_signal);
-    std::string dur = format_duration(start_ts, end_ts, status.empty());
+    std::string dur = format_duration(start_ts, end_ts, g_pool.empty(exit_status_id));
     int nch = static_cast<int>(children.size());
     std::string prefix = sfmt("%*s%s", depth * 4, "",
         !has_kids ? "  " : (collapsed_flag ? "\xe2\x96\xb6 " : "\xe2\x96\xbc "));
@@ -1324,12 +1131,11 @@ RowData process_t::makeRow(int depth) const {
 static RowData make_proc_flat_row(process_t *p) {
     std::string id_str(p->getKey());
     std::string marker;
-    auto status = p->get_exit_status_sv();
-    if (status == "exited")
+    if (g_pool.eq(p->exit_status_id, "exited"))
         marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-    else if (status == "signaled")
+    else if (g_pool.eq(p->exit_status_id, "signaled"))
         marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
-    std::string dur = format_duration(p->start_ts, p->end_ts, status.empty());
+    std::string dur = format_duration(p->start_ts, p->end_ts, g_pool.empty(p->exit_status_id));
     std::string text = sfmt("[%d] %s%s%s%s", p->tgid, p->display_name().c_str(),
                             marker.c_str(), dur.empty() ? "" : "  ", dur.c_str());
     RowData d;
@@ -1680,12 +1486,11 @@ static void build_lpane_dep_cmds(std::vector<RowData> &rows, int reverse) {
         std::string id_str = std::to_string(pt);
         const auto &name = p->display_name();
         std::string marker;
-        auto pstatus = p->get_exit_status_sv();
-        if (pstatus == "exited")
+        if (g_pool.eq(p->exit_status_id, "exited"))
             marker = p->exit_code == 0 ? " \xe2\x9c\x93" : " \xe2\x9c\x97";
-        else if (pstatus == "signaled")
+        else if (g_pool.eq(p->exit_status_id, "signaled"))
             marker = sfmt(" \xe2\x9a\xa1%d", p->exit_signal);
-        std::string dur = format_duration(p->start_ts, p->end_ts, pstatus.empty());
+        std::string dur = format_duration(p->start_ts, p->end_ts, g_pool.empty(p->exit_status_id));
         std::string text = sfmt("[%d] %s%s%s%s", pt, name.c_str(), marker.c_str(),
                                 dur.empty() ? "" : "  ", dur.c_str());
         emit_row(rows, id_str, p->style(), "", text, 0, id_str, false);
@@ -1723,13 +1528,12 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
     emit_row(rows, "tgid", RowStyle::Normal, "", sfmt("TGID:  %d", p->tgid), -1, "", false);
     emit_row(rows, "ppid", RowStyle::Normal, "", sfmt("PPID:  %d", p->ppid), -1, "", false);
     emit_row(rows, "exe", RowStyle::Normal, "", sfmt("EXE:   %s", p->get_exe().c_str()), -1, "", false);
-    auto exit_status = p->get_exit_status_sv();
-    if (!exit_status.empty()) {
-        std::string text = exit_status == "signaled"
+    if (!g_pool.empty(p->exit_status_id)) {
+        std::string text = g_pool.eq(p->exit_status_id, "signaled")
             ? sfmt("Exit: signal %d%s", p->exit_signal, p->core_dumped ? " (core)" : "")
             : sfmt("Exit: exited code=%d", p->exit_code);
         emit_row(rows, "exit",
-                 (exit_status == "exited" && p->exit_code == 0) ? RowStyle::Green : RowStyle::Error,
+                 (g_pool.eq(p->exit_status_id, "exited") && p->exit_code == 0) ? RowStyle::Green : RowStyle::Error,
                  "", text, -1, "", false);
     }
     int nchildren = static_cast<int>(p->children.size());
@@ -1775,7 +1579,7 @@ static void build_rpane_process(std::vector<RowData> &rows, const std::string &i
             text = sfmt("%s [UNLINK] %s", tsbuf, ev.get_path().c_str());
             break;
         case EV_EXIT:
-            text = (ev.get_status_sv() == "signaled")
+            text = g_pool.eq(ev.status_id, "signaled")
                 ? sfmt("%s [EXIT] signal %d%s", tsbuf, ev.signal, ev.core_dumped ? " (core)" : "")
                 : sfmt("%s [EXIT] exited code=%d", tsbuf, ev.code);
             break;
@@ -2399,8 +2203,7 @@ static void free_all() {
     free_nonabs_paths();
     g_input_lines.clear();
     g_output_collapsed.clear();
-    g_strings.clear();
-    g_blobs.clear();
+    g_pool.clear();
 }
 
 /* ── Test API (non-static, called from tests.cpp) ─────────────────── */
