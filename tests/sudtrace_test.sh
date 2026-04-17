@@ -88,6 +88,13 @@ t1 t2 t3 t4 t5 t6 t7 t8:
 	@/bin/echo $@-done
 EOF
 
+cat > "$TMPDIR/shebang_args.sh" << 'EOF'
+#!/bin/bash
+printf 'argv0:%s\n' "$0"
+printf 'arg1:%s\n' "$1"
+EOF
+chmod +x "$TMPDIR/shebang_args.sh"
+
 cat > "$TMPDIR/static32.c" << 'EOF'
 #include <unistd.h>
 int main(void) {
@@ -561,6 +568,14 @@ run_test "basic: hello world traced" \
 run_test "basic: stderr captured" \
     'grep -q "STDERR" "$TMPDIR/hello.jsonl"' \
     'grep -q "hello world" "$TMPDIR/hello.jsonl"'
+
+OUT=$("$SUDTRACE" -o "$TMPDIR/shebang_args.jsonl" -- "$TMPDIR/shebang_args.sh" v045 2>&1)
+run_test "basic: shebang script keeps interpreter argv aligned" \
+    'printf "%s\n" "$OUT" | grep -F -q -- "argv0:$TMPDIR/shebang_args.sh"' \
+    'printf "%s\n" "$OUT" | grep -F -q -- "arg1:v045"' \
+    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/shebang_args.jsonl"' \
+    'grep -q "\"status\":\"exited\"" "$TMPDIR/shebang_args.jsonl"' \
+    '! grep -q "\"signal\"" "$TMPDIR/shebang_args.jsonl"'
 
 # ── Test: multithreaded tracing ────────────────────────────────────────
 

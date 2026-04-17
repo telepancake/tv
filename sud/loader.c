@@ -17,10 +17,16 @@
 void load_and_run_elf(const char *path, int argc, char **argv,
                       int drop_count)
 {
-    /* Compute the visible argv (what the target process should see) */
+    /* Compute the visible argv for emitted trace metadata. */
     int vis_argc = argc - drop_count;
     char **vis_argv = argv + drop_count;
     if (vis_argc < 0) vis_argc = 0;
+
+    /* Compute the runtime argv for the loaded program itself.
+     * Only an injected PT_INTERP entry should be hidden from the new stack;
+     * shebang interpreters must still receive their own argv[0]. */
+    int runtime_argc = argc;
+    char **runtime_argv = argv;
 
     /* Record the target program's resolved path so the SIGSYS handler can
      * mask /proc/self/exe and other identity queries. */
@@ -313,14 +319,14 @@ void load_and_run_elf(const char *path, int argc, char **argv,
     if (environ)
         while (environ[envc]) envc++;
 
-    int total_slots = 1 + vis_argc + 1 + envc + 1 + 128;
+    int total_slots = 1 + runtime_argc + 1 + envc + 1 + 128;
     sp -= total_slots;
     sp = (unsigned long *)((unsigned long)sp & ~0xfUL);
 
     int idx = 0;
-    sp[idx++] = vis_argc;
-    for (int i = 0; i < vis_argc; i++)
-        sp[idx++] = (unsigned long)vis_argv[i];
+    sp[idx++] = runtime_argc;
+    for (int i = 0; i < runtime_argc; i++)
+        sp[idx++] = (unsigned long)runtime_argv[i];
     sp[idx++] = 0;
     for (int i = 0; i < envc; i++)
         sp[idx++] = (unsigned long)environ[i];
@@ -358,6 +364,10 @@ void load_and_run_elf(const char *path, int argc, char **argv,
             phdr_addr = load_base + ehdr.e_phoff;
 
         int use_interp_mode = (drop_count > 0 && target_fd >= 0);
+        if (use_interp_mode && argc > 1) {
+            runtime_argc = argc - 1;
+            runtime_argv = argv + 1;
+        }
 
         int aux_fd2 = open("/proc/self/auxv", O_RDONLY);
         if (aux_fd2 >= 0) {
