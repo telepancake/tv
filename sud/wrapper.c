@@ -251,6 +251,37 @@ int main(int argc, char **argv)
         run_argv[i] = strdup(argv[argi + i]);
     run_argv[run_argc] = NULL;
 
+    /* If the resolved target is a dynamically linked ELF, we need to
+     * load it via its PT_INTERP (ld-linux).  Prepend the dynamic linker
+     * to run_argv so that load_and_run_elf loads ld-linux as the primary
+     * ELF and the target binary as the secondary.  Without this, jumping
+     * to a dynamic binary's entry point without ld-linux causes SIGSEGV. */
+    char elf_interp_buf[PATH_MAX];
+    const char *load_path = resolved;
+    int dyn = check_elf_dynamic(resolved, elf_interp_buf,
+                                sizeof(elf_interp_buf), NULL);
+    if (dyn == 1) {
+        int new_run_argc = run_argc + 1;
+        char **new_run_argv = calloc((size_t)new_run_argc + 1, sizeof(char *));
+        if (!new_run_argv) {
+            const char msg[] = "sud: out of memory for argv\n";
+            raw_write(2, msg, sizeof(msg) - 1);
+            _exit(1);
+        }
+        new_run_argv[0] = strdup(elf_interp_buf);
+        for (int i = 0; i < run_argc; i++)
+            new_run_argv[i + 1] = run_argv[i];
+        new_run_argv[new_run_argc] = NULL;
+
+        /* The old run_argv entries were moved into new_run_argv,
+         * so just free the old array shell. */
+        free(run_argv);
+        run_argv = new_run_argv;
+        run_argc = new_run_argc;
+        drop_count++;
+        load_path = elf_interp_buf;
+    }
+
     /* Rewrite /proc/self/cmdline */
     {
         int vis_argc = run_argc - drop_count;
@@ -259,5 +290,5 @@ int main(int argc, char **argv)
     }
 
     /* Load the ELF and jump — never returns */
-    load_and_run_elf(resolved, run_argc, run_argv, drop_count);
+    load_and_run_elf(load_path, run_argc, run_argv, drop_count);
 }

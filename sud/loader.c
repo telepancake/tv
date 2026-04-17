@@ -143,9 +143,14 @@ void load_and_run_elf(const char *path, int argc, char **argv,
     int target_fd = -1;
     memset(&target_ehdr, 0, sizeof(target_ehdr));
 
-    if (drop_count > 0 && vis_argc > 0 && vis_argv[0]) {
+    if (drop_count > 0 && argc > 1 && argv[1]) {
+        /* The target binary is always argv[1]: the first argument after
+         * the main ELF (ld-linux).  For example:
+         *   argv = [ld-linux, /bin/bash, ./script.sh, arg]  drop_count=2
+         *   → target is /bin/bash (argv[1]), NOT ./script.sh (vis_argv[0])
+         * When drop_count == 1, argv[1] == vis_argv[0] so this is safe. */
         char target_resolved[PATH_MAX];
-        const char *target_name = vis_argv[0];
+        const char *target_name = argv[1];
         if (!resolve_path(target_name, target_resolved, sizeof(target_resolved)))
             snprintf_(target_resolved, sizeof(target_resolved), "%s", target_name);
 
