@@ -120,15 +120,15 @@ static void init_wrapper_paths(void)
 
 static void init_path_env(void)
 {
-    /* Cache $PATH for resolve_path() */
+    /* Cache $PATH for resolve_path().
+     * PATH has no kernel-imposed length limit — build environments
+     * (Nix, Guix, complex CI) routinely produce very long values.
+     * Allocate exactly the right size via strdup (which uses mmap
+     * in our freestanding malloc). */
     const char *path = getenv("PATH");
     if (!path || !path[0])
         path = "/usr/bin:/bin";
-    int i = 0;
-    while (path[i] && i < (int)sizeof(g_path_env) - 1) {
-        g_path_env[i] = path[i]; i++;
-    }
-    g_path_env[i] = '\0';
+    g_path_env = strdup(path);
 }
 
 static void init_output_fd(void)
@@ -237,12 +237,16 @@ int main(int argc, char **argv)
         (fstat(STDOUT_FILENO, (struct stat *)&g_creator_stdout_stbuf) == 0);
 
     /* Make safe copies of run_argv for cmdline rewrite.
-     * These are bounded: we copy only what the kernel gave us in argv
-     * (which is always bounded by the original exec). */
+     * Allocated once at startup based on actual argc — no fixed-size
+     * truncation.  The freestanding malloc uses mmap, so this is fine
+     * for a one-time allocation. */
     int run_argc = argc - argi;
-    char *run_argv_storage[256];  /* Fixed-size: no unbounded allocation */
-    char **run_argv = run_argv_storage;
-    if (run_argc > 255) run_argc = 255;
+    char **run_argv = calloc((size_t)run_argc + 1, sizeof(char *));
+    if (!run_argv) {
+        const char msg[] = "sud: out of memory for argv\n";
+        raw_write(2, msg, sizeof(msg) - 1);
+        _exit(1);
+    }
     for (int i = 0; i < run_argc; i++)
         run_argv[i] = strdup(argv[argi + i]);
     run_argv[run_argc] = NULL;
