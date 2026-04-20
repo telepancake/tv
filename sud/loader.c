@@ -71,7 +71,7 @@ static void crash_diagnostic_handler(int sig, siginfo_t *info, void *uctx_raw)
         int dlen;
         fmt_int_dec(msg + pos, &dlen, info->si_code);
         pos += dlen;
-        if (info->si_code == 0x80) {
+        if (info->si_code == SI_KERNEL) {
             const char t[] = " (SI_KERNEL)";
             memcpy(msg + pos, t, sizeof(t) - 1); pos += sizeof(t) - 1;
         }
@@ -624,8 +624,9 @@ void load_and_run_elf(const char *path, int argc, char **argv,
      * even when the main stack is corrupted (which is common for
      * SI_KERNEL crashes where iret fails due to bad segment state). */
     {
-        /* Set up an alternate signal stack (16KB mmap'd region). */
-        void *altstack = mmap(NULL, 16384,
+#define DIAG_ALTSTACK_SIZE 16384
+        /* Set up an alternate signal stack. */
+        void *altstack = mmap(NULL, DIAG_ALTSTACK_SIZE,
                               PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS,
                               -1, 0);
@@ -634,9 +635,10 @@ void load_and_run_elf(const char *path, int argc, char **argv,
             struct { void *ss_sp; int ss_flags; size_t ss_size; } ss;
             ss.ss_sp = altstack;
             ss.ss_flags = 0;
-            ss.ss_size = 16384;
+            ss.ss_size = DIAG_ALTSTACK_SIZE;
             raw_syscall6(SYS_sigaltstack, (long)&ss, 0, 0, 0, 0, 0);
         }
+#undef DIAG_ALTSTACK_SIZE
 
         struct kernel_sigaction_raw segv_sa;
         memset(&segv_sa, 0, sizeof(segv_sa));
