@@ -136,7 +136,9 @@ private:
 
 /* Root of the file tree — represents "/" */
 static PathItem g_path_root;
-static std::vector<PathItem*> g_nonabs_paths;   /* paths like "pipe:[12345]" that don't start with "/" */
+/* Abstract handles like "pipe:[12345]" or "socket:[…]" that don't start with
+   "/" — keyed by the interned name IID for O(1) lookup. */
+static std::unordered_map<IID, PathItem*> g_nonabs_paths;
 
 /* Intern a path into the PathItem hierarchy.  Returns the leaf node. */
 static PathItem *intern_path_item(const std::string &path) {
@@ -144,12 +146,12 @@ static PathItem *intern_path_item(const std::string &path) {
     if (path[0] != '/') {
         /* Non-absolute path (pipe, etc.) — keep as flat item */
         IID nid = g_pool.put(path);
-        for (auto *p : g_nonabs_paths)
-            if (p->name_id == nid) return p;
+        auto it = g_nonabs_paths.find(nid);
+        if (it != g_nonabs_paths.end()) return it->second;
         auto *np = new PathItem();
         np->name_id = nid;
         np->is_dir = false;
-        g_nonabs_paths.push_back(np);
+        g_nonabs_paths.emplace(nid, np);
         return np;
     }
     /* Traverse/create hierarchy for absolute path. */
@@ -174,9 +176,8 @@ static PathItem *find_path_item(const std::string &path) {
     if (path.empty()) return nullptr;
     if (path[0] != '/') {
         IID nid = g_pool.put(path);
-        for (auto *p : g_nonabs_paths)
-            if (p->name_id == nid) return p;
-        return nullptr;
+        auto it = g_nonabs_paths.find(nid);
+        return it != g_nonabs_paths.end() ? it->second : nullptr;
     }
     PathItem *cur = &g_path_root;
     size_t i = 1;
@@ -210,7 +211,7 @@ static void free_path_tree(PathItem *node) {
 }
 
 static void free_nonabs_paths() {
-    for (auto *p : g_nonabs_paths) delete p;
+    for (auto &kv : g_nonabs_paths) delete kv.second;
     g_nonabs_paths.clear();
 }
 
@@ -1368,8 +1369,8 @@ static void build_lpane_files(std::vector<RowData> &rows) {
         /* Flat mode: collect all leaf files, sort by full path. */
         std::vector<PathItem*> leaves;
         collect_file_leaves(&g_path_root, leaves);
-        for (auto *np : g_nonabs_paths)
-            if (np->opens > 0 || np->unlinks > 0) leaves.push_back(np);
+        for (auto &kv : g_nonabs_paths)
+            if (kv.second->opens > 0 || kv.second->unlinks > 0) leaves.push_back(kv.second);
         std::sort(leaves.begin(), leaves.end(), [](PathItem *a, PathItem *b) {
             return a->fullPath() < b->fullPath();
         });
@@ -1389,7 +1390,8 @@ static void build_lpane_files(std::vector<RowData> &rows) {
         /* Tree mode: DFS on PathItem hierarchy starting from root children. */
         add_file_tree_rec(rows, &g_path_root, 0);
         /* Non-absolute paths (pipes etc.) at the end. */
-        for (auto *np : g_nonabs_paths) {
+        for (auto &kv : g_nonabs_paths) {
+            PathItem *np = kv.second;
             if (np->opens == 0 && np->unlinks == 0) continue;
             std::string path = g_pool.str(np->name_id);
             if (!file_passes_filters(np, path)) continue;
