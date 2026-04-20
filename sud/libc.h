@@ -341,6 +341,7 @@ extern int g_errno_value;
 #define SA_RESTORER     0x04000000
 #define SA_ONSTACK      0x08000000
 #define SIG_SETMASK     2
+#define SI_KERNEL       0x80
 
 /* ================================================================
  * Limits and clock
