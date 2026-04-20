@@ -1049,10 +1049,6 @@ static void parallel_ingest(std::vector<std::string> &lines) {
     for (int w = 0; w < nthreads_p2; w++)
         workers[w] = std::make_unique<trace_db_t>();
 
-    /* Track original order for stitching: (worker, local_event_index). */
-    struct slot_t { int16_t worker; int orig_idx; };
-    std::vector<std::vector<slot_t>> worker_order(nthreads_p2);
-
     auto p2_worker = [&](int wid) {
         auto &db = *workers[wid];
         for (int tgid : worker_tgids[wid]) {
