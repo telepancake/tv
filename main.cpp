@@ -121,7 +121,10 @@ private:
     mutable std::string cached_key_;
 
     /* Transparent hash/eq so we can look up by string_view without
-       allocating a std::string for the common (already-exists) case. */
+       allocating a std::string for the common (already-exists) case.
+       Safety: keys are string_views into each child's PathItem::name.
+       PathItem nodes are append-only (never destroyed or renamed during
+       the tree's lifetime), so the views remain valid. */
     struct SvHash {
         using is_transparent = void;
         size_t operator()(std::string_view s) const noexcept {

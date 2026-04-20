@@ -102,10 +102,9 @@ bool json_get(const char *json, const char *key, std::string_view &out) {
     const char *p = std::strstr(json, pat);
     if (!p) return false;
     p += pat_len;
-    /* Find the end of the JSON string. We only need to scan forward from
-       the match position, not from the start. */
-    const char *end = p;
-    while (*end) end++;
+    /* Scan forward from match position for end-of-string, avoiding a
+       full-length strlen from the beginning of json. */
+    const char *end = p + std::strlen(p);
     p = skip_ws(p, end);
     const char *ve = json_skip_value(p, end);
     if (!ve) return false;
