@@ -49,7 +49,7 @@ static constexpr int    ZSTD_LEVEL         = 1;
    lower 28 bits = local entry index within that shard. */
 static constexpr int      NUM_SHARDS  = 16;
 static constexpr int      SHARD_BITS  = 4;
-static constexpr int      SHARD_SHIFT = 32 - SHARD_BITS;   /* 28 */
+static constexpr int      SHARD_SHIFT = 32 - SHARD_BITS;
 static constexpr uint32_t LOCAL_MASK  = (1u << SHARD_SHIFT) - 1;
 
 static int      shard_of(IID id)  { return static_cast<int>(id >> SHARD_SHIFT); }
@@ -293,7 +293,8 @@ IID Intern::find(std::string_view data) const {
     uint64_t h = fnv1a(data.data(), data.size());
     int s = hash_to_shard(h);
     auto &shard = m_->shards[s];
-    /* Safe without lock when called after ingestion (append-only data). */
+    /* NOTE: not safe to call concurrently with put() to the same shard.
+       Intended for use after ingestion completes (all puts done). */
     return shard.htab_find(h, data.data(), data.size());
 }
 
