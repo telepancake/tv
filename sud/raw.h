@@ -34,14 +34,25 @@ static inline long raw_syscall6(long nr, long a0, long a1, long a2,
     return ret;
 #else
     long ret;
+    /* On i386, all 6 GPRs (eax–edi) are consumed by the syscall ABI,
+     * so ebp must carry arg5.  We cannot push ebp to save it because
+     * that changes esp BEFORE the compiler-generated operand for a5 is
+     * read — if the compiler chose an esp-relative memory operand for
+     * a5, the push shifts it by 4 bytes, loading the wrong value.
+     *
+     * Fix (same technique as musl libc): push a5 while esp is still at
+     * its original value (so any esp-relative operand is correct), then
+     * push ebp, then load a5 from the known stack slot. */
     __asm__ volatile(
-        "push %%ebp\n\t"
-        "mov %[a5], %%ebp\n\t"
-        "int $0x80\n\t"
-        "pop %%ebp"
+        "pushl %[a5]\n\t"
+        "pushl %%ebp\n\t"
+        "movl  4(%%esp), %%ebp\n\t"
+        "int   $0x80\n\t"
+        "popl  %%ebp\n\t"
+        "addl  $4, %%esp"
         : "=a"(ret)
         : "a"(nr), "b"(a0), "c"(a1), "d"(a2), "S"(a3), "D"(a4),
-          [a5] "rm"(a5)
+          [a5] "g"(a5)
         : "memory"
     );
     return ret;
