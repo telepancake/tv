@@ -906,58 +906,570 @@ static void parallel_ingest(std::vector<std::string> &lines);
 static void ingest_zstd_file(const char *path);
 
 /* ── Parallel batch ingestion ──────────────────────────────────────── */
-/* Pre-parse JSON in parallel threads (which also intern strings and
-   compress blobs via thread-safe g_pool), then apply events
-   sequentially to global state.  Called once per batch. */
+/* Phase 1 (parallel): parse JSON lines + intern strings via g_pool.
+   Phase 2 (parallel): bucket by tgid; each worker owns its tgid range,
+     builds a thread-local g_events slice, process_t set, and path-tree
+     delta (a small trie of new nodes + per-node counter increments).
+   Merge (sequential): stitch per-worker event slices in original order,
+     fold path-tree deltas into the global trie, merge processes, and
+     establish parent-child links.                                      */
 
 #include <thread>
 
 static constexpr int MAX_PARSE_THREADS = 8;
 static constexpr int MIN_LINES_PER_THREAD = 64;
-/* ~128K lines per batch keeps peak memory ~25–50 MB per batch (typical
-   JSON lines are 100–400 bytes) while still providing enough work for
-   the parallel parse threads.  Much larger batches risk OOM on huge
-   traces; much smaller ones increase batch-overhead. */
+/* Phase 2 workers do more work per event (path resolution, process
+   state), so a lower threshold per thread is appropriate. */
+static constexpr int MIN_EVENTS_PER_P2_THREAD = 16;
+/* ~128K lines per batch keeps peak memory ~25–50 MB per batch. */
 static constexpr int INGEST_BATCH_SIZE = 128 * 1024;
+
+/* ── Phase-2 worker state ─────────────────────────────────────────── */
+
+struct phase2_worker_t {
+    /* Thread-local path trie (same structure as global, independent root). */
+    PathItem local_root;
+    std::unordered_map<uint32_t, PathItem*> local_nonabs;
+
+    /* Events produced by this worker, tagged with original index. */
+    struct tagged_event {
+        int orig_idx;       /* position in original parsed[] array */
+        trace_event_t ev;
+    };
+    std::vector<tagged_event> events;
+
+    /* Process state for each tgid owned by this worker. */
+    std::unordered_map<int, std::unique_ptr<process_t>> procs;
+
+    /* Per-worker minimum timestamp. */
+    double min_ts = 0;
+    bool   has_min_ts = false;
+
+    phase2_worker_t() { local_root.is_dir = true; }
+
+    /* Non-copyable (owns heap PathItem nodes). */
+    phase2_worker_t(const phase2_worker_t &) = delete;
+    phase2_worker_t &operator=(const phase2_worker_t &) = delete;
+    phase2_worker_t(phase2_worker_t &&) = default;
+    phase2_worker_t &operator=(phase2_worker_t &&) = default;
+
+    ~phase2_worker_t() {
+        free_path_tree_children(&local_root);
+        for (auto &[k, v] : local_nonabs) delete v;
+    }
+
+    /* ── Local path interning (mirrors global intern_path_item) ──── */
+
+    PathItem *intern_path(std::string_view path) {
+        if (path.empty()) return nullptr;
+        if (path[0] != '/') {
+            /* Abstract handle → flat map (same as global g_nonabs_paths). */
+            InlineIID nid = g_pool.put_inline(path);
+            auto it = local_nonabs.find(nid.v);
+            if (it != local_nonabs.end()) return it->second;
+            auto *np = new PathItem();
+            np->name_id = nid;
+            np->is_dir = false;
+            local_nonabs.emplace(nid.v, np);
+            return np;
+        }
+        PathItem *cur = &local_root;
+        size_t i = 1;
+        while (i < path.size()) {
+            auto sl = path.find('/', i);
+            size_t seg_len = (sl == std::string_view::npos)
+                                 ? path.size() - i : sl - i;
+            std::string_view seg(path.data() + i, seg_len);
+            if (seg.empty()) {
+                i = (sl == std::string_view::npos) ? path.size() : sl + 1;
+                continue;
+            }
+            bool is_last = (sl == std::string_view::npos);
+            InlineIID seg_id = g_pool.put_inline(seg);
+            cur = cur->getOrCreateChild(seg_id, !is_last);
+            i = is_last ? path.size() : sl + 1;
+        }
+        return cur;
+    }
+
+    PathItem *intern_classified_local(path_kind_t kind,
+                                      std::string_view raw,
+                                      std::string_view cwd) {
+        switch (kind) {
+        case PK_NONE: return nullptr;
+        case PK_ABS:  return intern_path(canon_path(raw));
+        case PK_ABSTRACT: return intern_path(raw);
+        case PK_RELATIVE: {
+            std::string resolved = resolve_relative(raw, cwd);
+            if (resolved.empty()) return nullptr;
+            return intern_path(resolved);
+        }
+        }
+        return nullptr;
+    }
+
+    /* ── Local process access ─────────────────────────────────────── */
+
+    process_t &get_proc(int tgid) {
+        auto [it, ins] = procs.try_emplace(tgid);
+        if (ins) { it->second = std::make_unique<process_t>();
+                   it->second->tgid = tgid; }
+        return *it->second;
+    }
+
+    /* ── Apply one preparsed event to local state ─────────────────── */
+
+    void apply(preparsed_event_t &pe, int orig_idx) {
+        auto &te = events.emplace_back();
+        te.orig_idx = orig_idx;
+        auto &ev = te.ev;
+        ev.kind = pe.kind;
+        ev.ts   = pe.ts;
+        ev.tgid = pe.tgid;
+        ev.ppid = pe.ppid;
+        ev.id   = 0;   /* assigned during merge */
+
+        int local_idx = static_cast<int>(events.size()) - 1;
+
+        if (!has_min_ts || ev.ts < min_ts) { min_ts = ev.ts; has_min_ts = true; }
+
+        auto &proc = get_proc(ev.tgid);
+        proc.event_indices.push_back(local_idx);
+        if (!proc.has_start || ev.ts < proc.start_ts)
+            { proc.start_ts = ev.ts; proc.has_start = 1; }
+        if (!proc.has_end   || ev.ts > proc.end_ts)
+            { proc.end_ts   = ev.ts; proc.has_end   = 1; }
+
+        if (!proc.parent_set && ev.ppid > 0 && ev.ppid != proc.tgid) {
+            proc.ppid = ev.ppid;
+            proc.parent_set = true;
+            /* Parent-child link deferred to merge phase. */
+        }
+
+        switch (ev.kind) {
+        case EV_CWD:
+        case EV_OPEN:
+        case EV_UNLINK:
+            if (ev.kind == EV_OPEN) {
+                ev.flags_id = pe.flags_id;
+                ev.mode     = pe.mode;
+                ev.err      = pe.err;
+            }
+            {
+                PathItem *pi = intern_classified_local(
+                    pe.path_kind, pe.raw_path, proc.cwd_view());
+                if (pi) {
+                    ev.path_item = pi;
+                    if (ev.kind == EV_CWD) {
+                        proc.set_cwd(pi);
+                    } else if (ev.kind == EV_OPEN) {
+                        bool wr = open_is_write(ev.mode, ev.flags_id);
+                        bool rd = open_is_read (ev.mode, ev.flags_id);
+                        if (wr) proc.has_write_open = 1;
+                        if (rd) { proc.read_paths.insert(pi);
+                                  pi->read_procs.insert(ev.tgid); }
+                        if (wr) { proc.write_paths.insert(pi);
+                                  pi->write_procs.insert(ev.tgid); }
+                        pi->opens++;
+                        if (ev.err) pi->errs++;
+                        pi->aggregated_mode |= ev.mode;
+                        if (wr && ev.ts > pi->last_open_write_ts)
+                            pi->last_open_write_ts = ev.ts;
+                        pi->proc_tgids.insert(ev.tgid);
+                        pi->open_event_indices.push_back(local_idx);
+                        pi->events.insert(local_idx);
+                    } else { /* EV_UNLINK */
+                        pi->unlinks++;
+                        if (ev.ts > pi->last_unlink_ts)
+                            pi->last_unlink_ts = ev.ts;
+                        pi->unlink_procs.insert(ev.tgid);
+                        pi->proc_tgids.insert(ev.tgid);
+                        pi->unlink_event_indices.push_back(local_idx);
+                        pi->events.insert(local_idx);
+                    }
+                }
+            }
+            break;
+        case EV_EXEC:
+            ev.exe_id   = pe.exe_id;
+            ev.argv_blob = pe.argv_blob;
+            proc.exe_id   = ev.exe_id;
+            proc.argv_blob = ev.argv_blob;
+            proc.update_display_name();
+            break;
+        case EV_EXIT:
+            ev.status_id   = pe.status_id;
+            ev.code        = pe.code;
+            ev.signal      = pe.signal_;
+            ev.core_dumped = pe.core_dumped;
+            proc.exit_status_id = ev.status_id;
+            proc.exit_code   = ev.code;
+            proc.exit_signal = ev.signal;
+            proc.core_dumped = ev.core_dumped;
+            proc.end_ts  = ev.ts;
+            proc.has_end = 1;
+            break;
+        case EV_STDOUT:
+        case EV_STDERR:
+            ev.data_blob = pe.data_blob;
+            if (ev.kind == EV_STDOUT) proc.has_stdout = 1;
+            break;
+        }
+    }
+};
+
+/* ── Path-trie merge helpers ──────────────────────────────────────── */
+
+/* Recursively fold a worker's local path trie into the global trie.
+   Merges counter increments (associative) and remaps local event indices
+   to global indices via idx_remap[local_idx] → global_idx.
+   Records local→global PathItem* mapping for pointer fixup. */
+static void merge_local_trie(
+    PathItem *local, PathItem *global,
+    std::unordered_map<PathItem*, PathItem*> &mapping,
+    const std::vector<int> &idx_remap)
+{
+    for (auto *child_item : local->children) {
+        auto *lc = static_cast<PathItem*>(child_item);
+        PathItem *gc = global->getOrCreateChild(lc->name_id, lc->is_dir);
+        mapping[lc] = gc;
+
+        /* Associative counter merge. */
+        gc->opens   += lc->opens;
+        gc->errs    += lc->errs;
+        gc->unlinks += lc->unlinks;
+        gc->aggregated_mode |= lc->aggregated_mode;
+        if (lc->last_open_write_ts > gc->last_open_write_ts)
+            gc->last_open_write_ts = lc->last_open_write_ts;
+        if (lc->last_unlink_ts > gc->last_unlink_ts)
+            gc->last_unlink_ts = lc->last_unlink_ts;
+
+        /* Merge unordered sets. */
+        for (auto t : lc->proc_tgids) gc->proc_tgids.insert(t);
+
+        /* Merge sorted_vec_sets. */
+        for (auto &v : lc->read_procs)   gc->read_procs.insert(v);
+        for (auto &v : lc->write_procs)  gc->write_procs.insert(v);
+        for (auto &v : lc->unlink_procs) gc->unlink_procs.insert(v);
+
+        /* Merge event-index vectors/sets (with remapping). */
+        for (auto li : lc->open_event_indices)
+            gc->open_event_indices.push_back(idx_remap[li]);
+        for (auto li : lc->unlink_event_indices)
+            gc->unlink_event_indices.push_back(idx_remap[li]);
+        for (auto &li : lc->events)
+            gc->events.insert(idx_remap[li]);
+
+        /* Recurse into subtree. */
+        merge_local_trie(lc, gc, mapping, idx_remap);
+    }
+}
+
+/* Remap a process's PathItem* fields using the combined mapping. */
+static void remap_proc_paths(
+    process_t &proc,
+    const std::unordered_map<PathItem*, PathItem*> &mapping)
+{
+    /* CWD */
+    if (proc.cwd_item) {
+        auto it = mapping.find(proc.cwd_item);
+        proc.cwd_item = (it != mapping.end()) ? it->second : nullptr;
+    }
+
+    /* read_paths, write_paths — rebuild with remapped pointers. */
+    auto remap_set = [&](sorted_vec_set<PathItem*, PathItemPtrLess> &s) {
+        sorted_vec_set<PathItem*, PathItemPtrLess> tmp;
+        for (auto *pi : s) {
+            auto it = mapping.find(pi);
+            if (it != mapping.end()) tmp.insert(it->second);
+        }
+        s = std::move(tmp);
+    };
+    remap_set(proc.read_paths);
+    remap_set(proc.write_paths);
+}
+
+/* ── parallel_ingest — main entry point ───────────────────────────── */
 
 static void parallel_ingest(std::vector<std::string> &lines) {
     if (lines.empty()) return;
     int nlines = static_cast<int>(lines.size());
 
-    /* Pre-parse all lines in parallel. */
+    /* ── Phase 1: Pre-parse JSON in parallel (unchanged). ────────── */
     std::vector<preparsed_event_t> parsed(nlines);
-    int nthreads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-    if (nthreads > MAX_PARSE_THREADS) nthreads = MAX_PARSE_THREADS;
-    if (nlines < nthreads * MIN_LINES_PER_THREAD) nthreads = 1;
+    int hw = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    int nthreads_p1 = std::min(hw, MAX_PARSE_THREADS);
+    if (nlines < nthreads_p1 * MIN_LINES_PER_THREAD) nthreads_p1 = 1;
 
-    auto worker = [&](int tid) {
-        int chunk = (nlines + nthreads - 1) / nthreads;
+    auto p1_worker = [&](int tid) {
+        int chunk = (nlines + nthreads_p1 - 1) / nthreads_p1;
         int lo = tid * chunk;
         int hi = std::min(lo + chunk, nlines);
         for (int i = lo; i < hi; i++)
             parsed[i] = preparse_line(lines[i].c_str());
     };
-
-    if (nthreads > 1) {
+    if (nthreads_p1 > 1) {
         std::vector<std::thread> threads;
-        threads.reserve(nthreads);
-        for (int t = 0; t < nthreads; t++)
-            threads.emplace_back(worker, t);
+        threads.reserve(nthreads_p1);
+        for (int t = 0; t < nthreads_p1; t++)
+            threads.emplace_back(p1_worker, t);
         for (auto &t : threads) t.join();
     } else {
-        worker(0);
+        p1_worker(0);
     }
-
-    /* Free line storage as soon as possible. */
     lines.clear();
     lines.shrink_to_fit();
 
-    /* Apply sequentially — updates global state. */
-    g_events.reserve(g_events.size() + nlines);
+    /* ── Collect input lines (not tgid-bucketed). ────────────────── */
     for (int i = 0; i < nlines; i++) {
-        if (parsed[i].valid)
-            apply_preparsed(parsed[i]);
+        if (parsed[i].valid && parsed[i].is_input)
+            g_input_lines.push_back(parsed[i].input_line_id);
     }
+
+    /* ── Count valid non-input events — decide parallel vs seq. ──── */
+    int n_trace = 0;
+    for (int i = 0; i < nlines; i++)
+        if (parsed[i].valid && !parsed[i].is_input) n_trace++;
+    if (n_trace == 0) return;
+
+    int nthreads_p2 = std::min(hw, MAX_PARSE_THREADS);
+    if (n_trace < nthreads_p2 * MIN_EVENTS_PER_P2_THREAD) nthreads_p2 = 1;
+
+    /* ── Sequential fallback for tiny batches or single core. ────── */
+    if (nthreads_p2 <= 1) {
+        g_events.reserve(g_events.size() + n_trace);
+        for (int i = 0; i < nlines; i++) {
+            if (parsed[i].valid && !parsed[i].is_input)
+                apply_preparsed(parsed[i]);
+        }
+        return;
+    }
+
+    /* ── Phase 2A: Bucket valid trace events by tgid. ────────────── */
+    struct bucket_entry { int orig_idx; };
+    std::unordered_map<int, std::vector<bucket_entry>> tgid_buckets;
+    tgid_buckets.reserve(256);
+    for (int i = 0; i < nlines; i++) {
+        auto &pe = parsed[i];
+        if (pe.valid && !pe.is_input)
+            tgid_buckets[pe.tgid].push_back({i});
+    }
+
+    /* Assign tgid ranges to workers (round-robin by bucket size,
+       largest-first, for rough load balancing). */
+    std::vector<std::pair<int, int>> tgid_list; /* (tgid, bucket_size) */
+    tgid_list.reserve(tgid_buckets.size());
+    for (auto &[tgid, bkt] : tgid_buckets)
+        tgid_list.push_back({tgid, static_cast<int>(bkt.size())});
+    std::sort(tgid_list.begin(), tgid_list.end(),
+              [](auto &a, auto &b){ return a.second > b.second; });
+
+    /* worker_tgids[w] = list of tgids assigned to worker w. */
+    std::vector<std::vector<int>> worker_tgids(nthreads_p2);
+    std::vector<int> worker_load(nthreads_p2, 0);
+    for (auto &[tgid, sz] : tgid_list) {
+        /* Pick the least-loaded worker. */
+        int best = 0;
+        for (int w = 1; w < nthreads_p2; w++)
+            if (worker_load[w] < worker_load[best]) best = w;
+        worker_tgids[best].push_back(tgid);
+        worker_load[best] += sz;
+    }
+
+    /* ── Phase 2B: Parallel per-tgid processing. ─────────────────── */
+    /* Use a raw array + placement-new to avoid requiring movable default
+       construction of all N workers up-front. */
+    std::vector<std::unique_ptr<phase2_worker_t>> workers(nthreads_p2);
+    for (int w = 0; w < nthreads_p2; w++)
+        workers[w] = std::make_unique<phase2_worker_t>();
+
+    auto p2_worker = [&](int wid) {
+        auto &ws = *workers[wid];
+        for (int tgid : worker_tgids[wid]) {
+            auto &bkt = tgid_buckets[tgid];
+            for (auto &be : bkt)
+                ws.apply(parsed[be.orig_idx], be.orig_idx);
+        }
+    };
+
+    {
+        std::vector<std::thread> threads;
+        threads.reserve(nthreads_p2);
+        for (int w = 0; w < nthreads_p2; w++)
+            threads.emplace_back(p2_worker, w);
+        for (auto &t : threads) t.join();
+    }
+
+    /* ── Phase 2C: Merge — stitch events, fold tries, merge procs. ── */
+
+    /* C1: Build the global event ordering.
+       Use a slot array indexed by orig_idx for O(nlines) ordering. */
+    struct slot_t { int16_t worker; int local_idx; };
+    std::vector<slot_t> slots(nlines, {-1, 0});
+    int total_events = 0;
+    for (int w = 0; w < nthreads_p2; w++) {
+        for (int j = 0; j < static_cast<int>(workers[w]->events.size()); j++) {
+            int oi = workers[w]->events[j].orig_idx;
+            slots[oi] = {static_cast<int16_t>(w), j};
+        }
+        total_events += static_cast<int>(workers[w]->events.size());
+    }
+
+    /* C2: Stitch events into g_events in original order;
+       build per-worker index remap tables (local_idx → global_idx). */
+    g_events.reserve(g_events.size() + total_events);
+    std::vector<std::vector<int>> idx_remap(nthreads_p2);
+    for (int w = 0; w < nthreads_p2; w++)
+        idx_remap[w].resize(workers[w]->events.size(), -1);
+
+    for (int i = 0; i < nlines; i++) {
+        if (slots[i].worker < 0) continue;
+        int w  = slots[i].worker;
+        int li = slots[i].local_idx;
+        auto &te = workers[w]->events[li];
+        auto &gev = g_events.emplace_back(std::move(te.ev));
+        int global_idx = static_cast<int>(g_events.size()) - 1;
+        gev.id = (gev.kind == EV_CWD) ? 0 : g_next_event_id++;
+        if (gev.id) g_event_id_to_index[gev.id] = global_idx;
+        idx_remap[w][li] = global_idx;
+    }
+
+    /* C3: Compute global g_base_ts from worker minima. */
+    for (int w = 0; w < nthreads_p2; w++) {
+        if (workers[w]->has_min_ts) {
+            if (g_base_ts == 0.0 || workers[w]->min_ts < g_base_ts)
+                g_base_ts = workers[w]->min_ts;
+        }
+    }
+
+    /* C4: Fold each worker's local path trie into the global trie.
+       All workers' local→global mappings go into one combined map
+       (local PathItem* are unique heap addresses, so no collisions). */
+    ensure_path_root();
+    std::unordered_map<PathItem*, PathItem*> pi_mapping;
+    for (int w = 0; w < nthreads_p2; w++) {
+        /* Map local root → global root (in case any ev.path_item == &local_root). */
+        pi_mapping[&workers[w]->local_root] = g_path_root;
+
+        merge_local_trie(&workers[w]->local_root, g_path_root,
+                         pi_mapping, idx_remap[w]);
+
+        /* Merge nonabs paths. */
+        for (auto &[nid_v, lp] : workers[w]->local_nonabs) {
+            auto it = g_nonabs_paths.find(nid_v);
+            PathItem *gp;
+            if (it != g_nonabs_paths.end()) {
+                gp = it->second;
+            } else {
+                gp = new PathItem();
+                gp->name_id = lp->name_id;
+                gp->is_dir  = lp->is_dir;
+                g_nonabs_paths.emplace(nid_v, gp);
+            }
+            pi_mapping[lp] = gp;
+
+            /* Merge counters (same logic as merge_local_trie body). */
+            gp->opens   += lp->opens;
+            gp->errs    += lp->errs;
+            gp->unlinks += lp->unlinks;
+            gp->aggregated_mode |= lp->aggregated_mode;
+            if (lp->last_open_write_ts > gp->last_open_write_ts)
+                gp->last_open_write_ts = lp->last_open_write_ts;
+            if (lp->last_unlink_ts > gp->last_unlink_ts)
+                gp->last_unlink_ts = lp->last_unlink_ts;
+            for (auto t : lp->proc_tgids)    gp->proc_tgids.insert(t);
+            for (auto &v : lp->read_procs)   gp->read_procs.insert(v);
+            for (auto &v : lp->write_procs)  gp->write_procs.insert(v);
+            for (auto &v : lp->unlink_procs) gp->unlink_procs.insert(v);
+            for (auto li : lp->open_event_indices)
+                gp->open_event_indices.push_back(idx_remap[w][li]);
+            for (auto li : lp->unlink_event_indices)
+                gp->unlink_event_indices.push_back(idx_remap[w][li]);
+            for (auto &li : lp->events)
+                gp->events.insert(idx_remap[w][li]);
+        }
+    }
+
+    /* C5: Remap ev.path_item in the newly appended g_events. */
+    int gev_start = static_cast<int>(g_events.size()) - total_events;
+    for (int i = gev_start; i < static_cast<int>(g_events.size()); i++) {
+        if (g_events[i].path_item) {
+            auto it = pi_mapping.find(g_events[i].path_item);
+            if (it != pi_mapping.end())
+                g_events[i].path_item = it->second;
+        }
+    }
+
+    /* C6: Merge worker processes into g_proc_map.
+       Each tgid is owned by exactly one worker within a batch, but a
+       tgid may already exist in g_proc_map from a previous batch. */
+    for (int w = 0; w < nthreads_p2; w++) {
+        auto &remap = idx_remap[w];
+        for (auto &[tgid, lp] : workers[w]->procs) {
+            /* Remap local PathItem* to global PathItem* first. */
+            remap_proc_paths(*lp, pi_mapping);
+            /* Remap local event indices to global. */
+            for (auto &li : lp->event_indices) li = remap[li];
+
+            auto [it, inserted] = g_proc_map.try_emplace(tgid);
+            if (inserted) {
+                /* New process — move the whole object. */
+                it->second = std::move(lp);
+            } else {
+                /* Existing process from a previous batch — merge. */
+                auto &gp = *it->second;
+                if (lp->has_start && (!gp.has_start || lp->start_ts < gp.start_ts))
+                    { gp.start_ts = lp->start_ts; gp.has_start = 1; }
+                if (lp->has_end && (!gp.has_end || lp->end_ts > gp.end_ts))
+                    { gp.end_ts = lp->end_ts; gp.has_end = 1; }
+                if (!gp.parent_set && lp->parent_set)
+                    { gp.ppid = lp->ppid; gp.parent_set = true; }
+                if (lp->exe_id)
+                    { gp.exe_id = lp->exe_id; gp.argv_blob = lp->argv_blob;
+                      gp.update_display_name(); }
+                if (lp->cwd_item) gp.cwd_item = lp->cwd_item;
+                if (lp->exit_status_id) {
+                    gp.exit_status_id = lp->exit_status_id;
+                    gp.exit_code   = lp->exit_code;
+                    gp.exit_signal = lp->exit_signal;
+                    gp.core_dumped = lp->core_dumped;
+                }
+                gp.has_write_open |= lp->has_write_open;
+                gp.has_stdout     |= lp->has_stdout;
+                gp.event_indices.insert(gp.event_indices.end(),
+                    lp->event_indices.begin(), lp->event_indices.end());
+                for (auto *pi : lp->read_paths)  gp.read_paths.insert(pi);
+                for (auto *pi : lp->write_paths) gp.write_paths.insert(pi);
+            }
+        }
+    }
+
+    /* C7: Establish parent-child links.
+       All processes from this batch are now in g_proc_map.  For each
+       process that recorded a ppid, link to the parent if it exists. */
+    for (int w = 0; w < nthreads_p2; w++) {
+        for (auto &[tgid, _lp] : workers[w]->procs) {
+            auto pit = g_proc_map.find(tgid);
+            if (pit == g_proc_map.end()) continue;
+            auto &proc = *pit->second;
+            if (!proc.parent_set || proc.ppid <= 0 || proc.ppid == proc.tgid)
+                continue;
+            /* Check if link already established (e.g. from previous batch). */
+            auto parent_it = g_proc_map.find(proc.ppid);
+            if (parent_it == g_proc_map.end()) continue;
+            auto &parent = *parent_it->second;
+            /* Avoid duplicate links: check if parent already has this child. */
+            bool already_linked = false;
+            for (auto *c : parent.children)
+                if (static_cast<process_t*>(c)->tgid == tgid)
+                    { already_linked = true; break; }
+            if (!already_linked)
+                parent.children.push_back(&proc);
+        }
+    }
+
+    /* Workers are destroyed here, freeing local path tries.
+       All local PathItem* have been remapped to global by now. */
 }
 
 static void ingest_zstd_file(const char *path) {
