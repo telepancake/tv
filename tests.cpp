@@ -1176,6 +1176,86 @@ static bool test_unlink_evfilt() {
     return true;
 }
 
+// Generate a trace with many tgids sharing the same files, large enough
+// to trigger the parallel phase-2 code path (MIN_EVENTS_PER_P2_THREAD=16,
+// so ≥64 events on a 4-core box).  The trace exercises:
+//   - multiple tgids reading/writing shared paths
+//   - relative path resolution (CWD + relative open)
+//   - parent-child links
+//   - exit events
+static std::string gen_parallel_p2_trace() {
+    std::string out;
+    char buf[1024];
+    int n_procs = 40;  // enough events: 40 * 5 = 200
+    for (int i = 0; i < n_procs; i++) {
+        int tgid = 8000 + i;
+        int ppid = (i == 0) ? 1 : 8000;
+        double ts = 100.0 + i * 0.1;
+        std::snprintf(buf, sizeof buf,
+            R"({"event":"CWD","tgid":%d,"pid":%d,"ppid":%d,"nspid":%d,"nstgid":%d,"ts":%.3f,"path":"/work"})" "\n",
+            tgid, tgid, ppid, tgid, tgid, ts);
+        out += buf;
+        std::snprintf(buf, sizeof buf,
+            R"({"event":"EXEC","tgid":%d,"pid":%d,"ppid":%d,"nspid":%d,"nstgid":%d,"ts":%.3f,"exe":"/usr/bin/p%d","argv":["p%d","--id","%d"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}})" "\n",
+            tgid, tgid, ppid, tgid, tgid, ts + 0.001, i, i, i);
+        out += buf;
+        // Each process reads shared.txt and writes output_N.txt (relative path)
+        std::snprintf(buf, sizeof buf,
+            R"({"event":"OPEN","tgid":%d,"pid":%d,"ppid":%d,"nspid":%d,"nstgid":%d,"ts":%.3f,"path":"shared.txt","flags":["O_RDONLY"],"fd":3})" "\n",
+            tgid, tgid, ppid, tgid, tgid, ts + 0.010);
+        out += buf;
+        std::snprintf(buf, sizeof buf,
+            R"({"event":"OPEN","tgid":%d,"pid":%d,"ppid":%d,"nspid":%d,"nstgid":%d,"ts":%.3f,"path":"output_%d.txt","flags":["O_WRONLY","O_CREAT","O_TRUNC"],"fd":4})" "\n",
+            tgid, tgid, ppid, tgid, tgid, ts + 0.011, i);
+        out += buf;
+        std::snprintf(buf, sizeof buf,
+            R"({"event":"EXIT","tgid":%d,"pid":%d,"ppid":%d,"nspid":%d,"nstgid":%d,"ts":%.3f,"status":"exited","code":%d,"raw":0})" "\n",
+            tgid, tgid, ppid, tgid, tgid, ts + 0.020, i % 3 == 0 ? 1 : 0);
+        out += buf;
+    }
+    return out;
+}
+
+static bool test_parallel_phase2_ingest() {
+    auto trace = gen_parallel_p2_trace();
+    tv_test_reset();
+    tv_test_load_string(trace.c_str());
+    tv_test_create(50, 120);
+
+    // Check process tree — all 40 processes should be present
+    int lp = tv_test_lpane();
+    ASSERT(row_exists(lp, "8000"), "missing root process 8000");
+    ASSERT(row_exists(lp, "8010"), "missing process 8010");
+    ASSERT(row_exists(lp, "8039"), "missing last process 8039");
+
+    // Check file view — shared.txt should be readable by all 40 procs
+    send(R"({"input":"key","name":"2"})");
+    lp = tv_test_lpane();
+    ASSERT(col_contains(lp, "shared.txt"), "missing shared.txt in file view");
+    ASSERT(col_contains(lp, "output_0.txt"), "missing output_0.txt");
+    ASSERT(col_contains(lp, "output_39.txt"), "missing output_39.txt");
+
+    // Check file detail for shared.txt — should show opens from many procs
+    send(R"({"input":"select","id":"/work/shared.txt"})");
+    ASSERT(rpane_col_contains("shared.txt"), "missing shared.txt in detail");
+    // The file should show 40 opens (detail shows "Opens: 40")
+    ASSERT(rpane_col_contains("Opens: 40"), "missing 'Opens: 40' for shared.txt");
+
+    // Check a process detail — verify events are present
+    send(R"({"input":"key","name":"1"})");
+    send(R"({"input":"select","id":"8005"})");
+    ASSERT(rpane_col_contains("8005"), "missing tgid in detail");
+    ASSERT(rpane_col_contains("p5"), "missing exe name");
+    ASSERT(rpane_col_contains("[OPEN]"), "missing OPEN event");
+    ASSERT(rpane_col_contains("[EXIT]"), "missing EXIT event");
+
+    // Verify parent-child: 8000 should be parent of 8001..8039
+    send(R"({"input":"select","id":"8000"})");
+    ASSERT(rpane_col_contains("8000"), "missing root in detail");
+
+    return true;
+}
+
 // ── Test registry ────────────────────────────────────────────────────
 
 static struct { const char *name; bool (*fn)(); } ALL_TESTS[] = {
@@ -1256,6 +1336,7 @@ static struct { const char *name; bool (*fn)(); } ALL_TESTS[] = {
     {"file_filter: refinement hides system paths",        test_file_refinement_filter},
     {"file_filter: glob pattern",                         test_file_glob_filter},
     {"unlink: event filter includes UNLINK",              test_unlink_evfilt},
+    {"parallel phase 2: multi-tgid ingest",              test_parallel_phase2_ingest},
 };
 
 int run_tests() {
