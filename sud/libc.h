@@ -322,6 +322,7 @@ extern int g_errno_value;
 /* ================================================================
  * Signals
  * ================================================================ */
+#define SIGBUS           7
 #define SIGSEGV          11
 #define SIGCHLD         17
 #define SIGSYS          31
