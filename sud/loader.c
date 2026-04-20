@@ -14,6 +14,149 @@
 #include "sud/loader.h"
 #include "deps/printf/printf.h"
 
+/*
+ * crash_diagnostic_handler — SIGSEGV handler for debugging.
+ *
+ * When the loaded binary crashes, this handler prints the faulting address,
+ * instruction pointer, and register state to stderr.  This output helps
+ * diagnose ELF loader issues (wrong segment mapping, bad auxv, etc.)
+ * without needing an external debugger.
+ *
+ * The handler uses only raw_write (via write to fd 2) which is async-signal-safe.
+ */
+static void fmt_hex_long(char *buf, unsigned long val)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (int i = (int)(sizeof(unsigned long) * 2 - 1); i >= 0; i--) {
+        buf[i] = hex[val & 0xf];
+        val >>= 4;
+    }
+    buf[sizeof(unsigned long) * 2] = '\0';
+}
+
+static void crash_diagnostic_handler(int sig, siginfo_t *info, void *uctx_raw)
+{
+    ucontext_t *uc = (ucontext_t *)uctx_raw;
+    char msg[512];
+    int pos = 0;
+    char hex[sizeof(unsigned long) * 2 + 1];
+
+    /* Header */
+    {
+        const char hdr[] = "\nsudtrace: CRASH DIAGNOSTIC\n"
+                           "  Signal: SIGSEGV\n";
+        memcpy(msg + pos, hdr, sizeof(hdr) - 1);
+        pos += sizeof(hdr) - 1;
+    }
+
+    /* Fault address: si_addr is at offset 12 in siginfo_t for SIGSEGV
+     * (after si_signo, si_errno, si_code).  The _pad0 field in our struct
+     * corresponds to si_addr for fault signals. */
+    {
+        const char s[] = "  Fault addr: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)info->_pad0);
+        memcpy(msg + pos, hex, sizeof(unsigned long) * 2);
+        pos += sizeof(unsigned long) * 2;
+        msg[pos++] = '\n';
+    }
+
+#if defined(__x86_64__)
+    {
+        const char s[] = "  RIP: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        unsigned long rip = (unsigned long)uc->uc_mcontext.gregs[REG_RIP];
+        for (int i = 15; i >= 0; i--) {
+            hex[i] = "0123456789abcdef"[rip & 0xf]; rip >>= 4;
+        }
+        memcpy(msg + pos, hex, 16); pos += 16;
+        msg[pos++] = '\n';
+    }
+    {
+        const char s[] = "  RSP: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        unsigned long rsp = (unsigned long)uc->uc_mcontext.gregs[REG_RSP];
+        for (int i = 15; i >= 0; i--) {
+            hex[i] = "0123456789abcdef"[rsp & 0xf]; rsp >>= 4;
+        }
+        memcpy(msg + pos, hex, 16); pos += 16;
+        msg[pos++] = '\n';
+    }
+#else
+    /* i386 registers */
+    {
+        const char s[] = "  EIP: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EIP]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        msg[pos++] = '\n';
+    }
+    {
+        const char s[] = "  ESP: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_ESP]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        msg[pos++] = '\n';
+    }
+    {
+        const char s[] = "  EAX: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EAX]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        const char s2[] = "  EBX: 0x";
+        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EBX]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        msg[pos++] = '\n';
+    }
+    {
+        const char s[] = "  ECX: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_ECX]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        const char s2[] = "  EDX: 0x";
+        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EDX]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        msg[pos++] = '\n';
+    }
+    {
+        const char s[] = "  ESI: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_ESI]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        const char s2[] = "  EDI: 0x";
+        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EDI]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        msg[pos++] = '\n';
+    }
+    {
+        const char s[] = "  EBP: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EBP]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        msg[pos++] = '\n';
+    }
+#endif
+
+    raw_write(2, msg, pos);
+
+    /* Re-raise with default handler to get core dump */
+    {
+        struct kernel_sigaction_raw dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.handler = (void (*)(int))0; /* SIG_DFL */
+        dfl.flags = SA_RESTORER;
+        dfl.restorer = sud_rt_sigreturn_restorer;
+        raw_syscall6(SYS_rt_sigaction, sig, (long)&dfl, 0,
+                     sizeof(dfl.mask), 0, 0);
+    }
+    raw_syscall6(SYS_kill, raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0),
+                 sig, 0, 0, 0, 0);
+    _exit(128 + sig);
+}
+
 void load_and_run_elf(const char *path, int argc, char **argv,
                       int drop_count)
 {
@@ -432,6 +575,21 @@ void load_and_run_elf(const char *path, int argc, char **argv,
     close(fd);
     if (target_fd >= 0)
         close(target_fd);
+
+    /* Install a diagnostic SIGSEGV handler to capture crash details.
+     * This runs in place of the default handler and prints the fault
+     * address and register state before aborting, which is invaluable
+     * for debugging issues with the in-process loader. */
+    {
+        struct kernel_sigaction_raw segv_sa;
+        memset(&segv_sa, 0, sizeof(segv_sa));
+        segv_sa.handler = (void (*)(int))crash_diagnostic_handler;
+        segv_sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER;
+        segv_sa.restorer = sud_rt_sigreturn_restorer;
+        segv_sa.mask = 0;
+        raw_syscall6(SYS_rt_sigaction, SIGSEGV, (long)&segv_sa, 0,
+                     sizeof(segv_sa.mask), 0, 0);
+    }
 
     /* Jump to the entry point */
     unsigned long entry = load_base + ehdr.e_entry;
