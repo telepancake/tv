@@ -97,20 +97,20 @@ struct PathItem : Item {
     std::string getParentKey()   const override;
     RowData     makeRow(int depth) const override;
 
-    /* O(1) child lookup via hash map. */
-    PathItem *getOrCreateChild(const std::string &child_name, bool dir) {
-        auto [it, inserted] = child_map_.try_emplace(child_name, nullptr);
-        if (!inserted) return it->second;
+    /* O(1) child lookup via hash map with heterogeneous (string_view) lookup. */
+    PathItem *getOrCreateChild(std::string_view child_name, bool dir) {
+        auto it = child_map_.find(child_name);
+        if (it != child_map_.end()) return it->second;
         auto *nc = new PathItem();
-        nc->name = child_name;
+        nc->name = std::string(child_name);
         nc->parent = this;
         nc->is_dir = dir;
         children.push_back(nc);
-        it->second = nc;
+        child_map_.emplace(std::string_view(nc->name), nc);
         return nc;
     }
 
-    PathItem *findChild(const std::string &child_name) const {
+    PathItem *findChild(std::string_view child_name) const {
         auto it = child_map_.find(child_name);
         return it != child_map_.end() ? it->second : nullptr;
     }
@@ -119,7 +119,22 @@ struct PathItem : Item {
 
 private:
     mutable std::string cached_key_;
-    std::unordered_map<std::string, PathItem*> child_map_;
+
+    /* Transparent hash/eq so we can look up by string_view without
+       allocating a std::string for the common (already-exists) case. */
+    struct SvHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view s) const noexcept {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+    struct SvEq {
+        using is_transparent = void;
+        bool operator()(std::string_view a, std::string_view b) const noexcept {
+            return a == b;
+        }
+    };
+    std::unordered_map<std::string_view, PathItem*, SvHash, SvEq> child_map_;
 };
 
 /* Root of the file tree — represents "/" */
@@ -145,7 +160,8 @@ static PathItem *intern_path_item(const std::string &path) {
     size_t i = 1; /* skip leading '/' */
     while (i < path.size()) {
         auto sl = path.find('/', i);
-        std::string seg = (sl == std::string::npos) ? path.substr(i) : path.substr(i, sl - i);
+        size_t seg_len = (sl == std::string::npos) ? path.size() - i : sl - i;
+        std::string_view seg(path.data() + i, seg_len);
         if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
         bool is_last = (sl == std::string::npos);
         cur = cur->getOrCreateChild(seg, !is_last);
@@ -166,7 +182,8 @@ static PathItem *find_path_item(const std::string &path) {
     size_t i = 1;
     while (i < path.size()) {
         auto sl = path.find('/', i);
-        std::string seg = (sl == std::string::npos) ? path.substr(i) : path.substr(i, sl - i);
+        size_t seg_len = (sl == std::string::npos) ? path.size() - i : sl - i;
+        std::string_view seg(path.data() + i, seg_len);
         if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
         PathItem *found = cur->findChild(seg);
         if (!found) return nullptr;

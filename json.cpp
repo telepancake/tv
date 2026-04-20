@@ -53,8 +53,13 @@ static const char *json_skip_value(const char *p, const char *end) {
 std::string json_decode_string(std::string_view sp) {
     if (sp.empty() || sp[0] != '"') return {};
     const char *p = sp.data() + 1, *end = sp.data() + sp.size() - 1;
-    std::string out;
+    /* Fast path: if no backslash, return the substring directly. */
+    const char *bs = static_cast<const char *>(std::memchr(p, '\\', static_cast<size_t>(end - p)));
+    if (!bs) return std::string(p, static_cast<size_t>(end - p));
+    /* Slow path: copy up to the first backslash, then decode escapes. */
+    std::string out(p, static_cast<size_t>(bs - p));
     out.reserve(static_cast<size_t>(end - p));
+    p = bs;
     while (p < end) {
         if (*p == '\\' && p + 1 < end) {
             p++;
@@ -93,11 +98,14 @@ std::string json_decode_string(std::string_view sp) {
 
 bool json_get(const char *json, const char *key, std::string_view &out) {
     char pat[128];
-    std::snprintf(pat, sizeof pat, "\"%s\":", key);
+    int pat_len = std::snprintf(pat, sizeof pat, "\"%s\":", key);
     const char *p = std::strstr(json, pat);
     if (!p) return false;
-    p += std::strlen(pat);
-    const char *end = json + std::strlen(json);
+    p += pat_len;
+    /* Find the end of the JSON string. We only need to scan forward from
+       the match position, not from the start. */
+    const char *end = p;
+    while (*end) end++;
     p = skip_ws(p, end);
     const char *ve = json_skip_value(p, end);
     if (!ve) return false;
