@@ -107,23 +107,22 @@ struct PathItem : Item {
     std::string getParentKey()   const override;
     RowData     makeRow(int depth) const override;
 
-    /* O(log n) child lookup via sorted_vec_set keyed by name IID.
-       Heterogeneous lookup lets us search by bare IID. */
+    /* O(1) average child lookup via unordered_map keyed by name IID. */
     PathItem *getOrCreateChild(IID child_name_id, bool dir) {
         auto it = children_set_.find(child_name_id);
-        if (it != children_set_.end()) return *it;
+        if (it != children_set_.end()) return it->second;
         auto *nc = new PathItem();
         nc->name_id = child_name_id;
         nc->parent = this;
         nc->is_dir = dir;
         children.push_back(nc);
-        children_set_.insert(nc);
+        children_set_.emplace(child_name_id, nc);
         return nc;
     }
 
     PathItem *findChild(IID child_name_id) const {
         auto it = children_set_.find(child_name_id);
-        return it != children_set_.end() ? *it : nullptr;
+        return it != children_set_.end() ? it->second : nullptr;
     }
 
     void clearChildSet() { children_set_.clear(); }
@@ -132,20 +131,7 @@ private:
     mutable IID         key_id_ = 0;
     mutable std::string key_fallback_;  /* only for paths ≥ 128 bytes */
 
-    /* Comparator: orders PathItem* by their interned name IID.
-       Supports heterogeneous lookup by bare IID. */
-    struct CmpByNameIID {
-        bool operator()(const PathItem *a, const PathItem *b) const {
-            return a->name_id < b->name_id;
-        }
-        bool operator()(const PathItem *a, IID b) const {
-            return a->name_id < b;
-        }
-        bool operator()(IID a, const PathItem *b) const {
-            return a < b->name_id;
-        }
-    };
-    mutable sorted_vec_set<PathItem*, CmpByNameIID> children_set_;
+    mutable std::unordered_map<IID, PathItem*> children_set_;
 };
 
 /* Root of the file tree — represents "/" */
