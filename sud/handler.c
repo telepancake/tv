@@ -531,7 +531,7 @@ void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
             void (*handler)(int);
             unsigned long flags;
             void (*restorer)(void);
-            unsigned long mask;
+            sud_sigset_word_t mask;
         };
         const struct kernel_sigaction *act =
             (const struct kernel_sigaction *)a1;

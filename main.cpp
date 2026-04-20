@@ -97,22 +97,47 @@ struct PathItem : Item {
     std::string getParentKey()   const override;
     RowData     makeRow(int depth) const override;
 
-    /* Find or create a child directory/file by name. */
-    PathItem *getOrCreateChild(const std::string &child_name, bool dir) {
-        for (auto *c : children) {
-            auto *pc = static_cast<PathItem*>(c);
-            if (pc->name == child_name) return pc;
-        }
+    /* O(1) child lookup via hash map with heterogeneous (string_view) lookup. */
+    PathItem *getOrCreateChild(std::string_view child_name, bool dir) {
+        auto it = child_map_.find(child_name);
+        if (it != child_map_.end()) return it->second;
         auto *nc = new PathItem();
-        nc->name = child_name;
+        nc->name = std::string(child_name);
         nc->parent = this;
         nc->is_dir = dir;
         children.push_back(nc);
+        child_map_.emplace(std::string_view(nc->name), nc);
         return nc;
     }
 
+    PathItem *findChild(std::string_view child_name) const {
+        auto it = child_map_.find(child_name);
+        return it != child_map_.end() ? it->second : nullptr;
+    }
+
+    void clearChildMap() { child_map_.clear(); }
+
 private:
     mutable std::string cached_key_;
+
+    /* Transparent hash/eq so we can look up by string_view without
+       allocating a std::string for the common (already-exists) case.
+       Safety: keys are string_views into each child's PathItem::name.
+       PathItem nodes are append-only (never destroyed or renamed during
+       the tree's lifetime), so the views remain valid. */
+    struct SvHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view s) const noexcept {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+    struct SvEq {
+        using is_transparent = void;
+        bool operator()(std::string_view a, std::string_view b) const noexcept {
+            return a == b;
+        }
+    };
+    std::unordered_map<std::string_view, PathItem*, SvHash, SvEq> child_map_;
 };
 
 /* Root of the file tree — represents "/" */
@@ -138,7 +163,8 @@ static PathItem *intern_path_item(const std::string &path) {
     size_t i = 1; /* skip leading '/' */
     while (i < path.size()) {
         auto sl = path.find('/', i);
-        std::string seg = (sl == std::string::npos) ? path.substr(i) : path.substr(i, sl - i);
+        size_t seg_len = (sl == std::string::npos) ? path.size() - i : sl - i;
+        std::string_view seg(path.data() + i, seg_len);
         if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
         bool is_last = (sl == std::string::npos);
         cur = cur->getOrCreateChild(seg, !is_last);
@@ -159,13 +185,10 @@ static PathItem *find_path_item(const std::string &path) {
     size_t i = 1;
     while (i < path.size()) {
         auto sl = path.find('/', i);
-        std::string seg = (sl == std::string::npos) ? path.substr(i) : path.substr(i, sl - i);
+        size_t seg_len = (sl == std::string::npos) ? path.size() - i : sl - i;
+        std::string_view seg(path.data() + i, seg_len);
         if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
-        PathItem *found = nullptr;
-        for (auto *c : cur->children) {
-            auto *pc = static_cast<PathItem*>(c);
-            if (pc->name == seg) { found = pc; break; }
-        }
+        PathItem *found = cur->findChild(seg);
         if (!found) return nullptr;
         cur = found;
         i = (sl == std::string::npos) ? path.size() : sl + 1;
@@ -184,7 +207,8 @@ static void free_path_tree(PathItem *node) {
            node->unlink_event_indices.clear();
            node->read_procs.clear(); node->write_procs.clear();
            node->unlink_procs.clear(); node->events.clear();
-           node->deps.clear(); node->rdeps.clear(); }
+           node->deps.clear(); node->rdeps.clear();
+           node->clearChildMap(); }
 }
 
 static void free_nonabs_paths() {
@@ -287,10 +311,15 @@ struct process_t : Item {
     std::vector<int> event_indices;
     std::string cached_display_name;
     mutable std::string cached_key_;
+    std::string cached_cwd_;
 
     std::string get_exe() const { return g_pool.str(exe_id); }
     std::vector<std::string> get_argv() const { return g_pool.get_argv(argv_blob); }
-    std::string get_cwd() const { return cwd_item ? cwd_item->fullPath() : std::string(); }
+    const std::string &get_cwd() const { return cached_cwd_; }
+    void set_cwd(PathItem *item) {
+        cwd_item = item;
+        cached_cwd_ = item ? item->fullPath() : std::string();
+    }
 
     void update_display_name() {
         std::string_view s = g_pool.view(exe_id);
@@ -672,7 +701,7 @@ static void apply_preparsed(const preparsed_event_t &pe) {
     case EV_CWD:
         if (!pe.raw_path.empty()) {
             ev.path_item = intern_path_item(pe.raw_path);
-            proc.cwd_item = ev.path_item;
+            proc.set_cwd(ev.path_item);
         }
         break;
     case EV_EXEC:
@@ -784,7 +813,7 @@ static void ingest_trace_line(const char *line) {
         if (json_get(line, "path", sp)) path = json_decode_string(sp);
         if (!path.empty()) {
             ev.path_item = intern_path_item(path);
-            proc.cwd_item = ev.path_item;
+            proc.set_cwd(ev.path_item);
         }
         break;
     }
@@ -883,65 +912,20 @@ static bool path_has_suffix(const char *path, const char *suffix) {
 static void parallel_ingest(std::vector<std::string> &lines);
 static void ingest_zstd_file(const char *path);
 
-static void ingest_zstd_file(const char *path) {
-    FILE *f = std::fopen(path, "rb");
-    if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
-    size_t in_cap = ZSTD_DStreamInSize(), out_cap = ZSTD_DStreamOutSize();
-    std::vector<unsigned char> in_buf(in_cap), out_buf(out_cap);
-    std::string line;
-    line.reserve(MAX_JSON_LINE);
-    ZSTD_DStream *stream = ZSTD_createDStream();
-    if (ZSTD_isError(ZSTD_initDStream(stream))) {
-        std::fprintf(stderr, "tv: zstd init failed for %s\n", path); std::exit(1);
-    }
-
-    /* Collect all decompressed lines, then parallel-ingest. */
-    std::vector<std::string> lines;
-    for (;;) {
-        size_t nread = std::fread(in_buf.data(), 1, in_cap, f);
-        ZSTD_inBuffer input = { in_buf.data(), nread, 0 };
-        while (input.pos < input.size) {
-            ZSTD_outBuffer output = { out_buf.data(), out_cap, 0 };
-            size_t rc = ZSTD_decompressStream(stream, &output, &input);
-            if (ZSTD_isError(rc)) {
-                std::fprintf(stderr, "tv: zstd decompress failed for %s: %s\n", path, ZSTD_getErrorName(rc));
-                std::exit(1);
-            }
-            size_t pos = 0;
-            while (pos < output.pos) {
-                auto *nl = static_cast<unsigned char*>(
-                    std::memchr(out_buf.data() + pos, '\n', output.pos - pos));
-                size_t chunk = nl ? static_cast<size_t>(nl - (out_buf.data() + pos)) : (output.pos - pos);
-                line.append(reinterpret_cast<char*>(out_buf.data() + pos), chunk);
-                pos += chunk;
-                if (nl) {
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
-                    line.clear();
-                    pos++;
-                }
-            }
-        }
-        if (nread == 0) break;
-    }
-    if (!line.empty()) {
-        if (line.back() == '\r') line.pop_back();
-        if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
-    }
-    ZSTD_freeDStream(stream);
-    std::fclose(f);
-    parallel_ingest(lines);
-}
-
 /* ── Parallel batch ingestion ──────────────────────────────────────── */
-/* Read all lines, pre-parse JSON in parallel threads (which also
-   interns strings and compresses blobs via thread-safe g_pool),
-   then apply events sequentially to global state. */
+/* Pre-parse JSON in parallel threads (which also intern strings and
+   compress blobs via thread-safe g_pool), then apply events
+   sequentially to global state.  Called once per batch. */
 
 #include <thread>
 
 static constexpr int MAX_PARSE_THREADS = 8;
 static constexpr int MIN_LINES_PER_THREAD = 64;
+/* ~128K lines per batch keeps peak memory ~25–50 MB per batch (typical
+   JSON lines are 100–400 bytes) while still providing enough work for
+   the parallel parse threads.  Much larger batches risk OOM on huge
+   traces; much smaller ones increase batch-overhead. */
+static constexpr int INGEST_BATCH_SIZE = 128 * 1024;
 
 static void parallel_ingest(std::vector<std::string> &lines) {
     if (lines.empty()) return;
@@ -983,6 +967,61 @@ static void parallel_ingest(std::vector<std::string> &lines) {
     }
 }
 
+static void ingest_zstd_file(const char *path) {
+    FILE *f = std::fopen(path, "rb");
+    if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
+    size_t in_cap = ZSTD_DStreamInSize(), out_cap = ZSTD_DStreamOutSize();
+    std::vector<unsigned char> in_buf(in_cap), out_buf(out_cap);
+    std::string line;
+    line.reserve(MAX_JSON_LINE);
+    ZSTD_DStream *stream = ZSTD_createDStream();
+    if (ZSTD_isError(ZSTD_initDStream(stream))) {
+        std::fprintf(stderr, "tv: zstd init failed for %s\n", path); std::exit(1);
+    }
+
+    /* Decompress and ingest in batches to avoid holding the entire
+       decompressed trace in memory. */
+    std::vector<std::string> lines;
+    for (;;) {
+        size_t nread = std::fread(in_buf.data(), 1, in_cap, f);
+        ZSTD_inBuffer input = { in_buf.data(), nread, 0 };
+        while (input.pos < input.size) {
+            ZSTD_outBuffer output = { out_buf.data(), out_cap, 0 };
+            size_t rc = ZSTD_decompressStream(stream, &output, &input);
+            if (ZSTD_isError(rc)) {
+                std::fprintf(stderr, "tv: zstd decompress failed for %s: %s\n", path, ZSTD_getErrorName(rc));
+                std::exit(1);
+            }
+            size_t pos = 0;
+            while (pos < output.pos) {
+                auto *nl = static_cast<unsigned char*>(
+                    std::memchr(out_buf.data() + pos, '\n', output.pos - pos));
+                size_t chunk = nl ? static_cast<size_t>(nl - (out_buf.data() + pos)) : (output.pos - pos);
+                line.append(reinterpret_cast<char*>(out_buf.data() + pos), chunk);
+                pos += chunk;
+                if (nl) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
+                    line.clear();
+                    pos++;
+                    if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE) {
+                        parallel_ingest(lines);
+                        lines.clear();
+                    }
+                }
+            }
+        }
+        if (nread == 0) break;
+    }
+    if (!line.empty()) {
+        if (line.back() == '\r') line.pop_back();
+        if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
+    }
+    if (!lines.empty()) parallel_ingest(lines);
+    ZSTD_freeDStream(stream);
+    std::fclose(f);
+}
+
 static void ingest_file(const char *path) {
     if (path_has_suffix(path, ".zst")) { ingest_zstd_file(path); return; }
     FILE *f = std::fopen(path, "r");
@@ -995,9 +1034,13 @@ static void ingest_file(const char *path) {
         if (nl) *nl = 0;
         if (nl && nl > buf && nl[-1] == '\r') nl[-1] = 0;
         if (buf[0] == '{') lines.emplace_back(buf);
+        if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE) {
+            parallel_ingest(lines);
+            lines.clear();
+        }
     }
     std::fclose(f);
-    parallel_ingest(lines);
+    if (!lines.empty()) parallel_ingest(lines);
 }
 
 /* ── Process tree ──────────────────────────────────────────────────── */
