@@ -901,7 +901,11 @@ static void ingest_zstd_file(const char *path);
 
 static constexpr int MAX_PARSE_THREADS = 8;
 static constexpr int MIN_LINES_PER_THREAD = 64;
-static constexpr int INGEST_BATCH_SIZE = 128 * 1024;  /* lines per batch */
+/* ~128K lines per batch keeps peak memory ~25–50 MB per batch (typical
+   JSON lines are 100–400 bytes) while still providing enough work for
+   the parallel parse threads.  Much larger batches risk OOM on huge
+   traces; much smaller ones increase batch-overhead. */
+static constexpr int INGEST_BATCH_SIZE = 128 * 1024;
 
 static void parallel_ingest(std::vector<std::string> &lines) {
     if (lines.empty()) return;
