@@ -355,15 +355,18 @@ bool Intern::eq(InlineIID a, InlineIID b) const {
     /* Equal data ⟺ equal IID by construction (sharding is content-derived
        and dedup is per-shard).  Verify in debug builds so an innocent
        change to hash_to_shard or put_locked can't silently break the
-       invariant. */
+       invariant.  Contrapositive: when a.v != b.v we must have differing
+       data — equal data here would mean dedup failed. */
 #ifndef NDEBUG
     if (a == b) return true;
     if (!a || !b) return false;
     auto va = view(a);
     auto vb = view(b);
-    assert(!(va.size() == vb.size() &&
-             std::memcmp(va.data(), vb.data(), va.size()) == 0)
-           && "Intern: equal data hashed to different IIDs (sharding invariant violated)");
+    bool data_equal = (va.size() == vb.size() &&
+                       std::memcmp(va.data(), vb.data(), va.size()) == 0);
+    assert(!data_equal &&
+           "Intern: equal data produced different InlineIIDs "
+           "(sharding/dedup invariant violated)");
     return false;
 #else
     return a == b;
@@ -480,12 +483,16 @@ std::vector<std::string> Intern::get_argv(BlobIID id) const {
 }
 
 bool Intern::eq(BlobIID a, BlobIID b) const {
-    /* Equal data ⟺ equal IID; same invariant as inline pool. */
+    /* Equal data ⟺ equal IID; same invariant as inline pool.
+       Contrapositive in debug: a != b ⇒ data differs. */
 #ifndef NDEBUG
     if (a == b) return true;
     if (!a || !b) return false;
     std::string sa = str(a), sb = str(b);
-    assert(sa != sb && "Intern: equal data hashed to different BlobIIDs");
+    bool data_equal = (sa == sb);
+    assert(!data_equal &&
+           "Intern: equal data produced different BlobIIDs "
+           "(sharding/dedup invariant violated)");
     return false;
 #else
     return a == b;
