@@ -1,19 +1,31 @@
-/* intern.h — Unified byte-interning library.
+/* intern.h — Unified byte-interning library with two typed pools.
  *
- * Every distinct blob of bytes gets a unique 32-bit ID (IID).
- * Duplicates share storage.  No deleting.
+ * Every distinct blob of bytes gets a unique ID.  Duplicates share storage.
+ * No deletion.
  *
- * Thread safety: put() is safe to call from multiple threads
- * concurrently — the pool is internally sharded (16 shards),
- * so different inputs usually lock different shards.
- * find() is NOT safe to call concurrently with put(); it is
- * intended for post-ingestion lookups only.
+ * Two pools, two distinct ID types:
  *
- * Internally the pool chooses the best representation per entry:
- *   • small blobs (< threshold): stored inline, O(1) view()
- *   • large blobs: ZSTD-compressed, decompressed on demand
+ *   InlineIID  — entries are *always* stored uncompressed.  view() returns
+ *                a string_view into the pool's arena and is total — it
+ *                never silently fails.  Use for short data that callers
+ *                want zero-copy access to: path components, exe basenames,
+ *                flag strings, status strings, search queries, etc.
  *
- * The interface is oblivious to the internal representation.
+ *   BlobIID    — entries may be ZSTD-compressed when large.  Only str()
+ *                / bytes() / write() are available; there is no view().
+ *                Use for data the caller will copy out anyway: full
+ *                paths, argv blobs, stdout/stderr captures.
+ *
+ * IID 0 ("empty") is the sentinel for both types.  The strong types
+ * statically prevent passing one kind of ID to a method expecting the
+ * other.
+ *
+ * Thread safety: put_inline() and put_blob() are safe to call from
+ * multiple threads concurrently — each pool is internally sharded
+ * (16 shards), so different inputs usually lock different shards.
+ * Reads (str/view/eq/...) are lock-free: entries and arenas are
+ * append-only, never modified after creation.  find_inline() is
+ * also concurrent-safe with put_inline().
  */
 #pragma once
 
@@ -24,8 +36,25 @@
 #include <vector>
 #include <iosfwd>
 
-/* Interned-blob identifier.  0 always means "empty / null". */
-using IID = uint32_t;
+/* ── Strong-typed IDs ─────────────────────────────────────────────── */
+
+struct InlineIID {
+    uint32_t v = 0;
+    constexpr bool empty() const { return v == 0; }
+    constexpr explicit operator bool() const { return v != 0; }
+    constexpr bool operator==(InlineIID o) const { return v == o.v; }
+    constexpr bool operator!=(InlineIID o) const { return v != o.v; }
+    constexpr bool operator< (InlineIID o) const { return v <  o.v; }
+};
+
+struct BlobIID {
+    uint32_t v = 0;
+    constexpr bool empty() const { return v == 0; }
+    constexpr explicit operator bool() const { return v != 0; }
+    constexpr bool operator==(BlobIID o) const { return v == o.v; }
+    constexpr bool operator!=(BlobIID o) const { return v != o.v; }
+    constexpr bool operator< (BlobIID o) const { return v <  o.v; }
+};
 
 class Intern {
 public:
@@ -34,61 +63,57 @@ public:
     Intern(const Intern &) = delete;
     Intern &operator=(const Intern &) = delete;
 
-    /* ── Store (deduplicate) ──────────────────────────────────── */
-    IID put(std::string_view data);
-    IID put(const void *data, size_t len);
-    IID put(const std::vector<uint8_t> &data);
+    /* ── Inline pool (always uncompressed; view() is total) ─────── */
 
-    /* Lookup without interning — returns 0 if the blob was never put().
-       NOT safe to call concurrently with put(); use after ingestion. */
-    IID find(std::string_view data) const;
+    InlineIID put_inline(std::string_view data);
+    InlineIID put_inline(const void *data, size_t len);
+
+    /* Lookup without inserting — concurrent-safe with put_inline()
+       on the same shard (uses shared/exclusive locking).  Returns
+       an empty InlineIID if the data was never interned. */
+    InlineIID find_inline(std::string_view data) const;
+
+    std::string_view view(InlineIID id) const;       /* total: never empty for non-empty id */
+    std::string      str (InlineIID id) const;       /* same bytes as view, copied out      */
+    size_t           size(InlineIID id) const;
+    bool             empty(InlineIID id) const { return id.empty(); }
+
+    /* Equality is exact: equal data ⟺ equal IID (debug-asserted). */
+    bool eq(InlineIID a, InlineIID b) const;
+    bool eq(InlineIID a, std::string_view data) const;
+
+    bool contains(InlineIID a, std::string_view needle) const;
+    bool glob    (InlineIID id, const char *pattern) const;
+
+    /* ── Blob pool (may be compressed; no view() is offered) ────── */
+
+    BlobIID put_blob(std::string_view data);
+    BlobIID put_blob(const void *data, size_t len);
+    BlobIID put_blob(const std::vector<uint8_t> &data);
 
     /* Convenience: store an argv-style vector as a single
-       null-separated blob and return one IID. */
-    IID put_argv(const std::vector<std::string> &argv);
+       null-separated blob and return one BlobIID. */
+    BlobIID put_blob_argv(const std::vector<std::string> &argv);
 
-    /* ── Retrieve ─────────────────────────────────────────────── */
-    /* Return a copy of the original bytes. */
-    std::string           str(IID id) const;
-    std::vector<uint8_t>  bytes(IID id) const;
+    std::string          str  (BlobIID id) const;
+    std::vector<uint8_t> bytes(BlobIID id) const;
+    std::vector<std::string> get_argv(BlobIID id) const;
+    size_t               size (BlobIID id) const;
+    bool                 empty(BlobIID id) const { return id.empty(); }
 
-    /* Fast O(1) view into pool storage — only valid for entries
-       stored inline (uncompressed).  Returns empty view for
-       compressed entries; caller should fall back to str(). */
-    std::string_view      view(IID id) const;
+    void write(BlobIID id, int fd) const;
+    void write(BlobIID id, std::ostream &os) const;
 
-    /* Original size in bytes. */
-    size_t                size(IID id) const;
+    bool eq(BlobIID a, BlobIID b) const;
+    bool eq(BlobIID a, std::string_view data) const;
 
-    /* Write original bytes to a file descriptor or stream. */
-    void write(IID id, int fd) const;
-    void write(IID id, std::ostream &os) const;
-
-    /* Convenience: decompress an argv blob back into a vector. */
-    std::vector<std::string> get_argv(IID id) const;
-
-    /* ── Compare ──────────────────────────────────────────────── */
-    /* Two interned IDs — same ID means equal, otherwise compare
-       the underlying bytes (fast: hash + size check first). */
-    bool eq(IID a, IID b) const;
-
-    /* Compare interned data with a raw blob, without interning
-       the blob.  Hash + size short-circuit first. */
-    bool eq(IID a, std::string_view data) const;
-    bool eq(IID a, const void *data, size_t len) const;
-
-    /* Substring search: does the interned data contain needle? */
-    bool contains(IID a, std::string_view needle) const;
-
-    /* ── Pattern matching ─────────────────────────────────────── */
-    /* POSIX fnmatch()-style glob against the interned data. */
-    bool glob(IID id, const char *pattern) const;
+    bool contains(BlobIID a, std::string_view needle) const;
+    bool glob    (BlobIID id, const char *pattern) const;
 
     /* ── Utility ──────────────────────────────────────────────── */
-    bool   empty(IID id) const;
     void   clear();
-    size_t count() const;        /* number of unique entries  */
-    size_t memory_bytes() const; /* approximate pool RAM      */
+    size_t count() const;        /* number of unique entries (both pools) */
+    size_t memory_bytes() const; /* approximate pool RAM                  */
 
 private:
     struct Impl;

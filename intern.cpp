@@ -1,19 +1,29 @@
-/* intern.cpp — Implementation of the unified interning library.
+/* intern.cpp — Implementation of the typed interning library.
  *
- * Internal design
- * ───────────────
- * The pool is split into NUM_SHARDS independent shards, each with its
- * own arena, entry table, hash table, ZSTD contexts, and mutex.
- * put() hashes the input, routes to a shard by the hash's upper bits,
- * and only locks that one shard — giving near-linear speedup when many
- * threads call put() concurrently (the common case during trace load).
+ * Two independent pools live side-by-side:
+ *
+ *   inline_pool_  — stores entries verbatim, never compressed.
+ *                   Backs InlineIID; view() is total.
+ *   blob_pool_    — may ZSTD-compress entries above COMPRESS_THRESHOLD.
+ *                   Backs BlobIID; only str()/bytes()/write() are exposed.
+ *
+ * Each pool is split into NUM_SHARDS independent shards, each with its
+ * own arena, entry table, hash table, ZSTD contexts (blob pool only),
+ * and shared/exclusive mutex.
+ *
+ * put_*() hashes the input, routes to a shard by the hash's upper bits,
+ * and only takes a write lock on that one shard — giving near-linear
+ * speedup when many threads call put_*() concurrently.
+ *
+ * find_inline() takes a shared lock so it is safe alongside put_inline().
  *
  * IID encoding:  upper SHARD_BITS select the shard,
  *                lower (32 − SHARD_BITS) are the local entry index.
- * IID 0 is always "empty / null" (shard 0, index 0 = sentinel).
+ * IID 0 is always "empty" (shard 0, index 0 = sentinel).
  *
- * Reads (str/view/eq/…) are lock-free: entries and arenas are
- * append-only, never modified after creation.
+ * Reads (str/view/eq/...) are lock-free: entries and arenas are
+ * append-only, never modified after creation.  std::vector reallocations
+ * during growth are guarded by the same shared/exclusive mutex.
  */
 
 #include "intern.h"
@@ -21,6 +31,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cassert>
+#include <shared_mutex>
 #include <mutex>
 #include <ostream>
 #include <unistd.h>
@@ -52,13 +63,11 @@ static constexpr int      SHARD_BITS  = 4;
 static constexpr int      SHARD_SHIFT = 32 - SHARD_BITS;
 static constexpr uint32_t LOCAL_MASK  = (1u << SHARD_SHIFT) - 1;
 
-static int      shard_of(IID id)  { return static_cast<int>(id >> SHARD_SHIFT); }
-static uint32_t local_of(IID id)  { return id & LOCAL_MASK; }
-static IID      make_iid(int shard, uint32_t local) {
+static int      shard_of(uint32_t id)  { return static_cast<int>(id >> SHARD_SHIFT); }
+static uint32_t local_of(uint32_t id)  { return id & LOCAL_MASK; }
+static uint32_t make_id(int shard, uint32_t local) {
     return (static_cast<uint32_t>(shard) << SHARD_SHIFT) | local;
 }
-/* Use upper bits of the 64-bit hash for shard routing (independent of
-   the lower bits used for hash-table probing within the shard). */
 static int hash_to_shard(uint64_t h) {
     return static_cast<int>(h >> (64 - SHARD_BITS)) & (NUM_SHARDS - 1);
 }
@@ -67,22 +76,39 @@ static int hash_to_shard(uint64_t h) {
 
 struct Entry {
     uint32_t offset;       /* start in arena            */
-    uint32_t stored_size;  /* bytes in arena (may be compressed) */
+    uint32_t stored_size;  /* bytes in arena (may be compressed in blob pool) */
     uint32_t orig_size;    /* original byte count       */
     uint64_t hash;         /* FNV-1a of original data   */
-    bool     compressed;   /* stored_size is ZSTD frame */
+    bool     compressed;   /* stored_size is ZSTD frame (blob pool only) */
 };
 
-/* ── Shard — one independent slice of the pool ────────────────────── */
+/* ── Shard — one independent slice of a pool ──────────────────────── */
+/* Templated on a compile-time flag controlling whether put may
+   compress.  Inline-pool shards never compress (no ZSTD context). */
 
+template <bool AllowCompress>
 struct Shard {
-    std::vector<char>  arena;
-    std::vector<Entry> entries;   /* index 0 = unused sentinel */
-    std::vector<IID>   htab;     /* open-addressing; 0 = empty slot */
-    size_t             htab_count = 0;
-    ZSTD_CCtx         *cctx = nullptr;
-    ZSTD_DCtx         *dctx = nullptr;
-    std::mutex         mu;
+    std::vector<char>   arena;
+    std::vector<Entry>  entries;          /* index 0 = unused sentinel */
+    std::vector<uint32_t> htab;           /* open-addressing; 0 = empty slot */
+    size_t              htab_count = 0;
+    ZSTD_CCtx          *cctx = nullptr;   /* nullptr in inline pool */
+    ZSTD_DCtx          *dctx = nullptr;   /* nullptr in inline pool */
+    mutable std::shared_mutex mu;
+
+    Shard() {
+        entries.push_back(Entry{0, 0, 0, 0, false}); /* sentinel */
+        htab.resize(64, 0);
+        if constexpr (AllowCompress) {
+            cctx = ZSTD_createCCtx();
+            dctx = ZSTD_createDCtx();
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, ZSTD_LEVEL);
+        }
+    }
+    ~Shard() {
+        if (cctx) ZSTD_freeCCtx(cctx);
+        if (dctx) ZSTD_freeDCtx(dctx);
+    }
 
     /* ── helpers ──────────────────────────────────────────────── */
 
@@ -116,8 +142,8 @@ struct Shard {
 
     void htab_grow() {
         size_t new_cap = htab.size() * 2;
-        std::vector<IID> new_tab(new_cap, 0);
-        for (IID id : htab) {
+        std::vector<uint32_t> new_tab(new_cap, 0);
+        for (uint32_t id : htab) {
             if (!id) continue;
             uint32_t loc = local_of(id);
             uint64_t h = entries[loc].hash;
@@ -128,11 +154,12 @@ struct Shard {
         htab = std::move(new_tab);
     }
 
-    IID htab_find(uint64_t hash, const void *data, size_t len) const {
+    /* Caller must hold at least a shared lock. */
+    uint32_t htab_find(uint64_t hash, const void *data, size_t len) const {
         size_t mask = htab.size() - 1;
         size_t slot = static_cast<size_t>(hash) & mask;
         for (;;) {
-            IID id = htab[slot];
+            uint32_t id = htab[slot];
             if (!id) return 0;
             uint32_t loc = local_of(id);
             auto &e = entries[loc];
@@ -142,7 +169,7 @@ struct Shard {
         }
     }
 
-    void htab_insert(IID id) {
+    void htab_insert(uint32_t id) {
         if (htab_count * 4 >= htab.size() * 3) htab_grow();
         size_t mask = htab.size() - 1;
         uint32_t loc = local_of(id);
@@ -152,20 +179,20 @@ struct Shard {
         htab_count++;
     }
 
-    /* ── put core (caller holds mu) ──────────────────────────── */
+    /* ── put core (caller holds exclusive lock) ──────────────── */
 
-    IID put_locked(int shard_idx, const void *data, size_t len, uint64_t h) {
-        IID existing = htab_find(h, data, len);
+    uint32_t put_locked(int shard_idx, const void *data, size_t len, uint64_t h) {
+        uint32_t existing = htab_find(h, data, len);
         if (existing) return existing;
 
         uint32_t local = static_cast<uint32_t>(entries.size());
-        IID id = make_iid(shard_idx, local);
+        uint32_t id = make_id(shard_idx, local);
         Entry e;
         e.hash = h;
         e.orig_size = static_cast<uint32_t>(len);
         e.offset = static_cast<uint32_t>(arena.size());
 
-        if (len < COMPRESS_THRESHOLD) {
+        if (!AllowCompress || len < COMPRESS_THRESHOLD) {
             arena.insert(arena.end(),
                          static_cast<const char *>(data),
                          static_cast<const char *>(data) + len);
@@ -196,168 +223,247 @@ struct Shard {
         htab_insert(id);
         return id;
     }
+
+    void clear_locked() {
+        arena.clear();
+        entries.clear();
+        entries.push_back(Entry{0, 0, 0, 0, false});
+        std::fill(htab.begin(), htab.end(), 0u);
+        htab_count = 0;
+    }
+
+    size_t mem_approx() const {
+        return arena.capacity()
+             + entries.capacity() * sizeof(Entry)
+             + htab.capacity() * sizeof(uint32_t);
+    }
+};
+
+using InlineShard = Shard<false>;
+using BlobShard   = Shard<true>;
+
+/* ── A typed pool: NUM_SHARDS shards, sharded by upper hash bits. */
+
+template <typename ShardT>
+struct Pool {
+    ShardT shards[NUM_SHARDS];
+
+    /* Read paths (lock-free w.r.t. arena/entries vector elements,
+       but we still take a shared lock so a concurrent push_back that
+       reallocates can't pull the rug from under us). */
+    const Entry &entry_locked(uint32_t id, std::shared_lock<std::shared_mutex> &lk) const {
+        auto &sh = shards[shard_of(id)];
+        lk = std::shared_lock<std::shared_mutex>(sh.mu);
+        return sh.entries[local_of(id)];
+    }
+    bool valid(uint32_t id) const {
+        if (!id) return false;
+        int s = shard_of(id);
+        if (s < 0 || s >= NUM_SHARDS) return false;
+        std::shared_lock<std::shared_mutex> lk(shards[s].mu);
+        return local_of(id) < shards[s].entries.size();
+    }
+
+    uint32_t put(const void *data, size_t len) {
+        if (!data || !len) return 0;
+        uint64_t h = fnv1a(data, len);
+        int s = hash_to_shard(h);
+        auto &sh = shards[s];
+        std::unique_lock<std::shared_mutex> lk(sh.mu);
+        return sh.put_locked(s, data, len, h);
+    }
+
+    uint32_t find(const void *data, size_t len) const {
+        if (!data || !len) return 0;
+        uint64_t h = fnv1a(data, len);
+        int s = hash_to_shard(h);
+        auto &sh = shards[s];
+        std::shared_lock<std::shared_mutex> lk(sh.mu);
+        return sh.htab_find(h, data, len);
+    }
+
+    void clear() {
+        for (auto &sh : shards) {
+            std::unique_lock<std::shared_mutex> lk(sh.mu);
+            sh.clear_locked();
+        }
+    }
+
+    size_t count() const {
+        size_t n = 0;
+        for (auto &sh : shards) {
+            std::shared_lock<std::shared_mutex> lk(sh.mu);
+            n += sh.entries.size() - 1;
+        }
+        return n;
+    }
+
+    size_t memory_bytes() const {
+        size_t n = 0;
+        for (auto &sh : shards) {
+            std::shared_lock<std::shared_mutex> lk(sh.mu);
+            n += sh.mem_approx();
+        }
+        return n;
+    }
 };
 
 /* ── Impl ─────────────────────────────────────────────────────────── */
 
 struct Intern::Impl {
-    Shard shards[NUM_SHARDS];
-
-    Impl() {
-        for (int i = 0; i < NUM_SHARDS; i++) {
-            auto &s = shards[i];
-            s.entries.push_back(Entry{0, 0, 0, 0, false}); /* sentinel */
-            s.htab.resize(64, 0);
-            s.cctx = ZSTD_createCCtx();
-            s.dctx = ZSTD_createDCtx();
-            ZSTD_CCtx_setParameter(s.cctx, ZSTD_c_compressionLevel, ZSTD_LEVEL);
-        }
-    }
-    ~Impl() {
-        for (auto &s : shards) {
-            if (s.cctx) ZSTD_freeCCtx(s.cctx);
-            if (s.dctx) ZSTD_freeDCtx(s.dctx);
-        }
-    }
-
-    /* Resolve IID → (shard, local) and get entry/raw. */
-    const Entry &entry(IID id) const {
-        return shards[shard_of(id)].entries[local_of(id)];
-    }
-    const char *raw(IID id) const {
-        auto &sh = shards[shard_of(id)];
-        return sh.raw(local_of(id));
-    }
-    void decompress_into(IID id, char *buf) const {
-        shards[shard_of(id)].decompress_into(local_of(id), buf);
-    }
-    bool content_eq(IID id, const void *data, size_t len) const {
-        return shards[shard_of(id)].content_eq(local_of(id), data, len);
-    }
-    bool valid(IID id) const {
-        if (!id) return false;
-        int s = shard_of(id);
-        uint32_t loc = local_of(id);
-        return s < NUM_SHARDS && loc < shards[s].entries.size();
-    }
+    Pool<InlineShard> inline_pool;
+    Pool<BlobShard>   blob_pool;
 };
-
-/* ── Public API ───────────────────────────────────────────────────── */
 
 Intern::Intern()  : m_(new Impl) {}
 Intern::~Intern() { delete m_; }
 
-IID Intern::put(std::string_view data) {
-    if (data.empty()) return 0;
-    uint64_t h = fnv1a(data.data(), data.size());
-    int s = hash_to_shard(h);
-    auto &shard = m_->shards[s];
-    std::lock_guard<std::mutex> lk(shard.mu);
-    return shard.put_locked(s, data.data(), data.size(), h);
+/* ── Inline pool API ─────────────────────────────────────────────── */
+
+InlineIID Intern::put_inline(std::string_view data) {
+    return InlineIID{ m_->inline_pool.put(data.data(), data.size()) };
+}
+InlineIID Intern::put_inline(const void *data, size_t len) {
+    return InlineIID{ m_->inline_pool.put(data, len) };
+}
+InlineIID Intern::find_inline(std::string_view data) const {
+    return InlineIID{ m_->inline_pool.find(data.data(), data.size()) };
 }
 
-IID Intern::put(const void *data, size_t len) {
-    if (!data || !len) return 0;
-    uint64_t h = fnv1a(data, len);
-    int s = hash_to_shard(h);
-    auto &shard = m_->shards[s];
-    std::lock_guard<std::mutex> lk(shard.mu);
-    return shard.put_locked(s, data, len, h);
+std::string_view Intern::view(InlineIID id) const {
+    if (!id) return {};
+    auto &sh = m_->inline_pool.shards[shard_of(id.v)];
+    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    auto &e = sh.entries[local_of(id.v)];
+    /* Inline pool guarantees uncompressed storage. */
+    return std::string_view(sh.raw(local_of(id.v)), e.orig_size);
 }
 
-IID Intern::put(const std::vector<uint8_t> &data) {
-    if (data.empty()) return 0;
-    uint64_t h = fnv1a(data.data(), data.size());
-    int s = hash_to_shard(h);
-    auto &shard = m_->shards[s];
-    std::lock_guard<std::mutex> lk(shard.mu);
-    return shard.put_locked(s, data.data(), data.size(), h);
+std::string Intern::str(InlineIID id) const {
+    auto sv = view(id);
+    return std::string(sv);
 }
 
-IID Intern::put_argv(const std::vector<std::string> &argv) {
-    if (argv.empty()) return 0;
+size_t Intern::size(InlineIID id) const {
+    if (!id) return 0;
+    auto &sh = m_->inline_pool.shards[shard_of(id.v)];
+    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    return sh.entries[local_of(id.v)].orig_size;
+}
+
+bool Intern::eq(InlineIID a, InlineIID b) const {
+    /* Equal data ⟺ equal IID by construction (sharding is content-derived
+       and dedup is per-shard).  Verify in debug builds so an innocent
+       change to hash_to_shard or put_locked can't silently break the
+       invariant. */
+#ifndef NDEBUG
+    if (a == b) return true;
+    if (!a || !b) return false;
+    auto va = view(a);
+    auto vb = view(b);
+    assert(!(va.size() == vb.size() &&
+             std::memcmp(va.data(), vb.data(), va.size()) == 0)
+           && "Intern: equal data hashed to different IIDs (sharding invariant violated)");
+    return false;
+#else
+    return a == b;
+#endif
+}
+
+bool Intern::eq(InlineIID a, std::string_view data) const {
+    if (!a) return data.empty();
+    auto sv = view(a);
+    return sv.size() == data.size() &&
+           std::memcmp(sv.data(), data.data(), sv.size()) == 0;
+}
+
+bool Intern::contains(InlineIID a, std::string_view needle) const {
+    if (needle.empty()) return true;
+    if (!a) return false;
+    auto sv = view(a);
+    return sv.find(needle) != std::string_view::npos;
+}
+
+bool Intern::glob(InlineIID id, const char *pattern) const {
+    if (!pattern || !id) return false;
+    auto sv = view(id);
+    std::string tmp(sv);
+    return fnmatch(pattern, tmp.c_str(), FNM_PATHNAME) == 0;
+}
+
+/* ── Blob pool API ───────────────────────────────────────────────── */
+
+BlobIID Intern::put_blob(std::string_view data) {
+    return BlobIID{ m_->blob_pool.put(data.data(), data.size()) };
+}
+BlobIID Intern::put_blob(const void *data, size_t len) {
+    return BlobIID{ m_->blob_pool.put(data, len) };
+}
+BlobIID Intern::put_blob(const std::vector<uint8_t> &data) {
+    return BlobIID{ m_->blob_pool.put(data.data(), data.size()) };
+}
+
+BlobIID Intern::put_blob_argv(const std::vector<std::string> &argv) {
+    if (argv.empty()) return BlobIID{};
     std::string flat;
+    size_t total = 0;
+    for (auto &s : argv) total += s.size() + 1;
+    flat.reserve(total);
     for (size_t i = 0; i < argv.size(); i++) {
         if (i) flat += '\0';
         flat += argv[i];
     }
-    uint64_t h = fnv1a(flat.data(), flat.size());
-    int s = hash_to_shard(h);
-    auto &shard = m_->shards[s];
-    std::lock_guard<std::mutex> lk(shard.mu);
-    return shard.put_locked(s, flat.data(), flat.size(), h);
+    return put_blob(flat);
 }
 
-IID Intern::find(std::string_view data) const {
-    if (data.empty()) return 0;
-    uint64_t h = fnv1a(data.data(), data.size());
-    int s = hash_to_shard(h);
-    auto &shard = m_->shards[s];
-    /* NOTE: not safe to call concurrently with put() to the same shard.
-       Intended for use after ingestion completes (all puts done). */
-    return shard.htab_find(h, data.data(), data.size());
-}
-
-/* ── Retrieve ─────────────────────────────────────────────────────── */
-
-std::string Intern::str(IID id) const {
-    if (!m_->valid(id)) return {};
-    auto &e = m_->entry(id);
+std::string Intern::str(BlobIID id) const {
+    if (!id) return {};
+    auto &sh = m_->blob_pool.shards[shard_of(id.v)];
+    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    auto &e = sh.entries[local_of(id.v)];
     if (!e.compressed)
-        return std::string(m_->raw(id), e.orig_size);
+        return std::string(sh.raw(local_of(id.v)), e.orig_size);
     std::string out(e.orig_size, '\0');
-    m_->decompress_into(id, out.data());
+    sh.decompress_into(local_of(id.v), out.data());
     return out;
 }
 
-std::vector<uint8_t> Intern::bytes(IID id) const {
-    if (!m_->valid(id)) return {};
-    auto &e = m_->entry(id);
+std::vector<uint8_t> Intern::bytes(BlobIID id) const {
+    if (!id) return {};
+    auto &sh = m_->blob_pool.shards[shard_of(id.v)];
+    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    auto &e = sh.entries[local_of(id.v)];
     std::vector<uint8_t> out(e.orig_size);
     if (!e.compressed)
-        std::memcpy(out.data(), m_->raw(id), e.orig_size);
+        std::memcpy(out.data(), sh.raw(local_of(id.v)), e.orig_size);
     else
-        m_->decompress_into(id, reinterpret_cast<char *>(out.data()));
+        sh.decompress_into(local_of(id.v), reinterpret_cast<char *>(out.data()));
     return out;
 }
 
-std::string_view Intern::view(IID id) const {
-    if (!m_->valid(id)) return {};
-    auto &e = m_->entry(id);
-    if (e.compressed) return {};
-    return {m_->raw(id), e.orig_size};
+size_t Intern::size(BlobIID id) const {
+    if (!id) return 0;
+    auto &sh = m_->blob_pool.shards[shard_of(id.v)];
+    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    return sh.entries[local_of(id.v)].orig_size;
 }
 
-size_t Intern::size(IID id) const {
-    if (!m_->valid(id)) return 0;
-    return m_->entry(id).orig_size;
+void Intern::write(BlobIID id, int fd) const {
+    if (!id) return;
+    std::string tmp = str(id);
+    ssize_t n = ::write(fd, tmp.data(), tmp.size());
+    (void)n;
 }
 
-void Intern::write(IID id, int fd) const {
-    if (!m_->valid(id)) return;
-    auto &e = m_->entry(id);
-    if (!e.compressed) {
-        ::write(fd, m_->raw(id), e.orig_size);
-    } else {
-        std::string tmp = str(id);
-        ::write(fd, tmp.data(), tmp.size());
-    }
+void Intern::write(BlobIID id, std::ostream &os) const {
+    if (!id) return;
+    std::string tmp = str(id);
+    os.write(tmp.data(), static_cast<std::streamsize>(tmp.size()));
 }
 
-void Intern::write(IID id, std::ostream &os) const {
-    if (!m_->valid(id)) return;
-    auto &e = m_->entry(id);
-    if (!e.compressed) {
-        os.write(m_->raw(id), e.orig_size);
-    } else {
-        std::string tmp = str(id);
-        os.write(tmp.data(), tmp.size());
-    }
-}
-
-std::vector<std::string> Intern::get_argv(IID id) const {
+std::vector<std::string> Intern::get_argv(BlobIID id) const {
     std::vector<std::string> out;
-    if (!m_->valid(id)) return out;
+    if (!id) return out;
     std::string flat = str(id);
     if (flat.empty()) return out;
     size_t pos = 0;
@@ -373,83 +479,59 @@ std::vector<std::string> Intern::get_argv(IID id) const {
     return out;
 }
 
-/* ── Compare ──────────────────────────────────────────────────────── */
-
-bool Intern::eq(IID a, IID b) const {
-    /* With sharding, identical data always hashes to the same shard
-       and is deduped there, so equal data ⟺ equal IID. */
+bool Intern::eq(BlobIID a, BlobIID b) const {
+    /* Equal data ⟺ equal IID; same invariant as inline pool. */
+#ifndef NDEBUG
+    if (a == b) return true;
+    if (!a || !b) return false;
+    std::string sa = str(a), sb = str(b);
+    assert(sa != sb && "Intern: equal data hashed to different BlobIIDs");
+    return false;
+#else
     return a == b;
+#endif
 }
 
-bool Intern::eq(IID a, std::string_view data) const {
-    if (!a && data.empty()) return true;
-    if (!m_->valid(a)) return data.empty();
-    return m_->content_eq(a, data.data(), data.size());
+bool Intern::eq(BlobIID a, std::string_view data) const {
+    if (!a) return data.empty();
+    auto &sh = m_->blob_pool.shards[shard_of(a.v)];
+    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    return sh.content_eq(local_of(a.v), data.data(), data.size());
 }
 
-bool Intern::eq(IID a, const void *data, size_t len) const {
-    if (!a && !len) return true;
-    if (!m_->valid(a)) return len == 0;
-    return m_->content_eq(a, data, len);
-}
-
-bool Intern::contains(IID a, std::string_view needle) const {
+bool Intern::contains(BlobIID a, std::string_view needle) const {
     if (needle.empty()) return true;
-    if (!m_->valid(a)) return false;
-    auto &e = m_->entry(a);
+    if (!a) return false;
+    auto &sh = m_->blob_pool.shards[shard_of(a.v)];
+    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    auto &e = sh.entries[local_of(a.v)];
     if (e.orig_size < needle.size()) return false;
     if (!e.compressed) {
-        std::string_view sv(m_->raw(a), e.orig_size);
+        std::string_view sv(sh.raw(local_of(a.v)), e.orig_size);
         return sv.find(needle) != std::string_view::npos;
     }
-    std::string tmp = str(a);
+    std::string tmp(e.orig_size, '\0');
+    sh.decompress_into(local_of(a.v), tmp.data());
     return tmp.find(needle) != std::string::npos;
 }
 
-/* ── Pattern matching ─────────────────────────────────────────────── */
-
-bool Intern::glob(IID id, const char *pattern) const {
-    if (!pattern) return false;
-    if (!m_->valid(id)) return false;
-    auto &e = m_->entry(id);
-    if (!e.compressed) {
-        std::string tmp(m_->raw(id), e.orig_size);
-        return fnmatch(pattern, tmp.c_str(), FNM_PATHNAME) == 0;
-    }
+bool Intern::glob(BlobIID id, const char *pattern) const {
+    if (!pattern || !id) return false;
     std::string tmp = str(id);
     return fnmatch(pattern, tmp.c_str(), FNM_PATHNAME) == 0;
 }
 
 /* ── Utility ──────────────────────────────────────────────────────── */
 
-bool Intern::empty(IID id) const {
-    return !m_->valid(id);
-}
-
 void Intern::clear() {
-    for (auto &s : m_->shards) {
-        std::lock_guard<std::mutex> lk(s.mu);
-        s.arena.clear();
-        s.entries.clear();
-        s.entries.push_back(Entry{0, 0, 0, 0, false});
-        std::fill(s.htab.begin(), s.htab.end(), 0u);
-        s.htab_count = 0;
-    }
+    m_->inline_pool.clear();
+    m_->blob_pool.clear();
 }
 
 size_t Intern::count() const {
-    size_t n = 0;
-    for (auto &s : m_->shards)
-        n += s.entries.size() - 1;  /* minus sentinel per shard */
-    return n;
+    return m_->inline_pool.count() + m_->blob_pool.count();
 }
 
 size_t Intern::memory_bytes() const {
-    size_t n = 0;
-    for (auto &s : m_->shards) {
-        n += s.arena.capacity();
-        n += s.entries.capacity() * sizeof(Entry);
-        n += s.htab.capacity() * sizeof(IID);
-    }
-    return n;
+    return m_->inline_pool.memory_bytes() + m_->blob_pool.memory_bytes();
 }
