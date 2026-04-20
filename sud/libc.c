@@ -57,14 +57,19 @@ static inline long mini_syscall6(long nr, long a0, long a1, long a2,
                                  long a3, long a4, long a5)
 {
     long ret;
+    /* Same fix as raw_syscall6 in raw.h: push a5 while esp is still
+     * at its original value to avoid corrupting esp-relative operands,
+     * then save/restore ebp around the syscall. */
     __asm__ volatile(
-        "push %%ebp\n\t"
-        "mov %[a5], %%ebp\n\t"
-        "int $0x80\n\t"
-        "pop %%ebp"
+        "pushl %[a5]\n\t"
+        "pushl %%ebp\n\t"
+        "movl  4(%%esp), %%ebp\n\t"
+        "int   $0x80\n\t"
+        "popl  %%ebp\n\t"
+        "addl  $4, %%esp"
         : "=a"(ret)
         : "a"(nr), "b"(a0), "c"(a1), "d"(a2), "S"(a3), "D"(a4),
-          [a5] "rm"(a5)
+          [a5] "g"(a5)
         : "memory");
     return ret;
 }

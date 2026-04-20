@@ -208,12 +208,15 @@ enum {
 typedef long long greg_t;
 typedef greg_t gregset_t[NGREG];
 
-/* Minimal mcontext — only gregs are needed by sudtrace.
- * Padding ensures the struct is large enough that uc_sigmask lands at
- * the correct offset within the kernel's signal frame. */
+/* Minimal mcontext — gregs + enough padding to match the kernel's
+ * sigcontext so that uc_sigmask lands at the correct offset within
+ * the kernel's signal frame.
+ *
+ * x86_64 sigcontext after gregs: fpstate(8) + reserved1[8](64) = 72 bytes
+ * = 9 unsigned long slots. */
 typedef struct {
     gregset_t gregs;
-    unsigned long __pad[64];
+    unsigned long __pad[9];
 } mcontext_t;
 
 typedef struct ucontext_t {
@@ -242,10 +245,13 @@ enum {
 typedef int greg_t;
 typedef greg_t gregset_t[NGREG];
 
-/* Same padding strategy as x86_64 — ensures uc_sigmask offset is safe. */
+/* i386 sigcontext after gregs[0..18]: fpstate(4) + oldmask(4) + cr2(4)
+ * = 12 bytes = 3 unsigned long slots.  This must match the kernel's
+ * struct sigcontext_32 so that uc_sigmask lands at the correct offset
+ * in the signal frame. */
 typedef struct {
     gregset_t gregs;
-    unsigned long __pad[64];
+    unsigned long __pad[3];
 } mcontext_t;
 
 typedef struct ucontext_t {
