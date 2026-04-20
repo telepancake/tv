@@ -1,7 +1,13 @@
 /* intern.h — Unified byte-interning library.
  *
  * Every distinct blob of bytes gets a unique 32-bit ID (IID).
- * Duplicates share storage.  No deleting.  Thread-safe put().
+ * Duplicates share storage.  No deleting.
+ *
+ * Thread safety: put() is safe to call from multiple threads
+ * concurrently — the pool is internally sharded (16 shards),
+ * so different inputs usually lock different shards.
+ * find() is NOT safe to call concurrently with put(); it is
+ * intended for post-ingestion lookups only.
  *
  * Internally the pool chooses the best representation per entry:
  *   • small blobs (< threshold): stored inline, O(1) view()
@@ -32,6 +38,10 @@ public:
     IID put(std::string_view data);
     IID put(const void *data, size_t len);
     IID put(const std::vector<uint8_t> &data);
+
+    /* Lookup without interning — returns 0 if the blob was never put().
+       NOT safe to call concurrently with put(); use after ingestion. */
+    IID find(std::string_view data) const;
 
     /* Convenience: store an argv-style vector as a single
        null-separated blob and return one IID. */

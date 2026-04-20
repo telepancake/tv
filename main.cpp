@@ -55,7 +55,7 @@ struct Item {
 /* ── PathItem — hierarchical filesystem path node ──────────────────── */
 
 struct PathItem : Item {
-    std::string         name;       /* single path component (e.g. "foo.c") */
+    IID                 name_id = 0; /* interned single path component */
     PathItem           *parent = nullptr;
     bool                is_dir = false;
 
@@ -78,66 +78,74 @@ struct PathItem : Item {
     bool was_ever_unlinked() const { return unlinks > 0; }
     bool unlinked_at_end() const { return last_unlink_ts > 0 && last_unlink_ts > last_open_write_ts; }
 
+    /* Name as string (retrieved from intern pool). */
+    std::string_view nameView() const { return g_pool.view(name_id); }
+
     /* Build full path by traversing parent chain. */
     std::string fullPath() const {
         if (!parent) return "/";
         std::string p = parent->fullPath();
         if (p != "/") p += '/';
-        p += name;
+        auto sv = g_pool.view(name_id);
+        if (!sv.empty()) p.append(sv.data(), sv.size());
+        else p += g_pool.str(name_id);
         return p;
     }
 
     std::string_view getKey() const override {
-        /* For engine row IDs — use full path.  Cached on first call. */
-        if (cached_key_.empty()) cached_key_ = fullPath();
-        return cached_key_;
+        /* IID-backed key: intern the full path, return a stable view
+           from the pool's arena.  Falls back to a string for the rare
+           case where the full path is ≥ 128 bytes (ZSTD-compressed). */
+        if (!key_id_) key_id_ = g_pool.put(fullPath());
+        auto sv = g_pool.view(key_id_);
+        if (!sv.empty()) return sv;
+        if (key_fallback_.empty()) key_fallback_ = g_pool.str(key_id_);
+        return key_fallback_;
     }
 
     RowStyle    style()          const override;
     std::string getParentKey()   const override;
     RowData     makeRow(int depth) const override;
 
-    /* O(1) child lookup via hash map with heterogeneous (string_view) lookup. */
-    PathItem *getOrCreateChild(std::string_view child_name, bool dir) {
-        auto it = child_map_.find(child_name);
-        if (it != child_map_.end()) return it->second;
+    /* O(log n) child lookup via sorted_vec_set keyed by name IID.
+       Heterogeneous lookup lets us search by bare IID. */
+    PathItem *getOrCreateChild(IID child_name_id, bool dir) {
+        auto it = children_set_.find(child_name_id);
+        if (it != children_set_.end()) return *it;
         auto *nc = new PathItem();
-        nc->name = std::string(child_name);
+        nc->name_id = child_name_id;
         nc->parent = this;
         nc->is_dir = dir;
         children.push_back(nc);
-        child_map_.emplace(std::string_view(nc->name), nc);
+        children_set_.insert(nc);
         return nc;
     }
 
-    PathItem *findChild(std::string_view child_name) const {
-        auto it = child_map_.find(child_name);
-        return it != child_map_.end() ? it->second : nullptr;
+    PathItem *findChild(IID child_name_id) const {
+        auto it = children_set_.find(child_name_id);
+        return it != children_set_.end() ? *it : nullptr;
     }
 
-    void clearChildMap() { child_map_.clear(); }
+    void clearChildSet() { children_set_.clear(); }
 
 private:
-    mutable std::string cached_key_;
+    mutable IID         key_id_ = 0;
+    mutable std::string key_fallback_;  /* only for paths ≥ 128 bytes */
 
-    /* Transparent hash/eq so we can look up by string_view without
-       allocating a std::string for the common (already-exists) case.
-       Safety: keys are string_views into each child's PathItem::name.
-       PathItem nodes are append-only (never destroyed or renamed during
-       the tree's lifetime), so the views remain valid. */
-    struct SvHash {
-        using is_transparent = void;
-        size_t operator()(std::string_view s) const noexcept {
-            return std::hash<std::string_view>{}(s);
+    /* Comparator: orders PathItem* by their interned name IID.
+       Supports heterogeneous lookup by bare IID. */
+    struct CmpByNameIID {
+        bool operator()(const PathItem *a, const PathItem *b) const {
+            return a->name_id < b->name_id;
+        }
+        bool operator()(const PathItem *a, IID b) const {
+            return a->name_id < b;
+        }
+        bool operator()(IID a, const PathItem *b) const {
+            return a < b->name_id;
         }
     };
-    struct SvEq {
-        using is_transparent = void;
-        bool operator()(std::string_view a, std::string_view b) const noexcept {
-            return a == b;
-        }
-    };
-    std::unordered_map<std::string_view, PathItem*, SvHash, SvEq> child_map_;
+    mutable sorted_vec_set<PathItem*, CmpByNameIID> children_set_;
 };
 
 /* Root of the file tree — represents "/" */
@@ -149,10 +157,11 @@ static PathItem *intern_path_item(const std::string &path) {
     if (path.empty()) return nullptr;
     if (path[0] != '/') {
         /* Non-absolute path (pipe, etc.) — keep as flat item */
+        IID nid = g_pool.put(path);
         for (auto *p : g_nonabs_paths)
-            if (p->name == path) return p;
+            if (p->name_id == nid) return p;
         auto *np = new PathItem();
-        np->name = path;
+        np->name_id = nid;
         np->is_dir = false;
         g_nonabs_paths.push_back(np);
         return np;
@@ -167,7 +176,8 @@ static PathItem *intern_path_item(const std::string &path) {
         std::string_view seg(path.data() + i, seg_len);
         if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
         bool is_last = (sl == std::string::npos);
-        cur = cur->getOrCreateChild(seg, !is_last);
+        IID seg_id = g_pool.put(seg);
+        cur = cur->getOrCreateChild(seg_id, !is_last);
         i = is_last ? path.size() : sl + 1;
     }
     return cur;
@@ -177,8 +187,9 @@ static PathItem *intern_path_item(const std::string &path) {
 static PathItem *find_path_item(const std::string &path) {
     if (path.empty()) return nullptr;
     if (path[0] != '/') {
+        IID nid = g_pool.put(path);
         for (auto *p : g_nonabs_paths)
-            if (p->name == path) return p;
+            if (p->name_id == nid) return p;
         return nullptr;
     }
     PathItem *cur = &g_path_root;
@@ -188,7 +199,8 @@ static PathItem *find_path_item(const std::string &path) {
         size_t seg_len = (sl == std::string::npos) ? path.size() - i : sl - i;
         std::string_view seg(path.data() + i, seg_len);
         if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
-        PathItem *found = cur->findChild(seg);
+        IID seg_id = g_pool.put(seg);
+        PathItem *found = cur->findChild(seg_id);
         if (!found) return nullptr;
         cur = found;
         i = (sl == std::string::npos) ? path.size() : sl + 1;
@@ -208,7 +220,7 @@ static void free_path_tree(PathItem *node) {
            node->read_procs.clear(); node->write_procs.clear();
            node->unlink_procs.clear(); node->events.clear();
            node->deps.clear(); node->rdeps.clear();
-           node->clearChildMap(); }
+           node->clearChildSet(); }
 }
 
 static void free_nonabs_paths() {
@@ -310,15 +322,16 @@ struct process_t : Item {
     sorted_vec_set<abs_path_t> write_paths;
     std::vector<int> event_indices;
     std::string cached_display_name;
-    mutable std::string cached_key_;
-    std::string cached_cwd_;
+
+    /* CWD stored as IID — no separate cached string. */
+    IID cwd_path_id = 0;
 
     std::string get_exe() const { return g_pool.str(exe_id); }
     std::vector<std::string> get_argv() const { return g_pool.get_argv(argv_blob); }
-    const std::string &get_cwd() const { return cached_cwd_; }
+    std::string get_cwd() const { return g_pool.str(cwd_path_id); }
     void set_cwd(PathItem *item) {
         cwd_item = item;
-        cached_cwd_ = item ? item->fullPath() : std::string();
+        cwd_path_id = item ? g_pool.put(item->fullPath()) : 0;
     }
 
     void update_display_name() {
@@ -335,14 +348,18 @@ struct process_t : Item {
     const std::string &display_name() const { return cached_display_name; }
 
     std::string_view getKey() const override {
-        if (cached_key_.empty()) cached_key_ = std::to_string(tgid);
-        return cached_key_;
+        /* tgid is the key — intern once for stable string_view. */
+        if (!key_id_) key_id_ = g_pool.put(std::to_string(tgid));
+        return g_pool.view(key_id_);
     }
     int         sortKey()        const override { return tgid; }
     RowStyle    style()          const override;
     bool        shouldShow()     const override;
     std::string getParentKey()   const override;
     RowData     makeRow(int depth) const override;
+
+private:
+    mutable IID key_id_ = 0;
 };
 
 struct app_state_t {
@@ -358,8 +375,21 @@ struct app_state_t {
     std::string file_glob;          /* glob pattern for file path filtering */
     std::string cursor_id;
     std::string dcursor_id;
-    std::string search;
-    std::string evfilt;
+
+    /* search / event filter kept as IID + string_view.
+       The IID gives stable storage; view() returns the value. */
+    IID search_id = 0;
+    IID evfilt_id = 0;
+
+    std::string_view search_sv() const { return g_pool.view(search_id); }
+    std::string_view evfilt_sv() const { return g_pool.view(evfilt_id); }
+
+    void set_search(const std::string &q) {
+        search_id = q.empty() ? 0 : g_pool.put(q);
+    }
+    void set_evfilt(const std::string &q) {
+        evfilt_id = q.empty() ? 0 : g_pool.put(q);
+    }
 };
 
 struct output_group_t {
@@ -381,7 +411,7 @@ static std::vector<trace_event_t> g_events;
 static int g_next_event_id = 1;
 static std::unordered_map<int, std::unique_ptr<process_t>> g_proc_map;
 /* Save-trace removed: users should run uproctrace/sudtrace directly. */
-static std::vector<std::string> g_input_lines;  /* buffered input commands (raw JSON) */
+static std::vector<IID> g_input_lines;  /* buffered input commands (interned JSON) */
 static app_state_t g_state;
 static std::unique_ptr<Tui> g_tui;
 static int g_headless;
@@ -442,12 +472,13 @@ static std::string canon_path(std::string_view path) {
     return out;
 }
 
-static std::string resolve_path_dup(const std::string &raw, const std::string &cwd) {
+static std::string resolve_path_dup(std::string_view raw, std::string_view cwd) {
     if (raw.empty()) return {};
-    if (raw[0] != '/' && raw[0] != '.' && raw.find(':') != std::string::npos) return raw;
+    if (raw[0] != '/' && raw[0] != '.' && raw.find(':') != std::string_view::npos)
+        return std::string(raw);
     std::string out;
     if (raw[0] == '/') out = raw;
-    else if (!cwd.empty()) out = cwd + "/" + raw;
+    else if (!cwd.empty()) { out = cwd; out += '/'; out += raw; }
     else out = raw;
     if (!out.empty() && out[0] == '/') out = canon_path(out);
     return out;
@@ -584,7 +615,7 @@ struct preparsed_event_t {
     double ts = 0;
     int tgid = 0, ppid = 0;
 
-    std::string raw_path;          /* CWD/OPEN/UNLINK: before resolution */
+    IID raw_path_id = 0;           /* CWD/OPEN/UNLINK: interned raw path */
 
     uint32_t exe_id = 0;          /* EXEC */
     uint32_t argv_blob = 0;       /* EXEC */
@@ -600,18 +631,18 @@ struct preparsed_event_t {
 
     uint32_t data_blob = 0;       /* STDOUT/STDERR */
 
-    std::string input_line;        /* "input" JSON line */
+    IID input_line_id = 0;        /* "input" JSON line — interned */
 };
 
 /* Phase 1: Parse a single JSON line into a preparsed_event_t.
-   Thread-safe: only uses g_pool (which is thread-safe). */
+   Thread-safe: only uses g_pool (which is sharded / lock-per-shard). */
 static preparsed_event_t preparse_line(const char *line) {
     preparsed_event_t pe;
     std::string_view sp;
     if (!line || !line[0] || line[0] != '{') return pe;
     if (json_get(line, "input", sp)) {
         pe.is_input = true;
-        pe.input_line = line;
+        pe.input_line_id = g_pool.put(std::string_view(line, std::strlen(line)));
         pe.valid = true;
         return pe;
     }
@@ -635,15 +666,20 @@ static preparsed_event_t preparse_line(const char *line) {
 
     switch (pe.kind) {
     case EV_CWD:
-        if (json_get(line, "path", sp)) pe.raw_path = json_decode_string(sp);
+        if (json_get(line, "path", sp)) {
+            std::string decoded = json_decode_string(sp);
+            if (!decoded.empty()) pe.raw_path_id = g_pool.put(decoded);
+        }
         break;
     case EV_EXEC:
         if (json_get(line, "exe", sp)) pe.exe_id = g_pool.put(json_decode_string(sp));
         if (json_get(line, "argv", sp)) pe.argv_blob = g_pool.put_argv(json_array_of_strings(sp));
         break;
     case EV_OPEN:
-        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
-            pe.raw_path = json_decode_string(sp);
+        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n') {
+            std::string decoded = json_decode_string(sp);
+            if (!decoded.empty()) pe.raw_path_id = g_pool.put(decoded);
+        }
         { std::vector<std::string> flags;
           if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
           pe.flags_id = g_pool.put(join_with_pipe(flags)); }
@@ -651,8 +687,10 @@ static preparsed_event_t preparse_line(const char *line) {
         if (json_get(line, "err", sp)) pe.err = span_to_int(sp, 0);
         break;
     case EV_UNLINK:
-        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
-            pe.raw_path = json_decode_string(sp);
+        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n') {
+            std::string decoded = json_decode_string(sp);
+            if (!decoded.empty()) pe.raw_path_id = g_pool.put(decoded);
+        }
         break;
     case EV_EXIT:
         if (json_get(line, "status", sp)) pe.status_id = g_pool.put(json_decode_string(sp));
@@ -671,7 +709,7 @@ static preparsed_event_t preparse_line(const char *line) {
 /* Phase 2: Apply a pre-parsed event to global state (NOT thread-safe). */
 static void apply_preparsed(const preparsed_event_t &pe) {
     if (pe.is_input) {
-        g_input_lines.emplace_back(pe.input_line);
+        g_input_lines.push_back(pe.input_line_id);
         return;
     }
 
@@ -699,8 +737,8 @@ static void apply_preparsed(const preparsed_event_t &pe) {
 
     switch (ev.kind) {
     case EV_CWD:
-        if (!pe.raw_path.empty()) {
-            ev.path_item = intern_path_item(pe.raw_path);
+        if (pe.raw_path_id) {
+            ev.path_item = intern_path_item(g_pool.str(pe.raw_path_id));
             proc.set_cwd(ev.path_item);
         }
         break;
@@ -715,7 +753,8 @@ static void apply_preparsed(const preparsed_event_t &pe) {
         ev.flags_id = pe.flags_id;
         ev.mode = pe.mode;
         ev.err = pe.err;
-        std::string resolved = resolve_path_dup(pe.raw_path, proc.get_cwd());
+        std::string resolved;
+        if (pe.raw_path_id) resolved = resolve_path_dup(g_pool.str(pe.raw_path_id), proc.get_cwd());
         if (is_write_open(ev)) proc.has_write_open = 1;
         if (!resolved.empty()) {
             PathItem *pi = intern_path_item(resolved);
@@ -735,7 +774,8 @@ static void apply_preparsed(const preparsed_event_t &pe) {
         break;
     }
     case EV_UNLINK: {
-        std::string resolved = resolve_path_dup(pe.raw_path, proc.get_cwd());
+        std::string resolved;
+        if (pe.raw_path_id) resolved = resolve_path_dup(g_pool.str(pe.raw_path_id), proc.get_cwd());
         if (!resolved.empty()) {
             PathItem *pi = intern_path_item(resolved);
             ev.path_item = pi;
@@ -900,7 +940,7 @@ static void ingest_trace_line(const char *line) {
 static void ingest_line(const char *line) {
     std::string_view sp;
     if (!line || !line[0] || line[0] != '{') return;
-    if (json_get(line, "input", sp)) g_input_lines.emplace_back(line);
+    if (json_get(line, "input", sp)) g_input_lines.push_back(g_pool.put(std::string_view(line, std::strlen(line))));
     else ingest_trace_line(line);
 }
 
@@ -1062,16 +1102,17 @@ static bool cmp_proc_tgid(int a, int b) {
 /* ── View building ─────────────────────────────────────────────────── */
 
 static bool proc_matches_search(const process_t &p) {
-    if (g_state.search.empty()) return false;
-    if (std::to_string(p.tgid).find(g_state.search) != std::string::npos) return true;
-    /* Use pool contains() — avoids decompression for inline entries,
-       and avoids interning the search term. */
-    if (g_pool.contains(p.exe_id, g_state.search)) return true;
-    if (g_pool.contains(p.argv_blob, g_state.search)) return true;
+    if (!g_state.search_id) return false;
+    auto q = g_state.search_sv();
+    /* Check tgid key via its string_view (already backed by intern pool). */
+    auto key = p.getKey();
+    if (!key.empty() && key.find(q) != std::string_view::npos) return true;
+    if (g_pool.contains(p.exe_id, q)) return true;
+    if (g_pool.contains(p.argv_blob, q)) return true;
     for (int ei : p.event_indices) {
         auto &ev = g_events[ei];
         if ((ev.kind == EV_STDOUT || ev.kind == EV_STDERR) && ev.data_blob != 0) {
-            if (g_pool.contains(ev.data_blob, g_state.search)) return true;
+            if (g_pool.contains(ev.data_blob, q)) return true;
         }
     }
     return false;
@@ -1175,7 +1216,9 @@ static RowData make_proc_flat_row(process_t *p) {
 /* ── File view ─────────────────────────────────────────────────────── */
 
 static bool file_matches_search(const std::string &path) {
-    return !g_state.search.empty() && path.find(g_state.search) != std::string::npos;
+    if (!g_state.search_id) return false;
+    auto q = g_state.search_sv();
+    return path.find(q) != std::string::npos;
 }
 
 /* Build fixed-width RWUE flags string for a PathItem. */
@@ -1274,14 +1317,15 @@ RowData PathItem::makeRow(int depth) const {
     std::string unlinks_text = unlinks ? sfmt(", %d unlinks", unlinks) : std::string();
     bool has_kids = hasChildren();
     std::string flags = path_flags_str(this);
+    auto nv = nameView();
     std::string text;
     if (has_kids) {
-        text = sfmt("%s %*s%s%s/  [%d opens, %d procs%s%s]", flags.c_str(), depth * 2, "",
+        text = sfmt("%s %*s%s%.*s/  [%d opens, %d procs%s%s]", flags.c_str(), depth * 2, "",
                     collapsed ? "\xe2\x96\xb6 " : "\xe2\x96\xbc ",
-                    name.c_str(), opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
+                    (int)nv.size(), nv.data(), opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
     } else {
-        text = sfmt("%s %*s%s  [%d opens, %d procs%s%s]", flags.c_str(), depth * 2, "",
-                    name.c_str(), opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
+        text = sfmt("%s %*s%.*s  [%d opens, %d procs%s%s]", flags.c_str(), depth * 2, "",
+                    (int)nv.size(), nv.data(), opens, nprocs, errs_text.c_str(), unlinks_text.c_str());
     }
     RowData d;
     d.id = fullp;
@@ -1304,8 +1348,8 @@ static void add_file_tree_rec(std::vector<RowData> &rows, PathItem *node, int de
         if (pc->is_dir || !pc->children.empty()) dirs.push_back(pc);
         else files.push_back(pc);
     }
-    std::sort(dirs.begin(), dirs.end(), [](PathItem *a, PathItem *b) { return a->name < b->name; });
-    std::sort(files.begin(), files.end(), [](PathItem *a, PathItem *b) { return a->name < b->name; });
+    std::sort(dirs.begin(), dirs.end(), [](PathItem *a, PathItem *b) { return a->name_id < b->name_id; });
+    std::sort(files.begin(), files.end(), [](PathItem *a, PathItem *b) { return a->name_id < b->name_id; });
 
     for (auto *d : dirs) {
         std::string dfp = d->fullPath();
@@ -1361,7 +1405,7 @@ static void build_lpane_files(std::vector<RowData> &rows) {
         /* Non-absolute paths (pipes etc.) at the end. */
         for (auto *np : g_nonabs_paths) {
             if (np->opens == 0 && np->unlinks == 0) continue;
-            std::string path = np->name;
+            std::string path = g_pool.str(np->name_id);
             if (!file_passes_filters(np, path)) continue;
             int nprocs = static_cast<int>(np->proc_tgids.size());
             std::string errs_text = np->errs ? sfmt(", %d errs", np->errs) : std::string();
@@ -1531,7 +1575,7 @@ static int format_ts(char *buf, size_t bufsz, double ts, double prev) {
 }
 
 static bool event_allowed(const trace_event_t &ev) {
-    if (g_state.evfilt.empty()) return true;
+    if (!g_state.evfilt_id) return true;
     const char *kind = "";
     switch (ev.kind) {
     case EV_CWD: kind = "CWD"; break;
@@ -1542,7 +1586,8 @@ static bool event_allowed(const trace_event_t &ev) {
     case EV_STDOUT: kind = "STDOUT"; break;
     case EV_STDERR: kind = "STDERR"; break;
     }
-    return std::strstr(kind, g_state.evfilt.c_str()) != nullptr;
+    auto q = g_state.evfilt_sv();
+    return std::string_view(kind).find(q) != std::string_view::npos;
 }
 
 static void build_rpane_process(std::vector<RowData> &rows, const std::string &id) {
@@ -1842,8 +1887,8 @@ static void update_status() {
     int cur = g_tui ? g_tui->get_cursor(g_lpane) : 0;
     std::string s = sfmt(" %s%s | row %d | TS:%s", mn[g_state.mode], g_state.grouped ? " tree" : "",
                          cur + 1, tsl[g_state.ts_mode]);
-    if (!g_state.evfilt.empty()) s += sfmt(" | F:%s", g_state.evfilt.c_str());
-    if (!g_state.search.empty()) s += sfmt(" | /%s", g_state.search.c_str());
+    if (g_state.evfilt_id) { auto q = g_state.evfilt_sv(); s += sfmt(" | F:%.*s", (int)q.size(), q.data()); }
+    if (g_state.search_id) { auto q = g_state.search_sv(); s += sfmt(" | /%.*s", (int)q.size(), q.data()); }
     if (g_state.lp_filter == 1) s += " | V:failed";
     else if (g_state.lp_filter == 2) s += " | V:running";
     if (g_state.mode >= 3 && g_state.mode <= 6) s += sfmt(" | D:%s", g_state.dep_filter ? "written" : "all");
@@ -1913,7 +1958,7 @@ static void set_cursor_to_search_hit(int dir) {
 }
 
 static void apply_search(const std::string &q) {
-    g_state.search = q;
+    g_state.set_search(q);
     /* Dirty lpane so the engine re-reads with search highlighting. */
     if (g_tui) g_tui->dirty(g_lpane);
     /* Scan lazily to find the first hit. */
@@ -2011,10 +2056,12 @@ static void dump_state(FILE *out) {
     int rows = g_tui ? g_tui->rows() : 24;
     int cols = g_tui ? g_tui->cols() : 80;
     std::fprintf(out, "=== STATE ===\n");
+    std::string search_s = g_pool.str(g_state.search_id);
+    std::string evfilt_s = g_pool.str(g_state.evfilt_id);
     std::fprintf(out, "cursor=%d scroll=%d focus=%d dcursor=%d dscroll=%d ts_mode=%d sort_key=%d grouped=%d mode=%d lp_filter=%d search=%s evfilt=%s rows=%d cols=%d dep_filter=%d\n",
             cursor, scroll, focus_r, dcursor, dscroll,
             g_state.ts_mode, g_state.sort_key, g_state.grouped, g_state.mode, g_state.lp_filter,
-            g_state.search.c_str(), g_state.evfilt.c_str(), rows, cols, g_state.dep_filter);
+            search_s.c_str(), evfilt_s.c_str(), rows, cols, g_state.dep_filter);
     std::fprintf(out, "=== END STATE ===\n");
 }
 
@@ -2088,7 +2135,7 @@ static int on_key_cb(Tui &tui, int key, int panel, int cursor, const char *row_i
     case 'v': g_state.lp_filter = (g_state.lp_filter + 1) % 3; reset_mode_selection(); break;
     case 'V': g_state.lp_filter = 0; break;
     case 'd': g_state.dep_filter ^= 1; break;
-    case 'F': g_state.evfilt.clear(); break;
+    case 'F': g_state.set_evfilt(""); break;
     case '/': {
         char buf[256] = "";
         if (tui.line_edit("/", buf, sizeof buf)) apply_search(buf);
@@ -2098,7 +2145,7 @@ static int on_key_cb(Tui &tui, int key, int panel, int cursor, const char *row_i
         char buf[64] = "";
         if (tui.line_edit("Filter: ", buf, sizeof buf)) {
             for (char *p = buf; *p; p++) *p = static_cast<char>(std::toupper(static_cast<unsigned char>(*p)));
-            g_state.evfilt = buf;
+            g_state.set_evfilt(buf);
         }
         break;
     }
@@ -2158,8 +2205,10 @@ static void process_input_line(const char *line) {
         apply_search(q);
         apply_state_change();
     } else if (kind == "evfilt") {
-        if (json_get(line, "q", sp)) g_state.evfilt = json_decode_string(sp);
-        for (auto &c : g_state.evfilt) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        std::string q;
+        if (json_get(line, "q", sp)) q = json_decode_string(sp);
+        for (auto &c : q) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        g_state.set_evfilt(q);
         apply_state_change();
     } else if (kind == "print") {
         std::string what;
@@ -2284,8 +2333,17 @@ int  tv_test_lp_filter()  { return g_state.lp_filter; }
 int  tv_test_dep_filter() { return g_state.dep_filter; }
 int  tv_test_file_refinement() { return g_state.file_refinement; }
 int  tv_test_file_mode_filter() { return g_state.file_mode_filter; }
-const char *tv_test_search() { return g_state.search.c_str(); }
-const char *tv_test_evfilt() { return g_state.evfilt.c_str(); }
+/* test helpers need null-terminated strings; use static buffers. */
+const char *tv_test_search() {
+    static std::string buf;
+    buf = g_pool.str(g_state.search_id);
+    return buf.c_str();
+}
+const char *tv_test_evfilt() {
+    static std::string buf;
+    buf = g_pool.str(g_state.evfilt_id);
+    return buf.c_str();
+}
 
 /* ── Main ──────────────────────────────────────────────────────────── */
 
@@ -2381,7 +2439,7 @@ int main(int argc, char **argv) {
     g_tui->dirty();
     update_status();
 
-    for (const auto &line : g_input_lines) process_input_line(line.c_str());
+    for (IID lid : g_input_lines) { std::string s = g_pool.str(lid); process_input_line(s.c_str()); }
     if (g_headless) {
         g_tui.reset();
         free_all();
