@@ -33,6 +33,9 @@ public:
     IID put(const void *data, size_t len);
     IID put(const std::vector<uint8_t> &data);
 
+    /* Lookup without interning — returns 0 if the blob was never put(). */
+    IID find(std::string_view data) const;
+
     /* Convenience: store an argv-style vector as a single
        null-separated blob and return one IID. */
     IID put_argv(const std::vector<std::string> &argv);
