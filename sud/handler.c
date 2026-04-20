@@ -64,8 +64,17 @@ void install_sigsys_handler_raw(void)
      * This is the root cause of failures in complex builds (LTO,
      * distrobox, etc.) where SIGCHLD from child process termination
      * interrupts the handler at high frequency.
+     *
+     * Exception: SIGSEGV (11) and SIGBUS (7) are left UNBLOCKED.
+     * These synchronous fault signals must be deliverable so that a
+     * diagnostic crash handler can report the faulting address and
+     * register state.  When they are blocked and a fault occurs, the
+     * kernel force-delivers them with SIG_DFL (termination), which
+     * bypasses any installed handler and makes the crash silent.
      */
     sa.mask = ~(sud_sigset_word_t)0;
+    sa.mask &= ~((sud_sigset_word_t)1 << (SIGSEGV - 1));  /* unblock SIGSEGV */
+    sa.mask &= ~((sud_sigset_word_t)1 << (SIGBUS - 1));   /* unblock SIGBUS  */
     raw_syscall6(SYS_rt_sigaction, SIGSYS, (long)&sa, 0,
                  sizeof(sa.mask), 0, 0);
 #endif
