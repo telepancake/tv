@@ -50,6 +50,7 @@
 #define SYS_rt_sigprocmask __NR_rt_sigprocmask
 #define SYS_ptrace         __NR_ptrace
 #define SYS_sched_yield    __NR_sched_yield
+#define SYS_sigaltstack    __NR_sigaltstack
 
 #ifdef __NR_exit_group
 #define SYS_exit_group     __NR_exit_group

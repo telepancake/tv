@@ -34,28 +34,55 @@ static void fmt_hex_long(char *buf, unsigned long val)
     buf[sizeof(unsigned long) * 2] = '\0';
 }
 
+static void fmt_int_dec(char *buf, int *len, int val)
+{
+    char tmp[12];
+    int neg = val < 0;
+    unsigned int u = neg ? (unsigned int)(-val) : (unsigned int)val;
+    int i = 0;
+    do { tmp[i++] = '0' + (u % 10); u /= 10; } while (u);
+    if (neg) tmp[i++] = '-';
+    *len = i;
+    for (int j = 0; j < i; j++) buf[j] = tmp[i - 1 - j];
+}
+
 static void crash_diagnostic_handler(int sig, siginfo_t *info, void *uctx_raw)
 {
     ucontext_t *uc = (ucontext_t *)uctx_raw;
-    char msg[512];
+    char msg[768];
     int pos = 0;
     char hex[sizeof(unsigned long) * 2 + 1];
 
-    /* Header */
+    /* Header with signal name */
     {
-        const char hdr[] = "\nsudtrace: CRASH DIAGNOSTIC\n"
-                           "  Signal: SIGSEGV\n";
+        const char hdr[] = "\nsudtrace: CRASH DIAGNOSTIC\n  Signal: ";
         memcpy(msg + pos, hdr, sizeof(hdr) - 1);
         pos += sizeof(hdr) - 1;
+        const char *name = (sig == SIGSEGV) ? "SIGSEGV" : "SIGBUS";
+        int nlen = (sig == SIGSEGV) ? 7 : 6;
+        memcpy(msg + pos, name, nlen); pos += nlen;
+        msg[pos++] = '\n';
     }
 
-    /* Fault address: si_addr is at offset 12 in siginfo_t for SIGSEGV
-     * (after si_signo, si_errno, si_code).  The _pad0 field in our struct
-     * corresponds to si_addr for fault signals. */
+    /* si_code — critical for distinguishing SI_KERNEL from SEGV_MAPERR etc. */
+    {
+        const char s[] = "  si_code: ";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        int dlen;
+        fmt_int_dec(msg + pos, &dlen, info->si_code);
+        pos += dlen;
+        if (info->si_code == 0x80) {
+            const char t[] = " (SI_KERNEL)";
+            memcpy(msg + pos, t, sizeof(t) - 1); pos += sizeof(t) - 1;
+        }
+        msg[pos++] = '\n';
+    }
+
+    /* Fault address (si_addr) */
     {
         const char s[] = "  Fault addr: 0x";
         memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)info->_pad0);
+        fmt_hex_long(hex, (unsigned long)info->si_addr);
         memcpy(msg + pos, hex, sizeof(unsigned long) * 2);
         pos += sizeof(unsigned long) * 2;
         msg[pos++] = '\n';
@@ -135,6 +162,18 @@ static void crash_diagnostic_handler(int sig, siginfo_t *info, void *uctx_raw)
         const char s[] = "  EBP: 0x";
         memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
         fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EBP]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        msg[pos++] = '\n';
+    }
+    /* Segment registers — SI_KERNEL often means a bad segment value */
+    {
+        const char s[] = "  GS: 0x";
+        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_GS]);
+        memcpy(msg + pos, hex, 8); pos += 8;
+        const char s2[] = "  FS: 0x";
+        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
+        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_FS]);
         memcpy(msg + pos, hex, 8); pos += 8;
         msg[pos++] = '\n';
     }
@@ -576,18 +615,38 @@ void load_and_run_elf(const char *path, int argc, char **argv,
     if (target_fd >= 0)
         close(target_fd);
 
-    /* Install a diagnostic SIGSEGV handler to capture crash details.
+    /* Install a diagnostic SIGSEGV/SIGBUS handler to capture crash details.
      * This runs in place of the default handler and prints the fault
      * address and register state before aborting, which is invaluable
-     * for debugging issues with the in-process loader. */
+     * for debugging issues with the in-process loader.
+     *
+     * SA_ONSTACK: use an alternate signal stack so the handler can run
+     * even when the main stack is corrupted (which is common for
+     * SI_KERNEL crashes where iret fails due to bad segment state). */
     {
+        /* Set up an alternate signal stack (16KB mmap'd region). */
+        void *altstack = mmap(NULL, 16384,
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS,
+                              -1, 0);
+        if (altstack != MAP_FAILED) {
+            /* sigaltstack expects a stack_t: { void *ss_sp; int ss_flags; size_t ss_size } */
+            struct { void *ss_sp; int ss_flags; size_t ss_size; } ss;
+            ss.ss_sp = altstack;
+            ss.ss_flags = 0;
+            ss.ss_size = 16384;
+            raw_syscall6(SYS_sigaltstack, (long)&ss, 0, 0, 0, 0, 0);
+        }
+
         struct kernel_sigaction_raw segv_sa;
         memset(&segv_sa, 0, sizeof(segv_sa));
         segv_sa.handler = (void (*)(int))crash_diagnostic_handler;
-        segv_sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER;
+        segv_sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER | SA_ONSTACK;
         segv_sa.restorer = sud_rt_sigreturn_restorer;
         segv_sa.mask = 0;
         raw_syscall6(SYS_rt_sigaction, SIGSEGV, (long)&segv_sa, 0,
+                     sizeof(segv_sa.mask), 0, 0);
+        raw_syscall6(SYS_rt_sigaction, SIGBUS, (long)&segv_sa, 0,
                      sizeof(segv_sa.mask), 0, 0);
     }
 
