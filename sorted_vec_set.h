@@ -54,6 +54,39 @@ public:
         return std::binary_search(v_.begin(), v_.end(), val, cmp_);
     }
 
+    /* Heterogeneous lookup — requires Cmp to support comparing T with K.
+       Useful with transparent comparators (e.g. looking up by a key
+       extracted from the element type). */
+    template<typename K>
+    bool contains(const K &key) {
+        ensure_sorted();
+        auto it = std::lower_bound(v_.begin(), v_.end(), key, cmp_);
+        return it != v_.end() && !cmp_(key, *it);
+    }
+
+    template<typename K>
+    bool contains(const K &key) const {
+        assert(sorted_);
+        auto it = std::lower_bound(v_.begin(), v_.end(), key, cmp_);
+        return it != v_.end() && !cmp_(key, *it);
+    }
+
+    template<typename K = T>
+    typename std::vector<T>::iterator find(const K &key) {
+        ensure_sorted();
+        auto it = std::lower_bound(v_.begin(), v_.end(), key, cmp_);
+        if (it != v_.end() && !cmp_(key, *it)) return it;
+        return v_.end();
+    }
+
+    template<typename K = T>
+    typename std::vector<T>::const_iterator find(const K &key) const {
+        assert(sorted_);
+        auto it = std::lower_bound(v_.begin(), v_.end(), key, cmp_);
+        if (it != v_.end() && !cmp_(key, *it)) return it;
+        return v_.end();
+    }
+
     void erase(const T &val) {
         ensure_sorted();
         auto it = std::lower_bound(v_.begin(), v_.end(), val, cmp_);
