@@ -174,19 +174,26 @@ typedef struct {
     int si_signo;
     int si_errno;
     int si_code;
-    int _pad0;           /* alignment padding to match kernel layout */
+    /* _sifields starts immediately at offset 12 — no padding.
+     * The kernel's siginfo_t (and compat_siginfo) has the union at
+     * offset 12; the earlier _pad0 was wrong and shifted all union
+     * members by 4 bytes, breaking si_pid/si_status for waitid. */
     union {
-        int _pad[28];    /* total size matches kernel's siginfo_t (128 bytes) */
+        int _pad[29];    /* total size matches kernel's siginfo_t (128 bytes) */
         struct {
             pid_t si_pid;
             unsigned int si_uid;
             int si_status;
         } _sigchld;
+        struct {
+            void *si_addr;   /* fault address (SIGSEGV, SIGBUS) */
+        } _sigfault;
     } _sifields;
 } siginfo_t;
 
 #define si_pid     _sifields._sigchld.si_pid
 #define si_status  _sifields._sigchld.si_status
+#define si_addr    _sifields._sigfault.si_addr
 
 /* ================================================================
  * ucontext_t — architecture-specific register context
