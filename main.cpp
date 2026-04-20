@@ -55,7 +55,7 @@ struct Item {
 /* ── PathItem — hierarchical filesystem path node ──────────────────── */
 
 struct PathItem : Item {
-    IID                 name_id = 0; /* interned single path component */
+    InlineIID           name_id{};   /* interned single path component */
     PathItem           *parent = nullptr;
     bool                is_dir = false;
 
@@ -78,93 +78,133 @@ struct PathItem : Item {
     bool was_ever_unlinked() const { return unlinks > 0; }
     bool unlinked_at_end() const { return last_unlink_ts > 0 && last_unlink_ts > last_open_write_ts; }
 
-    /* Name as string (retrieved from intern pool). */
+    /* Name as string_view — total because name_id is in the inline pool. */
     std::string_view nameView() const { return g_pool.view(name_id); }
 
-    /* Build full path by traversing parent chain. */
-    std::string fullPath() const {
-        if (!parent) return "/";
-        std::string p = parent->fullPath();
-        if (p != "/") p += '/';
-        auto sv = g_pool.view(name_id);
-        if (!sv.empty()) p.append(sv.data(), sv.size());
-        else p += g_pool.str(name_id);
-        return p;
+    /* Build full path, lazily cached.  Single allocation total per node. */
+    std::string_view fullPathView() const {
+        if (full_path_cached_) return full_path_;
+        if (!parent) {
+            full_path_ = "/";
+        } else {
+            /* Compute total length first to avoid reallocs. */
+            size_t total = 0;
+            for (const PathItem *n = this; n->parent; n = n->parent)
+                total += 1 + g_pool.view(n->name_id).size();
+            full_path_.clear();
+            full_path_.reserve(total);
+            /* Build by collecting the chain then emitting in reverse. */
+            std::vector<std::string_view> segs;
+            for (const PathItem *n = this; n->parent; n = n->parent)
+                segs.push_back(g_pool.view(n->name_id));
+            for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+                full_path_ += '/';
+                full_path_.append(it->data(), it->size());
+            }
+        }
+        full_path_cached_ = true;
+        return full_path_;
     }
+    std::string fullPath() const { return std::string(fullPathView()); }
 
-    std::string_view getKey() const override {
-        /* IID-backed key: intern the full path, return a stable view
-           from the pool's arena.  Falls back to a string for the rare
-           case where the full path is ≥ 128 bytes (ZSTD-compressed). */
-        if (!key_id_) key_id_ = g_pool.put(fullPath());
-        auto sv = g_pool.view(key_id_);
-        if (!sv.empty()) return sv;
-        if (key_fallback_.empty()) key_fallback_ = g_pool.str(key_id_);
-        return key_fallback_;
-    }
+    std::string_view getKey() const override { return fullPathView(); }
 
     RowStyle    style()          const override;
     std::string getParentKey()   const override;
     RowData     makeRow(int depth) const override;
 
     /* O(1) average child lookup via unordered_map keyed by name IID. */
-    PathItem *getOrCreateChild(IID child_name_id, bool dir) {
-        auto it = children_set_.find(child_name_id);
+    PathItem *getOrCreateChild(InlineIID child_name_id, bool dir) {
+        auto it = children_set_.find(child_name_id.v);
         if (it != children_set_.end()) return it->second;
         auto *nc = new PathItem();
         nc->name_id = child_name_id;
         nc->parent = this;
         nc->is_dir = dir;
         children.push_back(nc);
-        children_set_.emplace(child_name_id, nc);
+        children_set_.emplace(child_name_id.v, nc);
         return nc;
     }
 
-    PathItem *findChild(IID child_name_id) const {
-        auto it = children_set_.find(child_name_id);
+    PathItem *findChild(InlineIID child_name_id) const {
+        auto it = children_set_.find(child_name_id.v);
         return it != children_set_.end() ? it->second : nullptr;
     }
 
     void clearChildSet() { children_set_.clear(); }
+    void invalidateFullPathCache() { full_path_cached_ = false; full_path_.clear(); }
 
 private:
-    mutable IID         key_id_ = 0;
-    mutable std::string key_fallback_;  /* only for paths ≥ 128 bytes */
+    mutable std::string full_path_;        /* cached full path */
+    mutable bool        full_path_cached_ = false;
 
-    mutable std::unordered_map<IID, PathItem*> children_set_;
+    mutable std::unordered_map<uint32_t, PathItem*> children_set_;
 };
 
-/* Root of the file tree — represents "/" */
-static PathItem g_path_root;
+/* Deterministic ordering of PathItem* — by name IID up the parent chain.
+   Pointer compares are non-deterministic (ASLR); name-id chain is stable. */
+struct PathItemPtrLess {
+    bool operator()(const PathItem *a, const PathItem *b) const {
+        if (a == b) return false;
+        if (!a) return true;
+        if (!b) return false;
+        /* Walk both up to root, build chains, compare lexicographically. */
+        std::vector<uint32_t> ca, cb;
+        for (const PathItem *p = a; p->parent; p = p->parent) ca.push_back(p->name_id.v);
+        for (const PathItem *p = b; p->parent; p = p->parent) cb.push_back(p->name_id.v);
+        std::reverse(ca.begin(), ca.end());
+        std::reverse(cb.begin(), cb.end());
+        return ca < cb;
+    }
+};
+
+/* Root of the file tree — represents "/" — owned via unique_ptr so reset
+   on free_all() is one line and immune to "I forgot to clear field X". */
+static std::unique_ptr<PathItem> g_path_root_owner;
+static PathItem *g_path_root = nullptr;
 /* Abstract handles like "pipe:[12345]" or "socket:[…]" that don't start with
    "/" — keyed by the interned name IID for O(1) lookup. */
-static std::unordered_map<IID, PathItem*> g_nonabs_paths;
+static std::unordered_map<uint32_t, PathItem*> g_nonabs_paths;
 
-/* Intern a path into the PathItem hierarchy.  Returns the leaf node. */
-static PathItem *intern_path_item(const std::string &path) {
+static void ensure_path_root() {
+    if (!g_path_root_owner) {
+        g_path_root_owner = std::make_unique<PathItem>();
+        g_path_root_owner->is_dir = true;
+        g_path_root = g_path_root_owner.get();
+    }
+}
+
+/* Intern a path into the PathItem hierarchy.  Returns the leaf node.
+   Walks segments via string_view — no per-call std::string allocation.
+
+   Path classification is the caller's responsibility (Step C):
+   - Absolute paths ('/...') → trie under g_path_root
+   - Abstract handles ('pipe:[…]', etc.) → flat g_nonabs_paths map
+   - Relative paths must be resolved by the caller before calling here. */
+static PathItem *intern_path_item(std::string_view path) {
     if (path.empty()) return nullptr;
+    ensure_path_root();
     if (path[0] != '/') {
-        /* Non-absolute path (pipe, etc.) — keep as flat item */
-        IID nid = g_pool.put(path);
-        auto it = g_nonabs_paths.find(nid);
+        /* Abstract handle (pipe/socket/anon_inode/etc.) — flat map. */
+        InlineIID nid = g_pool.put_inline(path);
+        auto it = g_nonabs_paths.find(nid.v);
         if (it != g_nonabs_paths.end()) return it->second;
         auto *np = new PathItem();
         np->name_id = nid;
         np->is_dir = false;
-        g_nonabs_paths.emplace(nid, np);
+        g_nonabs_paths.emplace(nid.v, np);
         return np;
     }
     /* Traverse/create hierarchy for absolute path. */
-    PathItem *cur = &g_path_root;
-    cur->is_dir = true;
+    PathItem *cur = g_path_root;
     size_t i = 1; /* skip leading '/' */
     while (i < path.size()) {
         auto sl = path.find('/', i);
-        size_t seg_len = (sl == std::string::npos) ? path.size() - i : sl - i;
+        size_t seg_len = (sl == std::string_view::npos) ? path.size() - i : sl - i;
         std::string_view seg(path.data() + i, seg_len);
-        if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
-        bool is_last = (sl == std::string::npos);
-        IID seg_id = g_pool.put(seg);
+        if (seg.empty()) { i = (sl == std::string_view::npos) ? path.size() : sl + 1; continue; }
+        bool is_last = (sl == std::string_view::npos);
+        InlineIID seg_id = g_pool.put_inline(seg);
         cur = cur->getOrCreateChild(seg_id, !is_last);
         i = is_last ? path.size() : sl + 1;
     }
@@ -172,62 +212,49 @@ static PathItem *intern_path_item(const std::string &path) {
 }
 
 /* Lookup without creating. */
-static PathItem *find_path_item(const std::string &path) {
-    if (path.empty()) return nullptr;
+static PathItem *find_path_item(std::string_view path) {
+    if (path.empty() || !g_path_root) return nullptr;
     if (path[0] != '/') {
-        IID nid = g_pool.put(path);
-        auto it = g_nonabs_paths.find(nid);
+        InlineIID nid = g_pool.find_inline(path);
+        if (!nid) return nullptr;
+        auto it = g_nonabs_paths.find(nid.v);
         return it != g_nonabs_paths.end() ? it->second : nullptr;
     }
-    PathItem *cur = &g_path_root;
+    PathItem *cur = g_path_root;
     size_t i = 1;
     while (i < path.size()) {
         auto sl = path.find('/', i);
-        size_t seg_len = (sl == std::string::npos) ? path.size() - i : sl - i;
+        size_t seg_len = (sl == std::string_view::npos) ? path.size() - i : sl - i;
         std::string_view seg(path.data() + i, seg_len);
-        if (seg.empty()) { i = (sl == std::string::npos) ? path.size() : sl + 1; continue; }
-        IID seg_id = g_pool.put(seg);
+        if (seg.empty()) { i = (sl == std::string_view::npos) ? path.size() : sl + 1; continue; }
+        InlineIID seg_id = g_pool.find_inline(seg);
+        if (!seg_id) return nullptr;
         PathItem *found = cur->findChild(seg_id);
         if (!found) return nullptr;
         cur = found;
-        i = (sl == std::string::npos) ? path.size() : sl + 1;
+        i = (sl == std::string_view::npos) ? path.size() : sl + 1;
     }
     return cur;
 }
 
-/* Free all PathItems allocated with new. */
-static void free_path_tree(PathItem *node) {
-    for (auto *c : node->children) free_path_tree(static_cast<PathItem*>(c));
-    if (node != &g_path_root) delete node;
-    else { node->children.clear(); node->collapsed = false; node->opens = 0; node->errs = 0;
-           node->unlinks = 0; node->aggregated_mode = 0;
-           node->last_open_write_ts = 0; node->last_unlink_ts = 0;
-           node->proc_tgids.clear(); node->open_event_indices.clear();
-           node->unlink_event_indices.clear();
-           node->read_procs.clear(); node->write_procs.clear();
-           node->unlink_procs.clear(); node->events.clear();
-           node->deps.clear(); node->rdeps.clear();
-           node->clearChildSet(); }
+/* Recursively delete all PathItems below node (excluding node itself). */
+static void free_path_tree_children(PathItem *node) {
+    for (auto *c : node->children) {
+        free_path_tree_children(static_cast<PathItem*>(c));
+        delete static_cast<PathItem*>(c);
+    }
+    node->children.clear();
+    node->clearChildSet();
 }
 
-static void free_nonabs_paths() {
+/* Free the entire path tree, including the abstract-handle map. */
+static void free_path_tree_all() {
+    if (g_path_root) free_path_tree_children(g_path_root);
+    g_path_root_owner.reset();
+    g_path_root = nullptr;
     for (auto &kv : g_nonabs_paths) delete kv.second;
     g_nonabs_paths.clear();
 }
-
-/* ── Backward-compatible abs_path_t — now wraps PathItem* ─────────── */
-
-struct abs_path_t {
-    PathItem *ptr = nullptr;
-    abs_path_t() = default;
-    explicit abs_path_t(PathItem *p) : ptr(p) {}
-    bool operator==(const abs_path_t &o) const { return ptr == o.ptr; }
-    bool operator!=(const abs_path_t &o) const { return ptr != o.ptr; }
-    bool operator< (const abs_path_t &o) const { return ptr < o.ptr; }
-    bool empty() const { return !ptr; }
-    std::string str() const { return ptr ? ptr->fullPath() : std::string(); }
-    explicit operator bool() const { return ptr != nullptr; }
-};
 
 extern int uproctrace_main(int argc, char **argv);
 
@@ -272,16 +299,16 @@ struct trace_event_t {
 
     PathItem *path_item = nullptr;     /* resolved path (CWD/OPEN/UNLINK) */
 
-    uint32_t exe_id = 0;              /* EXEC: interned exe path */
-    uint32_t argv_blob = 0;           /* EXEC: interned argv */
+    BlobIID   exe_id{};               /* EXEC: interned exe path */
+    BlobIID   argv_blob{};            /* EXEC: interned argv */
 
-    uint32_t flags_id = 0;            /* OPEN: interned flag string */
+    InlineIID flags_id{};             /* OPEN: interned flag string */
     int mode = 0;                     /* OPEN: raw open flags integer */
     int err = 0;                      /* OPEN: errno if failed */
 
-    uint32_t data_blob = 0;           /* STDOUT/STDERR: interned output */
+    BlobIID   data_blob{};            /* STDOUT/STDERR: interned output */
 
-    uint32_t status_id = 0;           /* EXIT: interned status string */
+    InlineIID status_id{};            /* EXIT: interned status string */
     int code = 0;                     /* EXIT: exit code */
     int signal = 0;                   /* EXIT: signal number */
 
@@ -296,47 +323,45 @@ struct process_t : Item {
     bool parent_set = false;
     double start_ts = 0, end_ts = 0;
     int has_start = 0, has_end = 0;
-    uint32_t exe_id = 0;
-    uint32_t argv_blob = 0;
+    BlobIID   exe_id{};
+    BlobIID   argv_blob{};
     PathItem *cwd_item = nullptr;
-    uint32_t exit_status_id = 0;
+    InlineIID exit_status_id{};
     int exit_code = 0;
     int exit_signal = 0;
     int core_dumped = 0;
     int has_write_open = 0;
     int has_stdout = 0;
-    sorted_vec_set<abs_path_t> read_paths;
-    sorted_vec_set<abs_path_t> write_paths;
+    /* Sets of paths this process touched.  Sorted by name-id chain
+       (PathItemPtrLess) so iteration order is deterministic across runs. */
+    sorted_vec_set<PathItem*, PathItemPtrLess> read_paths;
+    sorted_vec_set<PathItem*, PathItemPtrLess> write_paths;
     std::vector<int> event_indices;
     std::string cached_display_name;
 
-    /* CWD stored as IID — no separate cached string. */
-    IID cwd_path_id = 0;
-
+    /* CWD as a PathItem* (was: separately interned IID).  Kills the
+       extra g_pool.put on every CWD/OPEN. */
     std::string get_exe() const { return g_pool.str(exe_id); }
     std::vector<std::string> get_argv() const { return g_pool.get_argv(argv_blob); }
-    std::string get_cwd() const { return g_pool.str(cwd_path_id); }
-    void set_cwd(PathItem *item) {
-        cwd_item = item;
-        cwd_path_id = item ? g_pool.put(item->fullPath()) : 0;
-    }
+    std::string get_cwd() const { return cwd_item ? cwd_item->fullPath() : std::string(); }
+    std::string_view cwd_view() const { return cwd_item ? cwd_item->fullPathView() : std::string_view(); }
+    void set_cwd(PathItem *item) { cwd_item = item; }
 
     void update_display_name() {
-        std::string_view s = g_pool.view(exe_id);
-        std::string argv0;
+        std::string s = get_exe();
         if (s.empty()) {
             auto argv = get_argv();
-            if (!argv.empty()) { argv0 = std::move(argv[0]); s = argv0; }
+            if (!argv.empty()) s = std::move(argv[0]);
         }
         if (s.empty()) { cached_display_name.clear(); return; }
         auto pos = s.rfind('/');
-        cached_display_name = std::string(pos != std::string_view::npos ? s.substr(pos + 1) : s);
+        cached_display_name = (pos != std::string::npos) ? s.substr(pos + 1) : std::move(s);
     }
     const std::string &display_name() const { return cached_display_name; }
 
     std::string_view getKey() const override {
         /* tgid is the key — intern once for stable string_view. */
-        if (!key_id_) key_id_ = g_pool.put(std::to_string(tgid));
+        if (!key_id_) key_id_ = g_pool.put_inline(std::to_string(tgid));
         return g_pool.view(key_id_);
     }
     int         sortKey()        const override { return tgid; }
@@ -346,7 +371,7 @@ struct process_t : Item {
     RowData     makeRow(int depth) const override;
 
 private:
-    mutable IID key_id_ = 0;
+    mutable InlineIID key_id_{};
 };
 
 struct app_state_t {
@@ -363,19 +388,18 @@ struct app_state_t {
     std::string cursor_id;
     std::string dcursor_id;
 
-    /* search / event filter kept as IID + string_view.
-       The IID gives stable storage; view() returns the value. */
-    IID search_id = 0;
-    IID evfilt_id = 0;
+    /* search / event filter — short user input strings, kept inline. */
+    InlineIID search_id{};
+    InlineIID evfilt_id{};
 
     std::string_view search_sv() const { return g_pool.view(search_id); }
     std::string_view evfilt_sv() const { return g_pool.view(evfilt_id); }
 
-    void set_search(const std::string &q) {
-        search_id = q.empty() ? 0 : g_pool.put(q);
+    void set_search(std::string_view q) {
+        search_id = q.empty() ? InlineIID{} : g_pool.put_inline(q);
     }
-    void set_evfilt(const std::string &q) {
-        evfilt_id = q.empty() ? 0 : g_pool.put(q);
+    void set_evfilt(std::string_view q) {
+        evfilt_id = q.empty() ? InlineIID{} : g_pool.put_inline(q);
     }
 };
 
@@ -396,9 +420,12 @@ enum {
 
 static std::vector<trace_event_t> g_events;
 static int g_next_event_id = 1;
+/* Maps event id → index into g_events.  Populated as events are appended.
+   Replaces a linear scan over g_events that the right-pane build used. */
+static std::unordered_map<int, int> g_event_id_to_index;
 static std::unordered_map<int, std::unique_ptr<process_t>> g_proc_map;
 /* Save-trace removed: users should run uproctrace/sudtrace directly. */
-static std::vector<IID> g_input_lines;  /* buffered input commands (interned JSON) */
+static std::vector<BlobIID> g_input_lines;  /* buffered input commands (interned JSON) */
 static app_state_t g_state;
 static std::unique_ptr<Tui> g_tui;
 static int g_headless;
@@ -459,17 +486,58 @@ static std::string canon_path(std::string_view path) {
     return out;
 }
 
-static std::string resolve_path_dup(std::string_view raw, std::string_view cwd) {
+/* Path classification.  Done once at parse time, never re-sniffed.
+
+   ABS       — starts with '/'.  Goes into the trie under g_path_root.
+   ABSTRACT  — looks like 'pipe:[…]', 'socket:[…]', 'anon_inode:…' —
+               i.e. doesn't start with '/' or '.' and contains ':'.
+               Stored in g_nonabs_paths flat map.
+   RELATIVE  — anything else (e.g. './build', 'foo/bar', '../x').
+               Resolved against the process CWD before interning. */
+enum path_kind_t : uint8_t {
+    PK_NONE = 0,
+    PK_ABS = 1,
+    PK_ABSTRACT = 2,
+    PK_RELATIVE = 3,
+};
+
+static path_kind_t classify_path(std::string_view raw) {
+    if (raw.empty()) return PK_NONE;
+    if (raw[0] == '/') return PK_ABS;
+    if (raw[0] != '.' && raw.find(':') != std::string_view::npos)
+        return PK_ABSTRACT;
+    return PK_RELATIVE;
+}
+
+/* Resolve a relative path against a CWD and canonicalise.  Returns the
+   resolved absolute path, or an empty string if cwd is unknown. */
+static std::string resolve_relative(std::string_view raw, std::string_view cwd) {
     if (raw.empty()) return {};
-    if (raw[0] != '/' && raw[0] != '.' && raw.find(':') != std::string_view::npos)
-        return std::string(raw);
     std::string out;
-    if (raw[0] == '/') out = raw;
-    else if (!cwd.empty()) { out = cwd; out += '/'; out += raw; }
-    else out = raw;
+    if (!cwd.empty()) { out.reserve(cwd.size() + 1 + raw.size()); out = cwd; out += '/'; out += raw; }
+    else { out.assign(raw); }
     if (!out.empty() && out[0] == '/') out = canon_path(out);
     return out;
 }
+
+/* Intern a path of any kind into the appropriate structure, given the
+   process CWD for resolving relative paths.  Returns the PathItem*, or
+   nullptr if the input was empty or relative-with-no-cwd. */
+static PathItem *intern_classified(path_kind_t kind, std::string_view raw,
+                                   std::string_view cwd) {
+    switch (kind) {
+    case PK_NONE: return nullptr;
+    case PK_ABS:  return intern_path_item(canon_path(raw));
+    case PK_ABSTRACT: return intern_path_item(raw);
+    case PK_RELATIVE: {
+        std::string resolved = resolve_relative(raw, cwd);
+        if (resolved.empty()) return nullptr;
+        return intern_path_item(resolved);
+    }
+    }
+    return nullptr;
+}
+
 
 /* ── View helpers ──────────────────────────────────────────────────── */
 
@@ -539,32 +607,6 @@ static process_t &get_process(int tgid) {
 
 /* ── Trace ingestion ───────────────────────────────────────────────── */
 
-static bool has_flag(const std::string &flags, const char *flag) {
-    return !flags.empty() && flags.find(flag) != std::string::npos;
-}
-
-static bool is_write_open(const trace_event_t &ev) {
-    if (ev.kind != EV_OPEN) return false;
-    if (ev.mode != 0) {
-        int acc = ev.mode & O_ACCMODE;
-        return acc == O_WRONLY || acc == O_RDWR ||
-               (ev.mode & O_CREAT) || (ev.mode & O_TRUNC);
-    }
-    std::string flags = ev.get_flags_text();
-    return has_flag(flags, "O_WRONLY") || has_flag(flags, "O_RDWR") ||
-         has_flag(flags, "O_CREAT") || has_flag(flags, "O_TRUNC");
-}
-
-static bool is_read_open(const trace_event_t &ev) {
-    if (ev.kind != EV_OPEN) return false;
-    if (ev.mode != 0) {
-        int acc = ev.mode & O_ACCMODE;
-        return acc == O_RDONLY || acc == O_RDWR;
-    }
-    std::string flags = ev.get_flags_text();
-    return has_flag(flags, "O_RDONLY") || has_flag(flags, "O_RDWR");
-}
-
 static std::string join_with_pipe(const std::vector<std::string> &arr) {
     std::string out;
     for (size_t i = 0; i < arr.size(); i++) {
@@ -593,7 +635,15 @@ static int key_name_to_code(const std::string &name) {
 
 /* ── Pre-parsed event for parallel ingestion ──────────────────────── */
 /* Phase 1 (parallel): extract JSON fields into this struct.
-   Phase 2 (sequential): apply to global state. */
+   Phase 2 (sequential): apply to global state.
+
+   Path resolution semantics (Step C):
+   - The decoded raw path is carried as `raw_path` (a std::string moved
+     out of the JSON decoder; never interned for transient use).
+   - The kind (ABS / ABSTRACT / RELATIVE) is classified once at parse
+     time so the ':' sniff isn't redone per event.
+   - In phase 2, RELATIVE paths are resolved against proc.get_cwd();
+     ABS paths are canonicalised; ABSTRACT paths are stored as-is. */
 
 struct preparsed_event_t {
     event_kind_t kind = EV_CWD;
@@ -602,23 +652,25 @@ struct preparsed_event_t {
     double ts = 0;
     int tgid = 0, ppid = 0;
 
-    IID raw_path_id = 0;           /* CWD/OPEN/UNLINK: interned raw path */
+    /* CWD/OPEN/UNLINK: decoded raw path + classification. */
+    std::string raw_path;
+    path_kind_t path_kind = PK_NONE;
 
-    uint32_t exe_id = 0;          /* EXEC */
-    uint32_t argv_blob = 0;       /* EXEC */
+    BlobIID   exe_id{};            /* EXEC */
+    BlobIID   argv_blob{};         /* EXEC */
 
-    uint32_t flags_id = 0;        /* OPEN */
-    int mode = 0;                 /* OPEN */
-    int err = 0;                  /* OPEN */
+    InlineIID flags_id{};          /* OPEN */
+    int mode = 0;                  /* OPEN */
+    int err = 0;                   /* OPEN */
 
-    uint32_t status_id = 0;       /* EXIT */
-    int code = 0;                 /* EXIT */
-    int signal_ = 0;              /* EXIT */
-    uint8_t core_dumped = 0;      /* EXIT */
+    InlineIID status_id{};         /* EXIT */
+    int code = 0;                  /* EXIT */
+    int signal_ = 0;               /* EXIT */
+    uint8_t core_dumped = 0;       /* EXIT */
 
-    uint32_t data_blob = 0;       /* STDOUT/STDERR */
+    BlobIID   data_blob{};         /* STDOUT/STDERR */
 
-    IID input_line_id = 0;        /* "input" JSON line — interned */
+    BlobIID   input_line_id{};     /* "input" JSON line — interned blob */
 };
 
 /* Phase 1: Parse a single JSON line into a preparsed_event_t.
@@ -629,7 +681,7 @@ static preparsed_event_t preparse_line(const char *line) {
     if (!line || !line[0] || line[0] != '{') return pe;
     if (json_get(line, "input", sp)) {
         pe.is_input = true;
-        pe.input_line_id = g_pool.put(std::string_view(line, std::strlen(line)));
+        pe.input_line_id = g_pool.put_blob(std::string_view(line, std::strlen(line)));
         pe.valid = true;
         return pe;
     }
@@ -651,50 +703,117 @@ static preparsed_event_t preparse_line(const char *line) {
     if (json_get(line, "tgid", sp)) pe.tgid = span_to_int(sp, 0);
     if (json_get(line, "ppid", sp)) pe.ppid = span_to_int(sp, 0);
 
+    auto take_path = [&](const char *jkey) {
+        if (json_get(line, jkey, sp) && !sp.empty() && sp[0] != 'n') {
+            pe.raw_path = json_decode_string(sp);
+            pe.path_kind = classify_path(pe.raw_path);
+        }
+    };
+
     switch (pe.kind) {
     case EV_CWD:
-        if (json_get(line, "path", sp)) {
-            std::string decoded = json_decode_string(sp);
-            if (!decoded.empty()) pe.raw_path_id = g_pool.put(decoded);
-        }
+        take_path("path");
         break;
     case EV_EXEC:
-        if (json_get(line, "exe", sp)) pe.exe_id = g_pool.put(json_decode_string(sp));
-        if (json_get(line, "argv", sp)) pe.argv_blob = g_pool.put_argv(json_array_of_strings(sp));
+        if (json_get(line, "exe", sp)) pe.exe_id = g_pool.put_blob(json_decode_string(sp));
+        if (json_get(line, "argv", sp)) pe.argv_blob = g_pool.put_blob_argv(json_array_of_strings(sp));
         break;
     case EV_OPEN:
-        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n') {
-            std::string decoded = json_decode_string(sp);
-            if (!decoded.empty()) pe.raw_path_id = g_pool.put(decoded);
-        }
+        take_path("path");
         { std::vector<std::string> flags;
           if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
-          pe.flags_id = g_pool.put(join_with_pipe(flags)); }
+          pe.flags_id = g_pool.put_inline(join_with_pipe(flags)); }
         if (json_get(line, "mode", sp)) pe.mode = span_to_int(sp, 0);
         if (json_get(line, "err", sp)) pe.err = span_to_int(sp, 0);
         break;
     case EV_UNLINK:
-        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n') {
-            std::string decoded = json_decode_string(sp);
-            if (!decoded.empty()) pe.raw_path_id = g_pool.put(decoded);
-        }
+        take_path("path");
         break;
     case EV_EXIT:
-        if (json_get(line, "status", sp)) pe.status_id = g_pool.put(json_decode_string(sp));
+        if (json_get(line, "status", sp)) pe.status_id = g_pool.put_inline(json_decode_string(sp));
         if (json_get(line, "code", sp)) pe.code = span_to_int(sp, 0);
         if (json_get(line, "signal", sp)) pe.signal_ = span_to_int(sp, 0);
         if (json_get(line, "core_dumped", sp)) pe.core_dumped = static_cast<uint8_t>(span_to_bool(sp, 0));
         break;
     case EV_STDOUT:
     case EV_STDERR:
-        if (json_get(line, "data", sp)) pe.data_blob = g_pool.put(json_decode_string(sp));
+        if (json_get(line, "data", sp)) pe.data_blob = g_pool.put_blob(json_decode_string(sp));
         break;
     }
     return pe;
 }
 
+/* Helpers shared by ingest fast paths (predicate inspection of an event
+   that has not yet had its .path_item set).  Use mode + flags_id only;
+   no string ops on the hot path. */
+static bool open_is_write(int mode, InlineIID flags_id) {
+    if (mode != 0) {
+        int acc = mode & O_ACCMODE;
+        return acc == O_WRONLY || acc == O_RDWR ||
+               (mode & O_CREAT) || (mode & O_TRUNC);
+    }
+    if (!flags_id) return false;
+    auto sv = g_pool.view(flags_id);
+    return sv.find("O_WRONLY") != std::string_view::npos ||
+           sv.find("O_RDWR")   != std::string_view::npos ||
+           sv.find("O_CREAT")  != std::string_view::npos ||
+           sv.find("O_TRUNC")  != std::string_view::npos;
+}
+static bool open_is_read(int mode, InlineIID flags_id) {
+    if (mode != 0) {
+        int acc = mode & O_ACCMODE;
+        return acc == O_RDONLY || acc == O_RDWR;
+    }
+    if (!flags_id) return false;
+    auto sv = g_pool.view(flags_id);
+    return sv.find("O_RDONLY") != std::string_view::npos ||
+           sv.find("O_RDWR")   != std::string_view::npos;
+}
+
+static bool is_write_open(const trace_event_t &ev) {
+    return ev.kind == EV_OPEN && open_is_write(ev.mode, ev.flags_id);
+}
+static bool is_read_open(const trace_event_t &ev) {
+    return ev.kind == EV_OPEN && open_is_read(ev.mode, ev.flags_id);
+}
+
+/* Apply a path-bearing event to the path tree and process state.
+   Shared between apply_preparsed() (batch path) and the live ingest. */
+static void apply_path_event(trace_event_t &ev, process_t &proc, int event_idx,
+                             path_kind_t pk, std::string_view raw_path) {
+    PathItem *pi = intern_classified(pk, raw_path, proc.cwd_view());
+    if (!pi) return;
+    ev.path_item = pi;
+
+    if (ev.kind == EV_CWD) {
+        proc.set_cwd(pi);
+        return;
+    }
+    if (ev.kind == EV_OPEN) {
+        bool wr = open_is_write(ev.mode, ev.flags_id);
+        bool rd = open_is_read (ev.mode, ev.flags_id);
+        if (wr) proc.has_write_open = 1;
+        if (rd) { proc.read_paths.insert(pi);  pi->read_procs.insert(ev.tgid); }
+        if (wr) { proc.write_paths.insert(pi); pi->write_procs.insert(ev.tgid); }
+        pi->opens++;
+        if (ev.err) pi->errs++;
+        pi->aggregated_mode |= ev.mode;
+        if (wr && ev.ts > pi->last_open_write_ts) pi->last_open_write_ts = ev.ts;
+        pi->proc_tgids.insert(ev.tgid);
+        pi->open_event_indices.push_back(event_idx);
+        pi->events.insert(event_idx);
+    } else if (ev.kind == EV_UNLINK) {
+        pi->unlinks++;
+        if (ev.ts > pi->last_unlink_ts) pi->last_unlink_ts = ev.ts;
+        pi->unlink_procs.insert(ev.tgid);
+        pi->proc_tgids.insert(ev.tgid);
+        pi->unlink_event_indices.push_back(event_idx);
+        pi->events.insert(event_idx);
+    }
+}
+
 /* Phase 2: Apply a pre-parsed event to global state (NOT thread-safe). */
-static void apply_preparsed(const preparsed_event_t &pe) {
+static void apply_preparsed(preparsed_event_t &pe) {
     if (pe.is_input) {
         g_input_lines.push_back(pe.input_line_id);
         return;
@@ -707,12 +826,13 @@ static void apply_preparsed(const preparsed_event_t &pe) {
     ev.ppid = pe.ppid;
     ev.id = (ev.kind == EV_CWD) ? 0 : g_next_event_id++;
     int event_idx = static_cast<int>(g_events.size()) - 1;
+    if (ev.id) g_event_id_to_index[ev.id] = event_idx;
     if (g_base_ts == 0.0 || ev.ts < g_base_ts) g_base_ts = ev.ts;
 
     auto &proc = get_process(ev.tgid);
     proc.event_indices.push_back(event_idx);
     if (!proc.has_start || ev.ts < proc.start_ts) { proc.start_ts = ev.ts; proc.has_start = 1; }
-    if (!proc.has_end || ev.ts > proc.end_ts) { proc.end_ts = ev.ts; proc.has_end = 1; }
+    if (!proc.has_end   || ev.ts > proc.end_ts)   { proc.end_ts   = ev.ts; proc.has_end   = 1; }
 
     if (!proc.parent_set && ev.ppid > 0 && ev.ppid != proc.tgid) {
         proc.ppid = ev.ppid;
@@ -724,10 +844,14 @@ static void apply_preparsed(const preparsed_event_t &pe) {
 
     switch (ev.kind) {
     case EV_CWD:
-        if (pe.raw_path_id) {
-            ev.path_item = intern_path_item(g_pool.str(pe.raw_path_id));
-            proc.set_cwd(ev.path_item);
+    case EV_OPEN:
+    case EV_UNLINK:
+        if (ev.kind == EV_OPEN) {
+            ev.flags_id = pe.flags_id;
+            ev.mode = pe.mode;
+            ev.err = pe.err;
         }
+        apply_path_event(ev, proc, event_idx, pe.path_kind, pe.raw_path);
         break;
     case EV_EXEC:
         ev.exe_id = pe.exe_id;
@@ -736,46 +860,6 @@ static void apply_preparsed(const preparsed_event_t &pe) {
         proc.argv_blob = ev.argv_blob;
         proc.update_display_name();
         break;
-    case EV_OPEN: {
-        ev.flags_id = pe.flags_id;
-        ev.mode = pe.mode;
-        ev.err = pe.err;
-        std::string resolved;
-        if (pe.raw_path_id) resolved = resolve_path_dup(g_pool.str(pe.raw_path_id), proc.get_cwd());
-        if (is_write_open(ev)) proc.has_write_open = 1;
-        if (!resolved.empty()) {
-            PathItem *pi = intern_path_item(resolved);
-            ev.path_item = pi;
-            abs_path_t ap(pi);
-            if (is_read_open(ev)) { proc.read_paths.insert(ap); pi->read_procs.insert(ev.tgid); }
-            if (is_write_open(ev)) { proc.write_paths.insert(ap); pi->write_procs.insert(ev.tgid); }
-            pi->opens++;
-            if (ev.err) pi->errs++;
-            pi->aggregated_mode |= ev.mode;
-            if (is_write_open(ev) && ev.ts > pi->last_open_write_ts)
-                pi->last_open_write_ts = ev.ts;
-            pi->proc_tgids.insert(ev.tgid);
-            pi->open_event_indices.push_back(event_idx);
-            pi->events.insert(event_idx);
-        }
-        break;
-    }
-    case EV_UNLINK: {
-        std::string resolved;
-        if (pe.raw_path_id) resolved = resolve_path_dup(g_pool.str(pe.raw_path_id), proc.get_cwd());
-        if (!resolved.empty()) {
-            PathItem *pi = intern_path_item(resolved);
-            ev.path_item = pi;
-            abs_path_t ap(pi);
-            pi->unlinks++;
-            if (ev.ts > pi->last_unlink_ts) pi->last_unlink_ts = ev.ts;
-            pi->unlink_procs.insert(ev.tgid);
-            pi->proc_tgids.insert(ev.tgid);
-            pi->unlink_event_indices.push_back(event_idx);
-            pi->events.insert(event_idx);
-        }
-        break;
-    }
     case EV_EXIT:
         ev.status_id = pe.status_id;
         ev.code = pe.code;
@@ -796,139 +880,21 @@ static void apply_preparsed(const preparsed_event_t &pe) {
     }
 }
 
-/* Legacy single-line ingestion (used for live trace). */
+/* Live ingestion path — single line, runs preparse then apply.  Keeping
+   this as a thin wrapper lets the same correctness/perf fixes apply to
+   live traces as to batch loads. */
 static void ingest_trace_line(const char *line) {
-    std::string_view sp;
-    if (!json_get(line, "event", sp)) return;
-    std::string kind = json_decode_string(sp);
-    if (kind.empty()) return;
-    auto &ev = g_events.emplace_back();
-    if (kind == "CWD") ev.kind = EV_CWD;
-    else if (kind == "EXEC") ev.kind = EV_EXEC;
-    else if (kind == "OPEN") ev.kind = EV_OPEN;
-    else if (kind == "UNLINK") ev.kind = EV_UNLINK;
-    else if (kind == "EXIT") ev.kind = EV_EXIT;
-    else if (kind == "STDOUT") ev.kind = EV_STDOUT;
-    else if (kind == "STDERR") ev.kind = EV_STDERR;
-    else { g_events.pop_back(); return; }
-    ev.id = (ev.kind == EV_CWD) ? 0 : g_next_event_id++;
-    int event_idx = static_cast<int>(g_events.size()) - 1;
-
-    if (json_get(line, "ts", sp)) ev.ts = span_to_double(sp, 0.0);
-    if (json_get(line, "tgid", sp)) ev.tgid = span_to_int(sp, 0);
-    if (json_get(line, "ppid", sp)) ev.ppid = span_to_int(sp, 0);
-    if (g_base_ts == 0.0 || ev.ts < g_base_ts) g_base_ts = ev.ts;
-
-    auto &proc = get_process(ev.tgid);
-    proc.event_indices.push_back(event_idx);
-    if (!proc.has_start || ev.ts < proc.start_ts) { proc.start_ts = ev.ts; proc.has_start = 1; }
-    if (!proc.has_end || ev.ts > proc.end_ts) { proc.end_ts = ev.ts; proc.has_end = 1; }
-
-    /* Parent-child linking: set parent exactly once; subsequent events
-       with a different ppid are ignored to maintain tree consistency. */
-    if (!proc.parent_set && ev.ppid > 0 && ev.ppid != proc.tgid) {
-        proc.ppid = ev.ppid;
-        proc.parent_set = true;
-        auto pit = g_proc_map.find(proc.ppid);
-        if (pit != g_proc_map.end())
-            pit->second->children.push_back(&proc);
-    }
-
-    switch (ev.kind) {
-    case EV_CWD: {
-        std::string path;
-        if (json_get(line, "path", sp)) path = json_decode_string(sp);
-        if (!path.empty()) {
-            ev.path_item = intern_path_item(path);
-            proc.set_cwd(ev.path_item);
-        }
-        break;
-    }
-    case EV_EXEC: {
-        if (json_get(line, "exe", sp)) {
-            std::string exe = json_decode_string(sp);
-            ev.exe_id = g_pool.put(exe);
-        }
-        if (json_get(line, "argv", sp)) {
-            auto argv = json_array_of_strings(sp);
-            ev.argv_blob = g_pool.put_argv(argv);
-        }
-        proc.exe_id = ev.exe_id;
-        proc.argv_blob = ev.argv_blob;
-        proc.update_display_name();
-        break;
-    }
-    case EV_OPEN: {
-        std::string raw_path;
-        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
-            raw_path = json_decode_string(sp);
-        std::vector<std::string> flags;
-        if (json_get(line, "flags", sp)) flags = json_array_of_strings(sp);
-        ev.flags_id = g_pool.put(join_with_pipe(flags));
-        if (json_get(line, "mode", sp)) ev.mode = span_to_int(sp, 0);
-        if (json_get(line, "err", sp)) ev.err = span_to_int(sp, 0);
-        std::string resolved = resolve_path_dup(raw_path, proc.get_cwd());
-        if (is_write_open(ev)) proc.has_write_open = 1;
-        if (!resolved.empty()) {
-            PathItem *pi = intern_path_item(resolved);
-            ev.path_item = pi;
-            abs_path_t ap(pi);
-            if (is_read_open(ev)) { proc.read_paths.insert(ap); pi->read_procs.insert(ev.tgid); }
-            if (is_write_open(ev)) { proc.write_paths.insert(ap); pi->write_procs.insert(ev.tgid); }
-            pi->opens++;
-            if (ev.err) pi->errs++;
-            pi->aggregated_mode |= ev.mode;
-            if (is_write_open(ev) && ev.ts > pi->last_open_write_ts)
-                pi->last_open_write_ts = ev.ts;
-            pi->proc_tgids.insert(ev.tgid);
-            pi->open_event_indices.push_back(event_idx);
-            pi->events.insert(event_idx);
-        }
-        break;
-    }
-    case EV_UNLINK: {
-        std::string raw_path;
-        if (json_get(line, "path", sp) && !sp.empty() && sp[0] != 'n')
-            raw_path = json_decode_string(sp);
-        std::string resolved = resolve_path_dup(raw_path, proc.get_cwd());
-        if (!resolved.empty()) {
-            PathItem *pi = intern_path_item(resolved);
-            ev.path_item = pi;
-            abs_path_t ap(pi);
-            pi->unlinks++;
-            if (ev.ts > pi->last_unlink_ts) pi->last_unlink_ts = ev.ts;
-            pi->unlink_procs.insert(ev.tgid);
-            pi->proc_tgids.insert(ev.tgid);
-            pi->unlink_event_indices.push_back(event_idx);
-            pi->events.insert(event_idx);
-        }
-        break;
-    }
-    case EV_EXIT:
-        if (json_get(line, "status", sp)) ev.status_id = g_pool.put(json_decode_string(sp));
-        if (json_get(line, "code", sp)) ev.code = span_to_int(sp, 0);
-        if (json_get(line, "signal", sp)) ev.signal = span_to_int(sp, 0);
-        if (json_get(line, "core_dumped", sp)) ev.core_dumped = static_cast<uint8_t>(span_to_bool(sp, 0));
-        proc.exit_status_id = ev.status_id;
-        proc.exit_code = ev.code;
-        proc.exit_signal = ev.signal;
-        proc.core_dumped = ev.core_dumped;
-        proc.end_ts = ev.ts;
-        proc.has_end = 1;
-        break;
-    case EV_STDOUT:
-    case EV_STDERR:
-        if (json_get(line, "data", sp)) ev.data_blob = g_pool.put(json_decode_string(sp));
-        if (ev.kind == EV_STDOUT) proc.has_stdout = 1;
-        break;
-    }
+    auto pe = preparse_line(line);
+    if (pe.valid && !pe.is_input) apply_preparsed(pe);
 }
 
 static void ingest_line(const char *line) {
-    std::string_view sp;
     if (!line || !line[0] || line[0] != '{') return;
-    if (json_get(line, "input", sp)) g_input_lines.push_back(g_pool.put(std::string_view(line, std::strlen(line))));
-    else ingest_trace_line(line);
+    std::string_view sp;
+    if (json_get(line, "input", sp))
+        g_input_lines.push_back(g_pool.put_blob(std::string_view(line, std::strlen(line))));
+    else
+        ingest_trace_line(line);
 }
 
 static bool path_has_suffix(const char *path, const char *suffix) {
@@ -1098,7 +1064,7 @@ static bool proc_matches_search(const process_t &p) {
     if (g_pool.contains(p.argv_blob, q)) return true;
     for (int ei : p.event_indices) {
         auto &ev = g_events[ei];
-        if ((ev.kind == EV_STDOUT || ev.kind == EV_STDERR) && ev.data_blob != 0) {
+        if ((ev.kind == EV_STDOUT || ev.kind == EV_STDERR) && ev.data_blob) {
             if (g_pool.contains(ev.data_blob, q)) return true;
         }
     }
@@ -1368,7 +1334,7 @@ static void build_lpane_files(std::vector<RowData> &rows) {
     if (!g_state.grouped) {
         /* Flat mode: collect all leaf files, sort by full path. */
         std::vector<PathItem*> leaves;
-        collect_file_leaves(&g_path_root, leaves);
+        if (g_path_root) collect_file_leaves(g_path_root, leaves);
         for (auto &kv : g_nonabs_paths)
             if (kv.second->opens > 0 || kv.second->unlinks > 0) leaves.push_back(kv.second);
         std::sort(leaves.begin(), leaves.end(), [](PathItem *a, PathItem *b) {
@@ -1388,7 +1354,7 @@ static void build_lpane_files(std::vector<RowData> &rows) {
         }
     } else {
         /* Tree mode: DFS on PathItem hierarchy starting from root children. */
-        add_file_tree_rec(rows, &g_path_root, 0);
+        if (g_path_root) add_file_tree_rec(rows, g_path_root, 0);
         /* Non-absolute paths (pipes etc.) at the end. */
         for (auto &kv : g_nonabs_paths) {
             PathItem *np = kv.second;
@@ -1491,16 +1457,20 @@ static void collect_dep_files(const std::string &start, int reverse,
             for (int tgid : pd->write_procs) {
                 auto *p = find_process(tgid);
                 if (!p) continue;
-                for (const auto &rp : p->read_paths)
-                    if (!seen.contains(rp.str())) queue.push_back(rp.str());
+                for (PathItem *rp : p->read_paths) {
+                    std::string s = rp ? rp->fullPath() : std::string();
+                    if (!s.empty() && !seen.contains(s)) queue.push_back(std::move(s));
+                }
             }
         } else {
             /* rdeps: procs that read cur → files they wrote */
             for (int tgid : pd->read_procs) {
                 auto *p = find_process(tgid);
                 if (!p) continue;
-                for (const auto &wp : p->write_paths)
-                    if (!seen.contains(wp.str())) queue.push_back(wp.str());
+                for (PathItem *wp : p->write_paths) {
+                    std::string s = wp ? wp->fullPath() : std::string();
+                    if (!s.empty() && !seen.contains(s)) queue.push_back(std::move(s));
+                }
             }
         }
     }
@@ -1691,9 +1661,9 @@ static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) 
 
 static void build_rpane_output(std::vector<RowData> &rows, const std::string &id) {
     int eid = id.empty() ? 0 : std::atoi(id.c_str());
-    trace_event_t *ev = nullptr;
-    for (auto &e : g_events) if (e.id == eid) { ev = &e; break; }
-    if (!ev) return;
+    auto it = g_event_id_to_index.find(eid);
+    if (it == g_event_id_to_index.end()) return;
+    trace_event_t *ev = &g_events[it->second];
     auto *p = find_process(ev->tgid);
     emit_row(rows, "hdr", RowStyle::Heading, "", "─── Output ───", -1, "", false);
     emit_row(rows, "stream", ev->kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "",
@@ -2257,9 +2227,9 @@ static void on_trace_fd_cb(Tui &tui, int fd) {
 
 static void free_all() {
     g_events.clear();
+    g_event_id_to_index.clear();
     g_proc_map.clear();
-    free_path_tree(&g_path_root);
-    free_nonabs_paths();
+    free_path_tree_all();
     g_input_lines.clear();
     g_output_collapsed.clear();
     g_pool.clear();
@@ -2427,7 +2397,7 @@ int main(int argc, char **argv) {
     g_tui->dirty();
     update_status();
 
-    for (IID lid : g_input_lines) { std::string s = g_pool.str(lid); process_input_line(s.c_str()); }
+    for (BlobIID lid : g_input_lines) { std::string s = g_pool.str(lid); process_input_line(s.c_str()); }
     if (g_headless) {
         g_tui.reset();
         free_all();
