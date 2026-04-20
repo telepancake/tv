@@ -44,6 +44,7 @@
 #define SYS_wait4          __NR_wait4
 #define SYS_exit           __NR_exit
 #define SYS_getpid         __NR_getpid
+#define SYS_kill           __NR_kill
 #define SYS_gettid         __NR_gettid
 #define SYS_clock_gettime  __NR_clock_gettime
 #define SYS_rt_sigprocmask __NR_rt_sigprocmask
@@ -321,6 +322,7 @@ extern int g_errno_value;
 /* ================================================================
  * Signals
  * ================================================================ */
+#define SIGSEGV          11
 #define SIGCHLD         17
 #define SIGSYS          31
 #define SIGKILL         9
