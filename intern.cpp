@@ -52,13 +52,6 @@
 #endif
 #include <common/xxhash.h>
 
-/* ── XXH64 hash from bundled xxHash (well-tested, much faster than FNV-1a) ── */
-
-static uint64_t fast_hash64(const void *data, size_t len) {
-    static constexpr uint64_t HASH_SEED = 0;
-    return XXH64(data, len, HASH_SEED);
-}
-
 /* ── Constants ────────────────────────────────────────────────────── */
 
 static constexpr size_t COMPRESS_THRESHOLD = 128;
@@ -274,7 +267,7 @@ struct Pool {
 
     uint32_t put(const void *data, size_t len) {
         if (!data || !len) return 0;
-        uint64_t h = fast_hash64(data, len);
+        uint64_t h = XXH3_64bits(data, len, 0xcbf29ce484222325ULL);
         int s = hash_to_shard(h);
         auto &sh = shards[s];
         std::unique_lock<std::mutex> lk(sh.mu);
@@ -283,7 +276,7 @@ struct Pool {
 
     uint32_t find(const void *data, size_t len) const {
         if (!data || !len) return 0;
-        uint64_t h = fast_hash64(data, len);
+        uint64_t h = XXH3_64bits(data, len, 0xcbf29ce484222325ULL);
         int s = hash_to_shard(h);
         auto &sh = shards[s];
         std::unique_lock<std::mutex> lk(sh.mu);
