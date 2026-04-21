@@ -6,7 +6,7 @@ SIGN    := $(KDIR)/scripts/sign-file
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv fv sudtrace
+all: tv fv sudtrace ctf-dump
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 # Generate a MOK keypair (one-time).  After this, run:
@@ -84,10 +84,17 @@ sud32: $(SUD_SRCS) sudtrace.lds
 sudtrace: sud/sudtrace.c sud32 sud64
 	cc -O2 -static -o sudtrace sud/sudtrace.c
 
+ctf-dump: tools/ctf-dump/ctf-dump.c ctf/encode.h
+	cc -std=c99 -O2 -Wall -Wextra -I. -o ctf-dump tools/ctf-dump/ctf-dump.c
+
+.PHONY: ctf-test
+ctf-test: ctf-dump
+	./ctf-dump --selftest
+
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv
 	./tv --test
 
 clean-bins:
-	rm -f tv fv gen_sql_h
+	rm -f tv fv gen_sql_h ctf-dump
 	-$(MAKE) -C $(ZSTD_DIR) clean

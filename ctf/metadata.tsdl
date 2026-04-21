@@ -1,0 +1,150 @@
+/* CTF 1.8 trace metadata for tv traces.
+ *
+ * One stream class, six event classes. Packets are sealed before commit;
+ * timestamps inside a packet are stored as ULEB128 deltas from
+ * packet.context.timestamp_begin.
+ *
+ * See ctf/SCHEMA.md for the human-readable companion.
+ *
+ * The trace UUID below is a placeholder pattern; producers substitute
+ * their per-trace UUID at startup time when they emit the metadata
+ * stream alongside the data stream. babeltrace2 reads the metadata
+ * stream from a sibling file named "metadata".
+ */
+
+/* trace.packet.header.magic */
+typealias integer { size = 32; align = 8; signed = false; byte_order = le; base = 16; } := uint32_t;
+typealias integer { size = 16; align = 8; signed = false; byte_order = le; base = 10; } := uint16_t;
+typealias integer { size = 64; align = 8; signed = false; byte_order = le; base = 10; } := uint64_t;
+typealias integer { size = 32; align = 8; signed = true;  byte_order = le; base = 10; } := int32_t;
+typealias integer { size = 8;  align = 8; signed = false; byte_order = le; base = 10; } := uint8_t;
+
+/* Variable-width ULEB128 used for per-event timestamp deltas.
+ * CTF expresses this via the "encoding" extension; we annotate it as a
+ * compound for documentation purposes — the actual bytes are read by
+ * the producer/consumer ULEB128 routines, not by the CTF metadata
+ * parser. babeltrace2 decodes this through a custom plugin if needed.
+ */
+typealias integer { size = 64; align = 8; signed = false; byte_order = le; base = 10;
+                    map = clock.monotonic.value; } := timestamp_ns_t;
+
+trace {
+    major = 1;
+    minor = 8;
+    uuid = "00000000-0000-0000-0000-000000000000";
+    byte_order = le;
+    packet.header := struct {
+        uint32_t magic;     /* 0xC1FC1FC1 */
+        uint8_t  uuid[16];
+        uint32_t stream_id;
+    };
+};
+
+env {
+    domain     = "kernel";
+    tracer_name = "tv-proctrace";
+    tracer_major = 1;
+    tracer_minor = 0;
+};
+
+clock {
+    name = monotonic;
+    description = "CLOCK_REALTIME, ns since the Unix epoch";
+    freq = 1000000000;
+    precision = 1;
+    offset_s = 0;
+    offset = 0;
+    absolute = true;
+};
+
+stream {
+    id = 0;
+    packet.context := struct {
+        timestamp_ns_t timestamp_begin;
+        timestamp_ns_t timestamp_end;
+        uint32_t       content_size;
+        uint32_t       packet_size;
+        uint16_t       producer_id;
+        uint32_t       events_discarded;
+    };
+    event.header := struct {
+        uint16_t       id;
+        /* ts_delta follows here as raw ULEB128 bytes */
+        int32_t        pid;
+        int32_t        tgid;
+        int32_t        ppid;
+        int32_t        nspid;
+        int32_t        nstgid;
+    };
+};
+
+/* Event class id 0: exec */
+event {
+    name = "exec";
+    id = 0;
+    stream_id = 0;
+    fields := struct {
+        /* exe: u32 len; u8 data[len]; */
+        /* argv_blob, env_blob, auxv_blob: same layout */
+    };
+};
+
+/* Event class id 1: exit */
+event {
+    name = "exit";
+    id = 1;
+    stream_id = 0;
+    fields := struct {
+        uint8_t  status;       /* 0 = exited, 1 = signaled */
+        int32_t  code_or_signal;
+        uint8_t  core_dumped;
+        int32_t  raw;
+    };
+};
+
+/* Event class id 2: open */
+event {
+    name = "open";
+    id = 2;
+    stream_id = 0;
+    fields := struct {
+        /* path: u32 len; u8 data[len]; */
+        uint32_t flags;
+        int32_t  fd;
+        uint64_t ino;
+        uint32_t dev_major;
+        uint32_t dev_minor;
+        int32_t  err;
+        uint8_t  inherited;
+    };
+};
+
+/* Event class id 3: cwd */
+event {
+    name = "cwd";
+    id = 3;
+    stream_id = 0;
+    fields := struct {
+        /* path: u32 len; u8 data[len]; */
+    };
+};
+
+/* Event class id 4: stdout */
+event {
+    name = "stdout";
+    id = 4;
+    stream_id = 0;
+    fields := struct {
+        /* data: u32 len; u8 data[len]; */
+    };
+};
+
+/* Event class id 5: stderr */
+event {
+    name = "stderr";
+    id = 5;
+    stream_id = 0;
+    fields := struct {
+        /* data: u32 len; u8 data[len]; */
+    };
+};
