@@ -649,7 +649,14 @@ static bool is_read_open(const trace_event_t &ev) {
 struct trace_db_t {
     std::vector<trace_event_t>    events;
     int                           next_event_id = 1;
-    std::unordered_map<int, int>  event_id_to_index;
+    /* Maps event id -> index into `events`.  Event ids are assigned
+       sequentially starting at 1 (CWD events get id 0 — the unused
+       slot 0 of this vector — and aren't recorded here), so a flat
+       vector is dense and uses ~4 B/entry instead of the ~30–40 B/entry
+       an unordered_map node would cost.  This matters during ingestion
+       of large traces (10^8 events ⇒ several GB saved).  Unfilled
+       slots (e.g. for skipped/CWD ids) hold the sentinel -1. */
+    std::vector<int>              event_id_to_index;
     std::unordered_map<int, std::unique_ptr<process_t>> proc_map;
     std::vector<BlobIID>          input_lines;
     double                        base_ts = 0;
@@ -797,7 +804,11 @@ struct trace_db_t {
         ev.ppid = pe.ppid;
         ev.id = (ev.kind == EV_CWD) ? 0 : next_event_id++;
         int event_idx = static_cast<int>(events.size()) - 1;
-        if (ev.id) event_id_to_index[ev.id] = event_idx;
+        if (ev.id) {
+            if (static_cast<size_t>(ev.id) >= event_id_to_index.size())
+                event_id_to_index.resize(static_cast<size_t>(ev.id) + 1, -1);
+            event_id_to_index[ev.id] = event_idx;
+        }
         if (base_ts == 0.0 || ev.ts < base_ts) base_ts = ev.ts;
 
         auto &proc = get_process(ev.tgid);
@@ -910,6 +921,7 @@ struct trace_db_t {
     void clear() {
         events.clear();
         event_id_to_index.clear();
+        event_id_to_index.shrink_to_fit();
         proc_map.clear();
         free_path_tree_all();
         input_lines.clear();
@@ -1106,6 +1118,21 @@ static void parallel_ingest(std::vector<std::string> &lines) {
         idx_remap[w].resize(workers[w]->events.size(), -1);
 
     int global_base = static_cast<int>(g_db.events.size());
+    /* Pre-size the id-index vector once: we'll assign at most one new id per
+       non-CWD event added in this batch.  A single resize avoids repeated
+       reallocations during the per-event tight loop below. */
+    {
+        int cwd_count = 0;
+        for (int i = 0; i < nlines; i++)
+            if (loc_map[i].worker >= 0 && parsed[i].kind == EV_CWD) cwd_count++;
+        int new_ids = total_events - cwd_count;
+        if (new_ids > 0) {
+            size_t need = static_cast<size_t>(g_db.next_event_id) +
+                          static_cast<size_t>(new_ids);
+            if (g_db.event_id_to_index.size() < need)
+                g_db.event_id_to_index.resize(need, -1);
+        }
+    }
     for (int i = 0; i < nlines; i++) {
         if (loc_map[i].worker < 0) continue;
         int w  = loc_map[i].worker;
@@ -1921,9 +1948,10 @@ static void build_rpane_file(std::vector<RowData> &rows, const std::string &id) 
 
 static void build_rpane_output(std::vector<RowData> &rows, const std::string &id) {
     int eid = id.empty() ? 0 : std::atoi(id.c_str());
-    auto it = g_db.event_id_to_index.find(eid);
-    if (it == g_db.event_id_to_index.end()) return;
-    trace_event_t *ev = &g_db.events[it->second];
+    if (eid <= 0 || static_cast<size_t>(eid) >= g_db.event_id_to_index.size()) return;
+    int idx = g_db.event_id_to_index[eid];
+    if (idx < 0 || idx >= static_cast<int>(g_db.events.size())) return;
+    trace_event_t *ev = &g_db.events[idx];
     auto *p = find_process(ev->tgid);
     emit_row(rows, "hdr", RowStyle::Heading, "", "─── Output ───", -1, "", false);
     emit_row(rows, "stream", ev->kind == EV_STDERR ? RowStyle::Error : RowStyle::Normal, "",
