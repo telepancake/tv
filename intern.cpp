@@ -50,10 +50,10 @@
 #define XXH_INLINE_ALL
 #include <common/xxhash.h>
 
-/* ── XXH3 64-bit hash (SIMD-friendly, excellent short+medium input perf) ── */
+/* ── XXH64 hash from bundled xxHash (well-tested, much faster than FNV-1a) ── */
 
 static uint64_t fast_hash64(const void *data, size_t len) {
-    return XXH3_64bits(data, len);
+    return XXH64(data, len, 0);
 }
 
 /* ── Constants ────────────────────────────────────────────────────── */
@@ -83,7 +83,7 @@ struct Entry {
     uint32_t offset;       /* start in arena            */
     uint32_t stored_size;  /* bytes in arena (may be compressed in blob pool) */
     uint32_t orig_size;    /* original byte count       */
-    uint64_t hash;         /* XXH3_64bits of original data */
+    uint64_t hash;         /* XXH64 of original data */
     bool     compressed;   /* stored_size is ZSTD frame (blob pool only) */
 };
 
