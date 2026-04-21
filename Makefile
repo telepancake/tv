@@ -48,6 +48,15 @@ CXXFLAGS := -std=c++23 -O2 -I$(ZSTD_DIR)
 TV_LIBS := -lm -pthread $(ZSTD_LIB)
 SUD_CFLAGS  := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer -I.
 SUD_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
+
+# Set SIGSYS_DIAG=1 to enable the SIGSYS handler entry/exit diagnostic dumps.
+# This prints the saved ucontext (registers, stack pointer, uc_stack) at both
+# handler entry and exit so that signal-frame corruption can be detected.
+# Example:  make SIGSYS_DIAG=1 sud32
+SIGSYS_DIAG ?= 0
+ifeq ($(SIGSYS_DIAG),1)
+SUD_CFLAGS  += -DSUDTRACE_SIGSYS_DIAG
+endif
 SUD_SRCS    := sud/wrapper.c sud/libc.c sud/raw.c sud/event.c sud/elf.c sud/handler.c sud/loader.c deps/printf/printf.c
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
