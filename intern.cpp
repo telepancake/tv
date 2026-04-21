@@ -47,9 +47,13 @@
 
 #include <fnmatch.h>
 #include <zstd.h>
-#ifndef XXH_INLINE_ALL
+/* zstd's bundled xxhash is namespaced as ZSTD_xxh*. We want a fresh
+ * inlined copy of the public API for our own pool hashing — undefine
+ * the namespace and the prior inclusion guard, then pull it in with
+ * XXH_INLINE_ALL so XXH3_64bits resolves locally. */
+#undef XXH_NAMESPACE
+#undef XXH_INLINE_ALL_31684351384
 #define XXH_INLINE_ALL
-#endif
 #include <common/xxhash.h>
 
 /* ── Constants ────────────────────────────────────────────────────── */
@@ -267,7 +271,7 @@ struct Pool {
 
     uint32_t put(const void *data, size_t len) {
         if (!data || !len) return 0;
-        uint64_t h = XXH3_64bits(data, len, 0xcbf29ce484222325ULL);
+        uint64_t h = XXH64(data, len, 0xcbf29ce484222325ULL);
         int s = hash_to_shard(h);
         auto &sh = shards[s];
         std::unique_lock<std::mutex> lk(sh.mu);
@@ -276,7 +280,7 @@ struct Pool {
 
     uint32_t find(const void *data, size_t len) const {
         if (!data || !len) return 0;
-        uint64_t h = XXH3_64bits(data, len, 0xcbf29ce484222325ULL);
+        uint64_t h = XXH64(data, len, 0xcbf29ce484222325ULL);
         int s = hash_to_shard(h);
         auto &sh = shards[s];
         std::unique_lock<std::mutex> lk(sh.mu);
