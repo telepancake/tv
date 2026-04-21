@@ -51,13 +51,44 @@ for line in f:
 f.close()
 ```
 
-`tv --uproctrace -o trace.jsonl.zst -- ...` writes zstd-compressed traces when the
-output filename ends in `.zst`, and `tv --trace trace.jsonl.zst` reads them back
-directly. Pass `--no-env` to `tv --uproctrace`, `tv -- ...`, or `sudtrace` to omit
-environment variables from emitted `EXEC` events. `make sudtrace` now builds
-freestanding static `sud32` and `sud64` helpers as well as the native `sudtrace`
-launcher, which prepends the matching helper automatically for static 32-bit and
-64-bit executables.
+## tv — viewing traces
+
+`tv` is a TUI viewer over a DuckDB-backed trace store. The pipeline is:
+
+```
+wire bytes ──► WireDecoder ──► DuckDB Appender ──► foo.tvdb (mmaped, columnar, zstd)
+                                                          │
+                                                          ▼
+                                                    SQL queries → TUI panels
+```
+
+The on-disk format is a single DuckDB native database file (`foo.tvdb`) with one
+table per wire event class (`exec`, `argv`, `env`, `auxv`, `exit_`, `open_`,
+`cwd`, `stdout_`, `stderr_`). Files are mmaped on open — "loading" a multi-GB
+trace is opening one fd. tv never builds an in-memory copy of the trace.
+
+```bash
+# Live: stream a command's wire events into a fresh .tvdb and view them.
+tv -- make -j8
+
+# Convert a wire file into a .tvdb (incremental, bounded memory) and open it.
+tv --trace trace.wire.zst         # creates trace.tvdb if missing/stale
+
+# Open an existing .tvdb directly (no ingest).
+tv --open trace.tvdb
+
+# Non-interactive: dump the current mode 1 (process tree) view to stdout.
+tv --open trace.tvdb --dump
+```
+
+Pass `--no-env` to omit environment variables from emitted `EXEC` events.
+`make sudtrace` builds the freestanding `sud32`/`sud64` helpers and the native
+`sudtrace` launcher.
+
+Currently SQL-backed: mode 1 (process tree) and the corresponding right-pane
+process detail. Modes 2..7 (file tree, event log, output, deps) display a
+`(not yet ported to SQL backend)` placeholder; they are scheduled for the
+follow-up PR.
 
 ---
 

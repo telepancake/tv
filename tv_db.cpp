@@ -1,0 +1,402 @@
+/* tv_db.cpp — DuckDB-backed storage and query layer. */
+
+#include "tv_db.h"
+#include "wire_in.h"
+
+#include "duckdb.h"
+
+extern "C" {
+#include "wire/wire.h"
+}
+
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+
+namespace {
+
+const char *const kSchemaSQL =
+    "CREATE TABLE IF NOT EXISTS exec("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  exe BLOB);"
+
+    "CREATE TABLE IF NOT EXISTS argv("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  idx UINTEGER, arg BLOB);"
+
+    "CREATE TABLE IF NOT EXISTS env("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  idx UINTEGER, key BLOB, val BLOB);"
+
+    "CREATE TABLE IF NOT EXISTS auxv("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  a_type UBIGINT, a_val UBIGINT);"
+
+    "CREATE TABLE IF NOT EXISTS exit_("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  status_kind TINYINT, code_or_sig INTEGER,"
+    "  core_dumped BOOLEAN, raw INTEGER);"
+
+    "CREATE TABLE IF NOT EXISTS open_("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  flags INTEGER, fd INTEGER, ino UBIGINT,"
+    "  dev_major UINTEGER, dev_minor UINTEGER, err INTEGER,"
+    "  inherited BOOLEAN, path BLOB);"
+
+    "CREATE TABLE IF NOT EXISTS cwd("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  cwd BLOB);"
+
+    "CREATE TABLE IF NOT EXISTS stdout_("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  data BLOB);"
+
+    "CREATE TABLE IF NOT EXISTS stderr_("
+    "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
+    "  nspid INTEGER, nstgid INTEGER,"
+    "  data BLOB);";
+
+/* exit/open/stdout/stderr collide with SQL keywords; tables use trailing
+ * underscore. The data_source layer aliases them in queries. */
+const char *table_for(int32_t type) {
+    switch (type) {
+        case EV_EXEC:   return "exec";
+        case EV_ARGV:   return "argv";
+        case EV_ENV:    return "env";
+        case EV_AUXV:   return "auxv";
+        case EV_EXIT:   return "exit_";
+        case EV_OPEN:   return "open_";
+        case EV_CWD:    return "cwd";
+        case EV_STDOUT: return "stdout_";
+        case EV_STDERR: return "stderr_";
+        default:        return nullptr;
+    }
+}
+
+void append_header(duckdb_appender ap, const WireEvent &ev) {
+    duckdb_append_uint64(ap, ev.ts_ns);
+    duckdb_append_int32(ap, ev.pid);
+    duckdb_append_int32(ap, ev.tgid);
+    duckdb_append_int32(ap, ev.ppid);
+    duckdb_append_int32(ap, ev.nspid);
+    duckdb_append_int32(ap, ev.nstgid);
+}
+
+/* Split NUL-separated blob into entries. A trailing NUL produces a
+ * trailing empty entry which we drop (matches the kernel's terminating
+ * NUL convention). Genuine empty entries in the middle are kept. */
+std::vector<std::pair<const char*, size_t>>
+split_nul(const char *data, size_t len) {
+    std::vector<std::pair<const char*, size_t>> out;
+    if (!data || len == 0) return out;
+    const char *start = data;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] == '\0') {
+            out.emplace_back(start, (size_t)(data + i - start));
+            start = data + i + 1;
+        }
+    }
+    if (start < data + len) {
+        out.emplace_back(start, (size_t)(data + len - start));
+    }
+    if (!out.empty() && out.back().second == 0 && data[len - 1] == '\0') {
+        out.pop_back();
+    }
+    return out;
+}
+
+} // namespace
+
+struct TvDb::Impl {
+    duckdb_database db = nullptr;
+    duckdb_connection con = nullptr;
+    std::string path_;
+    /* One appender per table, lazily created on first append. */
+    std::unordered_map<std::string, duckdb_appender> appenders;
+    bool dirty = false;
+
+    duckdb_appender get_appender(const char *table, std::string *err) {
+        std::string key(table);
+        auto it = appenders.find(key);
+        if (it != appenders.end()) return it->second;
+        duckdb_appender ap = nullptr;
+        if (duckdb_appender_create(con, nullptr, table, &ap) != DuckDBSuccess) {
+            if (err) {
+                const char *e = duckdb_appender_error(ap);
+                *err = std::string("appender create ") + table + ": " + (e ? e : "?");
+            }
+            if (ap) duckdb_appender_destroy(&ap);
+            return nullptr;
+        }
+        appenders.emplace(key, ap);
+        return ap;
+    }
+
+    bool flush(std::string *err) {
+        for (auto &kv : appenders) {
+            if (duckdb_appender_flush(kv.second) != DuckDBSuccess) {
+                if (err) {
+                    const char *e = duckdb_appender_error(kv.second);
+                    *err = "appender flush " + kv.first + ": " + (e ? e : "?");
+                }
+                return false;
+            }
+        }
+        if (dirty) {
+            duckdb_result r;
+            duckdb_state s = duckdb_query(con, "CHECKPOINT", &r);
+            if (s != DuckDBSuccess) {
+                if (err) {
+                    const char *e = duckdb_result_error(&r);
+                    *err = std::string("checkpoint: ") + (e ? e : "?");
+                }
+                duckdb_destroy_result(&r);
+                return false;
+            }
+            duckdb_destroy_result(&r);
+            dirty = false;
+        }
+        return true;
+    }
+
+    ~Impl() {
+        for (auto &kv : appenders) {
+            duckdb_appender_destroy(&kv.second);
+        }
+        if (con) duckdb_disconnect(&con);
+        if (db) duckdb_close(&db);
+    }
+};
+
+TvDb::TvDb() : impl_(std::make_unique<Impl>()) {}
+TvDb::~TvDb() = default;
+
+std::unique_ptr<TvDb> TvDb::open_with_path(const char *path,
+                                           const std::string &display,
+                                           std::string *err) {
+    auto db = std::unique_ptr<TvDb>(new TvDb());
+    if (duckdb_open(path, &db->impl_->db) != DuckDBSuccess) {
+        if (err) *err = "duckdb_open(" + display + ") failed";
+        return nullptr;
+    }
+    if (duckdb_connect(db->impl_->db, &db->impl_->con) != DuckDBSuccess) {
+        if (err) *err = "duckdb_connect failed";
+        return nullptr;
+    }
+    db->impl_->path_ = display;
+    duckdb_result r;
+    duckdb_state s = duckdb_query(db->impl_->con, kSchemaSQL, &r);
+    if (s != DuckDBSuccess) {
+        if (err) {
+            const char *e = duckdb_result_error(&r);
+            *err = std::string("schema: ") + (e ? e : "?");
+        }
+        duckdb_destroy_result(&r);
+        return nullptr;
+    }
+    duckdb_destroy_result(&r);
+    return db;
+}
+
+std::unique_ptr<TvDb> TvDb::open_file(const std::string &path,
+                                      std::string *err) {
+    return TvDb::open_with_path(path.c_str(), path, err);
+}
+
+std::unique_ptr<TvDb> TvDb::open_memory(std::string *err) {
+    return TvDb::open_with_path(nullptr, ":memory:", err);
+}
+
+bool TvDb::append(const WireEvent &ev, std::string *err) {
+    const char *t = table_for(ev.type);
+    if (!t) {
+        if (err) *err = "unknown event type " + std::to_string(ev.type);
+        return false;
+    }
+    duckdb_appender ap = impl_->get_appender(t, err);
+    if (!ap) return false;
+
+    impl_->dirty = true;
+
+    auto end_row = [&](duckdb_appender a) -> bool {
+        if (duckdb_appender_end_row(a) != DuckDBSuccess) {
+            if (err) {
+                const char *e = duckdb_appender_error(a);
+                *err = std::string("end_row ") + t + ": " + (e ? e : "?");
+            }
+            return false;
+        }
+        return true;
+    };
+
+    switch (ev.type) {
+    case EV_EXEC:
+        append_header(ap, ev);
+        duckdb_append_blob(ap, ev.blob, ev.blen);
+        return end_row(ap);
+
+    case EV_ARGV: {
+        auto parts = split_nul(ev.blob, ev.blen);
+        if (parts.empty()) {
+            /* Emit a single zero-arg row so the EXEC has a join key. */
+            append_header(ap, ev);
+            duckdb_append_uint32(ap, 0);
+            duckdb_append_blob(ap, "", 0);
+            return end_row(ap);
+        }
+        for (size_t i = 0; i < parts.size(); i++) {
+            append_header(ap, ev);
+            duckdb_append_uint32(ap, (uint32_t)i);
+            duckdb_append_blob(ap, parts[i].first, parts[i].second);
+            if (!end_row(ap)) return false;
+        }
+        return true;
+    }
+
+    case EV_ENV: {
+        auto parts = split_nul(ev.blob, ev.blen);
+        for (size_t i = 0; i < parts.size(); i++) {
+            const char *p = parts[i].first;
+            size_t n = parts[i].second;
+            const char *eq = (const char *)std::memchr(p, '=', n);
+            const char *key = p;
+            size_t klen = eq ? (size_t)(eq - p) : n;
+            const char *val = eq ? (eq + 1) : "";
+            size_t vlen = eq ? (size_t)(p + n - (eq + 1)) : 0;
+            append_header(ap, ev);
+            duckdb_append_uint32(ap, (uint32_t)i);
+            duckdb_append_blob(ap, key, klen);
+            duckdb_append_blob(ap, val, vlen);
+            if (!end_row(ap)) return false;
+        }
+        return true;
+    }
+
+    case EV_AUXV: {
+        size_t pair_sz = sizeof(uint64_t) * 2;
+        size_t n = ev.blen - (ev.blen % pair_sz);
+        for (size_t off = 0; off < n; off += pair_sz) {
+            uint64_t a_type, a_val;
+            std::memcpy(&a_type, ev.blob + off, sizeof a_type);
+            std::memcpy(&a_val, ev.blob + off + sizeof(uint64_t), sizeof a_val);
+            if (a_type == 0) break;
+            append_header(ap, ev);
+            duckdb_append_uint64(ap, a_type);
+            duckdb_append_uint64(ap, a_val);
+            if (!end_row(ap)) return false;
+        }
+        return true;
+    }
+
+    case EV_EXIT:
+        if (ev.n_extras < 4) { if (err) *err = "EV_EXIT extras"; return false; }
+        append_header(ap, ev);
+        duckdb_append_int8(ap, (int8_t)ev.extras[0]);
+        duckdb_append_int32(ap, (int32_t)ev.extras[1]);
+        duckdb_append_bool(ap, ev.extras[2] != 0);
+        duckdb_append_int32(ap, (int32_t)ev.extras[3]);
+        return end_row(ap);
+
+    case EV_OPEN:
+        if (ev.n_extras < 7) { if (err) *err = "EV_OPEN extras"; return false; }
+        append_header(ap, ev);
+        duckdb_append_int32(ap, (int32_t)ev.extras[0]);
+        duckdb_append_int32(ap, (int32_t)ev.extras[1]);
+        duckdb_append_uint64(ap, (uint64_t)ev.extras[2]);
+        duckdb_append_uint32(ap, (uint32_t)ev.extras[3]);
+        duckdb_append_uint32(ap, (uint32_t)ev.extras[4]);
+        duckdb_append_int32(ap, (int32_t)ev.extras[5]);
+        duckdb_append_bool(ap, ev.extras[6] != 0);
+        duckdb_append_blob(ap, ev.blob, ev.blen);
+        return end_row(ap);
+
+    case EV_CWD:
+    case EV_STDOUT:
+    case EV_STDERR:
+        append_header(ap, ev);
+        duckdb_append_blob(ap, ev.blob, ev.blen);
+        return end_row(ap);
+    }
+    if (err) *err = "unhandled event type " + std::to_string(ev.type);
+    return false;
+}
+
+bool TvDb::flush(std::string *err) {
+    return impl_->flush(err);
+}
+
+std::vector<int64_t> TvDb::query_int64(const std::string &sql,
+                                       std::string *err) {
+    std::vector<int64_t> out;
+    /* Make sure pending appends are visible before querying. */
+    if (!impl_->flush(err)) return out;
+    duckdb_result r;
+    if (duckdb_query(impl_->con, sql.c_str(), &r) != DuckDBSuccess) {
+        if (err) {
+            const char *e = duckdb_result_error(&r);
+            *err = std::string("query: ") + (e ? e : "?") + " :: " + sql;
+        }
+        duckdb_destroy_result(&r);
+        return out;
+    }
+    idx_t rows = duckdb_row_count(&r);
+    out.reserve(rows);
+    for (idx_t i = 0; i < rows; i++) {
+        out.push_back(duckdb_value_int64(&r, 0, i));
+    }
+    duckdb_destroy_result(&r);
+    return out;
+}
+
+std::vector<std::vector<std::string>>
+TvDb::query_strings(const std::string &sql, std::string *err) {
+    std::vector<std::vector<std::string>> out;
+    if (!impl_->flush(err)) return out;
+    duckdb_result r;
+    if (duckdb_query(impl_->con, sql.c_str(), &r) != DuckDBSuccess) {
+        if (err) {
+            const char *e = duckdb_result_error(&r);
+            *err = std::string("query: ") + (e ? e : "?") + " :: " + sql;
+        }
+        duckdb_destroy_result(&r);
+        return out;
+    }
+    idx_t rows = duckdb_row_count(&r);
+    idx_t cols = duckdb_column_count(&r);
+    out.reserve(rows);
+    for (idx_t i = 0; i < rows; i++) {
+        std::vector<std::string> row;
+        row.reserve(cols);
+        for (idx_t c = 0; c < cols; c++) {
+            char *v = duckdb_value_varchar(&r, c, i);
+            row.emplace_back(v ? v : "");
+            if (v) duckdb_free(v);
+        }
+        out.push_back(std::move(row));
+    }
+    duckdb_destroy_result(&r);
+    return out;
+}
+
+int64_t TvDb::total_event_count() {
+    std::string err;
+    auto v = query_int64(
+        "SELECT (SELECT COUNT(*) FROM exec) + (SELECT COUNT(*) FROM argv)"
+        " + (SELECT COUNT(*) FROM env) + (SELECT COUNT(*) FROM auxv)"
+        " + (SELECT COUNT(*) FROM exit_) + (SELECT COUNT(*) FROM open_)"
+        " + (SELECT COUNT(*) FROM cwd) + (SELECT COUNT(*) FROM stdout_)"
+        " + (SELECT COUNT(*) FROM stderr_)", &err);
+    return v.empty() ? -1 : v[0];
+}
+
+const std::string &TvDb::path() const { return impl_->path_; }
+void *TvDb::raw_conn() { return impl_->con; }
