@@ -23,9 +23,9 @@
  * Thread safety: put_inline() and put_blob() are safe to call from
  * multiple threads concurrently — each pool is internally sharded
  * (16 shards), so different inputs usually lock different shards.
- * Reads (str/view/eq/...) are lock-free: entries and arenas are
- * append-only, never modified after creation.  find_inline() is
- * also concurrent-safe with put_inline().
+ * Reads (str/view/eq/...) acquire the per-shard mutex briefly to
+ * guard against a concurrent put_*() reallocating the underlying
+ * vectors.  find_inline() is also concurrent-safe with put_inline().
  */
 #pragma once
 

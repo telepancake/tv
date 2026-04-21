@@ -9,21 +9,31 @@
  *
  * Each pool is split into NUM_SHARDS independent shards, each with its
  * own arena, entry table, hash table, ZSTD contexts (blob pool only),
- * and shared/exclusive mutex.
+ * and per-shard std::mutex.
  *
  * put_*() hashes the input, routes to a shard by the hash's upper bits,
- * and only takes a write lock on that one shard — giving near-linear
- * speedup when many threads call put_*() concurrently.
+ * and only locks that one shard — giving near-linear speedup when many
+ * threads call put_*() concurrently with different inputs.
  *
- * find_inline() takes a shared lock so it is safe alongside put_inline().
+ * find_inline() locks the same per-shard mutex so it is safe alongside
+ * put_inline() on the same shard.
+ *
+ * Note: an earlier version used std::shared_mutex.  Under glibc + static
+ * linking that pulls a weakref to pthread_rwlock_wrlock from libstdc++
+ * which can resolve to NULL when the rwlock object isn't dragged out of
+ * libpthread.a, crashing worker threads on the first lock.  We use
+ * std::mutex instead — critical sections here are all very short
+ * (memcpy + hash lookup, bounded by a single shard) and the 16-way
+ * sharding already makes contention negligible, so the difference is
+ * not measurable on real workloads.
  *
  * IID encoding:  upper SHARD_BITS select the shard,
  *                lower (32 − SHARD_BITS) are the local entry index.
  * IID 0 is always "empty" (shard 0, index 0 = sentinel).
  *
- * Reads (str/view/eq/...) are lock-free: entries and arenas are
- * append-only, never modified after creation.  std::vector reallocations
- * during growth are guarded by the same shared/exclusive mutex.
+ * Reads (str/view/eq/...) take the per-shard mutex briefly so that
+ * concurrent std::vector reallocations during growth (entries / arena)
+ * can't pull the rug from under them.
  */
 
 #include "intern.h"
@@ -31,7 +41,6 @@
 #include <cstring>
 #include <cstdio>
 #include <cassert>
-#include <shared_mutex>
 #include <mutex>
 #include <ostream>
 #include <unistd.h>
@@ -94,7 +103,7 @@ struct Shard {
     size_t              htab_count = 0;
     ZSTD_CCtx          *cctx = nullptr;   /* nullptr in inline pool */
     ZSTD_DCtx          *dctx = nullptr;   /* nullptr in inline pool */
-    mutable std::shared_mutex mu;
+    mutable std::mutex mu;
 
     Shard() {
         entries.push_back(Entry{0, 0, 0, 0, false}); /* sentinel */
@@ -248,19 +257,19 @@ template <typename ShardT>
 struct Pool {
     ShardT shards[NUM_SHARDS];
 
-    /* Read paths (lock-free w.r.t. arena/entries vector elements,
-       but we still take a shared lock so a concurrent push_back that
-       reallocates can't pull the rug from under us). */
-    const Entry &entry_locked(uint32_t id, std::shared_lock<std::shared_mutex> &lk) const {
+    /* Read paths take the per-shard mutex briefly to guard against a
+       concurrent push_back() reallocating arena/entries out from under
+       us.  The critical section is just a vector indexing op. */
+    const Entry &entry_locked(uint32_t id, std::unique_lock<std::mutex> &lk) const {
         auto &sh = shards[shard_of(id)];
-        lk = std::shared_lock<std::shared_mutex>(sh.mu);
+        lk = std::unique_lock<std::mutex>(sh.mu);
         return sh.entries[local_of(id)];
     }
     bool valid(uint32_t id) const {
         if (!id) return false;
         int s = shard_of(id);
         if (s < 0 || s >= NUM_SHARDS) return false;
-        std::shared_lock<std::shared_mutex> lk(shards[s].mu);
+        std::unique_lock<std::mutex> lk(shards[s].mu);
         return local_of(id) < shards[s].entries.size();
     }
 
@@ -269,7 +278,7 @@ struct Pool {
         uint64_t h = fnv1a(data, len);
         int s = hash_to_shard(h);
         auto &sh = shards[s];
-        std::unique_lock<std::shared_mutex> lk(sh.mu);
+        std::unique_lock<std::mutex> lk(sh.mu);
         return sh.put_locked(s, data, len, h);
     }
 
@@ -278,13 +287,13 @@ struct Pool {
         uint64_t h = fnv1a(data, len);
         int s = hash_to_shard(h);
         auto &sh = shards[s];
-        std::shared_lock<std::shared_mutex> lk(sh.mu);
+        std::unique_lock<std::mutex> lk(sh.mu);
         return sh.htab_find(h, data, len);
     }
 
     void clear() {
         for (auto &sh : shards) {
-            std::unique_lock<std::shared_mutex> lk(sh.mu);
+            std::unique_lock<std::mutex> lk(sh.mu);
             sh.clear_locked();
         }
     }
@@ -292,7 +301,7 @@ struct Pool {
     size_t count() const {
         size_t n = 0;
         for (auto &sh : shards) {
-            std::shared_lock<std::shared_mutex> lk(sh.mu);
+            std::unique_lock<std::mutex> lk(sh.mu);
             n += sh.entries.size() - 1;
         }
         return n;
@@ -301,7 +310,7 @@ struct Pool {
     size_t memory_bytes() const {
         size_t n = 0;
         for (auto &sh : shards) {
-            std::shared_lock<std::shared_mutex> lk(sh.mu);
+            std::unique_lock<std::mutex> lk(sh.mu);
             n += sh.mem_approx();
         }
         return n;
@@ -333,7 +342,7 @@ InlineIID Intern::find_inline(std::string_view data) const {
 std::string_view Intern::view(InlineIID id) const {
     if (!id) return {};
     auto &sh = m_->inline_pool.shards[shard_of(id.v)];
-    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    std::unique_lock<std::mutex> lk(sh.mu);
     auto &e = sh.entries[local_of(id.v)];
     /* Inline pool guarantees uncompressed storage. */
     return std::string_view(sh.raw(local_of(id.v)), e.orig_size);
@@ -347,7 +356,7 @@ std::string Intern::str(InlineIID id) const {
 size_t Intern::size(InlineIID id) const {
     if (!id) return 0;
     auto &sh = m_->inline_pool.shards[shard_of(id.v)];
-    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    std::unique_lock<std::mutex> lk(sh.mu);
     return sh.entries[local_of(id.v)].orig_size;
 }
 
@@ -422,7 +431,7 @@ BlobIID Intern::put_blob_argv(const std::vector<std::string> &argv) {
 std::string Intern::str(BlobIID id) const {
     if (!id) return {};
     auto &sh = m_->blob_pool.shards[shard_of(id.v)];
-    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    std::unique_lock<std::mutex> lk(sh.mu);
     auto &e = sh.entries[local_of(id.v)];
     if (!e.compressed)
         return std::string(sh.raw(local_of(id.v)), e.orig_size);
@@ -434,7 +443,7 @@ std::string Intern::str(BlobIID id) const {
 std::vector<uint8_t> Intern::bytes(BlobIID id) const {
     if (!id) return {};
     auto &sh = m_->blob_pool.shards[shard_of(id.v)];
-    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    std::unique_lock<std::mutex> lk(sh.mu);
     auto &e = sh.entries[local_of(id.v)];
     std::vector<uint8_t> out(e.orig_size);
     if (!e.compressed)
@@ -447,7 +456,7 @@ std::vector<uint8_t> Intern::bytes(BlobIID id) const {
 size_t Intern::size(BlobIID id) const {
     if (!id) return 0;
     auto &sh = m_->blob_pool.shards[shard_of(id.v)];
-    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    std::unique_lock<std::mutex> lk(sh.mu);
     return sh.entries[local_of(id.v)].orig_size;
 }
 
@@ -502,7 +511,7 @@ bool Intern::eq(BlobIID a, BlobIID b) const {
 bool Intern::eq(BlobIID a, std::string_view data) const {
     if (!a) return data.empty();
     auto &sh = m_->blob_pool.shards[shard_of(a.v)];
-    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    std::unique_lock<std::mutex> lk(sh.mu);
     return sh.content_eq(local_of(a.v), data.data(), data.size());
 }
 
@@ -510,7 +519,7 @@ bool Intern::contains(BlobIID a, std::string_view needle) const {
     if (needle.empty()) return true;
     if (!a) return false;
     auto &sh = m_->blob_pool.shards[shard_of(a.v)];
-    std::shared_lock<std::shared_mutex> lk(sh.mu);
+    std::unique_lock<std::mutex> lk(sh.mu);
     auto &e = sh.entries[local_of(a.v)];
     if (e.orig_size < needle.size()) return false;
     if (!e.compressed) {
