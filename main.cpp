@@ -28,6 +28,7 @@
 #include "sorted_vec_set.h"
 #include "json.h"
 #include "intern.h"
+#include "wire_in.h"
 
 /* ── Global intern pool ────────────────────────────────────────────── */
 /* Single unified pool for all interned data (strings, argv, output). */
@@ -601,6 +602,167 @@ static preparsed_event_t preparse_line(const char *line) {
     case EV_STDOUT:
     case EV_STDERR:
         if (json_get(line, "data", sp)) pe.data_blob = g_pool.put_blob(json_decode_string(sp));
+        break;
+    }
+    return pe;
+}
+
+/* ── Wire-format ingestion ────────────────────────────────────────── */
+/* The producers (sud, proctrace, uproctrace) emit binary wire events
+ * defined in wire/wire.h. wire_in.{h,cpp} is the streaming decoder.
+ * Here we adapt each WireRawEvent into the same preparsed_event_t the
+ * JSON path produces, so apply_preparsed() (and the parallel pipeline)
+ * stays unchanged.
+ *
+ * Note: we don't use parallel_ingest for wire input. The wire stream is
+ * delta-encoded, so it must be decoded in order — the decoder owns
+ * shared `ev_state`. After decoding, `apply_preparsed` is the only hot
+ * path and is fast enough sequentially for interactive viewing. (If
+ * profile shows otherwise, the post-decode preparsed_event_t buffer can
+ * be tgid-bucketed exactly like the JSON path.) */
+
+static std::string format_open_flags(int flags) {
+    /* Format an open(2) flags integer into the same `O_RDONLY|O_CLOEXEC`
+     * pipe-separated string that the JSON ingester used to receive. The
+     * access mode goes first; everything else is appended in fixed
+     * order. Unknown bits are emitted as 0xNNNN so they round-trip. */
+    std::string out;
+    int acc = flags & O_ACCMODE;
+    if      (acc == O_RDONLY) out = "O_RDONLY";
+    else if (acc == O_WRONLY) out = "O_WRONLY";
+    else if (acc == O_RDWR)   out = "O_RDWR";
+    else                       out = "O_RDONLY";  /* fallback */
+    int rest = flags & ~O_ACCMODE;
+    auto add = [&](int bit, const char *name) {
+        if (rest & bit) { out += '|'; out += name; rest &= ~bit; }
+    };
+#ifdef O_CREAT
+    add(O_CREAT, "O_CREAT");
+#endif
+#ifdef O_EXCL
+    add(O_EXCL, "O_EXCL");
+#endif
+#ifdef O_NOCTTY
+    add(O_NOCTTY, "O_NOCTTY");
+#endif
+#ifdef O_TRUNC
+    add(O_TRUNC, "O_TRUNC");
+#endif
+#ifdef O_APPEND
+    add(O_APPEND, "O_APPEND");
+#endif
+#ifdef O_NONBLOCK
+    add(O_NONBLOCK, "O_NONBLOCK");
+#endif
+#ifdef O_DSYNC
+    add(O_DSYNC, "O_DSYNC");
+#endif
+#ifdef O_SYNC
+    add(O_SYNC, "O_SYNC");
+#endif
+#ifdef O_DIRECTORY
+    add(O_DIRECTORY, "O_DIRECTORY");
+#endif
+#ifdef O_NOFOLLOW
+    add(O_NOFOLLOW, "O_NOFOLLOW");
+#endif
+#ifdef O_CLOEXEC
+    add(O_CLOEXEC, "O_CLOEXEC");
+#endif
+#ifdef O_PATH
+    add(O_PATH, "O_PATH");
+#endif
+#ifdef O_TMPFILE
+    /* O_TMPFILE includes O_DIRECTORY bits — test it before O_DIRECTORY
+     * above would normally matter, but we only print it if the full
+     * mask is set. */
+    if ((flags & O_TMPFILE) == O_TMPFILE) {
+        out += "|O_TMPFILE";
+        rest &= ~O_TMPFILE;
+    }
+#endif
+    if (rest) {
+        char buf[24];
+        std::snprintf(buf, sizeof buf, "|0x%x", rest);
+        out += buf;
+    }
+    return out;
+}
+
+/* Build a preparsed_event_t from one decoded wire event. Returns
+ * pe.valid=false for events tv doesn't surface (none, currently). */
+static preparsed_event_t preparse_wire(const WireRawEvent &w) {
+    preparsed_event_t pe;
+    pe.valid = true;
+    pe.ts    = (double)w.ts_ns / 1e9;
+    pe.tgid  = w.tgid;
+    pe.ppid  = w.ppid;
+
+    switch (w.kind) {
+    case WIRE_EV_CWD:
+        pe.kind = EV_CWD;
+        if (w.path_len) {
+            pe.raw_path.assign(w.path, w.path_len);
+            pe.path_kind = classify_path(pe.raw_path);
+        }
+        break;
+    case WIRE_EV_EXEC:
+        pe.kind = EV_EXEC;
+        if (w.exe_len) pe.exe_id = g_pool.put_blob(std::string_view(w.exe, w.exe_len));
+        if (w.argv_len) {
+            /* Wire's argv is raw NUL-separated bytes — split into the
+             * vector<string> shape put_blob_argv expects. Trim a single
+             * trailing NUL if present (kernel /proc/cmdline terminates). */
+            std::vector<std::string> argv;
+            size_t i = 0;
+            while (i < w.argv_len) {
+                size_t j = i;
+                while (j < w.argv_len && w.argv[j] != '\0') j++;
+                argv.emplace_back(w.argv + i, j - i);
+                if (j == w.argv_len) break;
+                i = j + 1;
+            }
+            /* Drop a trailing empty arg from a final NUL terminator. */
+            if (!argv.empty() && argv.back().empty()) argv.pop_back();
+            pe.argv_blob = g_pool.put_blob_argv(argv);
+        }
+        break;
+    case WIRE_EV_OPEN:
+        pe.kind = EV_OPEN;
+        if (w.path_len) {
+            pe.raw_path.assign(w.path, w.path_len);
+            pe.path_kind = classify_path(pe.raw_path);
+        }
+        pe.mode     = w.open_flags;     /* numeric flags carry O_ACCMODE bits */
+        pe.flags_id = g_pool.put_inline(format_open_flags(w.open_flags));
+        pe.err      = w.open_err;
+        break;
+    case WIRE_EV_EXIT: {
+        pe.kind = EV_EXIT;
+        /* Wire exit_status_kind: 0 = EXITED, 1 = SIGNALED (see
+         * wire/wire.h's EV_EXIT_EXITED / EV_EXIT_SIGNALED). */
+        const char *status = "exited";
+        if (w.exit_status_kind == 1) status = "signaled";
+        else if (w.exit_status_kind != 0) status = "unknown";
+        pe.status_id   = g_pool.put_inline(status);
+        if (w.exit_status_kind == 1) {
+            pe.signal_ = w.exit_code_or_sig;
+        } else {
+            pe.code    = w.exit_code_or_sig;
+        }
+        pe.core_dumped = w.exit_core_dumped ? 1 : 0;
+        break;
+    }
+    case WIRE_EV_STDOUT:
+        pe.kind = EV_STDOUT;
+        if (w.data_len) pe.data_blob = g_pool.put_blob(std::string_view(w.data, w.data_len));
+        break;
+    case WIRE_EV_STDERR:
+        pe.kind = EV_STDERR;
+        if (w.data_len) pe.data_blob = g_pool.put_blob(std::string_view(w.data, w.data_len));
+        break;
+    default:
+        pe.valid = false;
         break;
     }
     return pe;
@@ -1238,21 +1400,50 @@ static void parallel_ingest(std::vector<std::string> &lines) {
     }
 }
 
-static void ingest_zstd_file(const char *path) {
-    FILE *f = std::fopen(path, "rb");
-    if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
+/* ── wire-format file ingest helpers ──────────────────────────────── */
+/* For wire input we drive a single WireDecoder; the sink converts each
+ * decoded WireRawEvent into a preparsed_event_t and applies it directly
+ * to g_db. Sequential by design — see preparse_wire commentary. */
+static void ingest_wire_bytes_via(WireDecoder &dec, const void *data, size_t n) {
+    if (!dec.feed(data, n)) {
+        std::fprintf(stderr, "tv: wire decode error\n");
+        std::exit(1);
+    }
+}
+
+static WireDecoder make_db_wire_decoder() {
+    return WireDecoder([](const WireRawEvent &w) {
+        auto pe = preparse_wire(w);
+        if (pe.valid) g_db.apply_preparsed(pe);
+    });
+}
+
+static void ingest_wire_file_plain(FILE *f, const char *path) {
+    auto dec = make_db_wire_decoder();
+    unsigned char buf[64 * 1024];
+    while (true) {
+        size_t n = std::fread(buf, 1, sizeof buf, f);
+        if (n == 0) break;
+        ingest_wire_bytes_via(dec, buf, n);
+    }
+    if (std::ferror(f)) {
+        std::fprintf(stderr, "tv: read error in %s\n", path);
+        std::exit(1);
+    }
+    dec.flush();
+}
+
+static void ingest_wire_file_zstd(FILE *f, const char *path,
+                                   const unsigned char *carry,
+                                   size_t carry_n) {
+    auto dec = make_db_wire_decoder();
+    if (carry_n) ingest_wire_bytes_via(dec, carry, carry_n);
     size_t in_cap = ZSTD_DStreamInSize(), out_cap = ZSTD_DStreamOutSize();
     std::vector<unsigned char> in_buf(in_cap), out_buf(out_cap);
-    std::string line;
-    line.reserve(MAX_JSON_LINE);
     ZSTD_DStream *stream = ZSTD_createDStream();
     if (ZSTD_isError(ZSTD_initDStream(stream))) {
         std::fprintf(stderr, "tv: zstd init failed for %s\n", path); std::exit(1);
     }
-
-    /* Decompress and ingest in batches to avoid holding the entire
-       decompressed trace in memory. */
-    std::vector<std::string> lines;
     for (;;) {
         size_t nread = std::fread(in_buf.data(), 1, in_cap, f);
         ZSTD_inBuffer input = { in_buf.data(), nread, 0 };
@@ -1260,7 +1451,87 @@ static void ingest_zstd_file(const char *path) {
             ZSTD_outBuffer output = { out_buf.data(), out_cap, 0 };
             size_t rc = ZSTD_decompressStream(stream, &output, &input);
             if (ZSTD_isError(rc)) {
-                std::fprintf(stderr, "tv: zstd decompress failed for %s: %s\n", path, ZSTD_getErrorName(rc));
+                std::fprintf(stderr, "tv: zstd decompress failed for %s: %s\n",
+                             path, ZSTD_getErrorName(rc));
+                std::exit(1);
+            }
+            if (output.pos) ingest_wire_bytes_via(dec, out_buf.data(), output.pos);
+        }
+        if (nread == 0) break;
+    }
+    ZSTD_freeDStream(stream);
+    dec.flush();
+}
+
+static void ingest_zstd_file(const char *path) {
+    FILE *f = std::fopen(path, "rb");
+    if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
+    /* Decode the first frame's first byte to sniff format. */
+    size_t in_cap = ZSTD_DStreamInSize(), out_cap = ZSTD_DStreamOutSize();
+    std::vector<unsigned char> in_buf(in_cap), out_buf(out_cap);
+    ZSTD_DStream *stream = ZSTD_createDStream();
+    if (ZSTD_isError(ZSTD_initDStream(stream))) {
+        std::fprintf(stderr, "tv: zstd init failed for %s\n", path); std::exit(1);
+    }
+    /* Pull just enough to peek one decoded byte. */
+    unsigned char first = 0;
+    bool got_first = false;
+    std::vector<unsigned char> early_decoded;
+    while (!got_first) {
+        size_t nread = std::fread(in_buf.data(), 1, in_cap, f);
+        if (nread == 0) break;
+        ZSTD_inBuffer input = { in_buf.data(), nread, 0 };
+        while (input.pos < input.size && !got_first) {
+            ZSTD_outBuffer output = { out_buf.data(), out_cap, 0 };
+            size_t rc = ZSTD_decompressStream(stream, &output, &input);
+            if (ZSTD_isError(rc)) {
+                std::fprintf(stderr, "tv: zstd decompress failed for %s: %s\n",
+                             path, ZSTD_getErrorName(rc));
+                std::exit(1);
+            }
+            if (output.pos) {
+                first = out_buf.data()[0];
+                got_first = true;
+                early_decoded.assign(out_buf.data(), out_buf.data() + output.pos);
+            }
+        }
+        /* If we got a first byte, also retain any unconsumed compressed
+         * input so the chosen path can finish reading the file. */
+        if (got_first) {
+            /* push back unconsumed compressed bytes for the chosen path */
+            if (input.pos < input.size) {
+                std::fseek(f, -(long)(input.size - input.pos), SEEK_CUR);
+            }
+        }
+    }
+    if (!got_first) { ZSTD_freeDStream(stream); std::fclose(f); return; }
+
+    if (wire_looks_like_wire(first)) {
+        /* Restart zstd stream — we need a fresh one to feed the carry */
+        ZSTD_freeDStream(stream);
+        std::rewind(f);
+        ingest_wire_file_zstd(f, path, nullptr, 0);
+        std::fclose(f);
+        return;
+    }
+    /* JSONL path: line-buffered ingest as before. */
+    ZSTD_freeDStream(stream);
+    std::rewind(f);
+    /* Fresh stream for the JSONL decoder. */
+    std::string line;
+    line.reserve(MAX_JSON_LINE);
+    ZSTD_DStream *jstream = ZSTD_createDStream();
+    ZSTD_initDStream(jstream);
+    std::vector<std::string> lines;
+    for (;;) {
+        size_t nread = std::fread(in_buf.data(), 1, in_cap, f);
+        ZSTD_inBuffer input = { in_buf.data(), nread, 0 };
+        while (input.pos < input.size) {
+            ZSTD_outBuffer output = { out_buf.data(), out_cap, 0 };
+            size_t rc = ZSTD_decompressStream(jstream, &output, &input);
+            if (ZSTD_isError(rc)) {
+                std::fprintf(stderr, "tv: zstd decompress failed for %s: %s\n",
+                             path, ZSTD_getErrorName(rc));
                 std::exit(1);
             }
             size_t pos = 0;
@@ -1289,14 +1560,25 @@ static void ingest_zstd_file(const char *path) {
         if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
     }
     if (!lines.empty()) parallel_ingest(lines);
-    ZSTD_freeDStream(stream);
+    ZSTD_freeDStream(jstream);
     std::fclose(f);
 }
 
 static void ingest_file(const char *path) {
     if (path_has_suffix(path, ".zst")) { ingest_zstd_file(path); return; }
-    FILE *f = std::fopen(path, "r");
+    FILE *f = std::fopen(path, "rb");
     if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
+
+    /* Sniff first non-empty byte to choose format. */
+    int fb = std::fgetc(f);
+    if (fb == EOF) { std::fclose(f); return; }
+    std::ungetc(fb, f);
+
+    if (wire_looks_like_wire(static_cast<unsigned char>(fb))) {
+        ingest_wire_file_plain(f, path);
+        std::fclose(f);
+        return;
+    }
 
     std::vector<std::string> lines;
     char *buf = nullptr;
@@ -2469,14 +2751,28 @@ static void on_live_batch() {
     apply_state_change();
 }
 
+/* Live trace fd is always wire-format — uproctrace, the only live
+ * producer tv ever spawns, emits binary wire. We keep a persistent
+ * decoder across reads and count delivered events for live-batch
+ * coalescing. */
+static std::unique_ptr<WireDecoder> t_live_dec;
+static int t_live_did = 0;
+
+static WireDecoder &get_live_decoder() {
+    if (!t_live_dec) {
+        t_live_dec = std::make_unique<WireDecoder>([](const WireRawEvent &w) {
+            auto pe = preparse_wire(w);
+            if (pe.valid) { g_db.apply_preparsed(pe); t_live_did++; }
+        });
+    }
+    return *t_live_dec;
+}
+
 static void on_trace_fd_cb(Tui &tui, int fd) {
-    int n = static_cast<int>(read(fd, t_rbuf + t_rbuf_len, sizeof(t_rbuf) - static_cast<size_t>(t_rbuf_len) - 1));
+    unsigned char buf[64 * 1024];
+    int n = static_cast<int>(read(fd, buf, sizeof buf));
     if (n <= 0) {
-        if (t_rbuf_len > 0) {
-            t_rbuf[t_rbuf_len] = 0;
-            ingest_line(t_rbuf);
-            t_rbuf_len = 0;
-        }
+        if (t_live_dec) t_live_dec->flush();
         t_pending_live_rows = 0;
         t_live_batch_start_ms = 0;
         on_live_batch();
@@ -2484,19 +2780,15 @@ static void on_trace_fd_cb(Tui &tui, int fd) {
         if (t_trace_fd >= 0) { close(t_trace_fd); t_trace_fd = -1; }
         return;
     }
-    t_rbuf_len += n;
-    int did = 0;
-    while (true) {
-        char *nl = static_cast<char*>(std::memchr(t_rbuf, '\n', static_cast<size_t>(t_rbuf_len)));
-        if (!nl) break;
-        if (nl > t_rbuf && nl[-1] == '\r') nl[-1] = 0;
-        *nl = 0;
-        ingest_line(t_rbuf);
-        did++;
-        int used = static_cast<int>(nl - t_rbuf) + 1;
-        std::memmove(t_rbuf, nl + 1, static_cast<size_t>(t_rbuf_len - used));
-        t_rbuf_len -= used;
+    t_live_did = 0;
+    auto &dec = get_live_decoder();
+    if (!dec.feed(buf, static_cast<size_t>(n))) {
+        std::fprintf(stderr, "tv: live wire decode error\n");
+        tui.unwatch_fd(fd);
+        if (t_trace_fd >= 0) { close(t_trace_fd); t_trace_fd = -1; }
+        return;
     }
+    int did = t_live_did;
     if (did) {
         long long now = monotonic_millis();
         if (t_pending_live_rows == 0 && now >= 0) t_live_batch_start_ms = now;
@@ -2614,10 +2906,8 @@ int main(int argc, char **argv) {
     if (!load_mode && !trace_file[0] && !cmd) {
         std::fprintf(stderr,
             "Usage: tv [--module|--sud|--ptrace] -- <command> [args...]\n"
-            "       tv --load <file.db>\n"
-            "       tv --trace <file.jsonl[.zst]>\n"
-            "       tv --load <file.db> --trace <input.jsonl[.zst]>\n"
-            "       tv --uproctrace [-o FILE[.zst]] [--module|--sud|--ptrace] -- <command> [args...]\n");
+            "       tv --trace <file.wire[.zst] | file.jsonl[.zst]>\n"
+            "       tv --uproctrace [-o FILE[.wire[.zst]]] [--module|--sud|--ptrace] -- <command> [args...]\n");
         return 1;
     }
 
@@ -2666,6 +2956,7 @@ int main(int argc, char **argv) {
         free_all();
         return headless_mode ? 0 : 1;
     }
+    if (headless_mode) g_headless = 1;
 
     {
         g_lpane = g_tui->add_panel(g_lpane_def);

@@ -69,8 +69,8 @@ tv_sql.h: tv.sql gen_sql_h
 $(ZSTD_LIB):
 	$(MAKE) -C $(ZSTD_DIR) libzstd.a
 
-tv: main.cpp engine.cpp engine.h intern.cpp intern.h json.cpp json.h uproctrace.cpp tests.cpp $(ZSTD_LIB)
-	g++ $(CXXFLAGS) -o tv main.cpp engine.cpp intern.cpp json.cpp uproctrace.cpp tests.cpp -static $(TV_LIBS)
+tv: main.cpp engine.cpp engine.h intern.cpp intern.h json.cpp json.h uproctrace.cpp tests.cpp wire_in.cpp wire_in.h wire/wire.h $(ZSTD_LIB)
+	g++ $(CXXFLAGS) -o tv main.cpp engine.cpp intern.cpp json.cpp uproctrace.cpp tests.cpp wire_in.cpp -static $(TV_LIBS)
 
 fv: fv.cpp engine.cpp engine.h
 	g++ $(CXXFLAGS) -o fv fv.cpp engine.cpp
