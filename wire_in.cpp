@@ -11,13 +11,17 @@ extern "C" {
 
 /* ── per-atom length probe (without consuming) ────────────────────── */
 
+/* yeet's long-form length prefix can be up to 7 bytes (0xF8..0xFE);
+ * 0xFF is reserved. */
+static constexpr uint8_t YEET_MAX_LENSZ = 7;
+
 static size_t yeet_atom_len(const uint8_t *p, size_t n) {
     if (n == 0) return 0;
     uint8_t b = p[0];
     if (b < 0xC0u) return 1;
     if (b < 0xF8u) return 1u + (size_t)(b - 0xC0u);
     uint8_t lensz = (uint8_t)(b - 0xF8u);
-    if (lensz > 7) return (size_t)-1;
+    if (lensz > YEET_MAX_LENSZ) return (size_t)-1;
     if (n < 1u + (size_t)lensz) return 0;
     uint64_t len = 0;
     for (uint8_t i = 0; i < lensz; i++) {
@@ -38,12 +42,13 @@ struct WireDecoder::Impl {
 
     explicit Impl(Sink s) : sink(std::move(s)) {}
 
-    /* Try to consume one whole event from `buf`. Returns the number of
-     * bytes consumed, or 0 if not enough data, or (size_t)-1 on error. */
-    size_t consume_one() {
+    /* Try to consume one whole event from `buf` starting at offset `pos`.
+     * Returns the number of bytes consumed, 0 if not enough data, or
+     * (size_t)-1 on hard error. */
+    size_t consume_one(size_t pos) {
         if (error) return (size_t)-1;
-        const uint8_t *p = buf.data();
-        size_t n = buf.size();
+        const uint8_t *p = buf.data() + pos;
+        size_t n = buf.size() - pos;
         if (n == 0) return 0;
 
         /* version atom must be first */
@@ -119,22 +124,21 @@ bool WireDecoder::feed(const void *data, size_t n) {
     impl_->any_input = true;
     impl_->buf.insert(impl_->buf.end(),
                       (const uint8_t *)data, (const uint8_t *)data + n);
-    size_t consumed = 0;
-    while (true) {
+    /* Walk the buffer with a cursor; erase consumed bytes only once at
+     * the end. This keeps feed() linear in the number of bytes added,
+     * even when called byte-at-a-time across many events. */
+    size_t pos = 0;
+    while (pos < impl_->buf.size()) {
         if (impl_->error) return false;
-        if (consumed == impl_->buf.size()) break;
-        std::vector<uint8_t> &b = impl_->buf;
-        if (consumed > 0) {
-            b.erase(b.begin(), b.begin() + (ptrdiff_t)consumed);
-            consumed = 0;
-        }
-        size_t k = impl_->consume_one();
+        size_t k = impl_->consume_one(pos);
         if (k == (size_t)-1) return false;
         if (k == 0) break;
-        consumed += k;
+        pos += k;
     }
-    if (consumed > 0) impl_->buf.erase(impl_->buf.begin(),
-                                       impl_->buf.begin() + (ptrdiff_t)consumed);
+    if (pos > 0) {
+        impl_->buf.erase(impl_->buf.begin(),
+                         impl_->buf.begin() + (ptrdiff_t)pos);
+    }
     return !impl_->error;
 }
 
