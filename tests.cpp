@@ -1259,7 +1259,7 @@ static bool test_parallel_phase2_ingest() {
 static bool test_large_json_line_ingest() {
     const int tgid = 9100;
     const std::string marker = "LONG_LINE_MARKER_9100";
-    constexpr size_t kLargePayloadSize = (1u << 20) + 4096; // > previous MAX_JSON_LINE
+    constexpr size_t kLargePayloadSize = (1u << 20) + 4096; // > previous MAX_JSON_LINE (1048576)
     std::string payload(kLargePayloadSize, 'a');
     payload += marker;
 

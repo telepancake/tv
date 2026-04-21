@@ -1285,6 +1285,12 @@ static void ingest_file(const char *path) {
             lines.clear();
         }
     }
+    if (std::ferror(f)) {
+        std::free(buf);
+        std::fclose(f);
+        std::fprintf(stderr, "tv: read error in %s\n", path);
+        std::exit(1);
+    }
     std::free(buf);
     std::fclose(f);
     if (!lines.empty()) parallel_ingest(lines);
