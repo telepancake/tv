@@ -1274,8 +1274,8 @@ static void ingest_file(const char *path) {
     std::vector<std::string> lines;
     char *buf = nullptr;
     size_t cap = 0;
-    ssize_t nread = 0;
-    while ((nread = getline(&buf, &cap, f)) != -1) {
+    ssize_t nread;
+    while ((nread = getline(&buf, &cap, f)) > 0) {
         size_t len = static_cast<size_t>(nread);
         if (len > 0 && buf[len - 1] == '\n') len--;
         if (len > 0 && buf[len - 1] == '\r') len--;
