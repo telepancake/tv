@@ -15,7 +15,7 @@ modules.order
 sudtrace
 sud32
 sud64
-yeetdump
-wire2parquet
+/yeetdump
+/wire2parquet
 tests/trace_compare/hello_static
 tests/trace_compare/hello_dynamic
