@@ -201,6 +201,20 @@ static inline long raw_getdents64(int fd, void *buf, size_t count)
 #endif
 }
 
+/* mmap. i386 uses mmap2 (offset in pages); x86_64 uses mmap (offset in bytes). */
+static inline void *raw_mmap(void *addr, size_t length, int prot, int flags,
+                             int fd, off_t offset)
+{
+#ifdef SYS_mmap
+    long r = raw_syscall6(SYS_mmap, (long)addr, (long)length, prot, flags,
+                          fd, (long)offset);
+#else
+    long r = raw_syscall6(SYS_mmap2, (long)addr, (long)length, prot, flags,
+                          fd, (long)(offset >> 12));
+#endif
+    return (void *)r;
+}
+
 /* ================================================================
  * Signal-safe bump allocator — data in raw.c, inline interface here.
  * ================================================================ */

@@ -26,13 +26,23 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+#include <sched.h>
+#include "wire/wire.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
 #endif
 
-/* Reserve a high FD so children are unlikely to clobber it */
+/* Reserve two high FDs so children are unlikely to clobber them.
+ *   SUD_OUTPUT_FD : the wire output file
+ *   SUD_STATE_FD  : MAP_SHARED anon page with cross-process spinlock +
+ *                   shared ev_state (see sud/event.c: struct sud_shared) */
 #define SUD_OUTPUT_FD        1023
+#define SUD_STATE_FD         1022
+#define SUD_STATE_PAGE_SIZE  4096
 #define SUDTRACE_OUTFILE_ENV "SUDTRACE_OUTFILE"
 
 /* ================================================================
@@ -45,7 +55,8 @@ static void usage(const char *prog)
         "Usage: %s [-o FILE] [--no-env] -- command [args...]\n"
         "\n"
         "Syscall User Dispatch (SUD) based process tracer.\n"
-        "Produces JSONL event stream compatible with proctrace/uproctrace.\n",
+        "Produces a binary wire-format trace (see wire/wire.h).\n"
+        "Decode with: yeetdump FILE\n",
         prog);
     exit(1);
 }
@@ -139,11 +150,21 @@ static int detect_target_class(const char *path)
 }
 
 /* ================================================================
- * JSONL helpers for EXIT events from the wait loop.
- * Only the launcher needs to emit EXIT — it's the parent process.
+ * Wire-format event emission.
+ *
+ * The launcher emits EXIT events for children it reaps. To keep
+ * deltas consistent with the children's wire emissions, we share the
+ * same `struct sud_shared { int lock; ev_state st; }` page that
+ * sud/event.c uses — attached via SUD_STATE_FD, mmap'd MAP_SHARED.
  * ================================================================ */
 
 static int g_out_fd = -1;
+
+struct sud_shared_launcher {
+    volatile int lock;
+    ev_state     st;
+};
+static struct sud_shared_launcher *g_shared;  /* NULL until set up */
 
 static void get_timestamp(struct timespec *ts)
 {
@@ -172,30 +193,96 @@ static pid_t get_tgid_for(pid_t pid)
     return tgid > 0 ? tgid : pid;
 }
 
+static pid_t get_ppid_for(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    char buf[2048];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    char *p = strstr(buf, "PPid:");
+    if (!p) return 0;
+    p += 5;
+    while (*p == ' ' || *p == '\t') p++;
+    pid_t ppid = 0;
+    while (*p >= '0' && *p <= '9')
+        ppid = ppid * 10 + (*p++ - '0');
+    return ppid;
+}
+
+static void shared_lock(void)
+{
+    while (__sync_lock_test_and_set(&g_shared->lock, 1))
+        sched_yield();
+}
+
+static void shared_unlock(void)
+{
+    __sync_lock_release(&g_shared->lock);
+}
+
+static void write_all(int fd, const void *buf, size_t len)
+{
+    const char *p = buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+}
+
 static void emit_exit(pid_t pid, int status)
 {
+    if (g_out_fd < 0 || !g_shared) return;
+
+    pid_t tgid = get_tgid_for(pid);
+    pid_t ppid = get_ppid_for(pid);
     struct timespec ts;
     get_timestamp(&ts);
-    char line[512];
-    int exit_code = 0;
-    int signal_num = 0;
-    if (WIFEXITED(status))
-        exit_code = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status))
-        signal_num = WTERMSIG(status);
+    uint64_t ts_ns = (uint64_t)ts.tv_sec * 1000000000ull
+                   + (uint64_t)ts.tv_nsec;
 
-    int len = snprintf(line, sizeof(line),
-        "{\"event\":\"EXIT\",\"ts\":%ld.%09ld,\"pid\":%d",
-        (long)ts.tv_sec, ts.tv_nsec, pid);
-    if (WIFEXITED(status))
-        len += snprintf(line + len, sizeof(line) - len,
-            ",\"exit_code\":%d}\n", exit_code);
-    else
-        len += snprintf(line + len, sizeof(line) - len,
-            ",\"signal\":%d}\n", signal_num);
+    int64_t extras[4];
+    if (WIFEXITED(status)) {
+        extras[0] = EV_EXIT_EXITED;
+        extras[1] = WEXITSTATUS(status);
+        extras[2] = 0;
+        extras[3] = status;
+    } else if (WIFSIGNALED(status)) {
+        extras[0] = EV_EXIT_SIGNALED;
+        extras[1] = WTERMSIG(status);
+#ifdef WCOREDUMP
+        extras[2] = WCOREDUMP(status) ? 1 : 0;
+#else
+        extras[2] = (status & 0x80) ? 1 : 0;
+#endif
+        extras[3] = status;
+    } else {
+        extras[0] = EV_EXIT_EXITED;
+        extras[1] = 0;
+        extras[2] = 0;
+        extras[3] = status;
+    }
 
-    if (len > 0 && g_out_fd >= 0)
-        (void)write(g_out_fd, line, len);
+    shared_lock();
+    uint8_t hdr[EV_HEADER_MAX];
+    int hlen = ev_build_header(&g_shared->st, hdr,
+                               EV_EXIT, ts_ns,
+                               pid, tgid, ppid, pid, tgid,
+                               extras, 4);
+    if (hlen > 0) {
+        uint8_t buf[EV_HEADER_MAX + 16];
+        uint8_t *w = buf;
+        if (yeet_pair(&w, buf + sizeof buf, hdr, hlen, NULL, 0) == 0) {
+            write_all(g_out_fd, buf, (size_t)(w - buf));
+        }
+    }
+    shared_unlock();
 }
 
 /* ================================================================
@@ -408,6 +495,48 @@ int main(int argc, char **argv)
                 close(g_out_fd);
             g_out_fd = high_fd;
             /* NOT FD_CLOEXEC: wrapper child inherits the fd */
+        }
+    }
+
+    /* Set up the shared wire state page.
+     *
+     * memfd_create gives us an anonymous file that survives fork+exec.
+     * We size it to one page, mmap MAP_SHARED to zero it (ftruncate +
+     * MAP_SHARED => page starts zero which is exactly what ev_state
+     * and the spinlock want), and dup it to SUD_STATE_FD so every
+     * traced child inherits the fd and attaches to the same page via
+     * sud_wire_init(). Also do the initial mmap here so the launcher
+     * itself can emit wire events through the shared state. */
+    {
+        int mfd = (int)syscall(SYS_memfd_create, "sud_wire_state", 0u);
+        if (mfd < 0) {
+            perror("sudtrace: memfd_create");
+            exit(1);
+        }
+        if (ftruncate(mfd, SUD_STATE_PAGE_SIZE) < 0) {
+            perror("sudtrace: ftruncate state");
+            exit(1);
+        }
+        int sfd = dup2(mfd, SUD_STATE_FD);
+        if (sfd < 0) { perror("sudtrace: dup2 state"); exit(1); }
+        if (mfd != SUD_STATE_FD) close(mfd);
+        void *p = mmap(NULL, SUD_STATE_PAGE_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, sfd, 0);
+        if (p == MAP_FAILED) {
+            perror("sudtrace: mmap state");
+            exit(1);
+        }
+        g_shared = (struct sud_shared_launcher *)p;
+        /* zeroed by ftruncate */
+    }
+
+    /* Write the wire version atom once at the head of the output.
+     * Every consumer reads this first to validate format compatibility. */
+    {
+        uint8_t buf[EV_HEADER_MAX];
+        uint8_t *w = buf;
+        if (yeet_u64(&w, buf + sizeof buf, WIRE_VERSION) == 0) {
+            write_all(g_out_fd, buf, (size_t)(w - buf));
         }
     }
 

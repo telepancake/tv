@@ -81,8 +81,8 @@ sud64: $(SUD_SRCS) sudtrace.lds
 sud32: $(SUD_SRCS) sudtrace.lds
 	cc -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_SRCS) -lgcc
 
-sudtrace: sud/sudtrace.c sud32 sud64
-	cc -O2 -static -o sudtrace sud/sudtrace.c
+sudtrace: sud/sudtrace.c sud32 sud64 wire/wire.h
+	cc -O2 -I. -static -o sudtrace sud/sudtrace.c
 
 yeetdump: tools/yeetdump/yeetdump.c wire/wire.h
 	cc -std=c99 -O2 -Wall -Wextra -I. -o yeetdump tools/yeetdump/yeetdump.c
