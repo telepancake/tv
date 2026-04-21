@@ -47,13 +47,16 @@
 
 #include <fnmatch.h>
 #include <zstd.h>
+#ifndef XXH_INLINE_ALL
 #define XXH_INLINE_ALL
+#endif
 #include <common/xxhash.h>
 
 /* ── XXH64 hash from bundled xxHash (well-tested, much faster than FNV-1a) ── */
 
 static uint64_t fast_hash64(const void *data, size_t len) {
-    return XXH64(data, len, 0);
+    static constexpr uint64_t HASH_SEED = 0;
+    return XXH64(data, len, HASH_SEED);
 }
 
 /* ── Constants ────────────────────────────────────────────────────── */
