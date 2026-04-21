@@ -180,8 +180,9 @@ static std::string sfmt(const char *f, ...) {
     int n = std::vsnprintf(nullptr, 0, f, ap);
     va_end(ap);
     if (n < 0) { va_end(ap2); return {}; }
-    std::string s(static_cast<size_t>(n), '\0');
-    std::vsnprintf(s.data(), static_cast<size_t>(n) + 1, f, ap2);
+    std::string s(static_cast<size_t>(n) + 1, '\0');
+    std::vsnprintf(s.data(), s.size(), f, ap2);
+    s.resize(static_cast<size_t>(n));
     va_end(ap2);
     return s;
 }
@@ -962,6 +963,7 @@ static constexpr int MAX_PARSE_THREADS = 8;
 static constexpr int MIN_LINES_PER_THREAD = 64;
 static constexpr int MIN_EVENTS_PER_P2_THREAD = 16;
 static constexpr int INGEST_BATCH_SIZE = 128 * 1024;
+static constexpr size_t INGEST_BATCH_BYTES = 32u * 1024u * 1024u;
 
 static void parallel_ingest(std::vector<std::string> &lines) {
     if (lines.empty()) return;
@@ -1226,6 +1228,7 @@ static void ingest_zstd_file(const char *path) {
     /* Decompress and ingest in batches to avoid holding the entire
        decompressed trace in memory. */
     std::vector<std::string> lines;
+    size_t lines_bytes = 0;
     for (;;) {
         size_t nread = std::fread(in_buf.data(), 1, in_cap, f);
         ZSTD_inBuffer input = { in_buf.data(), nread, 0 };
@@ -1245,12 +1248,16 @@ static void ingest_zstd_file(const char *path) {
                 pos += chunk;
                 if (nl) {
                     if (!line.empty() && line.back() == '\r') line.pop_back();
-                    if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
+                    if (!line.empty() && line[0] == '{') {
+                        lines_bytes += line.size();
+                        lines.emplace_back(std::move(line));
+                    }
                     line.clear();
                     pos++;
-                    if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE) {
+                    if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE || lines_bytes >= INGEST_BATCH_BYTES) {
                         parallel_ingest(lines);
                         lines.clear();
+                        lines_bytes = 0;
                     }
                 }
             }
@@ -1259,7 +1266,10 @@ static void ingest_zstd_file(const char *path) {
     }
     if (!line.empty()) {
         if (line.back() == '\r') line.pop_back();
-        if (!line.empty() && line[0] == '{') lines.emplace_back(std::move(line));
+        if (!line.empty() && line[0] == '{') {
+            lines_bytes += line.size();
+            lines.emplace_back(std::move(line));
+        }
     }
     if (!lines.empty()) parallel_ingest(lines);
     ZSTD_freeDStream(stream);
@@ -1272,6 +1282,7 @@ static void ingest_file(const char *path) {
     if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
 
     std::vector<std::string> lines;
+    size_t lines_bytes = 0;
     char *buf = nullptr;
     size_t cap = 0;
     ssize_t nread;
@@ -1279,10 +1290,14 @@ static void ingest_file(const char *path) {
         size_t len = static_cast<size_t>(nread);
         if (len > 0 && buf[len - 1] == '\n') len--;
         if (len > 0 && buf[len - 1] == '\r') len--;
-        if (len > 0 && buf[0] == '{') lines.emplace_back(buf, len);
-        if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE) {
+        if (len > 0 && buf[0] == '{') {
+            lines_bytes += len;
+            lines.emplace_back(buf, len);
+        }
+        if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE || lines_bytes >= INGEST_BATCH_BYTES) {
             parallel_ingest(lines);
             lines.clear();
+            lines_bytes = 0;
         }
     }
     if (std::ferror(f)) {
