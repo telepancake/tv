@@ -180,6 +180,7 @@ static std::string sfmt(const char *f, ...) {
     int n = std::vsnprintf(nullptr, 0, f, ap);
     va_end(ap);
     if (n < 0) { va_end(ap2); return {}; }
+    /* Reserve one extra byte so vsnprintf can write the trailing '\0'. */
     std::string s(static_cast<size_t>(n) + 1, '\0');
     std::vsnprintf(s.data(), s.size(), f, ap2);
     s.resize(static_cast<size_t>(n));
@@ -963,6 +964,7 @@ static constexpr int MAX_PARSE_THREADS = 8;
 static constexpr int MIN_LINES_PER_THREAD = 64;
 static constexpr int MIN_EVENTS_PER_P2_THREAD = 16;
 static constexpr int INGEST_BATCH_SIZE = 128 * 1024;
+/* Cap batch memory to bound peak ingest RSS for large traces with long lines. */
 static constexpr size_t INGEST_BATCH_BYTES = 32u * 1024u * 1024u;
 
 static void parallel_ingest(std::vector<std::string> &lines) {
@@ -972,7 +974,19 @@ static void parallel_ingest(std::vector<std::string> &lines) {
     /* ── Phase 1: Parse JSON in parallel. ────────────────────────── */
     std::vector<preparsed_event_t> parsed(nlines);
     int hw = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    const char *parallel_env = std::getenv("TV_INGEST_PARALLEL");
+    bool allow_parallel = false;
+    if (parallel_env && parallel_env[0]) {
+        if (std::strcmp(parallel_env, "1") == 0 ||
+            std::strcmp(parallel_env, "true") == 0 ||
+            std::strcmp(parallel_env, "yes") == 0)
+            allow_parallel = true;
+    }
     int nthreads_p1 = 1;
+    if (allow_parallel) {
+        nthreads_p1 = std::min(hw, MAX_PARSE_THREADS);
+        if (nlines < nthreads_p1 * MIN_LINES_PER_THREAD) nthreads_p1 = 1;
+    }
 
     auto p1_worker = [&](int tid) {
         int chunk = (nlines + nthreads_p1 - 1) / nthreads_p1;
@@ -1006,6 +1020,10 @@ static void parallel_ingest(std::vector<std::string> &lines) {
     if (n_trace == 0) return;
 
     int nthreads_p2 = 1;
+    if (allow_parallel) {
+        nthreads_p2 = std::min(hw, MAX_PARSE_THREADS);
+        if (n_trace < nthreads_p2 * MIN_EVENTS_PER_P2_THREAD) nthreads_p2 = 1;
+    }
 
     /* ── Sequential fallback. ────────────────────────────────────── */
     if (nthreads_p2 <= 1) {
@@ -1252,7 +1270,7 @@ static void ingest_zstd_file(const char *path) {
                     }
                     line.clear();
                     pos++;
-                    if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE || lines_bytes >= INGEST_BATCH_BYTES) {
+                    if (lines.size() >= INGEST_BATCH_SIZE || lines_bytes >= INGEST_BATCH_BYTES) {
                         parallel_ingest(lines);
                         lines.clear();
                         lines_bytes = 0;
@@ -1292,7 +1310,7 @@ static void ingest_file(const char *path) {
             lines_bytes += len;
             lines.emplace_back(buf, len);
         }
-        if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE || lines_bytes >= INGEST_BATCH_BYTES) {
+        if (lines.size() >= INGEST_BATCH_SIZE || lines_bytes >= INGEST_BATCH_BYTES) {
             parallel_ingest(lines);
             lines.clear();
             lines_bytes = 0;
