@@ -1256,6 +1256,44 @@ static bool test_parallel_phase2_ingest() {
     return true;
 }
 
+static bool test_large_json_line_ingest() {
+    const int tgid = 9100;
+    const std::string marker = "LONG_LINE_MARKER_9100";
+    std::string payload((1 << 20) + 4096, 'a');
+    payload += marker;
+
+    std::string trace;
+    trace.reserve(payload.size() + 1024);
+    trace += R"({"event":"CWD","tgid":9100,"pid":9100,"ppid":1,"nspid":9100,"nstgid":9100,"ts":1.000,"path":"/tmp"})";
+    trace += "\n";
+    trace += R"({"event":"EXEC","tgid":9100,"pid":9100,"ppid":1,"nspid":9100,"nstgid":9100,"ts":1.001,"exe":"/usr/bin/p9100","argv":["p9100"],"env":{},"auxv":{"AT_UID":1000,"AT_EUID":1000,"AT_GID":1000,"AT_EGID":1000,"AT_SECURE":0}})";
+    trace += "\n";
+    trace += R"({"event":"STDOUT","tgid":9100,"pid":9100,"ppid":1,"nspid":9100,"nstgid":9100,"ts":1.010,"data":")";
+    trace += payload;
+    trace += R"("})";
+    trace += "\n";
+    trace += R"({"event":"EXIT","tgid":9100,"pid":9100,"ppid":1,"nspid":9100,"nstgid":9100,"ts":1.020,"status":"exited","code":0,"raw":0})";
+    trace += "\n";
+
+    tv_test_reset();
+    tv_test_load_string(trace.c_str());
+    tv_test_create(40, 120);
+    std::string search_input = std::string("{\"input\":\"search\",\"q\":\"") + marker + "\"}";
+    send(search_input.c_str());
+    int lp = tv_test_lpane();
+    bool found = false;
+    for (int i = 0; ; i++) {
+        auto *r = tv_test_tui()->get_cached_row(lp, i);
+        if (!r) break;
+        if (r->id == std::to_string(tgid) && r->style == RowStyle::Search) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT(found, "large JSON line payload marker not searchable (line likely truncated)");
+    return true;
+}
+
 // ── Test registry ────────────────────────────────────────────────────
 
 static struct { const char *name; bool (*fn)(); } ALL_TESTS[] = {
@@ -1337,6 +1375,7 @@ static struct { const char *name; bool (*fn)(); } ALL_TESTS[] = {
     {"file_filter: glob pattern",                         test_file_glob_filter},
     {"unlink: event filter includes UNLINK",              test_unlink_evfilt},
     {"parallel phase 2: multi-tgid ingest",              test_parallel_phase2_ingest},
+    {"ingest: large JSON line stays intact",             test_large_json_line_ingest},
 };
 
 int run_tests() {

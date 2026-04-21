@@ -1272,17 +1272,20 @@ static void ingest_file(const char *path) {
     if (!f) { std::fprintf(stderr, "tv: cannot open %s\n", path); std::exit(1); }
 
     std::vector<std::string> lines;
-    char buf[MAX_JSON_LINE];
-    while (std::fgets(buf, sizeof buf, f)) {
-        char *nl = std::strchr(buf, '\n');
-        if (nl) *nl = 0;
-        if (nl && nl > buf && nl[-1] == '\r') nl[-1] = 0;
-        if (buf[0] == '{') lines.emplace_back(buf);
+    char *buf = nullptr;
+    size_t cap = 0;
+    ssize_t nread = 0;
+    while ((nread = getline(&buf, &cap, f)) != -1) {
+        size_t len = static_cast<size_t>(nread);
+        if (len > 0 && buf[len - 1] == '\n') len--;
+        if (len > 0 && buf[len - 1] == '\r') len--;
+        if (len > 0 && buf[0] == '{') lines.emplace_back(buf, len);
         if (static_cast<int>(lines.size()) >= INGEST_BATCH_SIZE) {
             parallel_ingest(lines);
             lines.clear();
         }
     }
+    std::free(buf);
     std::fclose(f);
     if (!lines.empty()) parallel_ingest(lines);
 }
