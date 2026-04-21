@@ -972,8 +972,7 @@ static void parallel_ingest(std::vector<std::string> &lines) {
     /* ── Phase 1: Parse JSON in parallel. ────────────────────────── */
     std::vector<preparsed_event_t> parsed(nlines);
     int hw = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
-    int nthreads_p1 = std::min(hw, MAX_PARSE_THREADS);
-    if (nlines < nthreads_p1 * MIN_LINES_PER_THREAD) nthreads_p1 = 1;
+    int nthreads_p1 = 1;
 
     auto p1_worker = [&](int tid) {
         int chunk = (nlines + nthreads_p1 - 1) / nthreads_p1;
@@ -1006,8 +1005,7 @@ static void parallel_ingest(std::vector<std::string> &lines) {
         if (parsed[i].valid && !parsed[i].is_input) n_trace++;
     if (n_trace == 0) return;
 
-    int nthreads_p2 = std::min(hw, MAX_PARSE_THREADS);
-    if (n_trace < nthreads_p2 * MIN_EVENTS_PER_P2_THREAD) nthreads_p2 = 1;
+    int nthreads_p2 = 1;
 
     /* ── Sequential fallback. ────────────────────────────────────── */
     if (nthreads_p2 <= 1) {
