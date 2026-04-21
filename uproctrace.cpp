@@ -1,14 +1,16 @@
 /*
  * uproctrace.cpp — Userspace process tracer using ptrace (C++23 rewrite).
  *
- * Produces the same JSONL event stream as proctrace.c (kernel module),
- * but runs entirely in userspace via PTRACE.  Meant to be accessible
- * in environments where loading a kernel module is impractical.
+ * Produces the same binary wire-format event stream as proctrace.c
+ * (kernel module) and sudtrace, but runs entirely in userspace via
+ * PTRACE. Meant to be accessible in environments where loading a
+ * kernel module is impractical.
  *
  * Built into the tv binary.  Invoked as:
  *   tv --uproctrace [-o FILE] -- command [args...]
  *
- * Events emitted: CWD, EXEC, OPEN (real + inherited), EXIT, STDOUT, STDERR.
+ * Events emitted: CWD, EXEC, ARGV, ENV, AUXV, OPEN (real + inherited),
+ * EXIT, STDOUT, STDERR.
  */
 
 #ifndef _GNU_SOURCE
@@ -23,6 +25,10 @@
 #include <cctype>
 #include <cstdarg>
 #include <ctime>
+
+extern "C" {
+#include "wire/wire.h"
+}
 
 #include <string>
 #include <vector>
@@ -71,7 +77,7 @@ static inline long xptrace(int req, Args... args) {
 static constexpr size_t WRITE_CAPTURE_MAX   = 4096;
 static constexpr size_t ARGV_MAX_READ       = 32768;
 static constexpr size_t ENV_MAX_READ        = 65536;
-#define LINE_MAX_BUF        (PATH_MAX * 8 + 262144 + 1024)
+static constexpr size_t AUXV_MAX_READ       = 4096;
 static constexpr size_t TRACE_OUT_RING_SIZE = (1 << 20);
 static constexpr size_t TRACE_OUT_CHUNK_SIZE = (1 << 16);
 
@@ -101,6 +107,13 @@ static struct stat g_creator_stdout_st; /* stat of the session creator's stdout 
 static int g_creator_stdout_valid;
 static int g_trace_exec_env = 1;
 
+/* Global ev_state for wire format emission + mutex */
+static ev_state g_ev_state{};
+static pthread_mutex_t g_ev_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Forward declarations */
+static int trace_output_enqueue(const char *buf, size_t len);
+
 static bool path_has_suffix(const char *path, const char *suffix)
 {
     if (!path || !suffix) return false;
@@ -110,130 +123,37 @@ static bool path_has_suffix(const char *path, const char *suffix)
 }
 
 /* ================================================================
- * Timestamp
+ * Wire format event emission helper.
+ *
+ * Builds one wire event atom (header + blob) and writes to the output
+ * ring. Mirroring proctrace.c's emit_one and sud/event.c's emit_event.
  * ================================================================ */
 
-static void get_timestamp(struct timespec *ts)
+static void emit_one(int32_t type, uint64_t ts_ns,
+                     pid_t pid, pid_t tgid, pid_t ppid,
+                     pid_t nspid, pid_t nstgid,
+                     const int64_t *extras, unsigned n_extras,
+                     const void *blob, size_t blen)
 {
-    clock_gettime(CLOCK_REALTIME, ts);
-}
+    size_t buf_size = EV_HEADER_MAX + YEET_PREFIX_MAX + blen;
+    std::vector<uint8_t> buf(buf_size);
+    
+    uint8_t *p = buf.data();
+    const uint8_t *end = buf.data() + buf_size;
 
-/* ================================================================
- * JSON helpers
- * ================================================================ */
-
-static int json_escape(char *dst, int dstsize, const char *src, int srclen)
-{
-    int si, di = 0;
-    if (dstsize < 3) { if (dstsize > 0) dst[0] = '\0'; return 0; }
-    dst[di++] = '"';
-    for (si = 0; si < srclen && di + 7 < dstsize; si++) {
-        unsigned char c = static_cast<unsigned char>(src[si]);
-        switch (c) {
-        case '"':  dst[di++] = '\\'; dst[di++] = '"'; break;
-        case '\\': dst[di++] = '\\'; dst[di++] = '\\'; break;
-        case '\n': dst[di++] = '\\'; dst[di++] = 'n'; break;
-        case '\r': dst[di++] = '\\'; dst[di++] = 'r'; break;
-        case '\t': dst[di++] = '\\'; dst[di++] = 't'; break;
-        case '\b': dst[di++] = '\\'; dst[di++] = 'b'; break;
-        case '\f': dst[di++] = '\\'; dst[di++] = 'f'; break;
-        default:
-            if (c < 0x20)
-                di += snprintf(dst + di, dstsize - di, "\\u%04x", c);
-            else
-                dst[di++] = c;
-        }
+    pthread_mutex_lock(&g_ev_lock);
+    
+    uint8_t hdr[EV_HEADER_MAX];
+    int hlen = ev_build_header(&g_ev_state, hdr, type, ts_ns,
+                               pid, tgid, ppid, nspid, nstgid,
+                               extras, n_extras);
+    if (hlen > 0 && yeet_pair(&p, end, hdr, hlen, blob, blen) == 0) {
+        size_t total = static_cast<size_t>(p - buf.data());
+        pthread_mutex_unlock(&g_ev_lock);
+        trace_output_enqueue(reinterpret_cast<const char*>(buf.data()), total);
+    } else {
+        pthread_mutex_unlock(&g_ev_lock);
     }
-    dst[di++] = '"';
-    dst[di] = '\0';
-    return di;
-}
-
-/* Build a JSON array from a NUL-separated string (like /proc/.../cmdline) */
-static int json_argv_array(char *dst, int dstsize, const char *raw, int rawlen)
-{
-    int di = 0, si = 0;
-    dst[di++] = '[';
-    while (si < rawlen && di + 8 < dstsize) {
-        const char *arg = raw + si;
-        int arglen = 0;
-        while (si + arglen < rawlen && raw[si + arglen] != '\0') arglen++;
-        if (arglen == 0 && si + 1 >= rawlen) break;
-        if (di > 1) dst[di++] = ',';
-        di += json_escape(dst + di, dstsize - di, arg, arglen);
-        si += arglen + 1;
-    }
-    if (di < dstsize) dst[di++] = ']';
-    if (di < dstsize) dst[di] = '\0';
-    return di;
-}
-
-/* Build a JSON object from NUL-separated KEY=VALUE entries */
-static int json_env_object(char *dst, int dstsize, const char *raw, int rawlen)
-{
-    int di = 0, si = 0;
-    dst[di++] = '{';
-    while (si < rawlen && di + 16 < dstsize) {
-        const char *entry = raw + si;
-        int entlen = 0;
-        while (si + entlen < rawlen && raw[si + entlen] != '\0') entlen++;
-        if (entlen == 0 && si + 1 >= rawlen) break;
-        const char *eq = static_cast<const char *>(std::memchr(entry, '=', entlen));
-        int keylen, vallen;
-        const char *val;
-        if (eq) { keylen = static_cast<int>(eq - entry); val = eq + 1; vallen = entlen - keylen - 1; }
-        else { keylen = entlen; val = ""; vallen = 0; }
-        if (di > 1) dst[di++] = ',';
-        di += json_escape(dst + di, dstsize - di, entry, keylen);
-        dst[di++] = ':';
-        di += json_escape(dst + di, dstsize - di, val, vallen);
-        si += entlen + 1;
-    }
-    if (di < dstsize) dst[di++] = '}';
-    if (di < dstsize) dst[di] = '\0';
-    return di;
-}
-
-/* Open flags to JSON array */
-static int json_open_flags(int flags, char *buf, int buflen)
-{
-    int pos = 0, acc = flags & O_ACCMODE;
-    buf[pos++] = '[';
-    switch (acc) {
-    case O_RDONLY: pos += snprintf(buf + pos, buflen - pos, "\"O_RDONLY\""); break;
-    case O_WRONLY: pos += snprintf(buf + pos, buflen - pos, "\"O_WRONLY\""); break;
-    case O_RDWR:  pos += snprintf(buf + pos, buflen - pos, "\"O_RDWR\""); break;
-    default:      pos += snprintf(buf + pos, buflen - pos, "\"0x%x\"", acc); break;
-    }
-#define F(f) if ((flags & (f)) && pos < buflen - 2) \
-    pos += snprintf(buf + pos, buflen - pos, ",\"" #f "\"")
-    F(O_CREAT); F(O_EXCL); F(O_TRUNC); F(O_APPEND); F(O_NONBLOCK);
-    F(O_DIRECTORY); F(O_NOFOLLOW); F(O_CLOEXEC);
-#ifdef O_TMPFILE
-    F(O_TMPFILE);
-#endif
-#undef F
-    if (pos < buflen) buf[pos++] = ']';
-    if (pos < buflen) buf[pos] = '\0';
-    return pos;
-}
-
-/* ================================================================
- * JSON header helper
- * ================================================================ */
-
-static int json_header(char *buf, int buflen, const char *event,
-                       pid_t pid, pid_t tgid, pid_t ppid,
-                       struct timespec *ts)
-{
-    return snprintf(buf, buflen,
-        "{\"event\":\"%s\",\"ts\":%lld.%09ld,"
-        "\"pid\":%d,\"tgid\":%d,\"ppid\":%d,"
-        "\"nspid\":%d,\"nstgid\":%d",
-        event,
-        (long long)ts->tv_sec, ts->tv_nsec,
-        static_cast<int>(pid), static_cast<int>(tgid), static_cast<int>(ppid),
-        static_cast<int>(pid), static_cast<int>(tgid));
 }
 
 static int trace_output_write_plain(struct trace_output *out, const char *buf, size_t len)
@@ -320,33 +240,16 @@ static int trace_output_enqueue(const char *buf, size_t len)
     return 0;
 }
 
-static int trace_output_enqueue_line(const char *line, size_t len)
+/* ================================================================
+ * Timestamp
+ * ================================================================ */
+
+static uint64_t get_ts_ns(void)
 {
-    static const char exec_marker[] = "\"event\":\"EXEC\"";
-    static const char env_marker[] = ",\"env\":";
-
-    if (!line || len == 0)
-        return 0;
-    if (g_trace_exec_env)
-        return trace_output_enqueue(line, len);
-
-    std::string tmp(line, len);
-
-    if (tmp.find(exec_marker) == std::string::npos ||
-        tmp.find(env_marker) == std::string::npos)
-        return trace_output_enqueue(tmp.data(), tmp.size());
-
-    auto env_pos = tmp.find(",\"env\":");
-    auto auxv_pos = (env_pos != std::string::npos) ? tmp.find(",\"auxv\":", env_pos) : std::string::npos;
-    if (env_pos != std::string::npos && auxv_pos != std::string::npos) {
-        tmp.erase(env_pos, auxv_pos - env_pos);
-    }
-    return trace_output_enqueue(tmp.data(), tmp.size());
-}
-
-static void emit_line(const char *line, size_t len)
-{
-    (void)trace_output_enqueue_line(line, len);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL 
+         + static_cast<uint64_t>(ts.tv_nsec);
 }
 
 /* ================================================================
@@ -453,88 +356,6 @@ static ssize_t write_proc_mem(pid_t pid, unsigned long addr, const void *buf, si
     ssize_t n = pwrite(fd, buf, len, static_cast<off_t>(addr));
     close(fd);
     return n;
-}
-
-/* Read /proc/PID/auxv and extract interesting entries */
-static int format_auxv_json(pid_t pid, char *buf, int buflen)
-{
-    char path[256];
-    snprintf(path, sizeof(path), "/proc/%d/auxv", static_cast<int>(pid));
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-
-    /* auxv is an array of Elf{32,64}_auxv_t */
-    unsigned char raw[4096];
-    ssize_t n = read(fd, raw, sizeof(raw));
-    close(fd);
-    if (n <= 0) return 0;
-
-    int pos = 0, first = 1;
-    /* Parse as native auxv_t (Elf64_auxv_t on 64-bit, Elf32_auxv_t on 32-bit) */
-#if __SIZEOF_POINTER__ == 8
-    typedef Elf64_auxv_t my_auxv_t;
-#else
-    typedef Elf32_auxv_t my_auxv_t;
-#endif
-    my_auxv_t *av = reinterpret_cast<my_auxv_t *>(raw);
-    int count = static_cast<int>(n / sizeof(my_auxv_t));
-    for (int i = 0; i < count; i++) {
-        unsigned long type = av[i].a_type;
-        unsigned long val  = av[i].a_un.a_val;
-        if (type == AT_NULL) break;
-
-        switch (type) {
-        case AT_UID: case AT_EUID: case AT_GID: case AT_EGID: case AT_SECURE:
-#ifdef AT_CLKTCK
-        case AT_CLKTCK:
-#endif
-        {
-            const char *nm =
-                type == AT_UID   ? "AT_UID" :
-                type == AT_EUID  ? "AT_EUID" :
-                type == AT_GID   ? "AT_GID" :
-                type == AT_EGID  ? "AT_EGID" :
-                type == AT_SECURE? "AT_SECURE" : "AT_CLKTCK";
-            if (!first) buf[pos++] = ',';
-            pos += snprintf(buf + pos, buflen - pos, "\"%s\":%lu", nm, val);
-            first = 0;
-        } break;
-#ifdef AT_EXECFN
-        case AT_EXECFN: {
-            /* val is a pointer in the tracee's address space */
-            char u[256];
-            ssize_t r = read_proc_mem(pid, val, u, sizeof(u) - 1);
-            if (r > 0) {
-                u[r] = '\0';
-                size_t slen = std::strlen(u);
-                char e[520];
-                json_escape(e, sizeof(e), u, static_cast<int>(slen));
-                if (!first) buf[pos++] = ',';
-                pos += snprintf(buf + pos, buflen - pos, "\"AT_EXECFN\":%s", e);
-                first = 0;
-            }
-        } break;
-#endif
-#ifdef AT_PLATFORM
-        case AT_PLATFORM: {
-            char u[64];
-            ssize_t r = read_proc_mem(pid, val, u, sizeof(u) - 1);
-            if (r > 0) {
-                u[r] = '\0';
-                size_t slen = std::strlen(u);
-                char e[140];
-                json_escape(e, sizeof(e), u, static_cast<int>(slen));
-                if (!first) buf[pos++] = ',';
-                pos += snprintf(buf + pos, buflen - pos, "\"AT_PLATFORM\":%s", e);
-                first = 0;
-            }
-        } break;
-#endif
-        default: break;
-        }
-        if (pos >= buflen - 1) break;
-    }
-    return pos;
 }
 
 /* ================================================================
@@ -691,83 +512,47 @@ static std::optional<std::string> read_tracee_string(pid_t pid, unsigned long ad
 static void emit_cwd_event(pid_t pid)
 {
     pid_t tgid, ppid;
-    struct timespec ts;
     get_cached_ids(pid, &tgid, &ppid);
-    get_timestamp(&ts);
+    uint64_t ts_ns = get_ts_ns();
 
     std::string cwd = read_proc_cwd(pid);
     if (cwd.empty()) return;
 
-    char cwd_esc[PATH_MAX * 2];
-    json_escape(cwd_esc, sizeof(cwd_esc), cwd.c_str(), static_cast<int>(cwd.size()));
-
-    char line[PATH_MAX * 2 + 256];
-    int pos = json_header(line, sizeof(line), "CWD", pid, tgid, ppid, &ts);
-    pos += snprintf(line + pos, sizeof(line) - pos, ",\"path\":%s}\n", cwd_esc);
-    if (pos > 0) emit_line(line, pos);
+    emit_one(EV_CWD, ts_ns, pid, tgid, ppid, pid, tgid,
+             nullptr, 0, cwd.data(), cwd.size());
 }
 
 static void emit_exec_event(pid_t pid)
 {
     pid_t tgid, ppid;
-    struct timespec ts;
     get_cached_ids(pid, &tgid, &ppid);
-    get_timestamp(&ts);
+    uint64_t ts_ns = get_ts_ns();
 
-    /* exe */
+    /* 1. EV_EXEC — exe path */
     std::string exe = read_proc_exe(pid);
-    char exe_esc[PATH_MAX * 2];
-    if (!exe.empty()) json_escape(exe_esc, sizeof(exe_esc), exe.c_str(), static_cast<int>(exe.size()));
+    emit_one(EV_EXEC, ts_ns, pid, tgid, ppid, pid, tgid,
+             nullptr, 0, exe.data(), exe.size());
 
-    /* argv */
+    /* 2. EV_ARGV — raw NUL-separated argv bytes from /proc/<pid>/cmdline */
     std::string argv_raw = read_proc_file(pid, "cmdline", ARGV_MAX_READ);
-    std::string argv_j;
-    if (!argv_raw.empty()) {
-        argv_j.resize(argv_raw.size() * 6 + 64);
-        json_argv_array(argv_j.data(), static_cast<int>(argv_j.size()),
-                        argv_raw.data(), static_cast<int>(argv_raw.size()));
-    }
+    emit_one(EV_ARGV, ts_ns, pid, tgid, ppid, pid, tgid,
+             nullptr, 0, argv_raw.data(), argv_raw.size());
 
-    /* env */
-    std::string env_raw;
-    std::string env_j;
+    /* 3. EV_ENV — raw NUL-separated environ bytes (only if g_trace_exec_env) */
     if (g_trace_exec_env) {
-        env_raw = read_proc_file(pid, "environ", ENV_MAX_READ);
-        if (!env_raw.empty()) {
-            env_j.resize(env_raw.size() * 6 + 64);
-            json_env_object(env_j.data(), static_cast<int>(env_j.size()),
-                           env_raw.data(), static_cast<int>(env_raw.size()));
-        }
+        std::string env_raw = read_proc_file(pid, "environ", ENV_MAX_READ);
+        emit_one(EV_ENV, ts_ns, pid, tgid, ppid, pid, tgid,
+                 nullptr, 0, env_raw.data(), env_raw.size());
     }
 
-    /* auxv */
-    char auxv_buf[4096];
-    auxv_buf[0] = '\0';
-    format_auxv_json(pid, auxv_buf, sizeof(auxv_buf));
-
-    /* Build line */
-    std::string line(LINE_MAX_BUF, '\0');
-    int pos = json_header(line.data(), LINE_MAX_BUF, "EXEC", pid, tgid, ppid, &ts);
-    if (g_trace_exec_env) {
-        pos += snprintf(line.data() + pos, LINE_MAX_BUF - pos,
-            ",\"exe\":%s,\"argv\":%s,\"env\":%s,\"auxv\":{%s}}\n",
-            !exe.empty() ? exe_esc : "null",
-            !argv_j.empty() ? argv_j.c_str() : "[]",
-            !env_j.empty() ? env_j.c_str() : "{}",
-            auxv_buf[0] ? auxv_buf : "");
-    } else {
-        pos += snprintf(line.data() + pos, LINE_MAX_BUF - pos,
-            ",\"exe\":%s,\"argv\":%s,\"auxv\":{%s}}\n",
-            !exe.empty() ? exe_esc : "null",
-            !argv_j.empty() ? argv_j.c_str() : "[]",
-            auxv_buf[0] ? auxv_buf : "");
-    }
-    if (pos > 0 && pos < LINE_MAX_BUF)
-        emit_line(line.data(), pos);
+    /* 4. EV_AUXV — raw /proc/<pid>/auxv bytes */
+    std::string auxv_raw = read_proc_file(pid, "auxv", AUXV_MAX_READ);
+    emit_one(EV_AUXV, ts_ns, pid, tgid, ppid, pid, tgid,
+             nullptr, 0, auxv_raw.data(), auxv_raw.size());
 }
 
 static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
-                                        struct timespec *ts,
+                                        uint64_t ts_ns,
                                         int fd_num)
 {
     /* Read fd link and stat */
@@ -779,7 +564,7 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
 
     struct stat st;
     if (fstatat(AT_FDCWD, link_path, &st, 0) < 0) {
-        /* If we can't stat through /proc, use the link text */
+        /* If we can't stat through /proc, use zeros */
         std::memset(&st, 0, sizeof(st));
     }
 
@@ -798,29 +583,26 @@ static void emit_inherited_open_for_fd(pid_t pid, pid_t tgid, pid_t ppid,
         }
     }
 
-    char path_esc[PATH_MAX * 2];
-    json_escape(path_esc, sizeof(path_esc), link_target, static_cast<int>(std::strlen(link_target)));
+    /* EV_OPEN extras: {flags, fd, ino, dev_major, dev_minor, err, inherited} */
+    int64_t extras[7] = {
+        static_cast<int64_t>(flags),
+        static_cast<int64_t>(fd_num),
+        static_cast<int64_t>(st.st_ino),
+        static_cast<int64_t>(major(st.st_dev)),
+        static_cast<int64_t>(minor(st.st_dev)),
+        0,  /* err */
+        1   /* inherited */
+    };
 
-    char flags_j[256];
-    json_open_flags(flags, flags_j, sizeof(flags_j));
-
-    char line[PATH_MAX * 2 + 512];
-    int pos = json_header(line, sizeof(line), "OPEN", pid, tgid, ppid, ts);
-    pos += snprintf(line + pos, sizeof(line) - pos,
-        ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%d,\"ino\":%lu,\"dev\":\"%u:%u\","
-        "\"inherited\":true}\n",
-        path_esc, flags_j, flags, fd_num,
-        (unsigned long)st.st_ino,
-        major(st.st_dev), minor(st.st_dev));
-    if (pos > 0) emit_line(line, pos);
+    emit_one(EV_OPEN, ts_ns, pid, tgid, ppid, pid, tgid,
+             extras, 7, link_target, std::strlen(link_target));
 }
 
 static void emit_inherited_open_events(pid_t pid)
 {
     pid_t tgid, ppid;
-    struct timespec ts;
     get_cached_ids(pid, &tgid, &ppid);
-    get_timestamp(&ts);
+    uint64_t ts_ns = get_ts_ns();
 
     char dir_path[256];
     snprintf(dir_path, sizeof(dir_path), "/proc/%d/fd", static_cast<int>(pid));
@@ -831,7 +613,7 @@ static void emit_inherited_open_events(pid_t pid)
     while ((ent = readdir(d)) != nullptr) {
         if (ent->d_name[0] == '.') continue;
         int fd_num = std::atoi(ent->d_name);
-        emit_inherited_open_for_fd(pid, tgid, ppid, &ts, fd_num);
+        emit_inherited_open_for_fd(pid, tgid, ppid, ts_ns, fd_num);
     }
     closedir(d);
 }
@@ -840,16 +622,8 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
                             long fd_or_err)
 {
     pid_t tgid, ppid;
-    struct timespec ts;
     get_cached_ids(pid, &tgid, &ppid);
-    get_timestamp(&ts);
-
-    char path_esc[PATH_MAX * 2];
-    if (path)
-        json_escape(path_esc, sizeof(path_esc), path, static_cast<int>(std::strlen(path)));
-
-    char flags_j[256];
-    json_open_flags(flags, flags_j, sizeof(flags_j));
+    uint64_t ts_ns = get_ts_ns();
 
     /* If successful, get inode info from /proc/pid/fd/N */
     unsigned long ino_nr = 0;
@@ -865,49 +639,30 @@ static void emit_open_event(pid_t pid, const char *path, int flags,
         }
     }
 
-    char line[PATH_MAX * 2 + 512];
-    int pos = json_header(line, sizeof(line), "OPEN", pid, tgid, ppid, &ts);
+    /* EV_OPEN extras: {flags, fd, ino, dev_major, dev_minor, err, inherited} */
+    int64_t extras[7] = {
+        static_cast<int64_t>(flags),
+        fd_or_err >= 0 ? static_cast<int64_t>(fd_or_err) : -1,
+        static_cast<int64_t>(ino_nr),
+        static_cast<int64_t>(dev_major),
+        static_cast<int64_t>(dev_minor),
+        fd_or_err < 0 ? static_cast<int64_t>(fd_or_err) : 0,  /* err */
+        0  /* not inherited */
+    };
 
-    if (fd_or_err >= 0)
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%ld,\"ino\":%lu,\"dev\":\"%u:%u\"}\n",
-            path ? path_esc : "null", flags_j, flags,
-            fd_or_err, ino_nr, dev_major, dev_minor);
-    else
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"err\":%ld}\n",
-            path ? path_esc : "null", flags_j, flags, fd_or_err);
+    const char *path_to_emit = path ? path : "";
+    size_t path_len = path ? std::strlen(path) : 0;
 
-    if (pos > 0) emit_line(line, pos);
-}
-
-static void emit_unlink_event(pid_t pid, const char *path, long ret)
-{
-    pid_t tgid, ppid;
-    struct timespec ts;
-    get_cached_ids(pid, &tgid, &ppid);
-    get_timestamp(&ts);
-
-    char path_esc[PATH_MAX * 2];
-    if (path)
-        json_escape(path_esc, sizeof(path_esc), path, static_cast<int>(std::strlen(path)));
-
-    char line[PATH_MAX * 2 + 256];
-    int pos = json_header(line, sizeof(line), "UNLINK", pid, tgid, ppid, &ts);
-    pos += snprintf(line + pos, sizeof(line) - pos,
-        ",\"path\":%s,\"ret\":%ld}\n",
-        path ? path_esc : "null", ret);
-
-    if (pos > 0) emit_line(line, pos);
+    emit_one(EV_OPEN, ts_ns, pid, tgid, ppid, pid, tgid,
+             extras, 7, path_to_emit, path_len);
 }
 
 static void emit_write_event(pid_t pid, const char *stream,
                              unsigned long buf_addr, size_t count)
 {
     pid_t tgid, ppid;
-    struct timespec ts;
     get_cached_ids(pid, &tgid, &ppid);
-    get_timestamp(&ts);
+    uint64_t ts_ns = get_ts_ns();
 
     size_t to_read = count;
     if (to_read > WRITE_CAPTURE_MAX) to_read = WRITE_CAPTURE_MAX;
@@ -918,46 +673,44 @@ static void emit_write_event(pid_t pid, const char *stream,
     to_read = static_cast<size_t>(n);
     data.resize(to_read);
 
-    std::string escaped(to_read * 6 + 4, '\0');
-    json_escape(escaped.data(), static_cast<int>(escaped.size()), data.data(), static_cast<int>(to_read));
+    /* EV_STDOUT or EV_STDERR */
+    int32_t ev = (stream[0] == 'S' && stream[3] == 'E') ? EV_STDERR : EV_STDOUT;
 
-    std::string line(to_read * 6 + 512, '\0');
-    int pos = json_header(line.data(), static_cast<int>(line.size()), stream, pid, tgid, ppid, &ts);
-    pos += snprintf(line.data() + pos, line.size() - pos,
-        ",\"len\":%zu,\"data\":%s}\n", to_read, escaped.c_str());
-
-    if (pos > 0) emit_line(line.data(), pos);
+    emit_one(ev, ts_ns, pid, tgid, ppid, pid, tgid,
+             nullptr, 0, data.data(), to_read);
 }
 
 static void emit_exit_event(pid_t pid, int status)
 {
     pid_t tgid, ppid;
-    struct timespec ts;
     get_cached_ids(pid, &tgid, &ppid);
-    get_timestamp(&ts);
+    uint64_t ts_ns = get_ts_ns();
 
-    char line[384];
-    int pos = json_header(line, sizeof(line), "EXIT", pid, tgid, ppid, &ts);
-
+    /* EV_EXIT extras: {status_kind, code_or_sig, core_dumped, raw} */
+    int64_t extras[4];
     if (WIFEXITED(status)) {
-        int code = WEXITSTATUS(status);
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"exited\",\"code\":%d,\"raw\":%d}\n", code, status);
+        extras[0] = EV_EXIT_EXITED;
+        extras[1] = WEXITSTATUS(status);
+        extras[2] = 0;
+        extras[3] = status;
     } else if (WIFSIGNALED(status)) {
-        int sig = WTERMSIG(status);
-        int core = 0;
+        extras[0] = EV_EXIT_SIGNALED;
+        extras[1] = WTERMSIG(status);
 #ifdef WCOREDUMP
-        core = WCOREDUMP(status) ? 1 : 0;
+        extras[2] = WCOREDUMP(status) ? 1 : 0;
+#else
+        extras[2] = 0;
 #endif
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"signaled\",\"signal\":%d,\"core_dumped\":%s,\"raw\":%d}\n",
-            sig, core ? "true" : "false", status);
+        extras[3] = status;
     } else {
-        pos += snprintf(line + pos, sizeof(line) - pos,
-            ",\"status\":\"unknown\",\"raw\":%d}\n", status);
+        extras[0] = EV_EXIT_EXITED;
+        extras[1] = 0;
+        extras[2] = 0;
+        extras[3] = status;
     }
 
-    if (pos > 0) emit_line(line, pos);
+    emit_one(EV_EXIT, ts_ns, pid, tgid, ppid, pid, tgid,
+             extras, 4, nullptr, 0);
 }
 
 /* ================================================================
@@ -1564,24 +1317,6 @@ static int handle_syscall_exit(pid_t pid, proc_state *ps)
         return 0;
     }
 
-    /* ---- unlinkat / unlink ---- */
-#ifdef SYS_unlinkat
-    if (syscall_nr == SYS_unlinkat && ret_val == 0) {
-        /* a0 = dirfd, a1 = pathname, a2 = flags */
-        auto path = read_tracee_string(pid, ps->arg1, PATH_MAX);
-        emit_unlink_event(pid, path ? path->c_str() : nullptr, ret_val);
-        return 0;
-    }
-#endif
-#ifdef SYS_unlink
-    if (syscall_nr == SYS_unlink && ret_val == 0) {
-        /* a0 = pathname */
-        auto path = read_tracee_string(pid, ps->arg0, PATH_MAX);
-        emit_unlink_event(pid, path ? path->c_str() : nullptr, ret_val);
-        return 0;
-    }
-#endif
-
     /* ---- write ---- */
     if (syscall_nr == SYS_write) {
         unsigned int fd = static_cast<unsigned int>(ps->arg0);
@@ -1928,6 +1663,16 @@ static int open_trace_output(const char *outfile)
         g_out.ring.reset();
         return -1;
     }
+
+    /* Emit WIRE_VERSION as the first thing in the stream */
+    uint8_t version_buf[16];
+    uint8_t *vp = version_buf;
+    const uint8_t *vend = version_buf + sizeof(version_buf);
+    if (yeet_u64(&vp, vend, WIRE_VERSION) == 0) {
+        trace_output_enqueue(reinterpret_cast<const char*>(version_buf), 
+                           static_cast<size_t>(vp - version_buf));
+    }
+
     return 0;
 }
 
@@ -1979,57 +1724,22 @@ static int close_trace_output(const char *outfile)
 static int copy_fd_to_output(int fd)
 {
     char buf[8192];
-
-    if (g_trace_exec_env) {
-        for (;;) {
-            ssize_t n = read(fd, buf, sizeof(buf));
-            if (n == 0) return 0;
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                perror("read");
-                return -1;
-            }
-            if (trace_output_enqueue(buf, static_cast<size_t>(n)) != 0) {
-                std::fprintf(stderr, "uproctrace: trace output queue failed\n");
-                return -1;
-            }
-        }
-    }
-
-    std::string pending;
+    
+    /* Both module and sud backends now produce wire format, which is
+     * binary and has no line structure. Just pass through. */
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
-        if (n == 0) break;
+        if (n == 0) return 0;
         if (n < 0) {
             if (errno == EINTR) continue;
             perror("read");
             return -1;
         }
-
-        pending.append(buf, static_cast<size_t>(n));
-
-        size_t start = 0;
-        while (start < pending.size()) {
-            auto nl_pos = pending.find('\n', start);
-            if (nl_pos == std::string::npos) break;
-            size_t line_len = nl_pos - start + 1;
-            if (trace_output_enqueue_line(pending.data() + start, line_len) != 0) {
-                std::fprintf(stderr, "uproctrace: trace output queue failed\n");
-                return -1;
-            }
-            start += line_len;
-        }
-
-        if (start > 0) {
-            pending.erase(0, start);
+        if (trace_output_enqueue(buf, static_cast<size_t>(n)) != 0) {
+            std::fprintf(stderr, "uproctrace: trace output queue failed\n");
+            return -1;
         }
     }
-
-    if (!pending.empty() && trace_output_enqueue_line(pending.data(), pending.size()) != 0) {
-        std::fprintf(stderr, "uproctrace: trace output queue failed\n");
-        return -1;
-    }
-    return 0;
 }
 
 static int wait_for_child(pid_t child)

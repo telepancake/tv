@@ -44,7 +44,7 @@ install:
 ZSTD_DIR  := deps/zstd/lib
 ZSTD_LIB  := $(ZSTD_DIR)/libzstd.a
 
-CXXFLAGS := -std=c++23 -O2 -I$(ZSTD_DIR)
+CXXFLAGS := -std=c++23 -O2 -I. -I$(ZSTD_DIR)
 TV_LIBS := -lm -pthread $(ZSTD_LIB)
 SUD_CFLAGS  := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer -I.
 SUD_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
