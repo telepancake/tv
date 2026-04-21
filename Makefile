@@ -6,7 +6,7 @@ SIGN    := $(KDIR)/scripts/sign-file
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv fv sudtrace ctf-dump
+all: tv fv sudtrace yeetdump
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 # Generate a MOK keypair (one-time).  After this, run:
@@ -84,17 +84,17 @@ sud32: $(SUD_SRCS) sudtrace.lds
 sudtrace: sud/sudtrace.c sud32 sud64
 	cc -O2 -static -o sudtrace sud/sudtrace.c
 
-ctf-dump: tools/ctf-dump/ctf-dump.c ctf/encode.h
-	cc -std=c99 -O2 -Wall -Wextra -I. -o ctf-dump tools/ctf-dump/ctf-dump.c
+yeetdump: tools/yeetdump/yeetdump.c wire/wire.h
+	cc -std=c99 -O2 -Wall -Wextra -I. -o yeetdump tools/yeetdump/yeetdump.c
 
-.PHONY: ctf-test
-ctf-test: ctf-dump
-	./ctf-dump --selftest
+.PHONY: wire-test
+wire-test: yeetdump
+	./yeetdump --selftest
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv
 	./tv --test
 
 clean-bins:
-	rm -f tv fv gen_sql_h ctf-dump
+	rm -f tv fv gen_sql_h yeetdump wire2parquet
 	-$(MAKE) -C $(ZSTD_DIR) clean
