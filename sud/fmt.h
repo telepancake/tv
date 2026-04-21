@@ -110,6 +110,20 @@ static inline char *fmt_size(char *buf, size_t val)
     return fmt_ulong(buf, (unsigned long)val);
 }
 
+/* Format an unsigned long as lowercase hex with exactly 'digits' hex digits
+ * (pad with leading zeros).  'digits' must be <= 16.  Returns pointer past
+ * last char written.  No "0x" prefix is emitted. */
+static inline char *fmt_hex_ul(char *buf, unsigned long val, int digits)
+{
+    static const char hextab[] = "0123456789abcdef";
+    for (int i = digits - 1; i >= 0; i--) {
+        buf[i] = hextab[val & 0xf];
+        val >>= 4;
+    }
+    buf[digits] = '\0';
+    return buf + digits;
+}
+
 /* Copy a string into buf.  Returns pointer past last char written. */
 static inline char *fmt_str(char *buf, const char *s)
 {

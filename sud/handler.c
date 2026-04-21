@@ -152,6 +152,90 @@ static int is_proc_self_exe(const char *rpath)
 }
 
 /* ================================================================
+ * sigsys_diag_dump — dump ucontext register state to stderr.
+ *
+ * Enabled at compile time with -DSUDTRACE_SIGSYS_DIAG.  Prints the
+ * saved signal frame (from uc) at handler ENTRY and EXIT so that
+ * changes to the frame inside the handler can be detected.  Also
+ * prints the live stack pointer at the moment of the call so that
+ * stack-overlap / alt-stack overflow can be detected.
+ *
+ * Build with:  make SIGSYS_DIAG=1 sud32   (or sud64)
+ * ================================================================ */
+#ifdef SUDTRACE_SIGSYS_DIAG
+#include "sud/fmt.h"
+static void sigsys_diag_dump(const char *tag, ucontext_t *uc,
+                              unsigned long sp_now)
+{
+    char msg[640];
+    char *p = msg;
+
+    /* Header */
+    p = fmt_str(p, "\nsudtrace: SIGSYS_DIAG ");
+    p = fmt_str(p, tag);
+    p = fmt_ch(p, '\n');
+
+    /* uc pointer and live stack pointer */
+    p = fmt_str(p, "  uc=0x");
+#if defined(__x86_64__)
+    p = fmt_hex_ul(p, (unsigned long)uc, 16);
+    p = fmt_str(p, "  sp_now=0x");
+    p = fmt_hex_ul(p, sp_now, 16);
+#else
+    p = fmt_hex_ul(p, (unsigned long)uc, 8);
+    p = fmt_str(p, "  sp_now=0x");
+    p = fmt_hex_ul(p, sp_now, 8);
+#endif
+    p = fmt_ch(p, '\n');
+
+    /* Saved instruction and stack pointers, and syscall register */
+#if defined(__x86_64__)
+    p = fmt_str(p, "  RIP=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_RIP], 16);
+    p = fmt_str(p, "  RSP=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_RSP], 16);
+    p = fmt_str(p, "  RAX=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_RAX], 16);
+    p = fmt_ch(p, '\n');
+#else
+    p = fmt_str(p, "  EIP=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_EIP], 8);
+    p = fmt_str(p, "  ESP=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_ESP], 8);
+    p = fmt_str(p, "  EAX=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_EAX], 8);
+    p = fmt_ch(p, '\n');
+    /* Segment registers — GS/FS and CS/SS; CS=gregs[15], SS=gregs[18].
+     * SI_KERNEL on i386 is commonly caused by bad segment state at iret. */
+    p = fmt_str(p, "  GS=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_GS], 8);
+    p = fmt_str(p, "  FS=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[REG_FS], 8);
+    p = fmt_str(p, "  CS=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[15], 8);
+    p = fmt_str(p, "  SS=0x");
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_mcontext.gregs[18], 8);
+    p = fmt_ch(p, '\n');
+#endif
+
+    /* uc_stack — shows which stack the kernel used for signal delivery */
+    p = fmt_str(p, "  uc_stack.ss_sp=0x");
+#if defined(__x86_64__)
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_stack.ss_sp, 16);
+#else
+    p = fmt_hex_ul(p, (unsigned long)uc->uc_stack.ss_sp, 8);
+#endif
+    p = fmt_str(p, " ss_flags=");
+    p = fmt_int(p, uc->uc_stack.ss_flags);
+    p = fmt_str(p, " ss_size=");
+    p = fmt_ulong(p, (unsigned long)uc->uc_stack.ss_size);
+    p = fmt_ch(p, '\n');
+
+    raw_write(2, msg, (size_t)(p - msg));
+}
+#endif /* SUDTRACE_SIGSYS_DIAG */
+
+/* ================================================================
  * SIGSYS handler — the core of SUD tracing.
  *
  * When a process with SUD enabled makes a syscall and the instruction
@@ -169,6 +253,18 @@ void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
 {
     ucontext_t *uc = (ucontext_t *)uctx_raw;
     (void)sig;
+
+#ifdef SUDTRACE_SIGSYS_DIAG
+    {
+        unsigned long sp_now;
+#if defined(__x86_64__)
+        __asm__ volatile("mov %%rsp, %0" : "=r"(sp_now));
+#else
+        __asm__ volatile("mov %%esp, %0" : "=r"(sp_now));
+#endif
+        sigsys_diag_dump("ENTRY", uc, sp_now);
+    }
+#endif
 
     /* Distinguish SUD-generated SIGSYS from seccomp-generated SIGSYS.
      *
@@ -691,5 +787,16 @@ void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     }
 #endif
 
+#ifdef SUDTRACE_SIGSYS_DIAG
+    {
+        unsigned long sp_now;
+#if defined(__x86_64__)
+        __asm__ volatile("mov %%rsp, %0" : "=r"(sp_now));
+#else
+        __asm__ volatile("mov %%esp, %0" : "=r"(sp_now));
+#endif
+        sigsys_diag_dump("EXIT ", uc, sp_now);
+    }
+#endif
     UC_SET_RET(uc, ret);
 }
