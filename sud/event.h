@@ -1,11 +1,10 @@
 /*
- * sud/event.h — JSONL event formatting and emission for sudtrace.
+ * sud/event.h — Wire-format event emission for sudtrace.
  *
- * Declares the globals, constants, and functions used to emit
- * structured JSONL trace events (EXEC, OPEN, CWD, STDOUT, STDERR,
- * EXIT, etc.) from both the SIGSYS signal handler and the startup
- * path.  All emit functions are async-signal-safe: they use only
- * raw syscalls, static buffers, and a spinlock for serialisation.
+ * Emits events in the binary wire format defined by wire/wire.h.
+ * All emit_* functions are async-signal-safe: raw syscalls only,
+ * static buffers, cross-process spinlock on a shared mmap page
+ * (so `ev_state` deltas stay coherent across traced children).
  */
 
 #ifndef SUD_EVENT_H
@@ -19,10 +18,13 @@
 #define WRITE_CAPTURE_MAX    4096
 #define ARGV_MAX_READ        32768
 #define ENV_MAX_READ         65536
-#define LINE_MAX_BUF         (PATH_MAX * 8 + 262144 + 1024)
 
-/* Reserve a high FD for our output so children are unlikely to clobber it */
+/* Reserve two high FDs so children are unlikely to clobber them.
+ *   SUD_OUTPUT_FD : the wire output file.
+ *   SUD_STATE_FD  : a MAP_SHARED anonymous page holding the
+ *                   cross-process emit spinlock + the shared ev_state. */
 #define SUD_OUTPUT_FD        1023
+#define SUD_STATE_FD         1022
 #define SUDTRACE_OUTFILE_ENV "SUDTRACE_OUTFILE"
 
 /* ================================================================
@@ -39,16 +41,14 @@ extern char      *g_path_env;
 extern int        g_trace_exec_env;
 
 /* ================================================================
- * JSON helpers
+ * Wire setup — must be called once per process after g_out_fd is set.
+ *
+ * sud_wire_init():
+ *   Map SUD_STATE_FD as MAP_SHARED so the encoder's ev_state is
+ *   shared across every traced child. Falls back to a process-local
+ *   state if the FD isn't set up (stand-alone wrapper runs).
  * ================================================================ */
-int json_escape(char *dst, int dstsize, const char *src, int srclen);
-int json_argv_array(char *dst, int dstsize, const char *raw, int rawlen);
-int json_argv_array_vec(char *dst, int dstsize, char *const *argv, int argc);
-int json_env_object(char *dst, int dstsize, const char *raw, int rawlen);
-int json_open_flags(int flags, char *buf, int buflen);
-int json_header(char *buf, int buflen, const char *event,
-                pid_t pid, pid_t tgid, pid_t ppid,
-                struct timespec *ts);
+void sud_wire_init(void);
 
 /* ================================================================
  * Proc helpers
@@ -60,7 +60,7 @@ pid_t   get_ppid(pid_t pid);
 pid_t   get_tgid(pid_t pid);
 
 /* ================================================================
- * Event emission
+ * Event emission (public API — callers unchanged from the JSONL era)
  * ================================================================ */
 void emit_cwd_event(pid_t pid);
 void emit_exec_event(pid_t pid, const char *fallback_exe,
