@@ -44,8 +44,15 @@ install:
 ZSTD_DIR  := deps/zstd/lib
 ZSTD_LIB  := $(ZSTD_DIR)/libzstd.a
 
-CXXFLAGS := -std=c++23 -O2 -I. -I$(ZSTD_DIR)
-TV_LIBS := -lm -pthread $(ZSTD_LIB)
+DUCKDB_DIR := deps/duckdb
+DUCKDB_AMAL_DIR := $(DUCKDB_DIR)/src/amalgamation
+DUCKDB_HPP := $(DUCKDB_AMAL_DIR)/duckdb.hpp
+DUCKDB_CPP := $(DUCKDB_AMAL_DIR)/duckdb.cpp
+DUCKDB_INC := $(DUCKDB_DIR)/src/include
+DUCKDB_OBJ := build/duckdb.o
+
+CXXFLAGS := -std=c++23 -O2 -I. -I$(ZSTD_DIR) -I$(DUCKDB_INC)
+TV_LIBS := -lm -pthread -ldl $(ZSTD_LIB)
 SUD_CFLAGS  := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer -I.
 SUD_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
 
@@ -63,8 +70,21 @@ SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 $(ZSTD_LIB):
 	$(MAKE) -C $(ZSTD_DIR) libzstd.a
 
-tv: main.cpp engine.cpp engine.h intern.cpp intern.h json.cpp json.h uproctrace.cpp tests.cpp wire_in.cpp wire_in.h wire/wire.h $(ZSTD_LIB)
-	g++ $(CXXFLAGS) -o tv main.cpp engine.cpp intern.cpp json.cpp uproctrace.cpp tests.cpp wire_in.cpp -static $(TV_LIBS)
+# DuckDB is vendored as a single ~25 MB amalgamation file. The amalgamation
+# script is run on demand. The resulting object is ~60 MB and takes ~7 min /
+# ~14 GB RAM to build; subsequent tv recompiles only re-link.
+$(DUCKDB_CPP): | $(DUCKDB_DIR)/scripts/amalgamation.py
+	cd $(DUCKDB_DIR) && python3 scripts/amalgamation.py
+
+$(DUCKDB_OBJ): $(DUCKDB_CPP)
+	@mkdir -p build
+	g++ -std=c++17 -O2 -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
+
+TV_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp wire_in.cpp tv_db.cpp data_source.cpp
+TV_HDRS := engine.h wire_in.h tv_db.h data_source.h wire/wire.h $(DUCKDB_HPP)
+
+tv: $(TV_SRCS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
+	g++ $(CXXFLAGS) -o tv $(TV_SRCS) $(DUCKDB_OBJ) $(TV_LIBS)
 
 fv: fv.cpp engine.cpp engine.h
 	g++ $(CXXFLAGS) -o fv fv.cpp engine.cpp
@@ -90,5 +110,5 @@ test: tv
 	./tv --test
 
 clean-bins:
-	rm -f tv fv yeetdump wire2parquet
+	rm -f tv fv yeetdump
 	-$(MAKE) -C $(ZSTD_DIR) clean

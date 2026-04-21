@@ -4,6 +4,8 @@ fv
 proctrace.ko
 tv_sql.h
 gen_sql_h
+build/
+deps/duckdb/src/amalgamation/
 # kernel module build artifacts
 *.o
 *.mod
