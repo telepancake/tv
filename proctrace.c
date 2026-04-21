@@ -1,10 +1,10 @@
 /*
  * proctrace.c — Log exec/exit/open/cwd/output for tagged process subtrees.
  *
- * v12
+ * v13
  * ===
  * • Output is read from the /proc/proctrace/new fd — no log file.
- *   open() creates session + tags opener.  read() drains JSONL.
+ *   open() creates session + tags opener.  read() drains binary wire format.
  *   close() destroys session.
  *
  * • Per-session kernel ring buffer with backpressure:
@@ -14,7 +14,7 @@
  *   events, no OOM, no disk I/O.
  *
  * • TGID-based tagging (threads bundled).
- * • Paths as JSON strings.
+ * • Binary wire format (see wire/wire.h).
  * • OPEN logs inode + device of the result.
  * • CWD event emitted on exec and chdir (replaces cwd field in EXEC).
  * • Compat 4.15–6.x.
@@ -54,6 +54,8 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/circ_buf.h>
+
+#include "wire/wire.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("proctrace");
@@ -122,79 +124,10 @@ MODULE_DESCRIPTION("Log exec/exit/open/cwd/output for tagged process subtrees");
 #define UNLINK_SYMBOL_FALLBACK  "vfs_unlink"
 
 /* ===============================================================
- * JSON string escaping (RFC 8259)
- * =============================================================== */
-
-static int json_escape(char *dst, int dstsize, const char *src, int srclen)
-{
-    int si, di = 0;
-    if (dstsize < 3) { if (dstsize > 0) dst[0]='\0'; return 0; }
-    dst[di++] = '"';
-    for (si = 0; si < srclen && di + 7 < dstsize; si++) {
-        unsigned char c = (unsigned char)src[si];
-        switch (c) {
-        case '"':  dst[di++]='\\'; dst[di++]='"'; break;
-        case '\\': dst[di++]='\\'; dst[di++]='\\'; break;
-        case '\n': dst[di++]='\\'; dst[di++]='n'; break;
-        case '\r': dst[di++]='\\'; dst[di++]='r'; break;
-        case '\t': dst[di++]='\\'; dst[di++]='t'; break;
-        case '\b': dst[di++]='\\'; dst[di++]='b'; break;
-        case '\f': dst[di++]='\\'; dst[di++]='f'; break;
-        default:
-            if (c < 0x20) di += snprintf(dst+di, dstsize-di, "\\u%04x", c);
-            else dst[di++] = c;
-        }
-    }
-    dst[di++] = '"'; dst[di] = '\0';
-    return di;
-}
-
-static int json_argv_array(char *dst, int dstsize, const char *raw, int rawlen)
-{
-    int di = 0, si = 0;
-    dst[di++] = '[';
-    while (si < rawlen && di + 8 < dstsize) {
-        const char *arg = raw + si; int arglen = 0;
-        while (si+arglen < rawlen && raw[si+arglen] != '\0') arglen++;
-        if (arglen == 0 && si+1 >= rawlen) break;
-        if (di > 1) dst[di++] = ',';
-        di += json_escape(dst+di, dstsize-di, arg, arglen);
-        si += arglen + 1;
-    }
-    if (di < dstsize) dst[di++] = ']';
-    if (di < dstsize) dst[di] = '\0';
-    return di;
-}
-
-static int json_env_object(char *dst, int dstsize, const char *raw, int rawlen)
-{
-    int di = 0, si = 0;
-    dst[di++] = '{';
-    while (si < rawlen && di + 16 < dstsize) {
-        const char *entry = raw + si; int entlen = 0;
-        const char *eq; int keylen, vallen; const char *val;
-        while (si+entlen < rawlen && raw[si+entlen] != '\0') entlen++;
-        if (entlen == 0 && si+1 >= rawlen) break;
-        eq = memchr(entry, '=', entlen);
-        if (eq) { keylen=eq-entry; val=eq+1; vallen=entlen-keylen-1; }
-        else { keylen=entlen; val=""; vallen=0; }
-        if (di > 1) dst[di++] = ',';
-        di += json_escape(dst+di, dstsize-di, entry, keylen);
-        dst[di++] = ':';
-        di += json_escape(dst+di, dstsize-di, val, vallen);
-        si += entlen + 1;
-    }
-    if (di < dstsize) dst[di++] = '}';
-    if (di < dstsize) dst[di] = '\0';
-    return di;
-}
-
-/* ===============================================================
  * Constants
  * =============================================================== */
 
 #define TAG_HASH_BITS       10
-#define LOG_LINE_MAX        (PATH_MAX * 8 + 262144 + 1024)
 #define ARGV_MAX_READ       32768
 #define ENV_MAX_READ        65536
 #define WRITE_CAPTURE_MAX   4096
@@ -233,6 +166,8 @@ struct ring_buffer {
     wait_queue_head_t   wq_reader;  /* reader waits here when empty */
     wait_queue_head_t   wq_writer;  /* writer waits here when full */
     bool                closed;     /* set on session teardown */
+    ev_state            st;         /* delta encoder state */
+    spinlock_t          emit_lock;  /* serialize ev_state + queue ordering */
 };
 
 static int ring_init(struct ring_buffer *rb, size_t size)
@@ -243,6 +178,8 @@ static int ring_init(struct ring_buffer *rb, size_t size)
     spin_lock_init(&rb->lock);
     init_waitqueue_head(&rb->wq_reader);
     init_waitqueue_head(&rb->wq_writer);
+    memset(&rb->st, 0, sizeof(rb->st));
+    spin_lock_init(&rb->emit_lock);
     return 0;
 }
 
@@ -368,8 +305,9 @@ struct trace_session {
     spinlock_t          tag_lock;
     atomic_t            tag_count;
 
-    atomic_t            pending_work;
-    wait_queue_head_t   wq_drain;
+    atomic_t                  pending_work;
+    wait_queue_head_t         wq_drain;
+    struct workqueue_struct  *log_wq;   /* per-session ordered workqueue */
 
     struct list_head    list;
 };
@@ -381,15 +319,19 @@ static atomic_t next_session_id = ATOMIC_INIT(1);
 static bool have_ksys_write;
 
 /* ===============================================================
- * Deferred writes via workqueue
+ * Deferred writes via per-session ordered workqueue
  * ===============================================================
  *
- * Probe handlers capture data into a heap buffer and queue work.
- * The work item writes into the ring buffer, blocking if full.
- * This provides backpressure to traced processes.
+ * Probe handlers (atomic-ish context) build the wire bytes for an
+ * event under the session's emit_lock, then queue a log_work item
+ * onto the per-session ORDERED workqueue. The work item runs in
+ * sleepable context and calls ring_write, which blocks on a full
+ * ring providing backpressure to traced processes.
+ *
+ * The ordered workqueue (`alloc_ordered_workqueue`) guarantees FIFO
+ * execution per session, preserving the byte order of delta-encoded
+ * events. Order across sessions is independent.
  */
-
-static struct workqueue_struct *log_wq;
 
 struct log_work {
     struct work_struct      work;
@@ -413,18 +355,74 @@ static void log_work_fn(struct work_struct *work)
     kfree(lw);
 }
 
-static void session_log_queue(struct trace_session *s,
-                              const char *buf, size_t len)
+/* Allocate an empty log_work with `cap` bytes of inline payload.
+ * Caller fills lw->data and sets lw->len, then calls
+ * session_log_submit() to enqueue. GFP_ATOMIC because callers run
+ * with the session's emit_lock held (irqs off). */
+static struct log_work *log_work_alloc(struct trace_session *s, size_t cap)
 {
     struct log_work *lw;
-    if (s->dead) return;
-    lw = kmalloc(sizeof(*lw) + len, GFP_ATOMIC);
-    if (!lw) return;
+    if (s->dead) return NULL;
+    lw = kmalloc(sizeof(*lw) + cap, GFP_ATOMIC);
+    if (!lw) return NULL;
     INIT_WORK(&lw->work, log_work_fn);
-    lw->session = s; lw->session_id = s->id; lw->len = len;
-    memcpy(lw->data, buf, len);
+    lw->session = s;
+    lw->session_id = s->id;
+    lw->len = 0;
+    return lw;
+}
+
+/* Enqueue a previously-built log_work onto the session's ordered
+ * workqueue. Must be called with the session's emit_lock held so
+ * that successive events for the same session enter the workqueue
+ * in delta-encoded byte order. */
+static void session_log_submit(struct trace_session *s, struct log_work *lw)
+{
     atomic_inc(&s->pending_work);
-    queue_work(log_wq, &lw->work);
+    queue_work(s->log_wq, &lw->work);
+}
+
+/* ===============================================================
+ * Wire event emission helper.
+ *
+ * Builds one wire event atom into a log_work and submits it to the
+ * session's per-session ordered workqueue. Must be called with the
+ * sessions list RCU-read-locked. Safe in atomic context (irqs are
+ * disabled by the spinlock). Drops the event silently on allocation
+ * failure or if the session is dying.
+ * =============================================================== */
+static void emit_one(struct trace_session *s,
+                     int32_t type, uint64_t ts_ns,
+                     pid_t pid, pid_t tgid, pid_t ppid,
+                     pid_t nspid, pid_t nstgid,
+                     const int64_t *extras, unsigned n_extras,
+                     const void *blob, size_t blen)
+{
+    struct log_work *lw;
+    unsigned long flags;
+    uint8_t hdr[EV_HEADER_MAX];
+    uint8_t *p;
+    const uint8_t *end;
+    int hlen;
+
+    lw = log_work_alloc(s, EV_HEADER_MAX + YEET_PREFIX_MAX + blen);
+    if (!lw) return;
+
+    p = (uint8_t *)lw->data;
+    end = p + EV_HEADER_MAX + YEET_PREFIX_MAX + blen;
+
+    spin_lock_irqsave(&s->ring.emit_lock, flags);
+    hlen = ev_build_header(&s->ring.st, hdr, type, ts_ns,
+                           pid, tgid, ppid, nspid, nstgid,
+                           extras, n_extras);
+    if (hlen > 0 &&
+        yeet_pair(&p, end, hdr, hlen, blob, blen) == 0) {
+        lw->len = (size_t)(p - (uint8_t *)lw->data);
+        session_log_submit(s, lw);
+        lw = NULL;
+    }
+    spin_unlock_irqrestore(&s->ring.emit_lock, flags);
+    if (lw) kfree(lw);
 }
 
 /* ===============================================================
@@ -511,11 +509,33 @@ static struct inode *get_fd_inode(unsigned int fd)
 static struct trace_session *session_create(pid_t root_tgid)
 {
     struct trace_session *s; int ret;
+    uint8_t version_atom[16];
+    uint8_t *p;
+    const uint8_t *end;
+    
     s = kzalloc(sizeof(*s), GFP_KERNEL);
     if (!s) return ERR_PTR(-ENOMEM);
 
     ret = ring_init(&s->ring, RING_BUF_SIZE);
     if (ret) { kfree(s); return ERR_PTR(ret); }
+
+    /* Per-session ordered workqueue: serialises log_work execution
+     * so that the byte order in the ring matches the order in which
+     * emit_* built (and delta-encoded) the events. */
+    s->log_wq = alloc_ordered_workqueue("proctrace-%u",
+                                        WQ_MEM_RECLAIM,
+                                        atomic_read(&next_session_id));
+    if (!s->log_wq) {
+        ring_destroy(&s->ring);
+        kfree(s);
+        return ERR_PTR(-ENOMEM);
+    }
+
+    /* Write WIRE_VERSION as first atom in the stream. */
+    p = version_atom;
+    end = version_atom + sizeof(version_atom);
+    if (yeet_u64(&p, end, WIRE_VERSION) == 0)
+        ring_write(&s->ring, (char*)version_atom, p - version_atom);
 
     s->id = atomic_fetch_inc(&next_session_id);
     s->root_tgid = root_tgid; s->dead = false;
@@ -566,6 +586,7 @@ static void session_destroy(struct trace_session *s)
      */
     wait_event(s->wq_drain, atomic_read(&s->pending_work) == 0);
 
+    if (s->log_wq) destroy_workqueue(s->log_wq);
     session_free_all_tags(s);
     ring_destroy(&s->ring);
     kfree(s);
@@ -638,77 +659,6 @@ static pid_t get_task_ns_tgid(struct task_struct *t)
 { pid_t p; rcu_read_lock(); p=task_tgid_nr_ns(t,task_active_pid_ns(t)); rcu_read_unlock(); return p; }
 
 /* ===============================================================
- * Auxv → JSON object innards
- * =============================================================== */
-
-static int format_auxv_json(struct task_struct *task, char *buf, int buflen)
-{
-    struct mm_struct *mm; int pos=0, i, first=1;
-    mm = get_task_mm(task); if (!mm) return 0;
-    for (i=0; i<AT_VECTOR_SIZE*2; i+=2) {
-        unsigned long type=mm->saved_auxv[i], val=mm->saved_auxv[i+1];
-        if (type==AT_NULL) break;
-        switch(type) {
-        case AT_UID: case AT_EUID: case AT_GID: case AT_EGID: case AT_SECURE:
-#ifdef AT_CLKTCK
-        case AT_CLKTCK:
-#endif
-        {
-            const char *n= type==AT_UID?"AT_UID":type==AT_EUID?"AT_EUID":
-                type==AT_GID?"AT_GID":type==AT_EGID?"AT_EGID":
-                type==AT_SECURE?"AT_SECURE":"AT_CLKTCK";
-            if(!first) buf[pos++]=',';
-            pos+=snprintf(buf+pos,buflen-pos,"\"%s\":%lu",n,val);
-            first=0;
-        } break;
-#ifdef AT_EXECFN
-        case AT_EXECFN: { char u[256]; char e[520];
-            long n=strncpy_from_user(u,(const char __user*)val,sizeof(u));
-            if(n>0){json_escape(e,sizeof(e),u,n); if(!first)buf[pos++]=',';
-                pos+=snprintf(buf+pos,buflen-pos,"\"AT_EXECFN\":%s",e); first=0;}
-        } break;
-#endif
-#ifdef AT_PLATFORM
-        case AT_PLATFORM: { char u[64]; char e[140];
-            long n=strncpy_from_user(u,(const char __user*)val,sizeof(u));
-            if(n>0){json_escape(e,sizeof(e),u,n); if(!first)buf[pos++]=',';
-                pos+=snprintf(buf+pos,buflen-pos,"\"AT_PLATFORM\":%s",e); first=0;}
-        } break;
-#endif
-        default: break;
-        }
-        if(pos>=buflen-1) break;
-    }
-    mmput(mm); return pos;
-}
-
-/* ===============================================================
- * Open flags → JSON array
- * =============================================================== */
-
-static int json_open_flags(int flags, char *buf, int buflen)
-{
-    int pos=0, acc=flags&O_ACCMODE;
-    buf[pos++]='[';
-    switch(acc){
-    case O_RDONLY:pos+=snprintf(buf+pos,buflen-pos,"\"O_RDONLY\"");break;
-    case O_WRONLY:pos+=snprintf(buf+pos,buflen-pos,"\"O_WRONLY\"");break;
-    case O_RDWR: pos+=snprintf(buf+pos,buflen-pos,"\"O_RDWR\"");break;
-    default:     pos+=snprintf(buf+pos,buflen-pos,"\"0x%x\"",acc);break;
-    }
-#define F(f) if((flags&(f))&&pos<buflen-2) pos+=snprintf(buf+pos,buflen-pos,",\""#f"\"")
-    F(O_CREAT);F(O_EXCL);F(O_TRUNC);F(O_APPEND);F(O_NONBLOCK);
-    F(O_DIRECTORY);F(O_NOFOLLOW);F(O_CLOEXEC);
-#ifdef O_TMPFILE
-    F(O_TMPFILE);
-#endif
-#undef F
-    if(pos<buflen) buf[pos++]=']';
-    if(pos<buflen) buf[pos]='\0';
-    return pos;
-}
-
-/* ===============================================================
  * Fast tgid check
  * =============================================================== */
 
@@ -723,20 +673,8 @@ static bool tgid_in_any_session(pid_t tgid)
 }
 
 /* ===============================================================
- * JSON header helper
+ * Emit CWD event
  * =============================================================== */
-
-static int json_header(char *buf, int buflen, const char *event,
-                       struct task_struct *task, struct timespec64 *ts)
-{
-    return snprintf(buf, buflen,
-        "{\"event\":\"%s\",\"ts\":%lld.%09ld,"
-        "\"pid\":%d,\"tgid\":%d,\"ppid\":%d,"
-        "\"nspid\":%d,\"nstgid\":%d",
-        event, (long long)ts->tv_sec, ts->tv_nsec,
-        task->pid, task->tgid, task_ppid_nr(task),
-        get_task_ns_pid(task), get_task_ns_tgid(task));
-}
 
 /* ===============================================================
  * Emit CWD event
@@ -747,34 +685,27 @@ static void emit_cwd_event(struct task_struct *task)
     struct trace_session *s;
     pid_t tgid = task->tgid;
     struct timespec64 ts;
-    char *cwd_buf, *cwd, *cwd_esc, *line;
-    int pos;
+    char *cwd_buf, *cwd;
+    uint64_t ts_ns;
 
     cwd_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
     if (!cwd_buf) return;
     cwd = get_task_cwd(task, cwd_buf, PATH_MAX);
     if (!cwd) { kfree(cwd_buf); return; }
 
-    cwd_esc = kmalloc(PATH_MAX*2, GFP_ATOMIC);
-    if (!cwd_esc) { kfree(cwd_buf); return; }
-    json_escape(cwd_esc, PATH_MAX*2, cwd, strlen(cwd));
-
-    line = kmalloc(PATH_MAX*2+256, GFP_ATOMIC);
-    if (!line) { kfree(cwd_esc); kfree(cwd_buf); return; }
-
     ktime_get_real_ts64(&ts);
-    pos = json_header(line, PATH_MAX*2+256, "CWD", task, &ts);
-    pos += snprintf(line+pos, PATH_MAX*2+256-pos, ",\"path\":%s}\n", cwd_esc);
+    ts_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 
-    if (pos > 0) {
-        rcu_read_lock();
-        list_for_each_entry_rcu(s, &sessions, list) {
-            if (!s->dead && session_is_tagged(s, tgid))
-                session_log_queue(s, line, (size_t)pos);
-        }
-        rcu_read_unlock();
+    rcu_read_lock();
+    list_for_each_entry_rcu(s, &sessions, list) {
+        if (!s->dead && session_is_tagged(s, tgid))
+            emit_one(s, EV_CWD, ts_ns,
+                     task->pid, task->tgid, task_ppid_nr(task),
+                     get_task_ns_pid(task), get_task_ns_tgid(task),
+                     NULL, 0, cwd, strlen(cwd));
     }
-    kfree(line); kfree(cwd_esc); kfree(cwd_buf);
+    rcu_read_unlock();
+    kfree(cwd_buf);
 }
 
 /* ===============================================================
@@ -787,33 +718,34 @@ static void emit_write_log(struct task_struct *task, const char *stream,
     struct trace_session *s;
     pid_t tgid = task->tgid;
     struct timespec64 ts;
-    char *ubuf=NULL, *escaped=NULL, *line=NULL;
-    size_t to_read; unsigned long left; int pos;
+    char *ubuf = NULL;
+    size_t to_read;
+    unsigned long left;
+    uint64_t ts_ns;
+    int32_t ev;
 
     ktime_get_real_ts64(&ts);
+    ts_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+
     to_read = count; if (to_read > WRITE_CAPTURE_MAX) to_read = WRITE_CAPTURE_MAX;
     ubuf = kmalloc(to_read, GFP_ATOMIC); if (!ubuf) return;
     left = copy_from_user(ubuf, (const void __user *)ubuf_ptr, to_read);
     if (left == to_read) goto out;
     to_read -= left;
 
-    escaped = kmalloc(to_read*6+4, GFP_ATOMIC); if (!escaped) goto out;
-    json_escape(escaped, to_read*6+4, ubuf, to_read);
+    ev = (stream[0] == 'S' && stream[3] == 'E') ? EV_STDERR : EV_STDOUT;
 
-    line = kmalloc(to_read*6+512, GFP_ATOMIC); if (!line) goto out;
-    pos = json_header(line, to_read*6+512, stream, task, &ts);
-    pos += snprintf(line+pos, to_read*6+512-pos,
-        ",\"len\":%zu,\"data\":%s}\n", to_read, escaped);
-
-    if (pos > 0) {
-        rcu_read_lock();
-        list_for_each_entry_rcu(s, &sessions, list) {
-            if (!s->dead && session_is_tagged(s, tgid))
-                session_log_queue(s, line, (size_t)pos);
-        }
-        rcu_read_unlock();
+    rcu_read_lock();
+    list_for_each_entry_rcu(s, &sessions, list) {
+        if (!s->dead && session_is_tagged(s, tgid))
+            emit_one(s, ev, ts_ns,
+                     task->pid, task->tgid, task_ppid_nr(task),
+                     get_task_ns_pid(task), get_task_ns_tgid(task),
+                     NULL, 0, ubuf, to_read);
     }
-out: kfree(line); kfree(escaped); kfree(ubuf);
+    rcu_read_unlock();
+out:
+    kfree(ubuf);
 }
 
 /* ===============================================================
@@ -869,9 +801,9 @@ static void emit_inherited_open_for_fd(struct task_struct *task,
     struct inode *ino;
     unsigned long ino_nr = 0;
     dev_t dev = 0;
-    char *path_buf = NULL, *path = NULL, *path_esc = NULL;
-    char *flags_j = NULL, *line = NULL;
-    int pos;
+    char *path_buf = NULL, *path = NULL;
+    uint64_t ts_ns;
+    int64_t extras[7];
 
     ino = file_inode(file);
     if (ino) { ino_nr = ino->i_ino; dev = ino->i_sb->s_dev; }
@@ -881,35 +813,28 @@ static void emit_inherited_open_for_fd(struct task_struct *task,
     path = file_path(file, path_buf, PATH_MAX);
     if (IS_ERR(path)) path = NULL;
 
-    path_esc = kmalloc(PATH_MAX*2, GFP_ATOMIC);
-    if (path_esc && path) json_escape(path_esc, PATH_MAX*2, path, strlen(path));
+    ts_ns = (uint64_t)ts->tv_sec * 1000000000ull + (uint64_t)ts->tv_nsec;
 
-    flags_j = kmalloc(256, GFP_ATOMIC);
-    if (flags_j) json_open_flags(file->f_flags, flags_j, 256);
+    extras[0] = (int64_t)file->f_flags;
+    extras[1] = (int64_t)fd;
+    extras[2] = (int64_t)ino_nr;
+    extras[3] = (int64_t)MAJOR(dev);
+    extras[4] = (int64_t)MINOR(dev);
+    extras[5] = 0;   /* err */
+    extras[6] = 1;   /* inherited */
 
-    line = kmalloc(PATH_MAX*2+512, GFP_ATOMIC);
-    if (!line) goto out;
-
-    pos = json_header(line, PATH_MAX*2+512, "OPEN", task, ts);
-    pos += snprintf(line+pos, PATH_MAX*2+512-pos,
-        ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%u,\"ino\":%lu,\"dev\":\"%u:%u\","
-        "\"inherited\":true}\n",
-        (path && path_esc) ? path_esc : "null",
-        flags_j ? flags_j : "[]",
-        file->f_flags,
-        fd, ino_nr, MAJOR(dev), MINOR(dev));
-
-    if (pos > 0) {
-        rcu_read_lock();
-        list_for_each_entry_rcu(s, &sessions, list) {
-            if (!s->dead && session_is_tagged(s, tgid))
-                session_log_queue(s, line, (size_t)pos);
-        }
-        rcu_read_unlock();
+    rcu_read_lock();
+    list_for_each_entry_rcu(s, &sessions, list) {
+        if (!s->dead && session_is_tagged(s, tgid))
+            emit_one(s, EV_OPEN, ts_ns,
+                     task->pid, task->tgid, task_ppid_nr(task),
+                     get_task_ns_pid(task), get_task_ns_tgid(task),
+                     extras, 7,
+                     path ? path : "", path ? strlen(path) : 0);
     }
+    rcu_read_unlock();
 
-out:
-    kfree(line); kfree(flags_j); kfree(path_esc); kfree(path_buf);
+    kfree(path_buf);
 }
 
 struct inherited_open_ctx {
@@ -945,11 +870,11 @@ static int exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     struct task_struct *task = current;
     pid_t tgid = task->tgid;
     struct timespec64 ts;
-    char *argv_raw=NULL, *env_raw=NULL, *argv_j=NULL, *env_j=NULL;
-    char *exe_buf=NULL, *exe=NULL, *exe_esc=NULL;
-    char *auxv_buf=NULL, *line=NULL;
+    char *argv_raw=NULL, *env_raw=NULL;
+    char *exe_buf=NULL, *exe=NULL;
     size_t argv_len=0, env_len=0;
-    int pos;
+    uint64_t ts_ns;
+    struct mm_struct *mm = NULL;
 
     if ((int)regs_return_value(regs) != 0) return 0;
     if (!tgid_in_any_session(tgid)) return 0;
@@ -958,46 +883,55 @@ static int exec_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     emit_cwd_event(task);
 
     ktime_get_real_ts64(&ts);
+    ts_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 
     exe_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
     if (exe_buf) exe = get_task_exe_path(task, exe_buf, PATH_MAX);
     argv_raw = read_task_argv_raw(task, &argv_len);
     env_raw = read_task_env_raw(task, &env_len);
 
-    exe_esc = kmalloc(PATH_MAX*2, GFP_ATOMIC);
-    if (exe_esc && exe) json_escape(exe_esc, PATH_MAX*2, exe, strlen(exe));
-    argv_j = kmalloc(ARGV_MAX_READ*6+64, GFP_ATOMIC);
-    if (argv_j && argv_raw) json_argv_array(argv_j, ARGV_MAX_READ*6+64, argv_raw, argv_len);
-    env_j = kmalloc(ENV_MAX_READ*6+64, GFP_ATOMIC);
-    if (env_j && env_raw) json_env_object(env_j, ENV_MAX_READ*6+64, env_raw, env_len);
-    auxv_buf = kmalloc(4096, GFP_ATOMIC);
-    if (auxv_buf) { auxv_buf[0]='\0'; format_auxv_json(task, auxv_buf, 4096); }
+    /* Snapshot AUXV once. */
+    mm = get_task_mm(task);
 
-    line = kmalloc(LOG_LINE_MAX, GFP_ATOMIC);
-    if (!line) goto out;
+    rcu_read_lock();
+    list_for_each_entry_rcu(s, &sessions, list) {
+        pid_t pid_, tgid_, ppid_, nspid_, nstgid_;
+        if (s->dead || !session_is_tagged(s, tgid)) continue;
 
-    pos = json_header(line, LOG_LINE_MAX, "EXEC", task, &ts);
-    pos += snprintf(line+pos, LOG_LINE_MAX-pos,
-        ",\"exe\":%s,\"argv\":%s,\"env\":%s,\"auxv\":{%s}}\n",
-        (exe_esc&&exe)?exe_esc:"null",
-        (argv_j&&argv_raw)?argv_j:"[]",
-        (env_j&&env_raw)?env_j:"{}",
-        (auxv_buf&&auxv_buf[0])?auxv_buf:"");
+        pid_   = task->pid;
+        tgid_  = task->tgid;
+        ppid_  = task_ppid_nr(task);
+        nspid_ = get_task_ns_pid(task);
+        nstgid_= get_task_ns_tgid(task);
 
-    if (pos > 0 && pos < LOG_LINE_MAX) {
-        rcu_read_lock();
-        list_for_each_entry_rcu(s, &sessions, list) {
-            if (!s->dead && session_is_tagged(s, tgid))
-                session_log_queue(s, line, (size_t)pos);
-        }
-        rcu_read_unlock();
+        /* 1. EV_EXEC — exe path */
+        emit_one(s, EV_EXEC, ts_ns, pid_, tgid_, ppid_, nspid_, nstgid_,
+                 NULL, 0, exe ? exe : "", exe ? strlen(exe) : 0);
+
+        /* 2. EV_ARGV — raw NUL-separated argv */
+        if (argv_raw && argv_len > 0)
+            emit_one(s, EV_ARGV, ts_ns, pid_, tgid_, ppid_, nspid_, nstgid_,
+                     NULL, 0, argv_raw, argv_len);
+
+        /* 3. EV_ENV — raw NUL-separated env */
+        if (env_raw && env_len > 0)
+            emit_one(s, EV_ENV, ts_ns, pid_, tgid_, ppid_, nspid_, nstgid_,
+                     NULL, 0, env_raw, env_len);
+
+        /* 4. EV_AUXV — raw saved_auxv bytes */
+        if (mm)
+            emit_one(s, EV_AUXV, ts_ns, pid_, tgid_, ppid_, nspid_, nstgid_,
+                     NULL, 0, mm->saved_auxv,
+                     AT_VECTOR_SIZE * 2 * sizeof(unsigned long));
     }
+    rcu_read_unlock();
+
+    if (mm) mmput(mm);
 
     /* Emit fake OPEN events for inherited fds (pipes, redirects, etc). */
     emit_inherited_open_events(task);
-out:
-    kfree(line); kfree(auxv_buf); kfree(env_j); kfree(argv_j);
-    kfree(exe_esc); kfree(env_raw); kfree(argv_raw); kfree(exe_buf);
+
+    kfree(env_raw); kfree(argv_raw); kfree(exe_buf);
     return 0;
 }
 
@@ -1012,48 +946,65 @@ static int exit_pre(struct kprobe *p, struct pt_regs *regs)
     struct trace_session *s;
     struct task_struct *task = current;
     pid_t tgid = task->tgid;
-    long code; struct timespec64 ts;
-    char line[384]; int pos, exit_sig, exit_val; bool core_dumped;
+    long code;
+    struct timespec64 ts;
+    uint64_t ts_ns;
+    int64_t extras[4];
+    int exit_sig, exit_val;
+    bool core_dumped;
 
     if (task->pid != task->tgid) return 0;
-    if (tgid_in_any_session(tgid)) {
+    if (!tgid_in_any_session(tgid)) goto untag;
+
 #if defined(CONFIG_X86_64)
-        code=(long)regs->di;
+    code=(long)regs->di;
 #elif defined(CONFIG_X86)
-        code=(long)regs->ax;
+    code=(long)regs->ax;
 #elif defined(CONFIG_ARM64)
-        code=(long)regs->regs[0];
+    code=(long)regs->regs[0];
 #elif defined(CONFIG_ARM)
-        code=(long)regs->ARM_r0;
+    code=(long)regs->ARM_r0;
 #elif defined(CONFIG_S390)
-        code=(long)regs->gprs[2];
+    code=(long)regs->gprs[2];
 #elif defined(CONFIG_PPC)
-        code=(long)regs->gpr[3];
+    code=(long)regs->gpr[3];
 #else
-        code=0;
+    code=0;
 #endif
-        ktime_get_real_ts64(&ts);
-        exit_sig=code&0x7f; core_dumped=!!(code&0x80); exit_val=(code>>8)&0xff;
-        pos = json_header(line, sizeof(line), "EXIT", task, &ts);
-        if (exit_sig==0)
-            pos+=snprintf(line+pos,sizeof(line)-pos,
-                ",\"status\":\"exited\",\"code\":%d,\"raw\":%ld}\n",exit_val,code);
-        else
-            pos+=snprintf(line+pos,sizeof(line)-pos,
-                ",\"status\":\"signaled\",\"signal\":%d,\"core_dumped\":%s,\"raw\":%ld}\n",
-                exit_sig,core_dumped?"true":"false",code);
-        if (pos>0&&pos<(int)sizeof(line)) {
-            rcu_read_lock();
-            list_for_each_entry_rcu(s,&sessions,list){
-                if(!s->dead&&session_is_tagged(s,tgid))
-                    session_log_queue(s,line,(size_t)pos);
-            }
-            rcu_read_unlock();
-        }
+
+    ktime_get_real_ts64(&ts);
+    ts_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+
+    exit_sig = code & 0x7f;
+    core_dumped = !!(code & 0x80);
+    exit_val = (code >> 8) & 0xff;
+
+    if (exit_sig == 0) {
+        extras[0] = EV_EXIT_EXITED;
+        extras[1] = exit_val;
+        extras[2] = 0;
+        extras[3] = code;
+    } else {
+        extras[0] = EV_EXIT_SIGNALED;
+        extras[1] = exit_sig;
+        extras[2] = core_dumped ? 1 : 0;
+        extras[3] = code;
     }
+
     rcu_read_lock();
-    list_for_each_entry_rcu(s,&sessions,list){
-        if(!s->dead&&session_is_tagged(s,tgid)) session_untag_pid(s,tgid);
+    list_for_each_entry_rcu(s, &sessions, list) {
+        if (!s->dead && session_is_tagged(s, tgid))
+            emit_one(s, EV_EXIT, ts_ns,
+                     task->pid, task->tgid, task_ppid_nr(task),
+                     get_task_ns_pid(task), get_task_ns_tgid(task),
+                     extras, 4, NULL, 0);
+    }
+    rcu_read_unlock();
+
+untag:
+    rcu_read_lock();
+    list_for_each_entry_rcu(s, &sessions, list) {
+        if (!s->dead && session_is_tagged(s, tgid)) session_untag_pid(s, tgid);
     }
     rcu_read_unlock();
     return 0;
@@ -1087,21 +1038,21 @@ static int open_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     pid_t tgid=task->tgid;
     struct timespec64 ts;
     long fd_or_err=(long)regs_return_value(regs);
-    char *upath=NULL,*path_esc=NULL,*flags_j=NULL,*line=NULL;
-    int pos; long n;
-    struct inode *ino=NULL; unsigned long ino_nr=0; dev_t dev=0;
+    char *upath=NULL;
+    long n;
+    struct inode *ino=NULL;
+    unsigned long ino_nr=0;
+    dev_t dev=0;
+    uint64_t ts_ns;
+    int64_t extras[7];
 
     if(!d->filename_ptr||!tgid_in_any_session(tgid)) return 0;
     ktime_get_real_ts64(&ts);
+    ts_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 
     upath=kmalloc(PATH_MAX,GFP_ATOMIC); if(!upath) return 0;
     n=strncpy_from_user(upath,(const char __user*)d->filename_ptr,PATH_MAX);
     if(n<=0) goto out;
-
-    path_esc=kmalloc(PATH_MAX*2,GFP_ATOMIC);
-    if(path_esc) json_escape(path_esc,PATH_MAX*2,upath,n);
-    flags_j=kmalloc(256,GFP_ATOMIC);
-    if(flags_j) json_open_flags(d->flags,flags_j,256);
 
     /* Get inode of result fd. */
     if(fd_or_err>=0){
@@ -1113,28 +1064,25 @@ static int open_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
         }
     }
 
-    line=kmalloc(PATH_MAX*2+512,GFP_ATOMIC); if(!line) goto out;
-    pos=json_header(line,PATH_MAX*2+512,"OPEN",task,&ts);
+    extras[0] = (int64_t)d->flags;
+    extras[1] = (int64_t)(fd_or_err >= 0 ? fd_or_err : -1);
+    extras[2] = (int64_t)ino_nr;
+    extras[3] = (int64_t)MAJOR(dev);
+    extras[4] = (int64_t)MINOR(dev);
+    extras[5] = (int64_t)(fd_or_err >= 0 ? 0 : fd_or_err);  /* err */
+    extras[6] = 0;  /* inherited=false */
 
-    if(fd_or_err>=0)
-        pos+=snprintf(line+pos,PATH_MAX*2+512-pos,
-            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"fd\":%ld,\"ino\":%lu,\"dev\":\"%u:%u\"}\n",
-            path_esc?path_esc:"null", flags_j?flags_j:"[]",
-            d->flags, fd_or_err, ino_nr, MAJOR(dev), MINOR(dev));
-    else
-        pos+=snprintf(line+pos,PATH_MAX*2+512-pos,
-            ",\"path\":%s,\"flags\":%s,\"mode\":%d,\"err\":%ld}\n",
-            path_esc?path_esc:"null", flags_j?flags_j:"[]", d->flags, fd_or_err);
-
-    if(pos>0){
-        rcu_read_lock();
-        list_for_each_entry_rcu(s,&sessions,list){
-            if(!s->dead&&session_is_tagged(s,tgid))
-                session_log_queue(s,line,(size_t)pos);
-        }
-        rcu_read_unlock();
+    rcu_read_lock();
+    list_for_each_entry_rcu(s,&sessions,list){
+        if(!s->dead&&session_is_tagged(s,tgid))
+            emit_one(s, EV_OPEN, ts_ns,
+                     task->pid, task->tgid, task_ppid_nr(task),
+                     get_task_ns_pid(task), get_task_ns_tgid(task),
+                     extras, 7, upath, n);
     }
-out: kfree(line);kfree(flags_j);kfree(path_esc);kfree(upath);
+    rcu_read_unlock();
+out:
+    kfree(upath);
     return 0;
 }
 
@@ -1182,40 +1130,7 @@ static int unlink_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static int unlink_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct unlink_probe_data *d=(void*)ri->data;
-    struct trace_session *s;
-    struct task_struct *task=current;
-    pid_t tgid=task->tgid;
-    struct timespec64 ts;
-    long ret=(long)regs_return_value(regs);
-    char *upath=NULL,*path_esc=NULL,*line=NULL;
-    int pos; long n;
-
-    if(!d->filename_ptr||ret!=0||!tgid_in_any_session(tgid)) return 0;
-    ktime_get_real_ts64(&ts);
-
-    upath=kmalloc(PATH_MAX,GFP_ATOMIC); if(!upath) return 0;
-    n=strncpy_from_user(upath,(const char __user*)d->filename_ptr,PATH_MAX);
-    if(n<=0) goto out;
-
-    path_esc=kmalloc(PATH_MAX*2,GFP_ATOMIC);
-    if(path_esc) json_escape(path_esc,PATH_MAX*2,upath,n);
-
-    line=kmalloc(PATH_MAX*2+256,GFP_ATOMIC); if(!line) goto out;
-    pos=json_header(line,PATH_MAX*2+256,"UNLINK",task,&ts);
-    pos+=snprintf(line+pos,PATH_MAX*2+256-pos,
-        ",\"path\":%s,\"ret\":%ld}\n",
-        path_esc?path_esc:"null", ret);
-
-    if(pos>0){
-        rcu_read_lock();
-        list_for_each_entry_rcu(s,&sessions,list){
-            if(!s->dead&&session_is_tagged(s,tgid))
-                session_log_queue(s,line,(size_t)pos);
-        }
-        rcu_read_unlock();
-    }
-out: kfree(line);kfree(path_esc);kfree(upath);
+    /* UNLINK is not part of the wire format. Drop it entirely. */
     return 0;
 }
 
@@ -1423,11 +1338,9 @@ static int __init proctrace_init(void)
     const char *fork_sym, *exec_sym, *open_sym;
 
     capture_devnull_inode();
-    log_wq = alloc_workqueue("proctrace", WQ_UNBOUND, 0);
-    if (!log_wq) return -ENOMEM;
 
     proc_dir = proc_mkdir("proctrace", NULL);
-    if (!proc_dir) { ret=-ENOMEM; goto err_wq; }
+    if (!proc_dir) { ret=-ENOMEM; goto err_root; }
     if (!proc_create("new",0666,proc_dir,&proc_new_ops)) goto err_proc;
     if (!proc_create("sessions",0444,proc_dir,&proc_sessions_ops)) goto err_proc;
 
@@ -1493,7 +1406,7 @@ static int __init proctrace_init(void)
 err_exec: unregister_kretprobe(&exec_kretprobe);
 err_fork: unregister_kretprobe(&fork_kretprobe);
 err_proc: proc_remove(proc_dir);
-err_wq:   destroy_workqueue(log_wq);
+err_root:
     return ret?ret:-ENOMEM;
 }
 
@@ -1526,7 +1439,9 @@ static void __exit proctrace_exit(void)
         wake_up_interruptible(&s->ring.wq_reader);
     }
     mutex_unlock(&sessions_mutex);
-    flush_workqueue(log_wq); destroy_workqueue(log_wq);
+    /* Each session destroys its own per-session workqueue from
+     * session_destroy(), so there's no global workqueue to flush
+     * here — just process the cleanup list. */
     mutex_lock(&sessions_mutex);
     list_for_each_entry_safe(s,tmp,&sessions,list){
         list_del(&s->list);
