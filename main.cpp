@@ -660,6 +660,15 @@ static std::string format_open_flags(int flags) {
 #ifdef O_SYNC
     add(O_SYNC, "O_SYNC");
 #endif
+#ifdef O_TMPFILE
+    /* O_TMPFILE includes O_DIRECTORY bits — test (and consume) it
+     * before the bare O_DIRECTORY check below so the output reads
+     * `O_TMPFILE` rather than the redundant `O_DIRECTORY|O_TMPFILE`. */
+    if ((flags & O_TMPFILE) == O_TMPFILE) {
+        out += "|O_TMPFILE";
+        rest &= ~O_TMPFILE;
+    }
+#endif
 #ifdef O_DIRECTORY
     add(O_DIRECTORY, "O_DIRECTORY");
 #endif
@@ -671,15 +680,6 @@ static std::string format_open_flags(int flags) {
 #endif
 #ifdef O_PATH
     add(O_PATH, "O_PATH");
-#endif
-#ifdef O_TMPFILE
-    /* O_TMPFILE includes O_DIRECTORY bits — test it before O_DIRECTORY
-     * above would normally matter, but we only print it if the full
-     * mask is set. */
-    if ((flags & O_TMPFILE) == O_TMPFILE) {
-        out += "|O_TMPFILE";
-        rest &= ~O_TMPFILE;
-    }
 #endif
     if (rest) {
         char buf[24];

@@ -47,10 +47,12 @@
 
 #include <fnmatch.h>
 #include <zstd.h>
-/* zstd's bundled xxhash is namespaced as ZSTD_xxh*. We want a fresh
- * inlined copy of the public API for our own pool hashing — undefine
- * the namespace and the prior inclusion guard, then pull it in with
- * XXH_INLINE_ALL so XXH3_64bits resolves locally. */
+/* zstd's bundled xxhash is namespaced as ZSTD_xxh*. Pull in a fresh,
+ * un-namespaced copy of the public API for our own pool hashing — undef
+ * the namespace and the prior inclusion guard, then include with
+ * XXH_INLINE_ALL. We use XXH64 (not XXH3_64bits) because the upstream
+ * XXH3_64bits is a 2-arg function; passing a third (seed) argument
+ * makes the macro chain expand to a non-existent symbol. */
 #undef XXH_NAMESPACE
 #undef XXH_INLINE_ALL_31684351384
 #define XXH_INLINE_ALL

@@ -60,12 +60,6 @@ endif
 SUD_SRCS    := sud/wrapper.c sud/libc.c sud/raw.c sud/event.c sud/elf.c sud/handler.c sud/loader.c deps/printf/printf.c
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
-gen_sql_h: gen_sql_h.c
-	cc -O2 -o gen_sql_h gen_sql_h.c
-
-tv_sql.h: tv.sql gen_sql_h
-	./gen_sql_h tv.sql tv_sql.h
-
 $(ZSTD_LIB):
 	$(MAKE) -C $(ZSTD_DIR) libzstd.a
 
@@ -96,5 +90,5 @@ test: tv
 	./tv --test
 
 clean-bins:
-	rm -f tv fv gen_sql_h yeetdump wire2parquet
+	rm -f tv fv yeetdump wire2parquet
 	-$(MAKE) -C $(ZSTD_DIR) clean

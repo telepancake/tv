@@ -33,7 +33,7 @@ static size_t yeet_atom_len(const uint8_t *p, size_t n) {
     if (b < 0xC0u) return 1;
     if (b < 0xF8u) return 1u + (size_t)(b - 0xC0u);
     uint8_t lensz = (uint8_t)(b - 0xF8u);
-    if (lensz < 1 || lensz > 7) return (size_t)-1;
+    if (lensz > 7) return (size_t)-1;
     if (n < 1u + lensz) return 0;
     uint64_t len = 0;
     for (uint8_t i = 0; i < lensz; i++) {
