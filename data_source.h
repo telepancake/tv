@@ -87,6 +87,9 @@ private:
     void lpane_events();
     void lpane_deps(int reverse);     /* 0=deps, 1=rdeps */
     void lpane_dep_cmds(int reverse); /* 0=dcmds, 1=rcmds */
+    /* Common-prefix "hat" row inserted at the top of file-tree views
+     * (mode 2) when all visible rows share a deep parent path. */
+    void emit_path_hat();
 
     /* Mode-specific rpane builders. */
     void rpane_process_detail(const std::string &tgid);

@@ -912,6 +912,118 @@ void TvDataSource::lpane_files() {
         }
     };
     emit(&root, 0);
+
+    /* "Hat" row: longest common path-segment prefix shared by all
+     * emitted rows. The user complaint was that a deeply-nested
+     * subtree shows giant left-margin indent ("│  │  │  ..."). When
+     * everything visible lives under e.g. /usr/include/dir_0/sub_0/,
+     * we surface that prefix once at the top, flush-left and styled
+     * as a heading, and strip it from the body so the leftmost column
+     * carries actual differentiating data.
+     *
+     * Skipped when:
+     *   - fewer than 2 rows (nothing to factor)
+     *   - the prefix is just "/" or "" (already flush-left visually)
+     *   - the user pinned a subtree (state_.subtree_only) - then the
+     *     existing subtree banner is the hat, no duplicate. */
+    if (!state_.subtree_only && lpane_.size() >= 2) {
+        emit_path_hat();
+    }
+}
+
+/* Find longest common path-segment prefix across lpane_ rows whose id
+ * is a path. Mutates the rows to strip the prefix and inserts a hat
+ * row at the front. Path-segment-aware: "/usr/include/dir_0/" and
+ * "/usr/include/dir_0/sub_0/file.h" share "/usr/include/dir_0/", but
+ * "/usr/inc/" and "/usr/include/" only share "/usr/".
+ *
+ * Strategy: look only at *leaf file* rows (id not ending in '/') for
+ * the prefix calculation. Directory-aggregate rows that are strict
+ * prefixes of the hat get folded into the hat (hidden). This is what
+ * factors out the giant left-margin indent the user complained about
+ * in deep trees - the dir rows merge into the header. */
+void TvDataSource::emit_path_hat() {
+    auto is_path_row = [](const RowData &r) {
+        return !r.id.empty() && r.id[0] == '/' &&
+               !(r.id.size() >= 2 && r.id[0] == '_' && r.id[1] == '_');
+    };
+    auto is_leaf = [&](const RowData &r) {
+        return is_path_row(r) && r.id.back() != '/';
+    };
+    /* Need at least 2 leaves to factor anything; with one leaf the
+     * hat would simply be that leaf's parent and we'd hide nothing
+     * useful. */
+    int n_leaves = 0;
+    const std::string *first_leaf = nullptr;
+    for (const auto &r : lpane_) {
+        if (!is_leaf(r)) continue;
+        if (!first_leaf) first_leaf = &r.id;
+        if (++n_leaves >= 2) break;
+    }
+    if (n_leaves < 2 || !first_leaf) return;
+    std::string prefix = *first_leaf;
+    for (const auto &r : lpane_) {
+        if (!is_leaf(r)) continue;
+        size_t i = 0;
+        while (i < prefix.size() && i < r.id.size() && prefix[i] == r.id[i])
+            i++;
+        prefix.resize(i);
+        if (prefix.empty()) return;
+    }
+    size_t slash = prefix.rfind('/');
+    if (slash == std::string::npos || slash == 0) return;
+    prefix.resize(slash + 1);
+    if (prefix.size() <= 1) return;
+
+    /* Drop dir-aggregate rows whose id is a prefix-of-or-equal-to the
+     * hat. They're now represented by the hat itself - keeping them
+     * would just be a stutter ("/usr/" then "/usr/include/" then hat
+     * "/usr/include/dir_0/"). */
+    auto is_subsumed_dir = [&](const RowData &r) {
+        if (!is_path_row(r)) return false;
+        if (r.id.empty() || r.id.back() != '/') return false;
+        return prefix.size() >= r.id.size() &&
+               prefix.compare(0, r.id.size(), r.id) == 0;
+    };
+    lpane_.erase(std::remove_if(lpane_.begin(), lpane_.end(),
+                                is_subsumed_dir),
+                 lpane_.end());
+
+    /* Strip the prefix from each surviving row's display column.
+     * Re-derive the indent from the path tail's '/' count so cols[1]
+     * stays consistent with the visible hierarchy. */
+    for (auto &r : lpane_) {
+        if (!is_path_row(r)) continue;
+        if (r.cols.size() < 2) continue;
+        if (r.id.size() <= prefix.size()) continue;
+        std::string tail = r.id.substr(prefix.size());
+        bool is_dir = !tail.empty() && tail.back() == '/';
+        std::string body = is_dir ? tail.substr(0, tail.size() - 1) : tail;
+        int depth = 0;
+        for (size_t i = 0; i + 1 < body.size(); i++)
+            if (body[i] == '/') depth++;
+        size_t last_slash = body.rfind('/');
+        std::string leaf = (last_slash == std::string::npos)
+            ? body
+            : body.substr(last_slash + 1);
+        std::string indent(depth * 2, ' ');
+        r.cols[1] = indent + leaf + (is_dir ? "/" : "");
+    }
+
+    /* Hat row, prepended. Style as Heading; flush-left in the path
+     * column. Display the prefix with a trailing arrow so it's
+     * obvious the body rows continue below it. */
+    RowData hat;
+    hat.id = "__hat_prefix";
+    hat.style = RowStyle::Heading;
+    hat.cols = {"", prefix, "", "", "", ""};
+    /* A blank separator row visually divides hat from list. */
+    RowData sep;
+    sep.id = "__hat_sep";
+    sep.style = RowStyle::Dim;
+    sep.cols = {"", "", "", "", "", ""};
+    lpane_.insert(lpane_.begin(), std::move(sep));
+    lpane_.insert(lpane_.begin(), std::move(hat));
 }
 
 /* -- Mode 0: output (stdout/stderr) view ---------------------------- */

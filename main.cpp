@@ -541,11 +541,13 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
 /* -- --dump[=MODE] : non-interactive dump of an lpane (for tests) ---- */
 
 int dump_mode(TvDb &db, int mode, const std::string &subject,
-              const std::string &flag_filter) {
+              const std::string &flag_filter,
+              const std::string &search) {
     AppState st;
     st.mode = mode;
     st.subject_file = subject;
     st.flag_filter = flag_filter;
+    st.search = search;
     TvDataSource ts(db, st);
     auto srcfn = ts.make_data_source();
     srcfn.row_begin(0);
@@ -679,6 +681,7 @@ int main(int argc, char **argv) {
     int  dump_mode_n = 1;
     std::string dump_subject;
     std::string dump_flags;
+    std::string dump_search;
     char **cmd = nullptr;
 
     for (int i = 1; i < argc; i++) {
@@ -695,6 +698,8 @@ int main(int argc, char **argv) {
             dump_subject = argv[++i];
         else if (!std::strncmp(argv[i], "--flags=", 8))
             dump_flags = argv[i] + 8;
+        else if (!std::strncmp(argv[i], "--search=", 9))
+            dump_search = argv[i] + 9;
         else if (!std::strcmp(argv[i], "--no-env")) no_env = 1;
         else if (!std::strcmp(argv[i], "--module"))  live_backend = LIVE_TRACE_BACKEND_MODULE;
         else if (!std::strcmp(argv[i], "--sud"))     live_backend = LIVE_TRACE_BACKEND_SUD;
@@ -798,7 +803,7 @@ int main(int argc, char **argv) {
             ::waitpid(lt.child_pid, nullptr, 0);
             db->flush(&err);
         }
-        return dump_mode(*db, dump_mode_n, dump_subject, dump_flags);
+        return dump_mode(*db, dump_mode_n, dump_subject, dump_flags, dump_search);
     }
 
     /* TUI. */
