@@ -1,5 +1,5 @@
 /*
- * engine.cpp — TUI engine implementation.
+ * engine.cpp - TUI engine implementation.
  *
  * Implements the Tui class declared in engine.h: terminal raw mode,
  * panel-based rendering with caching, keyboard input, fd watches, timers.
@@ -24,25 +24,30 @@
 #include <termios.h>
 #include <unistd.h>
 
-/* ── Constants ────────────────────────────────────────────────────── */
+/* -- Constants ------------------------------------------------------ */
 
 static constexpr int PANEL_NCOLS_MAX  = 32;
 static constexpr int MAX_WATCHES      = 16;
 static constexpr int MAX_TIMERS       = 16;
 
-/* ── Internal types ───────────────────────────────────────────────── */
+/* -- Internal types ------------------------------------------------- */
 
 namespace {
 
 struct Panel {
     PanelDef def{};
+    /* Owning copy of the column array — set_panel_columns() may swap in
+     * a different layout per app mode, and we don't want to require the
+     * caller to keep their ColDef array alive. */
+    std::vector<ColDef> cols_owned;
+    std::string         title_owned;
     int x = 0, y = 0, w = 0, h = 0;
     int cursor = 0, scroll = 0;
     int row_count = 0;
     bool dirty = true;
     char cursor_id[4096]{};
 
-    /* Lazy cache — rows are read progressively from the data source. */
+    /* Lazy cache - rows are read progressively from the data source. */
     std::vector<RowData> rows;
     bool complete = false; /* true when all rows have been read */
     bool iter_open = false; /* true when row_begin has been called for current refresh */
@@ -64,7 +69,7 @@ struct Timer {
 
 } // anon namespace
 
-/* ── Tui::Impl ────────────────────────────────────────────────────── */
+/* -- Tui::Impl ------------------------------------------------------ */
 
 struct Tui::Impl {
     DataSource source;
@@ -88,7 +93,7 @@ struct Tui::Impl {
     std::string scr;
 };
 
-/* ── Globals for signal handling + atexit ──────────────────────────── */
+/* -- Globals for signal handling + atexit ---------------------------- */
 
 static volatile int g_resized = 0;
 static Tui::Impl *g_atexit_impl = nullptr;
@@ -106,7 +111,7 @@ static void tty_restore(Tui::Impl *m) {
 
 static void atexit_restore() { if (g_atexit_impl) tty_restore(g_atexit_impl); }
 
-/* ── Screen buffer helpers ────────────────────────────────────────── */
+/* -- Screen buffer helpers ------------------------------------------ */
 
 static void sa(Tui::Impl *m, const char *s, int n) {
     m->scr.append(s, static_cast<size_t>(n));
@@ -130,7 +135,7 @@ static void sflush(Tui::Impl *m) {
     m->scr.clear();
 }
 
-/* ── Visible length (skip ANSI) ───────────────────────────────────── */
+/* -- Visible length (skip ANSI) ------------------------------------- */
 
 static int visible_len(const char *s) {
     int n = 0;
@@ -184,7 +189,7 @@ static const char *style_ansi(RowStyle s) {
     }
 }
 
-/* ── Panel helpers ────────────────────────────────────────────────── */
+/* -- Panel helpers -------------------------------------------------- */
 
 static void tty_size(Tui::Impl *m) {
     struct winsize ws;
@@ -289,10 +294,10 @@ static void p_resolve_id(Tui::Impl *m, Panel *p) {
     }
     if (!m->source.row_has_more || !m->source.row_has_more(pi))
         p->complete = true;
-    /* ID not found — keep current position (will be clamped). */
+    /* ID not found - keep current position (will be clamped). */
 }
 
-/* ── Box layout ───────────────────────────────────────────────────── */
+/* -- Box layout ----------------------------------------------------- */
 
 static int box_contains_focus(Tui::Impl *m, Box *b) {
     if (!b) return 0;
@@ -391,7 +396,7 @@ static void resolve_col_widths(const PanelDef *d, int tw, int *out) {
             if (d->cols[i].width < 0) { out[i] += tw - sum; break; }
 }
 
-/* ── Keyboard input ───────────────────────────────────────────────── */
+/* -- Keyboard input ------------------------------------------------- */
 
 static int read_key(Tui::Impl *m) {
     if (m->tty_fd < 0) return TUI_K_NONE;
@@ -427,7 +432,7 @@ static int read_key(Tui::Impl *m) {
     return static_cast<unsigned char>(c);
 }
 
-/* ── Rendering ────────────────────────────────────────────────────── */
+/* -- Rendering ------------------------------------------------------ */
 
 static void render_panel(Tui::Impl *m, Panel *p) {
     if (p->x < -9000) return;
@@ -436,9 +441,13 @@ static void render_panel(Tui::Impl *m, Panel *p) {
     int cy = p->y, ch = p->h;
     if (d->title) {
         sf(m, "\x1b[%d;%dH", cy + 1, p->x + 1);
-        sp(m, focused ? "\x1b[1;45;37m" : "\x1b[7m");
+        /* Active-panel indicator: bright magenta on white when focused,
+         * dim grey when not, plus a leading '>' marker so it's obvious
+         * even on terminals where colour is washed out. */
+        sp(m, focused ? "\x1b[1;45;97m" : "\x1b[2;7m");
         char hdr[512];
-        std::snprintf(hdr, sizeof hdr, " %s ", d->title);
+        std::snprintf(hdr, sizeof hdr, " %s %s ",
+                      focused ? ">" : " ", d->title);
         sput_field(m, hdr, p->w, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE);
         sp(m, "\x1b[0m");
         cy++; ch--;
@@ -507,7 +516,7 @@ static void render_all(Tui::Impl *m) {
     sflush(m);
 }
 
-/* ── Navigation ───────────────────────────────────────────────────── */
+/* -- Navigation ----------------------------------------------------- */
 
 static bool is_engine_nav_key(int k) {
     switch (k) {
@@ -589,9 +598,9 @@ static void fire_key_none(Tui &tui, Tui::Impl *m) {
     m->key_cb(tui, TUI_K_NONE, fp, fc, fid);
 }
 
-/* ══════════════════════════════════════════════════════════════════
+/* ==================================================================
  * Public Tui implementation
- * ══════════════════════════════════════════════════════════════════ */
+ * ================================================================== */
 
 Tui::Tui() : impl_(std::make_unique<Impl>()) {}
 Tui::~Tui() {
@@ -641,10 +650,41 @@ int Tui::add_panel(PanelDef def) {
     m->panels.emplace_back();
     auto &p = m->panels.back();
     p.def   = def;
+    /* Copy the caller's column array so they don't need to keep it
+     * alive, and so set_panel_columns() can later swap it. */
+    if (def.cols && def.ncols > 0) {
+        p.cols_owned.assign(def.cols, def.cols + def.ncols);
+        p.def.cols = p.cols_owned.data();
+    }
+    if (def.title) {
+        p.title_owned = def.title;
+        p.def.title   = p.title_owned.c_str();
+    }
     p.dirty = true;
     if (m->focus < 0 && (def.flags & TUI_PANEL_CURSOR))
         m->focus = idx;
     return idx;
+}
+
+void Tui::set_panel_columns(int panel, const ColDef *cols, int ncols,
+                            const char *title) {
+    auto *m = impl_.get();
+    auto *p = pget(m, panel);
+    if (!p) return;
+    if (cols && ncols > 0) {
+        p->cols_owned.assign(cols, cols + ncols);
+        p->def.cols  = p->cols_owned.data();
+        p->def.ncols = ncols;
+    } else {
+        p->cols_owned.clear();
+        p->def.cols  = nullptr;
+        p->def.ncols = 0;
+    }
+    if (title) {
+        p->title_owned = title;
+        p->def.title   = p->title_owned.c_str();
+    }
+    p->dirty = true;
 }
 
 int Tui::panel_count() const {

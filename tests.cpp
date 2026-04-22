@@ -1,4 +1,4 @@
-/* tests.cpp — tv self-tests.
+/* tests.cpp - tv self-tests.
  *
  * Run with `tv --test`. Strictly black-box: build a wire byte stream
  * in-memory, feed it through the same WireDecoder + TvDb path the
@@ -43,7 +43,7 @@ int g_pass = 0;
         __FILE__, __LINE__, #a, #b, _a.c_str(), _b.c_str()); } \
 } while (0)
 
-/* ── tiny wire-stream builder ─────────────────────────────────────── */
+/* -- tiny wire-stream builder --------------------------------------- */
 
 struct WireBuilder {
     std::vector<uint8_t> buf;
@@ -99,7 +99,7 @@ struct WireBuilder {
     }
 };
 
-/* ── fixture: a tiny synthetic trace ──────────────────────────────── */
+/* -- fixture: a tiny synthetic trace -------------------------------- */
 
 void build_fixture(WireBuilder &w) {
     /* Process 100: make all */
@@ -125,7 +125,7 @@ void build_fixture(WireBuilder &w) {
     w.event(EV_EXIT, 1600, 200, 200, 100, ex2, 4, nullptr, 0);
 }
 
-/* ── tests ─────────────────────────────────────────────────────────── */
+/* -- tests ----------------------------------------------------------- */
 
 void test_wire_decoder_parses_all_events() {
     WireBuilder w;
@@ -159,7 +159,7 @@ void test_wire_decoder_rejects_wrong_version() {
     /* Hand-craft a stream with a bad version. */
     uint8_t bad[2];
     uint8_t *p = bad;
-    yeet_u64(&p, bad + sizeof bad, 99); /* version 99 — unsupported */
+    yeet_u64(&p, bad + sizeof bad, 99); /* version 99 - unsupported */
     int evs = 0;
     WireDecoder dec([&](const WireEvent &){ evs++; });
     EXPECT(!dec.feed(bad, (size_t)(p - bad)));
@@ -261,7 +261,7 @@ void test_data_source_mode1_query() {
     }
 }
 
-/* ── lazy index materialisation ────────────────────────────────────── */
+/* -- lazy index materialisation -------------------------------------- */
 
 void test_proc_index_built_and_persisted() {
     std::string err;
@@ -298,7 +298,7 @@ void test_proc_index_built_and_persisted() {
             "SELECT value FROM tv_meta WHERE key='idx_proc'", &err);
         EXPECT_EQ((size_t)1, meta.size());
     }
-    /* Reopen — index must still be there. */
+    /* Reopen - index must still be there. */
     {
         auto db = TvDb::open_file(path, &err);
         if (!db) { ::unlink(path); g_fail++; return; }

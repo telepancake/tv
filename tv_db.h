@@ -1,4 +1,4 @@
-/* tv_db.h — tv's storage and query layer, on DuckDB.
+/* tv_db.h - tv's storage and query layer, on DuckDB.
  *
  * A trace lives on disk as a single DuckDB native database file
  * (`foo.tvdb`). One table per wire event class:

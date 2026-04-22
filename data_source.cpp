@@ -1,10 +1,10 @@
-/* data_source.cpp — implements data_source.h.
+/* data_source.cpp - implements data_source.h.
  *
  * Each mode rebuilds its panel from a SQL query. Heavy aggregations
  * are kept in tv_idx_* tables (built lazily via TvDb::ensure_*()).
  *
  * Tree views (process hierarchy, file path tree) build a small
- * adjacency map from the result set and DFS in C++ — no recursive CTE
+ * adjacency map from the result set and DFS in C++ - no recursive CTE
  * needed at the row-emit layer (recursive CTEs are reserved for
  * dep/rdep closure traversal in modes 4..7).
  */
@@ -26,7 +26,7 @@
 
 namespace {
 
-/* ── tiny formatting helpers ──────────────────────────────────────── */
+/* -- tiny formatting helpers ---------------------------------------- */
 
 std::string sfmt(const char *fmt, ...) {
     char buf[1024];
@@ -78,6 +78,25 @@ std::string basename_of(const std::string &p) {
     return pos == std::string::npos ? p : p.substr(pos + 1);
 }
 
+/* Compact number formatting: 0, 374, 26.8k, 1.56M, 374G, ...
+ * Used in column displays where horizontal space is tight - the user
+ * called out that "5 opens, 3 procs" wastes a fixed-width column with
+ * unit text repeated on every row. */
+std::string compact_count(uint64_t n) {
+    if (n < 1000) return std::to_string(n);
+    static const char *suf[] = {"k", "M", "G", "T", "P"};
+    double d = (double)n / 1000.0;
+    int idx = 0;
+    while (d >= 1000.0 && idx + 1 < (int)(sizeof suf / sizeof suf[0])) {
+        d /= 1000.0; idx++;
+    }
+    char buf[32];
+    if      (d >= 100) std::snprintf(buf, sizeof buf, "%.0f%s", d, suf[idx]);
+    else if (d >= 10)  std::snprintf(buf, sizeof buf, "%.1f%s", d, suf[idx]);
+    else               std::snprintf(buf, sizeof buf, "%.2f%s", d, suf[idx]);
+    return buf;
+}
+
 const char *style_for_exit(const std::string &kind, const std::string &code,
                            bool ended) {
     if (!ended) return "green";
@@ -120,7 +139,7 @@ RowData mk_kv(const std::string &id, const std::string &key,
     return r;
 }
 
-/* OPEN flags → human flags string (R/W/RW + O_CREAT/O_TRUNC hints). */
+/* OPEN flags -> human flags string (R/W/RW + O_CREAT/O_TRUNC hints). */
 std::string flags_text(int flags) {
     std::string s;
     int acc = flags & 3;
@@ -137,7 +156,7 @@ std::string flags_text(int flags) {
 
 } // namespace
 
-/* ── ctor / DataSource wiring ─────────────────────────────────────── */
+/* -- ctor / DataSource wiring --------------------------------------- */
 
 TvDataSource::TvDataSource(TvDb &db, AppState &state)
     : db_(db), state_(state) {}
@@ -157,6 +176,104 @@ void TvDataSource::invalidate() {
 
 void TvDataSource::invalidate_rpane() {
     built_rpane_ = false;
+}
+
+/* -- per-mode column layouts ---------------------------------------- */
+
+namespace {
+/* Column arrays kept as file-static so their addresses are stable
+ * across calls (the engine stores raw pointers via add_panel /
+ * set_panel_columns). Each layout drives both the panel chrome (the
+ * title doubles as a column-header row) and the per-row column
+ * emission in the matching lpane_*() builder. */
+
+/* Mode 0 - output stream:
+ *   col 0 time(8r) | col 1 k(2) | col 2 tgid(7r) | col 3 data(flex) */
+const ColDef k_lpane_cols_outputs[] = {
+    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 3, TUI_ALIGN_LEFT,  TUI_OVERFLOW_TRUNCATE},
+    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
+};
+
+/* Mode 1 - process tree:
+ *   col 0 name(flex) | col 1 pid(8r) | col 2 exit(8r) | col 3 dur(10r) */
+const ColDef k_lpane_cols_procs[] = {
+    {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
+    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    {10, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+};
+
+/* Mode 2 - file tree (flag column on LEFT, compact-number stat cols):
+ *   col 0 flag(4) | col 1 name(flex) | col 2 opens(7r) | col 3 procs(7r)
+ *   col 4 reads(7r) | col 5 writes(7r) */
+const ColDef k_lpane_cols_files[] = {
+    { 4, TUI_ALIGN_LEFT,  TUI_OVERFLOW_TRUNCATE},
+    {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
+    { 7, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 7, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 7, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 7, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+};
+
+/* Mode 3 - event log:
+ *   col 0 time(8r) | col 1 kind(7) | col 2 tgid(8r) | col 3 info(flex) */
+const ColDef k_lpane_cols_events[] = {
+    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 7, TUI_ALIGN_LEFT,  TUI_OVERFLOW_TRUNCATE},
+    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
+};
+
+/* Modes 4/5 - dep / rdep file closure (just name + a stat column). */
+const ColDef k_lpane_cols_deps[] = {
+    {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
+    { 7, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+};
+
+/* Modes 6/7 - dep cmds (process-shaped, just name + pid). */
+const ColDef k_lpane_cols_dep_cmds[] = {
+    {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
+    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+};
+
+/* rpane is a key/value detail panel and stays the same shape across
+ * modes: a fixed key column and a flex value column. */
+const ColDef k_rpane_cols[] = {
+    {18, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE},
+    {-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS},
+};
+
+} // namespace
+
+TvDataSource::PanelLayout TvDataSource::lpane_layout() const {
+    switch (state_.mode) {
+        case 0: return {k_lpane_cols_outputs, 4,
+            "  time      k    tgid  output"};
+        case 2: return {k_lpane_cols_files, 6,
+            "  flag  path                                 opens  procs  reads writes"};
+        case 3: return {k_lpane_cols_events, 4,
+            "  time     kind        tgid  event"};
+        case 4: case 5: return {k_lpane_cols_deps, 2,
+            "  path                                        opens"};
+        case 6: case 7: return {k_lpane_cols_dep_cmds, 2,
+            "  process                                       pid"};
+        case 1:
+        default: return {k_lpane_cols_procs, 4,
+            "  process                                       pid    exit   duration"};
+    }
+}
+
+TvDataSource::PanelLayout TvDataSource::rpane_layout() const {
+    return {k_rpane_cols, 2, "detail"};
+}
+
+void TvDataSource::apply_layout(Tui &tui, int lpane, int rpane) const {
+    auto l = lpane_layout();
+    auto r = rpane_layout();
+    tui.set_panel_columns(lpane, l.cols, l.ncols, l.title);
+    tui.set_panel_columns(rpane, r.cols, r.ncols, r.title);
 }
 
 bool dirty_for_lpane(const AppState &s,
@@ -218,7 +335,7 @@ RowData TvDataSource::row_next(int panel) {
     return rpane_.at(rpane_idx_++);
 }
 
-/* ── lpane dispatch ───────────────────────────────────────────────── */
+/* -- lpane dispatch ------------------------------------------------- */
 
 void TvDataSource::rebuild_lpane() {
     lpane_.clear();
@@ -241,7 +358,7 @@ void TvDataSource::rebuild_lpane() {
     }
 }
 
-/* ── Mode 1: process tree ─────────────────────────────────────────── */
+/* -- Mode 1: process tree ------------------------------------------- */
 
 namespace {
 struct ProcRow {
@@ -309,7 +426,7 @@ void TvDataSource::lpane_processes() {
      *   D  process exec'd a file that was written by another tgid
      *      in the trace (i.e. ran a derived script/elf)
      * The SQL uses semi-joins against open_/exec/tv_idx_open_canon to
-     * stay scalar-free — no rows are materialised in C++. */
+     * stay scalar-free - no rows are materialised in C++. */
     auto add_clause = [&](std::string &where, const std::string &c) {
         if (where.empty()) where = c;
         else where = "(" + where + ") AND " + c;
@@ -430,7 +547,9 @@ void TvDataSource::lpane_processes() {
             std::string text = state_.grouped ? indent : "";
             text += proc_name_label(p, /*basename_only=*/true,
                                     state_.show_pids);
-            std::string stats = proc_stats_label(p);
+            std::string dur = format_duration_ns(p.start_ns, p.end_ns);
+            std::string ex  = format_exit(p.exit_kind, p.exit_code,
+                                          p.core_dumped, p.ended);
             RowStyle style = RowStyle::Normal;
             if (!p.ended)             style = RowStyle::Green;
             else if (p.exit_kind == "1") style = RowStyle::Error;
@@ -442,10 +561,12 @@ void TvDataSource::lpane_processes() {
             row.id = std::to_string(p.tgid);
             row.parent_id = std::to_string(p.ppid);
             row.has_children = !p.children.empty();
+            /* 4-column row matching k_lpane_cols_procs:
+             *   name | pid | exit | duration */
             row.cols.push_back(std::move(text));
-            row.cols.push_back("");          /* col 1: badge — unused for procs */
-            row.cols.push_back(std::move(stats));
-            row.style = style;
+            row.cols.push_back(std::to_string(p.tgid));
+            row.cols.push_back(std::move(ex));
+            row.cols.push_back(std::move(dur));
             row.style = style;
             lpane_.push_back(std::move(row));
             if (!state_.grouped) return;
@@ -462,7 +583,7 @@ void TvDataSource::lpane_processes() {
     }
 }
 
-/* ── Mode 2: file tree ────────────────────────────────────────────── */
+/* -- Mode 2: file tree ---------------------------------------------- */
 
 namespace {
 struct FileRow {
@@ -472,20 +593,28 @@ struct FileRow {
 
 RowData mk_file_row(const FileRow &r, const std::string &display_name,
                     bool search_hit) {
-    /* 3-column row for the file pane: name | RWE badge | stats. */
+    /* 6-column row matching k_lpane_cols_files:
+     *   flag | name | opens | procs | reads | writes
+     * Flag column on the LEFT so the eye can scan a vertical strip
+     * for "W..." or "RW." rows. Numbers are compact (26.8k, 1.56M)
+     * and right-aligned to keep the column width fixed at 7. */
     std::string flags;
     flags += r.reads  ? 'R' : '-';
     flags += r.writes ? 'W' : '-';
     flags += r.errors ? 'E' : '-';
-    std::string stats = r.errors
-        ? sfmt("%d opens, %d procs, %d errs", r.opens, r.procs, r.errors)
-        : sfmt("%d opens, %d procs",          r.opens, r.procs);
     RowStyle st = r.errors ? RowStyle::Error :
                   r.writes ? RowStyle::Yellow : RowStyle::Normal;
     if (search_hit) st = RowStyle::Search;
     RowData row;
     row.id = r.path;
-    row.cols = { display_name, flags, stats };
+    row.cols = {
+        flags,
+        display_name,
+        compact_count((uint64_t)r.opens),
+        compact_count((uint64_t)r.procs),
+        compact_count((uint64_t)r.reads),
+        compact_count((uint64_t)r.writes),
+    };
     row.style = st;
     return row;
 }
@@ -659,19 +788,28 @@ void TvDataSource::lpane_files() {
                                          indent + c->component, hit);
                 lpane_.push_back(std::move(rw));
             } else {
-                /* Directory row: same column layout, with aggregated
-                 * RWE badge and a "(N files)" stats column. */
+                /* Directory row: same 6-column layout as leaf rows so
+                 * dirs and files line up. The badge comes from the
+                 * aggregate flags; the four stat columns get the
+                 * subtree totals (file_count fills the "procs" slot
+                 * for directories - it's the most useful number to
+                 * see while scanning the tree). */
                 FileRow agg = c->agg;
                 agg.path = c->full_path + "/";
                 std::string flags;
                 flags += agg.reads  ? 'R' : '-';
                 flags += agg.writes ? 'W' : '-';
                 flags += agg.errors ? 'E' : '-';
-                std::string stats = sfmt("%d file%s, %d opens",
-                    c->file_count, c->file_count == 1 ? "" : "s", agg.opens);
                 RowData rw;
                 rw.id = c->full_path + "/";
-                rw.cols = { indent + c->component + "/", flags, stats };
+                rw.cols = {
+                    flags,
+                    indent + c->component + "/",
+                    compact_count((uint64_t)agg.opens),
+                    compact_count((uint64_t)c->file_count),
+                    compact_count((uint64_t)agg.reads),
+                    compact_count((uint64_t)agg.writes),
+                };
                 /* Directories get cyan; failed-error directories take
                  * priority colouring to draw the eye. */
                 rw.style = agg.errors ? RowStyle::Error : RowStyle::CyanBold;
@@ -684,7 +822,7 @@ void TvDataSource::lpane_files() {
     emit(&root, 0);
 }
 
-/* ── Mode 0: output (stdout/stderr) view ──────────────────────────── */
+/* -- Mode 0: output (stdout/stderr) view ---------------------------- */
 
 void TvDataSource::lpane_outputs() {
     /* Chronological merged stdout+stderr stream.  When subtree_only is
@@ -703,7 +841,7 @@ void TvDataSource::lpane_outputs() {
     std::string where;
     if (!state_.search.empty())
         where = "d LIKE '%' || " + sql_escape(state_.search) + " || '%'";
-    /* Flag filter: O = stdout, E = stderr.  Both ⇒ both. */
+    /* Flag filter: O = stdout, E = stderr.  Both => both. */
     bool want_o = state_.flag_filter.find('O') != std::string::npos;
     bool want_e = state_.flag_filter.find('E') != std::string::npos;
     if (want_o && !want_e) {
@@ -731,8 +869,7 @@ void TvDataSource::lpane_outputs() {
         for (auto &c : data) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
         if (data.size() > 200) data = data.substr(0, 197) + "...";
         double rel = (ts_ns - base_ns) / 1e9;
-        std::string text = sfmt("+%6.3fs  [%s]  %s", rel, tgid.c_str(),
-                                data.c_str());
+        std::string time_s = sfmt("%6.3fs", rel);
         RowStyle st = (k == "E") ? RowStyle::Error : RowStyle::Normal;
         if (!state_.search.empty() &&
             data.find(state_.search) != std::string::npos)
@@ -740,18 +877,21 @@ void TvDataSource::lpane_outputs() {
         RowData row;
         /* id encodes tgid:ts_ns:k so the rpane can re-locate the event. */
         row.id = tgid + ":" + std::to_string(ts_ns) + ":" + k;
-        row.cols.push_back(std::move(text));
-        row.cols.push_back(k);                     /* O / E badge */
-        row.cols.push_back("");                    /* unused */
+        /* 4-column row matching k_lpane_cols_outputs:
+         *   time | k | tgid | data */
+        row.cols.push_back(std::move(time_s));
+        row.cols.push_back(k);
+        row.cols.push_back(tgid);
+        row.cols.push_back(std::move(data));
         row.style = st;
-        /* Enter on a row → jump to the producing process in mode 1. */
+        /* Enter on a row -> jump to the producing process in mode 1. */
         row.link_mode = 1;
         row.link_id   = tgid;
         lpane_.push_back(std::move(row));
     }
 }
 
-/* ── Mode 3: event log ────────────────────────────────────────────── */
+/* -- Mode 3: event log ---------------------------------------------- */
 
 void TvDataSource::lpane_events() {
     /* UNION ALL across event tables. We omit ARGV/ENV/AUXV; those are
@@ -795,8 +935,7 @@ void TvDataSource::lpane_events() {
             if (info.size() > 120) info = info.substr(0, 117) + "...";
         }
         double rel = (ts_ns - base_ns) / 1e9;
-        std::string text = sfmt("+%6.3fs  %-6s  [%s]  %s",
-            rel, kind.c_str(), tgid.c_str(), info.c_str());
+        std::string time_s = sfmt("%6.3fs", rel);
         RowStyle st = RowStyle::Normal;
         if      (kind == "STDERR" || kind == "EXIT") st = RowStyle::Error;
         else if (kind == "EXEC")                     st = RowStyle::CyanBold;
@@ -806,13 +945,18 @@ void TvDataSource::lpane_events() {
             st = RowStyle::Search;
         RowData row;
         row.id = tgid + ":" + std::to_string(ts_ns);
-        row.cols.push_back(std::move(text));
+        /* 4-column row matching k_lpane_cols_events:
+         *   time | kind | tgid | info */
+        row.cols.push_back(std::move(time_s));
+        row.cols.push_back(kind);
+        row.cols.push_back(tgid);
+        row.cols.push_back(std::move(info));
         row.style = st;
         lpane_.push_back(std::move(row));
     }
 }
 
-/* ── Modes 4 & 5: dep / rdep file closure ─────────────────────────── */
+/* -- Modes 4 & 5: dep / rdep file closure --------------------------- */
 
 void TvDataSource::lpane_deps(int reverse) {
     if (state_.subject_file.empty()) {
@@ -828,9 +972,9 @@ void TvDataSource::lpane_deps(int reverse) {
     }
     /* Recursive closure on (path) edges:
      *  reverse=0 (deps): from start, find all paths that fed into it.
-     *    edge: P writes A and reads B  ⇒  A depends on B.
+     *    edge: P writes A and reads B  =>  A depends on B.
      *  reverse=1 (rdeps): from start, find all paths derived from it.
-     *    edge: P reads A and writes B  ⇒  B is derived from A.
+     *    edge: P reads A and writes B  =>  B is derived from A.
      */
     const char *src_mode = reverse ? "0" : "1";   // edge mode of start side
     const char *dst_mode = reverse ? "1" : "0";   // edge mode of "next" side
@@ -862,13 +1006,16 @@ void TvDataSource::lpane_deps(int reverse) {
             st = RowStyle::Search;
         RowData row;
         row.id = path;
+        /* 2-column row matching k_lpane_cols_deps:
+         *   name | depth (just the closure depth - cheap, useful) */
         row.cols.push_back(std::move(text));
+        row.cols.push_back(std::to_string(d));
         row.style = st;
         lpane_.push_back(std::move(row));
     }
 }
 
-/* ── Modes 6 & 7: dep / rdep cmds (processes in closure) ──────────── */
+/* -- Modes 6 & 7: dep / rdep cmds (processes in closure) ------------ */
 
 void TvDataSource::lpane_dep_cmds(int reverse) {
     if (state_.subject_file.empty()) {
@@ -932,13 +1079,15 @@ void TvDataSource::lpane_dep_cmds(int reverse) {
             st = RowStyle::Search;
         RowData row;
         row.id = std::to_string(p.tgid);
+        /* 2-column row matching k_lpane_cols_dep_cmds: name | pid */
         row.cols.push_back(std::move(text));
+        row.cols.push_back(std::to_string(p.tgid));
         row.style = st;
         lpane_.push_back(std::move(row));
     }
 }
 
-/* ── rpane dispatch ───────────────────────────────────────────────── */
+/* -- rpane dispatch ------------------------------------------------- */
 
 namespace {
 bool is_heading_id(const std::string &id) {
@@ -1013,7 +1162,7 @@ void TvDataSource::rebuild_rpane() {
     }
 }
 
-/* ── rpane: process detail ────────────────────────────────────────── */
+/* -- rpane: process detail ------------------------------------------ */
 
 void TvDataSource::rpane_process_detail(const std::string &tgid_s) {
     /* Validate tgid is numeric. */
@@ -1039,7 +1188,7 @@ void TvDataSource::rpane_process_detail(const std::string &tgid_s) {
     int64_t end_ns   = p[4].empty() ? start_ns : std::stoll(p[4]);
     bool ended = !p[5].empty();
 
-    rpane_.push_back(mk_row("__hp", "── Process ──", RowStyle::Heading));
+    rpane_.push_back(mk_row("__hp", "[Process]", RowStyle::Heading));
     rpane_.push_back(mk_kv("tgid", "tgid", p[0]));
     rpane_.push_back(mk_kv("ppid", "ppid", p[1]));
     rpane_.push_back(mk_kv("exe",  "exe",  p[2]));
@@ -1056,7 +1205,7 @@ void TvDataSource::rpane_process_detail(const std::string &tgid_s) {
         "SELECT idx, CAST(arg AS VARCHAR) FROM argv WHERE tgid = " + tgid_s +
         " ORDER BY ts_ns DESC, idx ASC LIMIT 5000", &err);
     if (!argv.empty()) {
-        rpane_.push_back(mk_row("__ha", "── argv ──", RowStyle::Heading));
+        rpane_.push_back(mk_row("__ha", "[argv]", RowStyle::Heading));
         for (auto &a : argv) {
             rpane_.push_back(mk_kv("argv_" + a[0], "[" + a[0] + "]", a[1]));
         }
@@ -1068,7 +1217,7 @@ void TvDataSource::rpane_process_detail(const std::string &tgid_s) {
         "WHERE ppid = " + tgid_s + " ORDER BY start_ns LIMIT 5000", &err);
     if (!kids.empty()) {
         rpane_.push_back(mk_row("__hc",
-            sfmt("── children (%zu) ──", kids.size()),
+            sfmt("[children (%zu)]", kids.size()),
             RowStyle::Heading));
         for (auto &k : kids) {
             RowData rw = mk_kv("child_" + k[0], "[" + k[0] + "]",
@@ -1079,14 +1228,14 @@ void TvDataSource::rpane_process_detail(const std::string &tgid_s) {
         }
     }
 
-    /* opens — first 5000 with flags + err — using canonicalised paths
+    /* opens - first 5000 with flags + err - using canonicalised paths
      * so the user sees the same path string the file view shows. */
     auto opens = db_.query_strings(
         "SELECT ts_ns, fd, err, flags, path "
         "FROM tv_idx_open_canon WHERE tgid = " + tgid_s +
         " ORDER BY ts_ns LIMIT 5000", &err);
     if (!opens.empty()) {
-        rpane_.push_back(mk_row("__ho", sfmt("── opens (%zu) ──", opens.size()),
+        rpane_.push_back(mk_row("__ho", sfmt("[opens (%zu)]", opens.size()),
             RowStyle::Heading));
         size_t i = 0;
         for (auto &o : opens) {
@@ -1108,14 +1257,14 @@ void TvDataSource::rpane_process_detail(const std::string &tgid_s) {
         "SELECT idx, CAST(key AS VARCHAR), CAST(val AS VARCHAR) "
         "FROM env WHERE tgid = " + tgid_s + " ORDER BY idx LIMIT 5000", &err);
     if (!env.empty()) {
-        rpane_.push_back(mk_row("__he", sfmt("── env (%zu) ──", env.size()),
+        rpane_.push_back(mk_row("__he", sfmt("[env (%zu)]", env.size()),
             RowStyle::Heading));
         for (auto &e : env)
             rpane_.push_back(mk_kv("env_" + e[0], e[1], e[2]));
     }
 }
 
-/* ── rpane: output (mode 0) — show the producing process's events ─ */
+/* -- rpane: output (mode 0) - show the producing process's events - */
 
 void TvDataSource::rpane_output_detail(const std::string &id) {
     /* id format: "tgid:ts_ns:k" where k is O (stdout) or E (stderr).
@@ -1139,7 +1288,7 @@ void TvDataSource::rpane_output_detail(const std::string &id) {
         "       exit_kind, exit_code "
         "FROM tv_idx_proc WHERE tgid = " + tgid_s, &err);
     if (!pr.empty()) {
-        rpane_.push_back(mk_row("__hp", "── Process ──", RowStyle::Heading));
+        rpane_.push_back(mk_row("__hp", "[Process]", RowStyle::Heading));
         rpane_.push_back(mk_kv("tgid", "tgid", tgid_s));
         rpane_.push_back(mk_kv("name", "name", basename_of(pr.front()[0])));
         rpane_.push_back(mk_kv("exe",  "exe",  pr.front()[0]));
@@ -1149,7 +1298,7 @@ void TvDataSource::rpane_output_detail(const std::string &id) {
      * We CAST ts_ns to VARCHAR explicitly because the deprecated
      * duckdb_value_varchar API on a column whose union-projected type
      * is UBIGINT can sometimes return empty. */
-    rpane_.push_back(mk_row("__he", "── Events ──", RowStyle::Heading));
+    rpane_.push_back(mk_row("__he", "[Events]", RowStyle::Heading));
     std::string sql =
         "SELECT * FROM ("
         "  SELECT 'EXEC'   AS kind, CAST(ts_ns AS VARCHAR) AS ts, CAST(exe AS VARCHAR) AS info "
@@ -1196,7 +1345,7 @@ void TvDataSource::rpane_output_detail(const std::string &id) {
     }
 }
 
-/* ── rpane: file detail ───────────────────────────────────────────── */
+/* -- rpane: file detail --------------------------------------------- */
 
 void TvDataSource::rpane_file_detail(const std::string &path) {
     std::string err;
@@ -1227,7 +1376,7 @@ void TvDataSource::rpane_file_detail(const std::string &path) {
     }
     auto &r = pr.front();
     rpane_.push_back(mk_row("__hf",
-        is_dir ? "── Directory ──" : "── File ──", RowStyle::Heading));
+        is_dir ? "[Directory]" : "[File]", RowStyle::Heading));
     rpane_.push_back(mk_kv("path", "path", display_path));
     if (is_dir)
         rpane_.push_back(mk_kv("count", "files", r[7]));
@@ -1251,7 +1400,7 @@ void TvDataSource::rpane_file_detail(const std::string &path) {
         + opens_where +
         " ORDER BY o.ts_ns LIMIT 5000", &err);
     if (!opens.empty()) {
-        rpane_.push_back(mk_row("__ho", sfmt("── opens (%zu) ──", opens.size()),
+        rpane_.push_back(mk_row("__ho", sfmt("[opens (%zu)]", opens.size()),
             RowStyle::Heading));
         size_t i = 0;
         for (auto &o : opens) {
@@ -1273,7 +1422,7 @@ void TvDataSource::rpane_file_detail(const std::string &path) {
     }
 }
 
-/* ── rpane: event detail ──────────────────────────────────────────── */
+/* -- rpane: event detail -------------------------------------------- */
 
 void TvDataSource::rpane_event_detail(const std::string &id) {
     /* id format: "tgid:ts_ns" */
@@ -1284,7 +1433,7 @@ void TvDataSource::rpane_event_detail(const std::string &id) {
     for (char c : tgid_s) if (c < '0' || c > '9') return;
     for (char c : ts_s)   if (c < '0' || c > '9') return;
 
-    rpane_.push_back(mk_row("__he", "── Event ──", RowStyle::Heading));
+    rpane_.push_back(mk_row("__he", "[Event]", RowStyle::Heading));
     rpane_.push_back(mk_kv("tgid", "tgid", tgid_s));
     rpane_.push_back(mk_kv("ts_ns", "ts_ns", ts_s));
 
@@ -1318,7 +1467,7 @@ void TvDataSource::rpane_event_detail(const std::string &id) {
         "SELECT CAST(exe AS VARCHAR) "
         "FROM tv_idx_proc WHERE tgid = " + tgid_s, &err);
     if (!pr.empty()) {
-        rpane_.push_back(mk_row("__hp", "── Process ──", RowStyle::Heading));
+        rpane_.push_back(mk_row("__hp", "[Process]", RowStyle::Heading));
         rpane_.push_back(mk_kv("name", "name", basename_of(pr.front()[0])));
         rpane_.push_back(mk_kv("exe",  "exe",  pr.front()[0]));
     }
