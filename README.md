@@ -77,18 +77,50 @@ tv --trace trace.wire.zst         # creates trace.tvdb if missing/stale
 # Open an existing .tvdb directly (no ingest).
 tv --open trace.tvdb
 
-# Non-interactive: dump the current mode 1 (process tree) view to stdout.
-tv --open trace.tvdb --dump
+# Non-interactive: dump a panel mode to stdout (1=proc, 2=file, 3=event,
+# 4=deps, 5=rdeps, 6=dcmds, 7=rcmds; modes 4..7 need --subject FILE).
+tv --open trace.tvdb --dump=1
+tv --open trace.tvdb --dump=4 --subject /path/to/output
+
+# Subcommands (single static `tv` binary; sud32/sud64 stay separate).
+tv sud  -- <cmd>          # syscall-user-dispatch tracer (was sudtrace)
+tv dump trace.wire        # hexdump a wire stream (was yeetdump)
+tv ptrace -- <cmd>        # short for `tv uproctrace --ptrace --`
+tv module -- <cmd>        # short for `tv uproctrace --module --`
+tv test                   # built-in self-tests
 ```
 
 Pass `--no-env` to omit environment variables from emitted `EXEC` events.
-`make sudtrace` builds the freestanding `sud32`/`sud64` helpers and the native
-`sudtrace` launcher.
 
-Currently SQL-backed: mode 1 (process tree) and the corresponding right-pane
-process detail. Modes 2..7 (file tree, event log, output, deps) display a
-`(not yet ported to SQL backend)` placeholder; they are scheduled for the
-follow-up PR.
+### Panels
+
+All seven panel modes are SQL-backed:
+
+| Mode | Key | Contents | Right pane |
+| ---: | :-: | :--- | :--- |
+| 1 | `1` | Process tree (parent-child, basename, duration, exit) | argv, env, opens, children |
+| 2 | `2` | Per-path stats (R/W/E flags, opens, procs, errors) | opens log with flags+errs+who |
+| 3 | `3` | Event log (EXEC/CWD/OPEN/EXIT/STDOUT/STDERR by ts_ns) | per-kind detail + owning process |
+| 4 | `4` | Deps closure of subject file (recursive CTE) | file detail |
+| 5 | `5` | Reverse-deps closure of subject file | file detail |
+| 6 | `6` | Processes in dep closure | process detail |
+| 7 | `7` | Processes in reverse-dep closure | process detail |
+
+Modes 4..7 take their subject from the cursor in mode 2: navigate to a file, then press 4..7. Other keys: `/` search, `t` toggle tree/flat, `s` (mode 1) pin subtree, `?` help, `q` quit.
+
+### Lazy indices
+
+Heavy aggregations are materialised on first use into `tv_idx_proc`, `tv_idx_path`, `tv_idx_edge` and recorded in `tv_meta`. Subsequent opens of the same `.tvdb` reuse them — switching to a panel for the first time builds its index, switching back is instant.
+
+### Build
+
+DuckDB amalgamation is huge; the Makefile defaults to `clang++ -O0` because that compiles ~3× faster (~2-3 min) and uses ~⅓ the RAM (~5 GB) of `g++ -O2`. Override for release builds:
+
+```bash
+make tv DUCKDB_CXX=g++ DUCKDB_OPT=-O2
+```
+
+The resulting `tv` is statically linked; `-ldl` does not force a dynamic binary, contrary to popular belief — the linker just emits warnings about NSS at runtime, which `tv` does not exercise.
 
 ---
 
