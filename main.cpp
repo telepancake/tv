@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <fcntl.h>
 
 #include <memory>
@@ -72,7 +73,8 @@ const char *USAGE =
     "  tv ptrace -- <cmd> ...      shorthand for `tv uproctrace --ptrace --`\n"
     "  tv uproctrace [-o FILE] [--module|--sud|--ptrace] -- <cmd> ...\n"
     "                              raw recorder (writes wire to fd/file)\n"
-    "  tv test                     run built-in self-tests\n";
+    "  tv test                     run built-in self-tests\n"
+    "  tv ingest <wire> [-o OUT]   convert wire to .tvdb without UI\n";
 
 /* ── ingest helpers ───────────────────────────────────────────────── */
 
@@ -209,12 +211,17 @@ const char *HELP_LINES[] = {
     "  Enter    Follow row to its target panel",
     "",
     "  /text    Glob/text filter         Esc    Clear filters",
-    "  f...     Flag filter (mode 2: any of R/W/E)",
+    "  f...     Flag filter:",
+    "             mode 1 procs:  K=killed/running  F=fail-with-write",
+    "                            D=derived-exec",
+    "             mode 2 files:  R/W/E  +  w=written  f=fail-writer",
+    "                            s=non-system  k=non-kernel-iface",
+    "             mode 0 output: O=stdout E=stderr",
     "  s        Subtree-only (mode 1)    p      Show pid prefix (mode 1)",
     "  t        Tree / flat toggle (modes 1, 2)",
     "",
-    "  1  Process tree     2  File tree       3  Event log",
-    "  4  Deps             5  Reverse deps    6  Dep cmds       7  RDep cmds",
+    "  0  Output stream    1  Process tree    2  File tree    3  Event log",
+    "  4  Deps             5  Reverse deps    6  Dep cmds     7  RDep cmds",
     "  q  Quit             ?  Help",
     nullptr
 };
@@ -225,16 +232,29 @@ struct UiCtx {
     int           rpane = -1;
     AppState     *state = nullptr;
     TvDataSource *src = nullptr;
+    /* Idle cursor commit: lpane cursor changes set pending_cursor_id;
+     * a 100 ms timer commits it (and rebuilds the rpane) 300 ms after
+     * the last change.  This restores the previous "autopopulate on
+     * inactivity" behaviour without rebuilding the rpane on every
+     * keystroke. */
+    std::string   pending_cursor_id;
+    int64_t       last_cursor_change_ms = 0;
+    bool          have_pending = false;
 };
+
+int64_t now_ms() {
+    struct timeval tv; ::gettimeofday(&tv, nullptr);
+    return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
 
 void update_status(UiCtx &c) {
     if (!c.tui) return;
     static const char *MN[] = {
-        "?", "1:proc", "2:file", "3:event",
-        "4:dep", "5:rdep", "6:dcmd", "7:rcmd"
+        "0:out",  "1:proc", "2:file", "3:event",
+        "4:dep",  "5:rdep", "6:dcmd", "7:rcmd"
     };
     int m = c.state->mode;
-    const char *mn = (m >= 1 && m <= 7) ? MN[m] : "?";
+    const char *mn = (m >= 0 && m <= 7) ? MN[m] : "?";
     char buf[1024];
     int n = std::snprintf(buf, sizeof buf, "tv | %s%s",
         mn, c.state->grouped ? " tree" : " flat");
@@ -296,7 +316,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         seed_cursor_if_unset(c);
         return TUI_DEFAULT;
     }
-    if (key >= '1' && key <= '7') {
+    if (key >= '0' && key <= '7') {
         int new_mode = key - '0';
         /* When entering a dep mode (4..7) from the file view (mode 2),
          * pin the current cursor as the subject file so the closure
@@ -308,6 +328,8 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         }
         c.state->mode = new_mode;
         c.state->cursor_id.clear();
+        c.have_pending = false;          /* mode switch invalidates pending */
+        c.pending_cursor_id.clear();
         invalidate_and_redraw();
         return TUI_HANDLED;
     }
@@ -346,8 +368,13 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         return TUI_HANDLED;
     }
     if (key == 'f') {
-        char buf[16] = {};
-        if (tui.line_edit("flags (R/W/E, e.g. WE): ", buf, sizeof buf) >= 0) {
+        char buf[32] = {};
+        const char *prompt =
+            (c.state->mode == 1) ? "proc flags (K=killed/run F=fail-with-write D=derived-exec): " :
+            (c.state->mode == 2) ? "file flags (R/W/E + w/f/s/k computed): " :
+            (c.state->mode == 0) ? "output: O=stdout E=stderr: " :
+                                   "flags: ";
+        if (tui.line_edit(prompt, buf, sizeof buf) >= 0) {
             c.state->flag_filter = buf;
             invalidate_and_redraw();
         }
@@ -417,12 +444,14 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         }
         return TUI_HANDLED;
     }
-    /* Cursor changes update the rpane. */
+    /* Cursor changes: defer rpane rebuild so fast-scrolling doesn't
+     * trigger a SQL query per keystroke.  We just stash the live
+     * cursor id; a 100 ms timer (registered in main()) commits it
+     * 300 ms after the last cursor change. */
     if (panel == c.lpane && row_id && std::string(row_id) != c.state->cursor_id) {
-        c.state->cursor_id = row_id;
-        c.src->invalidate();
-        tui.dirty(c.rpane);
-        update_status(c);
+        c.pending_cursor_id = row_id;
+        c.have_pending = true;
+        c.last_cursor_change_ms = now_ms();
     }
     return TUI_DEFAULT;
 }
@@ -462,6 +491,59 @@ int dump_mode(TvDb &db, int mode, const std::string &subject) {
     return 0;
 }
 
+int ingest_main(int argc, char **argv) {
+    /* tv ingest <wire-file> [-o OUT.tvdb]
+     * Convert a .wire (or .wire.zst) trace to a .tvdb without spawning
+     * the TUI. Output defaults to next-to-input with .tvdb suffix. */
+    const char *in_path = nullptr;
+    const char *out_path = nullptr;
+    for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out_path = argv[++i];
+        else if (argv[i][0] == '-') {
+            std::fprintf(stderr,
+                "usage: tv ingest <wire> [-o OUT.tvdb]\n");
+            return 2;
+        }
+        else if (!in_path) in_path = argv[i];
+        else {
+            std::fprintf(stderr,
+                "tv ingest: unexpected positional arg: %s\n", argv[i]);
+            return 2;
+        }
+    }
+    if (!in_path) {
+        std::fprintf(stderr, "tv ingest: missing wire file\n"
+            "usage: tv ingest <wire> [-o OUT.tvdb]\n");
+        return 2;
+    }
+    std::string out_db = out_path ? std::string(out_path)
+                                  : default_tvdb_for_wire(in_path);
+    /* If the output is stale (older than wire), rebuild from scratch.
+     * Otherwise accept that the existing one is up to date. */
+    struct stat st_wire{}, st_db{};
+    bool need_build = ::stat(out_db.c_str(), &st_db) != 0;
+    if (!need_build && ::stat(in_path, &st_wire) == 0 &&
+        st_wire.st_mtime > st_db.st_mtime) need_build = true;
+    if (!need_build) {
+        std::fprintf(stderr,
+            "tv ingest: %s already up to date (use rm + retry to force)\n",
+            out_db.c_str());
+        return 0;
+    }
+    ::unlink(out_db.c_str());
+    std::string err;
+    auto db = TvDb::open_file(out_db, &err);
+    if (!db) { std::fprintf(stderr, "tv ingest: %s\n", err.c_str()); return 1; }
+    if (!ingest_wire_file(in_path, *db, &err)) {
+        std::fprintf(stderr, "tv ingest: %s\n", err.c_str()); return 1;
+    }
+    if (!db->flush(&err)) {
+        std::fprintf(stderr, "tv ingest: flush: %s\n", err.c_str()); return 1;
+    }
+    std::fprintf(stderr, "tv ingest: %s -> %s\n", in_path, out_db.c_str());
+    return 0;
+}
+
 } /* namespace */
 
 int main(int argc, char **argv) {
@@ -479,6 +561,8 @@ int main(int argc, char **argv) {
             return run_tests();
         if (!std::strcmp(sub, "uproctrace"))
             return uproctrace_main(argc - 1, argv + 1);
+        if (!std::strcmp(sub, "ingest"))
+            return ingest_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "module") || !std::strcmp(sub, "ptrace")) {
             /* tv module -- <cmd>  ==  tv uproctrace --module -- <cmd> */
             std::vector<char*> nargv;
@@ -520,7 +604,7 @@ int main(int argc, char **argv) {
         else if (!std::strncmp(argv[i], "--dump=", 7)) {
             dump = true;
             dump_mode_n = std::atoi(argv[i] + 7);
-            if (dump_mode_n < 1 || dump_mode_n > 7) dump_mode_n = 1;
+            if (dump_mode_n < 0 || dump_mode_n > 7) dump_mode_n = 1;
         }
         else if (!std::strcmp(argv[i], "--subject") && i + 1 < argc)
             dump_subject = argv[++i];
@@ -647,9 +731,25 @@ int main(int argc, char **argv) {
     }
     ui.tui = tui.get();
 
-    static const ColDef text_col[] = {{-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE}};
-    static const PanelDef lpane_def = {nullptr, text_col, 1, TUI_PANEL_CURSOR};
-    static const PanelDef rpane_def = {nullptr, text_col, 1,
+    /* lpane columns:
+     *   0: tree-prefix + name + tail   (flex, ellipsised on overflow)
+     *   1: flag badge (e.g. "RWE")     (fixed 4)
+     *   2: stats summary               (fixed 26, right-aligned)
+     * Modes that don't use cols 1/2 just emit empty strings. */
+    static const ColDef lpane_cols[] = {
+        {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
+        { 4, TUI_ALIGN_LEFT,  TUI_OVERFLOW_TRUNCATE},
+        {26, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    };
+    static const PanelDef lpane_def = {nullptr, lpane_cols, 3, TUI_PANEL_CURSOR};
+
+    /* rpane columns: key (fixed width) | value (flex).  The engine
+     * does the alignment, no fixed-width prefixing in app code. */
+    static const ColDef rpane_cols[] = {
+        {18, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE},
+        {-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS},
+    };
+    static const PanelDef rpane_def = {nullptr, rpane_cols, 2,
                                        TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
     ui.lpane = tui->add_panel(lpane_def);
     ui.rpane = tui->add_panel(rpane_def);
@@ -688,10 +788,28 @@ int main(int argc, char **argv) {
         });
         lt.dec = &dec;
         tui->watch_fd(lt.fd, [&](Tui &t, int fd){ on_trace_fd_cb(t, fd, lt); });
-        tui->run();
-    } else {
-        tui->run();
     }
+
+    /* Idle auto-select: every 100 ms check whether the lpane cursor
+     * has been stable for ≥ 300 ms; if so, commit it as state.cursor_id
+     * and rebuild the rpane.  Without this the rpane only updated on
+     * Enter, which the user found jarring. */
+    tui->add_timer(100, [&ui](Tui &t) {
+        if (!ui.have_pending) return 1;
+        if (now_ms() - ui.last_cursor_change_ms < 300) return 1;
+        if (ui.pending_cursor_id == ui.state->cursor_id) {
+            ui.have_pending = false;
+            return 1;
+        }
+        ui.state->cursor_id = ui.pending_cursor_id;
+        ui.have_pending = false;
+        ui.src->invalidate_rpane();
+        t.dirty(ui.rpane);
+        update_status(ui);
+        return 1;
+    });
+
+    tui->run();
 
     if (lt.fd >= 0) { ::close(lt.fd); lt.fd = -1; }
     if (lt.child_pid > 0) { ::kill(lt.child_pid, SIGTERM); ::waitpid(lt.child_pid, nullptr, 0); }
