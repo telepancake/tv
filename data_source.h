@@ -25,11 +25,15 @@ class TvDb;
 struct AppState {
     int          mode = 1;
     std::string  cursor_id;        /* current cursor row id (mode-dependent) */
-    std::string  search;           /* /search query */
+    std::string  search;           /* /search query — substring/glob filter */
+    std::string  flag_filter;      /* mode 2: "R"/"W"/"E"/"RW" etc. (any-of) */
     std::string  subject_file;     /* anchor for modes 4..7 */
     bool         grouped = true;   /* tree (true) vs flat (false) view */
     bool         subtree_only = false;  /* mode 1: restrict to subtree of cursor */
     std::string  subtree_root;     /* mode 1: tgid of subtree root */
+    bool         show_pids = false;     /* mode 1: prefix labels with [tgid] */
+    /* Right-pane section collapsing: heading id (e.g. "__ho") → collapsed. */
+    std::vector<std::string> collapsed_sections;
 };
 
 class TvDataSource {
@@ -72,7 +76,10 @@ private:
     std::string built_for_subject_;
     int    built_for_mode_ = -1;
     std::string built_for_search_;
+    std::string built_for_flag_filter_;
     bool   built_for_grouped_ = true;
     bool   built_for_subtree_only_ = false;
     std::string built_for_subtree_root_;
+    bool   built_for_show_pids_ = false;
+    std::vector<std::string> built_for_collapsed_;
 };

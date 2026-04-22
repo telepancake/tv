@@ -514,17 +514,53 @@ bool TvDb::ensure_path_index(std::string *err) {
     std::string val;
     if (meta_get(impl_->con, "idx_path", val)) return true;
 
-    /* Per-path stats; flags & 3 == 0  → read-only open. */
+    /* Canonicalise relative open paths against the latest CWD for the
+     * tgid that precedes the open's ts_ns.  Without this, two tgids
+     * that opened "Makefile" from different cwds would be reported as
+     * the same file (and an absolute /home/x/proj/Makefile and a
+     * relative Makefile from the same cwd would be reported as two
+     * different files). */
+    const char *canon_sql =
+        "CREATE TABLE IF NOT EXISTS tv_idx_open_canon AS "
+        "WITH ranked AS ("
+        "  SELECT o.ts_ns, o.tgid, o.fd, o.flags, o.err, "
+        "         CAST(o.path AS VARCHAR) AS raw_path, "
+        "         CAST(c.cwd AS VARCHAR)  AS cwd, "
+        "         ROW_NUMBER() OVER ( "
+        "           PARTITION BY o.ts_ns, o.tgid, o.fd, o.path "
+        "           ORDER BY c.ts_ns DESC) AS rn "
+        "  FROM open_ o "
+        "  LEFT JOIN cwd c ON c.tgid = o.tgid AND c.ts_ns <= o.ts_ns "
+        ") "
+        "SELECT ts_ns, tgid, fd, flags, err, raw_path, "
+        "       CASE "
+        "         WHEN raw_path LIKE '/%' THEN raw_path "
+        "         WHEN cwd IS NULL OR raw_path LIKE 'pipe:%' "
+        "              OR raw_path LIKE 'socket:%' OR raw_path LIKE 'anon_inode:%' "
+        "           THEN raw_path "
+        "         WHEN cwd = '/' THEN '/' || raw_path "
+        "         ELSE cwd || '/' || raw_path "
+        "       END AS path "
+        "FROM ranked WHERE rn = 1";
+    if (!run_query(impl_->con, canon_sql, err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_path "
+                   "ON tv_idx_open_canon(path)", err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_tgid "
+                   "ON tv_idx_open_canon(tgid)", err)) return false;
+
+    /* Per-canonical-path stats; flags & 3 == 0  → read-only open. */
     const char *sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_path AS "
-        "SELECT CAST(path AS VARCHAR) AS path, "
+        "SELECT path, "
         "       COUNT(*) AS opens, "
         "       SUM(CASE WHEN err <> 0 THEN 1 ELSE 0 END) AS errors, "
         "       COUNT(DISTINCT tgid) AS procs, "
         "       SUM(CASE WHEN (flags & 3) = 0 THEN 1 ELSE 0 END) AS reads, "
         "       SUM(CASE WHEN (flags & 3) <> 0 THEN 1 ELSE 0 END) AS writes, "
         "       MIN(ts_ns) AS first_ns, MAX(ts_ns) AS last_ns "
-        "FROM open_ GROUP BY path";
+        "FROM tv_idx_open_canon GROUP BY path";
     if (!run_query(impl_->con, sql, err)) return false;
     if (!run_query(impl_->con,
                    "CREATE INDEX IF NOT EXISTS tv_idx_path_path "
@@ -539,13 +575,18 @@ bool TvDb::ensure_edge_index(std::string *err) {
     std::string val;
     if (meta_get(impl_->con, "idx_edge", val)) return true;
 
+    /* The path index canonicalises relative paths against cwd; we
+     * depend on it so that dep/rdep traversal doesn't get fragmented
+     * by the same file appearing under multiple aliases. */
+    if (!ensure_path_index(err)) return false;
+
     /* (tgid, path, mode) where mode = 0 read, 1 write. Successful opens
      * only — failures (err != 0) don't create dependencies. */
     const char *sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_edge AS "
-        "SELECT DISTINCT tgid, CAST(path AS VARCHAR) AS path, "
+        "SELECT DISTINCT tgid, path, "
         "       CASE WHEN (flags % 4) = 0 THEN 0 ELSE 1 END AS mode "
-        "FROM open_ WHERE err = 0";
+        "FROM tv_idx_open_canon WHERE err = 0";
     if (!run_query(impl_->con, sql, err)) return false;
     if (!run_query(impl_->con,
                    "CREATE INDEX IF NOT EXISTS tv_idx_edge_path "

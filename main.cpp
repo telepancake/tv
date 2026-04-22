@@ -205,12 +205,16 @@ const char *HELP_LINES[] = {
     "  ─────────────────────────────────────────",
     "",
     "  ↑↓ jk    Navigate    PgUp/PgDn  Page    g/G  First/Last",
-    "  Tab      Switch panel    Enter   Follow link to process",
-    "  /text    Search current panel    Esc    Clear search",
+    "  Tab      Toggle section (info pane) / switch focus elsewhere",
+    "  Enter    Follow row to its target panel",
+    "",
+    "  /text    Glob/text filter         Esc    Clear filters",
+    "  f...     Flag filter (mode 2: any of R/W/E)",
+    "  s        Subtree-only (mode 1)    p      Show pid prefix (mode 1)",
+    "  t        Tree / flat toggle (modes 1, 2)",
     "",
     "  1  Process tree     2  File tree       3  Event log",
     "  4  Deps             5  Reverse deps    6  Dep cmds       7  RDep cmds",
-    "  s  Toggle subtree-only (mode 1)",
     "  q  Quit             ?  Help",
     nullptr
 };
@@ -231,7 +235,7 @@ void update_status(UiCtx &c) {
     };
     int m = c.state->mode;
     const char *mn = (m >= 1 && m <= 7) ? MN[m] : "?";
-    char buf[512];
+    char buf[1024];
     int n = std::snprintf(buf, sizeof buf, "tv | %s%s",
         mn, c.state->grouped ? " tree" : " flat");
     if (!c.state->cursor_id.empty())
@@ -240,13 +244,43 @@ void update_status(UiCtx &c) {
     if (!c.state->subject_file.empty() && m >= 4 && m <= 7)
         n += std::snprintf(buf + n, sizeof buf - n, " | subj=%s",
                            c.state->subject_file.c_str());
+    /* Composed filter list — every active filter shown.  Order:
+     * subtree, glob, flags. */
+    if (c.state->subtree_only && !c.state->subtree_root.empty())
+        n += std::snprintf(buf + n, sizeof buf - n, " | subtree=%s",
+                           c.state->subtree_root.c_str());
     if (!c.state->search.empty())
         n += std::snprintf(buf + n, sizeof buf - n, " | /%s",
                            c.state->search.c_str());
+    if (!c.state->flag_filter.empty())
+        n += std::snprintf(buf + n, sizeof buf - n, " | flags=%s",
+                           c.state->flag_filter.c_str());
+    if (c.state->show_pids)
+        n += std::snprintf(buf + n, sizeof buf - n, " | pids");
     n += std::snprintf(buf + n, sizeof buf - n,
-        " | 1..7 mode  t tree/flat  s subtree  / search  ? help");
+        " | 1..7 mode  t tree  s subtree  / glob  f flags  p pids  ? help");
     (void)n;
     c.tui->set_status(buf);
+}
+
+/* Set cursor_id to the first user-row in the lpane when nothing is
+ * selected yet (so the right pane is populated on startup and after
+ * mode switches, instead of showing "(select a row)" until you nudge
+ * the cursor down).  Skips synthetic rows with ids starting with "__"
+ * (e.g. "__hint", "__empty"). */
+void seed_cursor_if_unset(UiCtx &c) {
+    if (!c.state->cursor_id.empty()) return;
+    for (int i = 0; i < 4096; i++) {
+        const RowData *r = c.tui->get_cached_row(c.lpane, i);
+        if (!r) break;
+        if (r->id.size() >= 2 && r->id[0] == '_' && r->id[1] == '_') continue;
+        c.state->cursor_id = r->id;
+        c.tui->set_cursor_idx(c.lpane, i);
+        c.src->invalidate();
+        c.tui->dirty(c.rpane);
+        update_status(c);
+        return;
+    }
 }
 
 int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
@@ -256,6 +290,12 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         tui.dirty();
         update_status(c);
     };
+    /* Right after every key (and at idle ticks) make sure cur is set —
+     * the lpane has just been (re)built and we know its first row. */
+    if (key == TUI_K_NONE) {
+        seed_cursor_if_unset(c);
+        return TUI_DEFAULT;
+    }
     if (key >= '1' && key <= '7') {
         int new_mode = key - '0';
         /* When entering a dep mode (4..7) from the file view (mode 2),
@@ -271,9 +311,22 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         invalidate_and_redraw();
         return TUI_HANDLED;
     }
-    if (key == 'q' || key == TUI_K_ESC) {
-        if (key == TUI_K_ESC && !c.state->search.empty()) {
+    if (key == 'q') { tui.quit(); return TUI_HANDLED; }
+    if (key == TUI_K_ESC) {
+        /* Esc clears every active filter, layered. */
+        if (!c.state->search.empty()) {
             c.state->search.clear();
+            invalidate_and_redraw();
+            return TUI_HANDLED;
+        }
+        if (!c.state->flag_filter.empty()) {
+            c.state->flag_filter.clear();
+            invalidate_and_redraw();
+            return TUI_HANDLED;
+        }
+        if (c.state->subtree_only) {
+            c.state->subtree_only = false;
+            c.state->subtree_root.clear();
             invalidate_and_redraw();
             return TUI_HANDLED;
         }
@@ -286,15 +339,29 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
     }
     if (key == '/') {
         char buf[128] = {};
-        if (tui.line_edit("search: ", buf, sizeof buf) >= 0) {
+        if (tui.line_edit("glob/text: ", buf, sizeof buf) >= 0) {
             c.state->search = buf;
             invalidate_and_redraw();
         }
         return TUI_HANDLED;
     }
-    /* Tree/flat toggle (mode 1, mode 2). */
+    if (key == 'f') {
+        char buf[16] = {};
+        if (tui.line_edit("flags (R/W/E, e.g. WE): ", buf, sizeof buf) >= 0) {
+            c.state->flag_filter = buf;
+            invalidate_and_redraw();
+        }
+        return TUI_HANDLED;
+    }
+    /* Tree/flat toggle (modes 1, 2). */
     if (key == 't') {
         c.state->grouped = !c.state->grouped;
+        invalidate_and_redraw();
+        return TUI_HANDLED;
+    }
+    /* Show/hide pid prefix in mode 1. */
+    if (key == 'p') {
+        c.state->show_pids = !c.state->show_pids;
         invalidate_and_redraw();
         return TUI_HANDLED;
     }
@@ -308,6 +375,46 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
             c.state->subtree_root = c.state->cursor_id;
         }
         invalidate_and_redraw();
+        return TUI_HANDLED;
+    }
+    /* Tab on the rpane: collapse/expand the section the cursor is on. */
+    if (key == TUI_K_TAB && panel == c.rpane && row_id) {
+        std::string id = row_id;
+        /* Find the heading the cursor sits on or under. */
+        int cur = tui.get_cursor(c.rpane);
+        std::string heading_id;
+        for (int i = cur; i >= 0; i--) {
+            const RowData *r = tui.get_cached_row(c.rpane, i);
+            if (!r) break;
+            if (r->id.size() >= 2 && r->id[0] == '_' && r->id[1] == '_'
+                && r->style == RowStyle::Heading) {
+                heading_id = r->id;
+                break;
+            }
+        }
+        if (!heading_id.empty()) {
+            auto &v = c.state->collapsed_sections;
+            auto it = std::find(v.begin(), v.end(), heading_id);
+            if (it == v.end()) v.push_back(heading_id);
+            else v.erase(it);
+            c.src->invalidate();
+            tui.dirty(c.rpane);
+        }
+        return TUI_HANDLED;
+    }
+    /* Enter on rpane row → navigate using link metadata. */
+    if (key == TUI_K_ENTER && panel == c.rpane && row_id) {
+        int cur = tui.get_cursor(c.rpane);
+        const RowData *r = tui.get_cached_row(c.rpane, cur);
+        if (r && r->link_mode > 0 && !r->link_id.empty()) {
+            int target_mode = r->link_mode;
+            std::string target_id = r->link_id;
+            c.state->mode = target_mode;
+            c.state->cursor_id = target_id;
+            c.tui->focus(c.lpane);
+            invalidate_and_redraw();
+            c.tui->set_cursor(c.lpane, target_id.c_str());
+        }
         return TUI_HANDLED;
     }
     /* Cursor changes update the rpane. */
@@ -329,11 +436,28 @@ int dump_mode(TvDb &db, int mode, const std::string &subject) {
     TvDataSource ts(db, st);
     auto srcfn = ts.make_data_source();
     srcfn.row_begin(0);
+    std::string first_real_id;
     while (srcfn.row_has_more(0)) {
         RowData r = srcfn.row_next(0);
+        if (first_real_id.empty() && !(r.id.size() >= 2 && r.id[0] == '_' && r.id[1] == '_'))
+            first_real_id = r.id;
         std::printf("%s", r.id.c_str());
         for (auto &col : r.cols) std::printf("\t%s", col.c_str());
         std::printf("\n");
+    }
+    /* Also dump the right pane for the first real row, so tests can
+     * verify the info-pane content end-to-end. */
+    if (!first_real_id.empty()) {
+        st.cursor_id = first_real_id;
+        ts.invalidate();
+        srcfn.row_begin(1);
+        std::printf("--- rpane for %s ---\n", first_real_id.c_str());
+        while (srcfn.row_has_more(1)) {
+            RowData r = srcfn.row_next(1);
+            std::printf("%s", r.id.c_str());
+            for (auto &col : r.cols) std::printf("\t%s", col.c_str());
+            std::printf("\n");
+        }
     }
     return 0;
 }
@@ -540,6 +664,22 @@ int main(int argc, char **argv) {
     });
     update_status(ui);
     tui->dirty();
+
+    /* Force the lpane to materialise so we can pick its first row id
+     * as the initial cursor. Otherwise the right pane is empty and
+     * "cur=" is unset until the user presses a key. */
+    {
+        DataSource ds = src.make_data_source();
+        ds.row_begin(0);
+        while (ds.row_has_more(0)) {
+            RowData r = ds.row_next(0);
+            if (r.id.size() >= 2 && r.id[0] == '_' && r.id[1] == '_') continue;
+            state.cursor_id = r.id;
+            update_status(ui);
+            break;
+        }
+        src.invalidate();
+    }
 
     if (lt.fd >= 0) {
         WireDecoder dec([&](const WireEvent &ev) {
