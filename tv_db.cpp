@@ -525,23 +525,26 @@ bool TvDb::ensure_path_index(std::string *err) {
     if (meta_get(impl_->con, "idx_path", val)) return true;
 
     /* Canonicalise relative open paths against the latest CWD for the
-     * tgid that precedes the open's ts_ns. We *only* keep the
-     * canonicalised path column (no raw_path duplicate); on large
-     * traces (10^8 opens) raw_path was a 3-5 GB redundant copy of the
-     * data already in `open_`. */
+     * tgid that precedes the open's ts_ns.
+     *
+     * Earlier versions used a window function over a regular LEFT JOIN
+     * on `cwd.tgid = open.tgid AND cwd.ts_ns <= open.ts_ns`. That join
+     * produces (opens X cwds-per-tgid) intermediate rows and was
+     * peaking at ~29 GB RSS on a 14 GB wire trace before the
+     * ROW_NUMBER() filter dropped them.
+     *
+     * DuckDB's ASOF JOIN does the "most-recent-row-with-ts <= mine"
+     * lookup natively in O(N log N) sort-merge with at most one
+     * matching row per probe. No row explosion, no window function,
+     * no dedup needed. The materialised on-disk layout is the same
+     * as before, just produced via a different plan.
+     *
+     * Open paths get canonicalised by gluing the cwd in front of any
+     * non-absolute path; pseudo-paths (pipe:, socket:, anon_inode:)
+     * are passed through unchanged. */
     const char *canon_sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_open_canon AS "
-        "WITH ranked AS ("
-        "  SELECT o.ts_ns, o.tgid, o.fd, o.flags, o.err, "
-        "         CAST(o.path AS VARCHAR) AS raw_path, "
-        "         CAST(c.cwd AS VARCHAR)  AS cwd, "
-        "         ROW_NUMBER() OVER ( "
-        "           PARTITION BY o.ts_ns, o.tgid, o.fd, o.path "
-        "           ORDER BY c.ts_ns DESC) AS rn "
-        "  FROM open_ o "
-        "  LEFT JOIN cwd c ON c.tgid = o.tgid AND c.ts_ns <= o.ts_ns "
-        ") "
-        "SELECT ts_ns, tgid, fd, flags, err, "
+        "SELECT o.ts_ns, o.tgid, o.fd, o.flags, o.err, "
         "       CASE "
         "         WHEN raw_path LIKE '/%' THEN raw_path "
         "         WHEN cwd IS NULL OR raw_path LIKE 'pipe:%' "
@@ -550,7 +553,14 @@ bool TvDb::ensure_path_index(std::string *err) {
         "         WHEN cwd = '/' THEN '/' || raw_path "
         "         ELSE cwd || '/' || raw_path "
         "       END AS path "
-        "FROM ranked WHERE rn = 1";
+        "FROM ( "
+        "  SELECT o.ts_ns, o.tgid, o.fd, o.flags, o.err, "
+        "         CAST(o.path AS VARCHAR) AS raw_path, "
+        "         CAST(c.cwd  AS VARCHAR) AS cwd "
+        "  FROM open_ o "
+        "  ASOF LEFT JOIN cwd c "
+        "    ON o.tgid = c.tgid AND o.ts_ns >= c.ts_ns "
+        ") o";
     if (!run_query(impl_->con, canon_sql, err)) return false;
     if (!run_query(impl_->con,
                    "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_path "
