@@ -514,30 +514,17 @@ bool TvDb::ensure_path_index(std::string *err) {
     std::string val;
     if (meta_get(impl_->con, "idx_path", val)) return true;
 
-    /* Per-path stats; flags % 4 == 0  → read-only open. The vendored
-     * DuckDB amalgamation is missing the core_functions extension —
-     * which means SUM, AVG, FIRST, LAST, COUNT(DISTINCT), bitwise & ,
-     * and regex_* are all unavailable. Stick to COUNT/MIN/MAX (which
-     * live in the always-on built-in catalog) and use the standard
-     * `COUNT(CASE WHEN cond THEN 1 END)` NULL trick to count
-     * conditionally. */
+    /* Per-path stats; flags & 3 == 0  → read-only open. */
     const char *sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_path AS "
-        "WITH base AS ("
-        "  SELECT CAST(path AS VARCHAR) AS path, tgid, err, flags FROM open_"
-        "), pp AS ("
-        "  SELECT DISTINCT path, tgid FROM base"
-        "), procs AS ("
-        "  SELECT path, COUNT(*) AS procs FROM pp GROUP BY path"
-        ") "
-        "SELECT b.path, "
+        "SELECT CAST(path AS VARCHAR) AS path, "
         "       COUNT(*) AS opens, "
-        "       COUNT(CASE WHEN b.err <> 0 THEN 1 END) AS errors, "
-        "       MAX(p.procs) AS procs, "
-        "       COUNT(CASE WHEN (b.flags % 4) = 0 THEN 1 END) AS reads, "
-        "       COUNT(CASE WHEN (b.flags % 4) <> 0 THEN 1 END) AS writes "
-        "FROM base b JOIN procs p USING (path) "
-        "GROUP BY b.path";
+        "       SUM(CASE WHEN err <> 0 THEN 1 ELSE 0 END) AS errors, "
+        "       COUNT(DISTINCT tgid) AS procs, "
+        "       SUM(CASE WHEN (flags & 3) = 0 THEN 1 ELSE 0 END) AS reads, "
+        "       SUM(CASE WHEN (flags & 3) <> 0 THEN 1 ELSE 0 END) AS writes, "
+        "       MIN(ts_ns) AS first_ns, MAX(ts_ns) AS last_ns "
+        "FROM open_ GROUP BY path";
     if (!run_query(impl_->con, sql, err)) return false;
     if (!run_query(impl_->con,
                    "CREATE INDEX IF NOT EXISTS tv_idx_path_path "
