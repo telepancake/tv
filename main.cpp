@@ -29,6 +29,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <zstd.h>
 
@@ -39,6 +40,9 @@
 
 extern int uproctrace_main(int argc, char **argv);
 extern int run_tests(); /* tests.cpp */
+extern int fv_main(int argc, char **argv); /* fv.cpp */
+extern "C" int sudtrace_main(int argc, char **argv);  /* sud/sudtrace.c */
+extern "C" int yeetdump_main(int argc, char **argv);  /* tools/yeetdump/yeetdump.c */
 
 namespace {
 
@@ -50,10 +54,25 @@ enum live_trace_backend {
 };
 
 const char *USAGE =
-    "Usage: tv [--module|--sud|--ptrace] -- <command> [args...]\n"
-    "       tv --trace <file.wire[.zst]>\n"
-    "       tv --open  <file.tvdb>\n"
-    "       tv --uproctrace [-o FILE[.wire[.zst]]] [--module|--sud|--ptrace] -- <command> [args...]\n";
+    "tv — process trace viewer (DuckDB-backed)\n"
+    "\n"
+    "Subcommands:\n"
+    "  tv [--module|--sud|--ptrace] -- <cmd> [args...]\n"
+    "                              record live and view\n"
+    "  tv --trace <file.wire[.zst]>      ingest into <file>.tvdb and view\n"
+    "  tv --open  <file.tvdb>            open existing tvdb and view\n"
+    "  tv --dump                         dump mode 1 (process tree) to stdout (with --trace/--open)\n"
+    "\n"
+    "Tools (folded in from former separate binaries):\n"
+    "  tv sud [args...]            sudtrace launcher (former sudtrace)\n"
+    "  tv dump <wire-file>...      hexdump a wire stream (former yeetdump)\n"
+    "  tv dump --selftest          wire-format roundtrip test\n"
+    "  tv fv [path]                file viewer (former fv)\n"
+    "  tv module -- <cmd> ...      shorthand for `tv uproctrace --module --`\n"
+    "  tv ptrace -- <cmd> ...      shorthand for `tv uproctrace --ptrace --`\n"
+    "  tv uproctrace [-o FILE] [--module|--sud|--ptrace] -- <cmd> ...\n"
+    "                              raw recorder (writes wire to fd/file)\n"
+    "  tv test                     run built-in self-tests\n";
 
 /* ── ingest helpers ───────────────────────────────────────────────── */
 
@@ -182,14 +201,17 @@ void on_trace_fd_cb(Tui &tui, int fd, LiveTrace &lt) {
 
 const char *HELP_LINES[] = {
     "",
-    "  Process Trace Viewer (DuckDB-backed)",
-    "  ────────────────────────────────────",
+    "  tv — Process Trace Viewer (DuckDB-backed)",
+    "  ─────────────────────────────────────────",
     "",
-    "  ↑↓ jk   Navigate    PgUp/PgDn  Page    g  First    Tab  Switch pane",
-    "  /text   Search current panel    Esc    Clear search",
-    "  1       Process tree (the only mode currently SQL-backed)",
-    "  2..7    Stub: not yet ported to SQL backend",
-    "  q       Quit    ?  Help",
+    "  ↑↓ jk    Navigate    PgUp/PgDn  Page    g/G  First/Last",
+    "  Tab      Switch panel    Enter   Follow link to process",
+    "  /text    Search current panel    Esc    Clear search",
+    "",
+    "  1  Process tree     2  File tree       3  Event log",
+    "  4  Deps             5  Reverse deps    6  Dep cmds       7  RDep cmds",
+    "  s  Toggle subtree-only (mode 1)",
+    "  q  Quit             ?  Help",
     nullptr
 };
 
@@ -284,6 +306,38 @@ int dump_mode1(TvDb &db) {
 } /* namespace */
 
 int main(int argc, char **argv) {
+    /* Subcommand dispatch (must be the first positional arg, before any
+     * --flag). This consolidates what used to be separate binaries. */
+    if (argc >= 2 && argv[1][0] != '-') {
+        const char *sub = argv[1];
+        if (!std::strcmp(sub, "sud"))
+            return sudtrace_main(argc - 1, argv + 1);
+        if (!std::strcmp(sub, "dump"))
+            return yeetdump_main(argc - 1, argv + 1);
+        if (!std::strcmp(sub, "fv"))
+            return fv_main(argc - 1, argv + 1);
+        if (!std::strcmp(sub, "test"))
+            return run_tests();
+        if (!std::strcmp(sub, "uproctrace"))
+            return uproctrace_main(argc - 1, argv + 1);
+        if (!std::strcmp(sub, "module") || !std::strcmp(sub, "ptrace")) {
+            /* tv module -- <cmd>  ==  tv uproctrace --module -- <cmd> */
+            std::vector<char*> nargv;
+            nargv.push_back((char*)"uproctrace");
+            std::string flag = std::string("--") + sub;
+            nargv.push_back((char*)flag.c_str());
+            for (int i = 2; i < argc; i++) nargv.push_back(argv[i]);
+            return uproctrace_main((int)nargv.size(), nargv.data());
+        }
+        /* Fall through: not a known subcommand. Treat as a usage error
+         * rather than silently feeding it to the TUI parser, which
+         * would just print USAGE again. */
+        std::fprintf(stderr, "tv: unknown subcommand: %s\n\n", sub);
+        std::fputs(USAGE, stderr);
+        return 1;
+    }
+
+    /* Legacy long-flag entry points (kept for back-compat). */
     if (argc >= 2 && std::strcmp(argv[1], "--uproctrace") == 0)
         return uproctrace_main(argc - 1, argv + 1);
     if (argc >= 2 && std::strcmp(argv[1], "--test") == 0)

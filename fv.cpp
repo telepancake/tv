@@ -499,7 +499,7 @@ static void build_layout()
 
 /* ── main ─────────────────────────────────────────────────────────────── */
 
-int main(int argc, char **argv)
+int fv_main(int argc, char **argv)
 {
     const char *startpath = (argc > 1) ? argv[1] : ".";
     char abspath[PATH_MAX];
