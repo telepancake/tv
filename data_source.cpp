@@ -13,6 +13,7 @@
 #include "tv_db.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -52,7 +53,7 @@ std::string format_duration_ns(int64_t start_ns, int64_t end_ns) {
 std::string format_exit(const std::string &kind, const std::string &code,
                         const std::string &core, bool ended) {
     if (!ended) return "running";
-    if (kind.empty()) return "—";
+    if (kind.empty()) return "-";
     int k = std::atoi(kind.c_str());
     int c = std::atoi(code.c_str());
     if (k == 1) {
@@ -95,6 +96,78 @@ std::string compact_count(uint64_t n) {
     else if (d >= 10)  std::snprintf(buf, sizeof buf, "%.1f%s", d, suf[idx]);
     else               std::snprintf(buf, sizeof buf, "%.2f%s", d, suf[idx]);
     return buf;
+}
+
+/* -- flag filter grammar -------------------------------------------- *
+ *
+ * The user asked for require / forbid / all-of / any-of semantics on
+ * one input line. The grammar is small:
+ *
+ *   bare letter   require flag    "W"      = must have W
+ *   '+' letter    require flag    "+W"     = must have W
+ *   '-' letter    forbid  flag    "-E"     = must NOT have E
+ *   juxtaposition AND group       "+W-E"   = must have W AND not E
+ *   ','           group separator "+W,+R"  = (must have W) OR (must have R)
+ *
+ * Whitespace is ignored. The signed prefix ('+' or '-') applies only
+ * to the letter that follows, then resets. Bare letters keep working
+ * as legacy "+letter" so old habits don't break.
+ *
+ * A FlagSpec is a disjunction of conjunctions. Each builder maps the
+ * letters to mode-specific SQL via a callback, and build_flag_sql()
+ * assembles "(a AND NOT b) OR (c)" expressions. */
+
+struct FlagPred { char letter; bool require; };
+struct FlagSpec { std::vector<std::vector<FlagPred>> groups; };
+
+FlagSpec parse_flag_spec(const std::string &s) {
+    FlagSpec fs;
+    std::vector<FlagPred> cur;
+    bool sign = true;            /* default: require */
+    for (char c : s) {
+        if (c == ' ' || c == '\t') continue;
+        if (c == ',') {
+            if (!cur.empty()) { fs.groups.push_back(std::move(cur)); cur.clear(); }
+            sign = true;
+            continue;
+        }
+        if (c == '+') { sign = true;  continue; }
+        if (c == '-') { sign = false; continue; }
+        if (std::isalpha((unsigned char)c)) {
+            cur.push_back({c, sign});
+            sign = true;          /* sign applies to one letter only */
+        }
+    }
+    if (!cur.empty()) fs.groups.push_back(std::move(cur));
+    return fs;
+}
+
+bool flag_spec_uses(const FlagSpec &fs, char l) {
+    for (auto &g : fs.groups)
+        for (auto &p : g)
+            if (p.letter == l) return true;
+    return false;
+}
+
+template <typename Fn>
+std::string build_flag_sql(const FlagSpec &fs, Fn letter_to_sql) {
+    if (fs.groups.empty()) return "";
+    std::string out;
+    for (auto &g : fs.groups) {
+        std::string conj;
+        for (auto &p : g) {
+            std::string e = letter_to_sql(p.letter);
+            if (e.empty()) continue;
+            std::string clause = p.require ? ("(" + e + ")")
+                                           : ("NOT (" + e + ")");
+            if (!conj.empty()) conj += " AND ";
+            conj += clause;
+        }
+        if (conj.empty()) continue;
+        if (!out.empty()) out += " OR ";
+        out += "(" + conj + ")";
+    }
+    return out;
 }
 
 const char *style_for_exit(const std::string &kind, const std::string &code,
@@ -282,13 +355,16 @@ bool dirty_for_lpane(const AppState &s,
                      bool prev_grouped, bool prev_subtree_only,
                      const std::string &prev_subtree_root,
                      const std::string &prev_subject,
-                     bool prev_show_pids) {
+                     bool prev_show_pids,
+                     int64_t prev_ts_after, int64_t prev_ts_before) {
     return s.mode != prev_mode || s.search != prev_search ||
            s.flag_filter != prev_flag_filter ||
            s.grouped != prev_grouped || s.subtree_only != prev_subtree_only ||
            s.subtree_root != prev_subtree_root ||
            s.subject_file != prev_subject ||
-           s.show_pids != prev_show_pids;
+           s.show_pids != prev_show_pids ||
+           s.ts_after_ns  != prev_ts_after ||
+           s.ts_before_ns != prev_ts_before;
 }
 
 void TvDataSource::row_begin(int panel) {
@@ -298,7 +374,8 @@ void TvDataSource::row_begin(int panel) {
                             built_for_flag_filter_,
                             built_for_grouped_, built_for_subtree_only_,
                             built_for_subtree_root_, built_for_subject_,
-                            built_for_show_pids_);
+                            built_for_show_pids_,
+                            built_for_ts_after_ns_, built_for_ts_before_ns_);
         if (stale) {
             rebuild_lpane();
             built_for_mode_ = state_.mode;
@@ -309,6 +386,8 @@ void TvDataSource::row_begin(int panel) {
             built_for_subtree_root_ = state_.subtree_root;
             built_for_subject_ = state_.subject_file;
             built_for_show_pids_ = state_.show_pids;
+            built_for_ts_after_ns_ = state_.ts_after_ns;
+            built_for_ts_before_ns_ = state_.ts_before_ns;
             built_lpane_ = true;
         }
         lpane_idx_ = 0;
@@ -419,42 +498,48 @@ void TvDataSource::lpane_processes() {
         "       start_ns, end_ns, "
         "       exit_kind, exit_code, core_dumped "
         "FROM tv_idx_proc";
-    /* Computed-flag filter for processes:
+    /* Computed-flag filter for processes. Letters are mode-specific:
      *   K  killed by signal OR still running when trace ended
      *   F  exited != 0 with at least one file open for writing
      *      (filters out grep/test/etc. with normal non-zero rc)
      *   D  process exec'd a file that was written by another tgid
      *      in the trace (i.e. ran a derived script/elf)
-     * The SQL uses semi-joins against open_/exec/tv_idx_open_canon to
-     * stay scalar-free - no rows are materialised in C++. */
-    auto add_clause = [&](std::string &where, const std::string &c) {
-        if (where.empty()) where = c;
-        else where = "(" + where + ") AND " + c;
-    };
+     * The grammar (`+W`, `-E`, comma alternation) is parsed once into a
+     * FlagSpec; build_flag_sql() composes per-letter SQL fragments
+     * with AND/OR/NOT. */
     std::string where;
-    bool need_canon_for_proc = false;
-    for (char ch : state_.flag_filter) {
-        switch (ch) {
-            case 'K': add_clause(where,
-                "exit_kind = 1 OR exit_kind IS NULL"); break;
-            case 'F': add_clause(where,
+    FlagSpec flagspec = parse_flag_spec(state_.flag_filter);
+    bool need_canon_for_proc =
+        flag_spec_uses(flagspec, 'F') || flag_spec_uses(flagspec, 'D');
+    auto proc_letter_sql = [](char l) -> std::string {
+        switch (l) {
+            case 'K': return "exit_kind = 1 OR exit_kind IS NULL";
+            case 'F': return
                 "((exit_kind = 0 AND exit_code <> 0) OR exit_kind = 1 "
                 " OR exit_kind IS NULL) "
                 "AND tgid IN (SELECT DISTINCT tgid FROM tv_idx_open_canon "
-                "             WHERE (flags & 3) <> 0 AND err = 0)");
-                need_canon_for_proc = true; break;
-            case 'D': add_clause(where,
+                "             WHERE (flags & 3) <> 0 AND err = 0)";
+            case 'D': return
                 "tgid IN ("
                 "  SELECT e.tgid FROM exec e "
                 "  WHERE EXISTS ("
                 "    SELECT 1 FROM tv_idx_open_canon w "
                 "    WHERE w.tgid <> e.tgid AND (w.flags & 3) <> 0 "
                 "      AND w.err = 0 AND w.path = CAST(e.exe AS VARCHAR) "
-                "      AND w.ts_ns < e.ts_ns))");
-                need_canon_for_proc = true; break;
-            default: break;   /* file-mode flags ignored on procs */
+                "      AND w.ts_ns < e.ts_ns))";
         }
-    }
+        return "";        /* unknown letters are silently ignored */
+    };
+    std::string fexpr = build_flag_sql(flagspec, proc_letter_sql);
+    if (!fexpr.empty()) where = fexpr;
+    /* Time cutoffs (modes 0/1/3 honour these): start_ns is the proc's
+     * entry timestamp - "after T" keeps procs that started at or after T. */
+    if (state_.ts_after_ns > 0)
+        where = (where.empty() ? "" : "(" + where + ") AND ") +
+                sfmt("start_ns >= %lld", (long long)state_.ts_after_ns);
+    if (state_.ts_before_ns > 0)
+        where = (where.empty() ? "" : "(" + where + ") AND ") +
+                sfmt("start_ns <= %lld", (long long)state_.ts_before_ns);
     if (need_canon_for_proc) {
         if (!db_.ensure_path_index(&err)) {
             lpane_.push_back(mk_row("__err", err, RowStyle::Error));
@@ -632,8 +717,7 @@ void TvDataSource::lpane_files() {
     std::string where;
     if (!state_.search.empty())
         where += "path LIKE '%' || " + sql_escape(state_.search) + " || '%'";
-    /* Flag filter: any subset of {R,W,E,w,f,s,k}; row must satisfy ALL
-     * requested categories.
+    /* File flag vocabulary (parsed by parse_flag_spec):
      *   R/W/E: raw read/write/error (matches the visible badge)
      *   w    : "written and not unlinked afterwards" (currently
      *          approximated as writes>0; we don't track unlink yet)
@@ -643,30 +727,38 @@ void TvDataSource::lpane_files() {
      *          (/usr, /bin, /sbin, /lib*, /opt, /srv)
      *   k    : path is NOT a kernel/IPC pseudo-path (pipe:, socket:,
      *          anon_inode:, /dev/, /sys/, /proc/) */
-    auto add_clause = [&](const std::string &c) {
-        if (where.empty()) where = c;
-        else where = "(" + where + ") AND " + c;
-    };
-    bool need_failed_writers = false;
-    for (char ch : state_.flag_filter) {
-        switch (ch) {
-            case 'R': add_clause("reads  > 0");  break;
-            case 'W': add_clause("writes > 0");  break;
-            case 'E': add_clause("errors > 0");  break;
-            case 'w': add_clause("writes > 0");  break;
-            case 'f': add_clause("path IN (SELECT path FROM tv_idx_path_failed_writers)");
-                      need_failed_writers = true; break;
-            case 's': add_clause(
+    FlagSpec flagspec = parse_flag_spec(state_.flag_filter);
+    bool need_failed_writers = flag_spec_uses(flagspec, 'f');
+    auto file_letter_sql = [](char l) -> std::string {
+        switch (l) {
+            case 'R': return "reads  > 0";
+            case 'W': return "writes > 0";
+            case 'E': return "errors > 0";
+            case 'w': return "writes > 0";
+            case 'f': return "path IN (SELECT path FROM tv_idx_path_failed_writers)";
+            case 's': return
                 "NOT (path LIKE '/usr/%' OR path LIKE '/bin/%' OR "
                      "path LIKE '/sbin/%' OR path LIKE '/lib%' OR "
-                     "path LIKE '/opt/%' OR path LIKE '/srv/%')"); break;
-            case 'k': add_clause(
+                     "path LIKE '/opt/%' OR path LIKE '/srv/%')";
+            case 'k': return
                 "NOT (path LIKE 'pipe:%' OR path LIKE 'socket:%' OR "
                      "path LIKE 'anon_inode:%' OR path LIKE '/dev/%' OR "
-                     "path LIKE '/sys/%' OR path LIKE '/proc/%')"); break;
-            default: break;
+                     "path LIKE '/sys/%' OR path LIKE '/proc/%')";
         }
+        return "";
+    };
+    std::string fexpr = build_flag_sql(flagspec, file_letter_sql);
+    if (!fexpr.empty()) {
+        if (where.empty()) where = fexpr;
+        else where = "(" + where + ") AND (" + fexpr + ")";
     }
+    /* Time cutoffs: a file's first_ns is when it first appeared. */
+    if (state_.ts_after_ns > 0)
+        where = (where.empty() ? "" : "(" + where + ") AND ") +
+                sfmt("first_ns >= %lld", (long long)state_.ts_after_ns);
+    if (state_.ts_before_ns > 0)
+        where = (where.empty() ? "" : "(" + where + ") AND ") +
+                sfmt("first_ns <= %lld", (long long)state_.ts_before_ns);
     if (need_failed_writers) {
         if (!db_.ensure_proc_index(&err)) {
             lpane_.push_back(mk_row("__err", err, RowStyle::Error));
@@ -841,16 +933,29 @@ void TvDataSource::lpane_outputs() {
     std::string where;
     if (!state_.search.empty())
         where = "d LIKE '%' || " + sql_escape(state_.search) + " || '%'";
-    /* Flag filter: O = stdout, E = stderr.  Both => both. */
-    bool want_o = state_.flag_filter.find('O') != std::string::npos;
-    bool want_e = state_.flag_filter.find('E') != std::string::npos;
-    if (want_o && !want_e) {
-        if (!where.empty()) where = "(" + where + ") AND k = 'O'";
-        else where = "k = 'O'";
-    } else if (want_e && !want_o) {
-        if (!where.empty()) where = "(" + where + ") AND k = 'E'";
-        else where = "k = 'E'";
+    /* Output flag vocabulary: O = stdout, E = stderr.
+     * Grammar lets you say "+O,-E" (only stdout, no stderr) etc. */
+    FlagSpec flagspec = parse_flag_spec(state_.flag_filter);
+    auto out_letter_sql = [](char l) -> std::string {
+        switch (l) {
+            case 'O': return "k = 'O'";
+            case 'E': return "k = 'E'";
+        }
+        return "";
+    };
+    std::string fexpr = build_flag_sql(flagspec, out_letter_sql);
+    if (!fexpr.empty()) {
+        if (where.empty()) where = fexpr;
+        else where = "(" + where + ") AND (" + fexpr + ")";
     }
+    if (state_.ts_after_ns > 0)
+        where = (where.empty() ? "" : "(" + where + ") AND ") +
+                sfmt("CAST(ts AS UBIGINT) >= %llu",
+                     (unsigned long long)state_.ts_after_ns);
+    if (state_.ts_before_ns > 0)
+        where = (where.empty() ? "" : "(" + where + ") AND ") +
+                sfmt("CAST(ts AS UBIGINT) <= %llu",
+                     (unsigned long long)state_.ts_before_ns);
     sql = "SELECT * FROM (" + sql + ")";
     if (!where.empty()) sql += " WHERE " + where;
     sql += " ORDER BY CAST(ts AS UBIGINT) LIMIT 5000";
@@ -915,6 +1020,17 @@ void TvDataSource::lpane_events() {
     if (!state_.search.empty())
         sql = "SELECT * FROM (" + sql + ") WHERE info LIKE '%' || " +
               sql_escape(state_.search) + " || '%'";
+    /* Time cutoffs apply uniformly across all event tables. */
+    if (state_.ts_after_ns > 0 || state_.ts_before_ns > 0) {
+        std::string w;
+        if (state_.ts_after_ns > 0)
+            w = sfmt("ts_ns >= %lld", (long long)state_.ts_after_ns);
+        if (state_.ts_before_ns > 0) {
+            if (!w.empty()) w += " AND ";
+            w += sfmt("ts_ns <= %lld", (long long)state_.ts_before_ns);
+        }
+        sql = "SELECT * FROM (" + sql + ") WHERE " + w;
+    }
     sql = "SELECT * FROM (" + sql + ") ORDER BY ts_ns LIMIT 5000";
 
     auto rows = db_.query_strings(sql, &err);

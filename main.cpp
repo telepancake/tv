@@ -55,7 +55,7 @@ enum live_trace_backend {
 };
 
 const char *USAGE =
-    "tv — process trace viewer (DuckDB-backed)\n"
+    "tv - process trace viewer (DuckDB-backed)\n"
     "\n"
     "Subcommands:\n"
     "  tv [--module|--sud|--ptrace] -- <cmd> [args...]\n"
@@ -203,22 +203,28 @@ void on_trace_fd_cb(Tui &tui, int fd, LiveTrace &lt) {
 
 const char *HELP_LINES[] = {
     "",
-    "  tv — Process Trace Viewer (DuckDB-backed)",
-    "  ─────────────────────────────────────────",
+    "  tv - Process Trace Viewer (DuckDB-backed)",
+    "  -----------------------------------------",
     "",
-    "  ↑↓ jk    Navigate    PgUp/PgDn  Page    g/G  First/Last",
-    "  Tab      Toggle section (info pane) / switch focus elsewhere",
-    "  Enter    Follow row to its target panel",
+    "  Up/Down jk  Navigate    PgUp/PgDn  Page    g/G  First/Last",
+    "  Tab         Toggle section (info pane) / switch focus elsewhere",
+    "  Enter       Follow row to its target panel",
     "",
-    "  /text    Glob/text filter         Esc    Clear filters",
-    "  f...     Flag filter:",
-    "             mode 1 procs:  K=killed/running  F=fail-with-write",
-    "                            D=derived-exec",
-    "             mode 2 files:  R/W/E  +  w=written  f=fail-writer",
-    "                            s=non-system  k=non-kernel-iface",
-    "             mode 0 output: O=stdout E=stderr",
-    "  s        Subtree-only (mode 1)    p      Show pid prefix (mode 1)",
-    "  t        Tree / flat toggle (modes 1, 2)",
+    "  /text       Glob/text filter         Esc    Clear filters (layered)",
+    "  f...        Flag filter. Grammar:",
+    "                 +L  require flag L     -L  forbid flag L",
+    "                 ',' separates OR-groups; juxtaposition = AND",
+    "                 examples: '+W'   '+W-E'   '+W,+R'   '-k-s'",
+    "              Flag letters per mode:",
+    "                 mode 1 procs:  K=killed/running  F=fail-with-write",
+    "                                D=derived-exec",
+    "                 mode 2 files:  R/W/E  +  w=written  f=fail-writer",
+    "                                s=non-system  k=non-kernel-iface",
+    "                 mode 0 output: O=stdout E=stderr",
+    "  <  >        Time cutoff (before/after) seeded from cursor;",
+    "              press the same key again to clear.",
+    "  s           Subtree-only (mode 1)     p   Show pid prefix (mode 1)",
+    "  t           Tree / flat toggle (modes 1, 2)",
     "",
     "  0  Output stream    1  Process tree    2  File tree    3  Event log",
     "  4  Deps             5  Reverse deps    6  Dep cmds     7  RDep cmds",
@@ -232,6 +238,7 @@ struct UiCtx {
     int           rpane = -1;
     AppState     *state = nullptr;
     TvDataSource *src = nullptr;
+    TvDb         *db = nullptr;       /* for direct lookups (e.g. ts seed) */
     /* Idle cursor commit: lpane cursor changes set pending_cursor_id;
      * a 100 ms timer commits it (and rebuilds the rpane) 300 ms after
      * the last change.  This restores the previous "autopopulate on
@@ -275,10 +282,16 @@ void update_status(UiCtx &c) {
     if (!c.state->flag_filter.empty())
         n += std::snprintf(buf + n, sizeof buf - n, " | flags=%s",
                            c.state->flag_filter.c_str());
+    if (c.state->ts_after_ns)
+        n += std::snprintf(buf + n, sizeof buf - n, " | >=%lld",
+                           (long long)c.state->ts_after_ns);
+    if (c.state->ts_before_ns)
+        n += std::snprintf(buf + n, sizeof buf - n, " | <=%lld",
+                           (long long)c.state->ts_before_ns);
     if (c.state->show_pids)
         n += std::snprintf(buf + n, sizeof buf - n, " | pids");
     n += std::snprintf(buf + n, sizeof buf - n,
-        " | 1..7 mode  t tree  s subtree  / glob  f flags  p pids  ? help");
+        " | 1..7 mode  t tree  s subtree  </> time  / glob  f flags  ? help");
     (void)n;
     c.tui->set_status(buf);
 }
@@ -349,6 +362,11 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
             invalidate_and_redraw();
             return TUI_HANDLED;
         }
+        if (c.state->ts_after_ns || c.state->ts_before_ns) {
+            c.state->ts_after_ns = c.state->ts_before_ns = 0;
+            invalidate_and_redraw();
+            return TUI_HANDLED;
+        }
         if (c.state->subtree_only) {
             c.state->subtree_only = false;
             c.state->subtree_root.clear();
@@ -371,12 +389,16 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         return TUI_HANDLED;
     }
     if (key == 'f') {
-        char buf[32] = {};
+        char buf[64] = {};
+        /* Grammar: bare letters or `+L` require, `-L` forbid;
+         * juxtaposition = AND inside a group, ',' = OR between groups.
+         * Examples: "+W-E" rows that write but don't error;
+         *           "+W,+R" rows that write OR rows that read. */
         const char *prompt =
-            (c.state->mode == 1) ? "proc flags (K=killed/run F=fail-with-write D=derived-exec): " :
-            (c.state->mode == 2) ? "file flags (R/W/E + w/f/s/k computed): " :
-            (c.state->mode == 0) ? "output: O=stdout E=stderr: " :
-                                   "flags: ";
+            (c.state->mode == 1) ? "proc flags +/- (K=killed F=fail-with-write D=derived-exec; ',' = OR): " :
+            (c.state->mode == 2) ? "file flags +/- (R/W/E + w/f/s/k; ',' = OR): " :
+            (c.state->mode == 0) ? "output flags +/- (O=stdout E=stderr; ',' = OR): " :
+                                   "flags +/- (',' = OR): ";
         if (tui.line_edit(prompt, buf, sizeof buf) >= 0) {
             c.state->flag_filter = buf;
             invalidate_and_redraw();
@@ -405,6 +427,62 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
             c.state->subtree_root = c.state->cursor_id;
         }
         invalidate_and_redraw();
+        return TUI_HANDLED;
+    }
+    /* Time cutoffs: '<' = "before", '>' = "after".
+     *   first press  : seed cutoff from the cursor's timestamp
+     *   second press : clear the cutoff
+     * Companion to the subtree filter - lets the user slice a long
+     * trace down to a window without losing search/flag state. */
+    if (key == '<' || key == '>') {
+        bool is_before = (key == '<');
+        int64_t &slot = is_before ? c.state->ts_before_ns
+                                  : c.state->ts_after_ns;
+        if (slot != 0) {
+            slot = 0;
+            invalidate_and_redraw();
+            return TUI_HANDLED;
+        }
+        /* Look up cursor timestamp in a mode-appropriate way. */
+        int64_t ts = 0;
+        const std::string &cur = c.state->cursor_id;
+        if (!cur.empty()) {
+            if (c.state->mode == 0 || c.state->mode == 3) {
+                /* cursor id is "tgid:ts_ns[:k]". */
+                auto p1 = cur.find(':');
+                if (p1 != std::string::npos) {
+                    auto p2 = cur.find(':', p1 + 1);
+                    std::string ts_s = (p2 == std::string::npos)
+                        ? cur.substr(p1 + 1)
+                        : cur.substr(p1 + 1, p2 - p1 - 1);
+                    try { ts = std::stoll(ts_s); } catch (...) {}
+                }
+            } else if (c.state->mode == 1 && c.db) {
+                std::string e;
+                auto rows = c.db->query_strings(
+                    "SELECT start_ns FROM tv_idx_proc WHERE tgid = " +
+                    cur + " LIMIT 1", &e);
+                if (!rows.empty() && !rows[0][0].empty())
+                    try { ts = std::stoll(rows[0][0]); } catch (...) {}
+            } else if (c.state->mode == 2 && c.db) {
+                /* path needs literal-quoting; do it inline. */
+                std::string esc = "'";
+                for (char ch : cur) {
+                    if (ch == '\'') esc += "''"; else esc += ch;
+                }
+                esc += "'";
+                std::string e;
+                auto rows = c.db->query_strings(
+                    "SELECT first_ns FROM tv_idx_path WHERE path = " +
+                    esc + " LIMIT 1", &e);
+                if (!rows.empty() && !rows[0][0].empty())
+                    try { ts = std::stoll(rows[0][0]); } catch (...) {}
+            }
+        }
+        if (ts > 0) {
+            slot = ts;
+            invalidate_and_redraw();
+        }
         return TUI_HANDLED;
     }
     /* Tab on the rpane: collapse/expand the section the cursor is on. */
@@ -462,10 +540,12 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
 
 /* -- --dump[=MODE] : non-interactive dump of an lpane (for tests) ---- */
 
-int dump_mode(TvDb &db, int mode, const std::string &subject) {
+int dump_mode(TvDb &db, int mode, const std::string &subject,
+              const std::string &flag_filter) {
     AppState st;
     st.mode = mode;
     st.subject_file = subject;
+    st.flag_filter = flag_filter;
     TvDataSource ts(db, st);
     auto srcfn = ts.make_data_source();
     srcfn.row_begin(0);
@@ -598,6 +678,7 @@ int main(int argc, char **argv) {
     bool dump = false;
     int  dump_mode_n = 1;
     std::string dump_subject;
+    std::string dump_flags;
     char **cmd = nullptr;
 
     for (int i = 1; i < argc; i++) {
@@ -612,6 +693,8 @@ int main(int argc, char **argv) {
         }
         else if (!std::strcmp(argv[i], "--subject") && i + 1 < argc)
             dump_subject = argv[++i];
+        else if (!std::strncmp(argv[i], "--flags=", 8))
+            dump_flags = argv[i] + 8;
         else if (!std::strcmp(argv[i], "--no-env")) no_env = 1;
         else if (!std::strcmp(argv[i], "--module"))  live_backend = LIVE_TRACE_BACKEND_MODULE;
         else if (!std::strcmp(argv[i], "--sud"))     live_backend = LIVE_TRACE_BACKEND_SUD;
@@ -715,7 +798,7 @@ int main(int argc, char **argv) {
             ::waitpid(lt.child_pid, nullptr, 0);
             db->flush(&err);
         }
-        return dump_mode(*db, dump_mode_n, dump_subject);
+        return dump_mode(*db, dump_mode_n, dump_subject, dump_flags);
     }
 
     /* TUI. */
@@ -725,6 +808,7 @@ int main(int argc, char **argv) {
     UiCtx ui;
     ui.state = &state;
     ui.src = &src;
+    ui.db = db.get();
 
     bool headless = !::isatty(STDIN_FILENO) || !::isatty(STDOUT_FILENO);
     auto tui = headless ? Tui::open_headless(src.make_data_source(), 24, 80)

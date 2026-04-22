@@ -36,7 +36,7 @@ namespace {
 
 struct Panel {
     PanelDef def{};
-    /* Owning copy of the column array — set_panel_columns() may swap in
+    /* Owning copy of the column array - set_panel_columns() may swap in
      * a different layout per app mode, and we don't want to require the
      * caller to keep their ColDef array alive. */
     std::vector<ColDef> cols_owned;

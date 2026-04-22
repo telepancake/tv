@@ -4,11 +4,11 @@
  * A Smalltalk-style column browser built on engine.h/engine.cpp.
  *
  * Layout:
- *   ┌──────┬──────┬──────┐
+ *   +------+------+------+
  *   | d0   | d1   | d2   |   <- dir columns (engine auto-scrolls via HSCROLL)
  *   +------+------+------+
  *   | content            |   <- file content (text or hex)
- *   └────────────────────┘
+ *   +--------------------+
  *   status bar
  *
  * Keys:

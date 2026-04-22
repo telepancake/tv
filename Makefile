@@ -123,6 +123,21 @@ tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
 	$(CXX) $(CXXFLAGS) $(TV_LDFLAGS) -o tv $(TV_CXX_SRCS) $(TV_C_OBJS) \
 	    $(DUCKDB_OBJ) $(TV_LIBS)
 
+# Release build: production-grade flags, asserts off, debug info stripped.
+# Use:  make release        (drop the dev-friendly default `tv` binary first)
+# Note: `tv` and `tv-release` share intermediate objects with the dev build
+# only via $(DUCKDB_OBJ). If you want a pristine release rebuild from the
+# DuckDB amalgamation too, also pass DUCKDB_OPT=-O2 explicitly:
+#   make clean-tv && make release DUCKDB_OPT=-O2 DUCKDB_CXX=g++
+.PHONY: release clean-tv
+release: CXXFLAGS := -std=c++23 -O2 -DNDEBUG -fno-stack-protector -I. -I$(ZSTD_DIR) -I$(DUCKDB_INC)
+release: CFLAGS   := -std=c11   -O2 -DNDEBUG -I. -I$(ZSTD_DIR)
+release: TV_LDFLAGS := -static -s
+release: tv
+
+clean-tv:
+	rm -f tv $(TV_C_OBJS)
+
 sud64: $(SUD_SRCS) sudtrace.lds
 	$(CC) -m64 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sud64 $(SUD_SRCS) -lgcc
 
