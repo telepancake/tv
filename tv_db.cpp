@@ -200,10 +200,26 @@ std::unique_ptr<TvDb> TvDb::open_with_path(const char *path,
     /* Memory-friendly defaults - let DuckDB spill to disk freely
      * instead of clinging to multi-GB result sets. preserve_insertion_order
      * lets the query planner stream large windowed/grouped queries
-     * (the path-canonicalisation builder benefits a lot). */
+     * (the path-canonicalisation builder benefits a lot).
+     *
+     * memory_limit caps DuckDB's working set. The user reported 24 GB
+     * RSS on a 14 GB wire trace; cap it at 2 GB so DuckDB spills to
+     * temp_directory instead. The temp dir defaults to next to the
+     * .duckdb file - that's fine for our .tvdb workflow. */
     duckdb_result r0;
     (void)duckdb_query(db->impl_->con,
         "PRAGMA preserve_insertion_order=false;",
+        &r0);
+    duckdb_destroy_result(&r0);
+    (void)duckdb_query(db->impl_->con,
+        "PRAGMA memory_limit='2GB';",
+        &r0);
+    duckdb_destroy_result(&r0);
+    /* Default DuckDB threading is one-thread-per-core. On a fat host
+     * that adds up - each thread holds its own per-operator state.
+     * Cap to a sensible 4 unless the user overrides via env. */
+    (void)duckdb_query(db->impl_->con,
+        "PRAGMA threads=4;",
         &r0);
     duckdb_destroy_result(&r0);
 
@@ -527,24 +543,25 @@ bool TvDb::ensure_path_index(std::string *err) {
     /* Canonicalise relative open paths against the latest CWD for the
      * tgid that precedes the open's ts_ns.
      *
-     * Earlier versions used a window function over a regular LEFT JOIN
-     * on `cwd.tgid = open.tgid AND cwd.ts_ns <= open.ts_ns`. That join
-     * produces (opens X cwds-per-tgid) intermediate rows and was
-     * peaking at ~29 GB RSS on a 14 GB wire trace before the
-     * ROW_NUMBER() filter dropped them.
-     *
-     * DuckDB's ASOF JOIN does the "most-recent-row-with-ts <= mine"
-     * lookup natively in O(N log N) sort-merge with at most one
-     * matching row per probe. No row explosion, no window function,
-     * no dedup needed. The materialised on-disk layout is the same
-     * as before, just produced via a different plan.
+     * History:
+     *   v1: window function over a regular LEFT JOIN. Row explosion -
+     *       opens X cwds_per_tgid intermediates (29 GB on 14 GB trace).
+     *   v2: ASOF JOIN materialised into a table. Correct algorithm but
+     *       still allocated and stored ~6M rows even though the only
+     *       *per-row* consumers are dep/rdep traversals (built lazily
+     *       in ensure_edge_index). The user re-tested with a build
+     *       trace and saw 24 GB peak just from this materialisation.
+     *   v3 (here): canon is a *view*. tv_idx_path aggregates straight
+     *       through the ASOF JOIN; no row is held in memory beyond
+     *       what the streaming aggregate needs. tv_idx_edge upgrades
+     *       canon to a real table only when dep/rdep modes are used.
      *
      * Open paths get canonicalised by gluing the cwd in front of any
      * non-absolute path; pseudo-paths (pipe:, socket:, anon_inode:)
      * are passed through unchanged. */
     const char *canon_sql =
-        "CREATE TABLE IF NOT EXISTS tv_idx_open_canon AS "
-        "SELECT o.ts_ns, o.tgid, o.fd, o.flags, o.err, "
+        "CREATE OR REPLACE VIEW tv_idx_open_canon AS "
+        "SELECT ts_ns, tgid, fd, flags, err, "
         "       CASE "
         "         WHEN raw_path LIKE '/%' THEN raw_path "
         "         WHEN cwd IS NULL OR raw_path LIKE 'pipe:%' "
@@ -560,22 +577,22 @@ bool TvDb::ensure_path_index(std::string *err) {
         "  FROM open_ o "
         "  ASOF LEFT JOIN cwd c "
         "    ON o.tgid = c.tgid AND o.ts_ns >= c.ts_ns "
-        ") o";
+        ")";
     if (!run_query(impl_->con, canon_sql, err)) return false;
-    if (!run_query(impl_->con,
-                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_path "
-                   "ON tv_idx_open_canon(path)", err)) return false;
-    if (!run_query(impl_->con,
-                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_tgid "
-                   "ON tv_idx_open_canon(tgid)", err)) return false;
 
-    /* Per-canonical-path stats; flags & 3 == 0  -> read-only open. */
+    /* Per-canonical-path stats; flags & 3 == 0  -> read-only open.
+     * approx_count_distinct (HLL) is used for proc count instead of
+     * exact COUNT(DISTINCT). Exact distinct over (path, tgid) on a
+     * many-process trace materialised the full pair set in the GROUP
+     * BY hash table - the user reported 24 GB RSS on a 14 GB trace
+     * dominated by exactly this. HLL is a fixed ~12 KB sketch per
+     * group with ~1.5% error, which is fine for a UI count-hint. */
     const char *sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_path AS "
         "SELECT path, "
         "       COUNT(*) AS opens, "
         "       SUM(CASE WHEN err <> 0 THEN 1 ELSE 0 END) AS errors, "
-        "       COUNT(DISTINCT tgid) AS procs, "
+        "       approx_count_distinct(tgid) AS procs, "
         "       SUM(CASE WHEN (flags & 3) = 0 THEN 1 ELSE 0 END) AS reads, "
         "       SUM(CASE WHEN (flags & 3) <> 0 THEN 1 ELSE 0 END) AS writes, "
         "       MIN(ts_ns) AS first_ns, MAX(ts_ns) AS last_ns "
@@ -585,6 +602,48 @@ bool TvDb::ensure_path_index(std::string *err) {
                    "CREATE INDEX IF NOT EXISTS tv_idx_path_path "
                    "ON tv_idx_path(path)", err)) return false;
     if (!meta_set(impl_->con, "idx_path", "1", err)) return false;
+    impl_->dirty = true;
+    return true;
+}
+
+/* Materialise tv_idx_open_canon as a real table the first time someone
+ * needs per-row access (dep/rdep modes). For mode 2 / mode 1 / process
+ * stats we stay on the view. Done as a separate function so the path
+ * index build path stays cheap. */
+bool TvDb::ensure_canon_table(std::string *err) {
+    if (!ensure_path_index(err)) return false;
+    std::string val;
+    if (meta_get(impl_->con, "idx_canon_table", val)) return true;
+    /* Drop the view, swap in a table backed by the same query. */
+    if (!run_query(impl_->con, "DROP VIEW IF EXISTS tv_idx_open_canon", err))
+        return false;
+    const char *materialise =
+        "CREATE TABLE tv_idx_open_canon AS "
+        "SELECT ts_ns, tgid, fd, flags, err, "
+        "       CASE "
+        "         WHEN raw_path LIKE '/%' THEN raw_path "
+        "         WHEN cwd IS NULL OR raw_path LIKE 'pipe:%' "
+        "              OR raw_path LIKE 'socket:%' OR raw_path LIKE 'anon_inode:%' "
+        "           THEN raw_path "
+        "         WHEN cwd = '/' THEN '/' || raw_path "
+        "         ELSE cwd || '/' || raw_path "
+        "       END AS path "
+        "FROM ( "
+        "  SELECT o.ts_ns, o.tgid, o.fd, o.flags, o.err, "
+        "         CAST(o.path AS VARCHAR) AS raw_path, "
+        "         CAST(c.cwd  AS VARCHAR) AS cwd "
+        "  FROM open_ o "
+        "  ASOF LEFT JOIN cwd c "
+        "    ON o.tgid = c.tgid AND o.ts_ns >= c.ts_ns "
+        ")";
+    if (!run_query(impl_->con, materialise, err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_path "
+                   "ON tv_idx_open_canon(path)", err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_tgid "
+                   "ON tv_idx_open_canon(tgid)", err)) return false;
+    if (!meta_set(impl_->con, "idx_canon_table", "1", err)) return false;
     impl_->dirty = true;
     return true;
 }

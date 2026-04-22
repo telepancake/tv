@@ -68,6 +68,11 @@ public:
     bool ensure_proc_index(std::string *err);   /* tv_idx_proc */
     bool ensure_path_index(std::string *err);   /* tv_idx_path */
     bool ensure_edge_index(std::string *err);   /* tv_idx_edge (proc<->path)*/
+    /* Promote tv_idx_open_canon from a view to a real table (with
+     * indices). Only needed when callers want per-row access to canon
+     * (dep/rdep modes). Aggregating consumers (tv_idx_path,
+     * tv_idx_edge, proc-flag F/D filters) stream through the view. */
+    bool ensure_canon_table(std::string *err);
 
     /* Path of the backing file (".tvdb" or ":memory:" for in-mem). */
     const std::string &path() const;
