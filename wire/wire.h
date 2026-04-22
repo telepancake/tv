@@ -12,9 +12,12 @@
  *
  * ── Stream layout ──────────────────────────────────────────────────
  * The stream is a flat sequence of yeet atoms. The first atom is
- *   yeet_u64(WIRE_VERSION)
+ *   yeet_u64(WIRE_VERSION_V1)   or   yeet_u64(WIRE_VERSION_V2)
  * everything after is a sequence of one-atom-per-event payloads
  * produced by yeet_pair(out, header, hlen, blob, blen).
+ *
+ * In v2, the header is preceded by yeet_u64(stream_id); see the
+ * comment on WIRE_VERSION_V2 below for the semantics.
  *
  * No packet boundaries. No record-end markers. No back-patching.
  * Producers never need to seek the output. A reader that drops a
@@ -53,10 +56,11 @@
  *            [type-specific extras: yeet_i64 each]
  *   blob   = the (possibly empty) opaque payload bytes
  *
- * Producers maintain one ev_state per output stream. Successive
- * events are delta-encoded against it — typical deltas are one byte.
- * For events with no blob (EV_EXIT) blen == 0; the outer atom is
- * still emitted so event boundaries are explicit.
+ * Producers maintain one ev_state per output stream (v1: one global;
+ * v2: one per stream_id). Successive events are delta-encoded against
+ * it - typical deltas are one byte. For events with no blob (EV_EXIT)
+ * blen == 0; the outer atom is still emitted so event boundaries are
+ * explicit.
  *
  * Each event class has at most one blob. argv/env/auxv are separate
  * event classes (EV_ARGV/EV_ENV/EV_AUXV), each with the raw bytes the
@@ -84,8 +88,36 @@
 extern "C" {
 #endif
 
-/* Version atom written as the first thing in any stream. */
-#define WIRE_VERSION 1u
+/* Version atom written as the first thing in any stream.
+ *
+ * v1: single global delta-encoded ev_state per stream. Producers that
+ *     write to the same fd must coordinate (the sud launcher used a
+ *     cross-process spinlock; proctrace and uproctrace are inherently
+ *     single-producer-per-fd). One ev_state at the decoder side.
+ *
+ * v2: each event payload is preceded by a stream_id varint
+ *     (yeet_u64(stream_id)). The decoder maintains one ev_state per
+ *     observed stream_id. Producers grab a stream_id once at startup
+ *     (atomic CAS counter in shared memory) and delta-encode against
+ *     a *process-local* ev_state - no cross-process lock needed; the
+ *     only requirement is that each event reach the fd as a single
+ *     atomic write() / writev(), which is the existing guarantee for
+ *     bounded-size writes to regular files and pipes ≤ PIPE_BUF.
+ *
+ *     stream_id = 0 is the "default" stream. v2 readers also accept
+ *     legacy v1-shaped events at this default stream_id, and a v1
+ *     producer that simply re-versions itself as v2 (without adding
+ *     stream_ids) keeps working - the decoder just sees everything
+ *     on stream 0. This is the "events without stream id are part of
+ *     a single, separate stream" compatibility path.
+ *
+ * Producers should pick the version they emit explicitly. The
+ * WIRE_VERSION alias defaults to v1 to avoid silently changing the
+ * format for the kernel module / uproctrace; sud opts into v2.
+ */
+#define WIRE_VERSION_V1 1u
+#define WIRE_VERSION_V2 2u
+#define WIRE_VERSION    WIRE_VERSION_V1
 
 /* Event class codes. Stable within one WIRE_VERSION. */
 enum {
@@ -367,6 +399,50 @@ static inline int ev_decode_header(ev_state *st,
     if (yeet_get_i64(&p, end, &d) < 0) { return -1; } st->ppid   += d; *ppid   = (int32_t)st->ppid;
     if (yeet_get_i64(&p, end, &d) < 0) { return -1; } st->nspid  += d; *nspid  = (int32_t)st->nspid;
     if (yeet_get_i64(&p, end, &d) < 0) { return -1; } st->nstgid += d; *nstgid = (int32_t)st->nstgid;
+    return (int)(p - hdr_bytes);
+}
+
+/* ─── v2 wrappers: stream_id-prefixed delta encoding ──────────────
+ *
+ * v2 events are exactly v1 events with a leading yeet_u64(stream_id)
+ * inside the outer atom payload. The remaining base-scalar deltas are
+ * computed against the per-stream ev_state passed in by the caller -
+ * the caller is responsible for keeping one ev_state per stream_id
+ * (typically: one per producer process, allocated once at startup).
+ *
+ * Comfortable bound: stream_id is at most 9 bytes (u64 worst case),
+ * plus EV_HEADER_MAX (160). */
+#define EV_HEADER_V2_MAX (EV_HEADER_MAX + 9u)
+
+static inline int ev_build_header_v2(uint32_t stream_id,
+                                     ev_state *st,
+                                     uint8_t hdr[EV_HEADER_V2_MAX],
+                                     int32_t type,
+                                     uint64_t ts_ns,
+                                     int32_t pid, int32_t tgid, int32_t ppid,
+                                     int32_t nspid, int32_t nstgid,
+                                     const int64_t *extras,
+                                     unsigned n_extras) {
+    uint8_t *p   = hdr;
+    const uint8_t *end = hdr + EV_HEADER_V2_MAX;
+    if (yeet_u64(&p, end, (uint64_t)stream_id) < 0) { return -1; }
+    int hlen = ev_build_header(st, p, type, ts_ns, pid, tgid, ppid,
+                               nspid, nstgid, extras, n_extras);
+    if (hlen < 0) { return -1; }
+    return (int)((p - hdr) + (uint64_t)hlen);
+}
+
+/* Decode the leading stream_id from a v2 event payload. Returns the
+ * number of bytes consumed (1..9), or -1 on truncation. The caller
+ * then runs ev_decode_header against the per-stream ev_state on
+ * (hdr_bytes + ret, hlen - ret). */
+static inline int ev_decode_stream_id(const uint8_t *hdr_bytes, uint64_t hlen,
+                                      uint32_t *out_stream_id) {
+    const uint8_t *p   = hdr_bytes;
+    const uint8_t *end = hdr_bytes + hlen;
+    uint64_t sid;
+    if (yeet_get_u64(&p, end, &sid) < 0) { return -1; }
+    *out_stream_id = (uint32_t)sid;
     return (int)(p - hdr_bytes);
 }
 

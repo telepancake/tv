@@ -3,23 +3,41 @@
  *
  * Emits events using the binary format from wire/wire.h:
  *   [version atom is written once by the launcher]
- *   <outer atom per event> = yeet_pair(hdr, blob)
+ *   <outer atom per event> = yeet_pair(stream_id || hdr, blob)
  *
  * Every emit path is async-signal-safe: raw syscalls, static buffers,
  * no malloc, no stdio, no TLS. The SIGSYS handler calls these from
  * arbitrary traced program contexts.
  *
- * Cross-process coherence
- * -----------------------
- * The encoder's ev_state and the emit spinlock live in a MAP_SHARED
- * anonymous mmap page that the parent launcher (sud/sudtrace.c)
- * attaches at a reserved FD (SUD_STATE_FD) before fork/exec. Every
- * traced child (possibly many processes) mmaps the same page, so the
- * delta stream stays consistent even though multiple processes write
- * to the same output fd under the same cross-process spinlock. If
- * the shared FD isn't set up (e.g. stand-alone use), we fall back to
- * a process-local state — the stream is only consistent if this is
- * also a single-process run.
+ * Cross-process coherence — per-process stream design (wire v2)
+ * -------------------------------------------------------------
+ * The previous design held a cross-process spinlock over a shared
+ * ev_state and serialised every emitter. That kills throughput,
+ * leaves async-signal-safety on a knife edge (a process killed mid-
+ * lock wedges every other tracee), and forces every event in a
+ * multi-process build to single-thread through one mutex.
+ *
+ * The new design:
+ *   - The launcher (sud/sudtrace.c) sets up SUD_STATE_FD as a single
+ *     MAP_SHARED page holding only `struct sud_shared { uint32_t
+ *     next_stream_id; }` — an atomic counter, no lock.
+ *   - Each process (the launcher itself + every traced child) calls
+ *     sud_wire_init() once on startup, which atomically grabs the
+ *     next stream_id with __sync_fetch_and_add and keeps a
+ *     *process-local* ev_state.
+ *   - Each event is built into a single static scratch buffer and
+ *     emitted with one raw_write() (or one raw_writev() if the blob
+ *     doesn't fit in scratch). Both syscalls are atomic against other
+ *     writers up to PIPE_BUF (pipes) or unconditionally on regular
+ *     files in Linux, so events from different processes interleave
+ *     at event boundaries but never inside an event.
+ *   - The decoder (wire_in.cpp) keeps one ev_state per observed
+ *     stream_id, so each producer's deltas stay coherent on its own
+ *     state.
+ *
+ * Stream id 0 is reserved for "default / legacy" — it's what a v1
+ * producer would land on. The launcher takes id 1; children get 2, 3,
+ * 4, …
  */
 
 #include "sud/libc.h"
@@ -42,16 +60,20 @@ char      *g_path_env;
 int        g_trace_exec_env       = 1;
 
 /* ================================================================
- * Shared encoder state (ev_state + spinlock).
+ * Shared atomic counter + per-process delta state.
  *
- * `sud_wire_init` maps SUD_STATE_FD for us so that every traced
- * child gets the *same* page and thus the same ev_state + lock.
+ * `sud_wire_init` maps SUD_STATE_FD (set up by the launcher) and
+ * grabs a fresh stream_id for this process via an atomic CAS-style
+ * fetch-and-add. The counter is the *only* cross-process datum; the
+ * delta state is process-local, so emit paths are lock-free.
  * ================================================================ */
 
 struct sud_shared {
-    volatile int lock;       /* 0=free, 1=held (cross-process TAS) */
-    ev_state     st;
-    /* (rest of the page is reserved for future use / padding) */
+    /* Bumped atomically; first hand-out is 1 (the launcher's), then
+     * 2, 3, … for each child. Stream id 0 stays reserved for legacy /
+     * "no stream id" producers. */
+    volatile uint32_t next_stream_id;
+    /* Rest of the page is reserved for future use / padding. */
 };
 
 #define SUD_SHARED_PAGE_SIZE 4096
@@ -59,19 +81,30 @@ struct sud_shared {
 static struct sud_shared  g_local_shared;              /* fallback */
 static struct sud_shared *g_shared = &g_local_shared;
 
+/* Process-local: never shared. */
+static ev_state g_ev_state;
+static uint32_t g_stream_id = 0;
+static int      g_stream_id_set = 0;
+
 void sud_wire_init(void)
 {
-    /* If the launcher set up SUD_STATE_FD (a MAP_SHARED memfd), mapping
-     * it gives us a page of zeroed memory shared with every sibling
-     * traced process — exactly what ev_state and the spinlock want.
-     * If the fd isn't present the mmap fails and we keep the process-
-     * local fallback. */
-    void *p = raw_mmap(NULL, SUD_SHARED_PAGE_SIZE,
-                       PROT_READ | PROT_WRITE, MAP_SHARED,
-                       SUD_STATE_FD, 0);
-    if (p == MAP_FAILED || !p)
-        return;                                         /* keep fallback */
-    g_shared = (struct sud_shared *)p;
+    /* If the launcher set up SUD_STATE_FD (a MAP_SHARED memfd),
+     * mapping it gives us a page of memory shared with every sibling
+     * traced process — exactly what the atomic stream-id counter
+     * wants. If the fd isn't present the mmap fails and we keep the
+     * process-local fallback (single-stream stand-alone runs). */
+    if (!g_stream_id_set) {
+        void *p = raw_mmap(NULL, SUD_SHARED_PAGE_SIZE,
+                           PROT_READ | PROT_WRITE, MAP_SHARED,
+                           SUD_STATE_FD, 0);
+        if (p != MAP_FAILED && p)
+            g_shared = (struct sud_shared *)p;
+        /* Atomic grab. __sync_fetch_and_add is async-signal-safe
+         * (single instruction lock-prefixed on x86) and works on the
+         * shared page. */
+        g_stream_id = __sync_fetch_and_add(&g_shared->next_stream_id, 1u) + 1u;
+        g_stream_id_set = 1;
+    }
 }
 
 /* ================================================================
@@ -135,25 +168,18 @@ static unsigned int sud_minor(unsigned long dev)
 #endif
 
 /* ================================================================
- * Cross-process spinlock + write helpers.
+ * Write helpers — no cross-process lock. raw_write/raw_writev are
+ * each one syscall, which the kernel treats atomically against other
+ * writers on regular files (and up to PIPE_BUF on pipes). Events
+ * are sized to fit in a single syscall, so different processes'
+ * events interleave at event boundaries only — never inside one.
  * ================================================================ */
 
-static void emit_lock(void)
-{
-    while (__sync_lock_test_and_set(&g_shared->lock, 1))
-        raw_sched_yield();
-}
-
-static void emit_unlock(void)
-{
-    __sync_lock_release(&g_shared->lock);
-}
-
-/* Write all `len` bytes of `buf` to g_out_fd via raw_write. Caller
- * already holds the spinlock. For event atoms bounded by the file's
- * single-write() atomicity this is the whole event; for very large
- * payloads (env blobs) the loop may block. */
-static void emit_raw_locked(const void *buf, size_t len)
+/* Write all `len` bytes of `buf` to g_out_fd via raw_write. Used for
+ * scratch-buffer-fits-the-event path; one call here = one atomic
+ * event on the wire. Falls back to a loop only on partial writes
+ * (regular files do this on EINTR / disk-full edge cases). */
+static void emit_raw(const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
     size_t off = 0;
@@ -177,21 +203,27 @@ static uint64_t get_ts_ns(void)
 /* ================================================================
  * Core event emitter.
  *
- * Builds the delta-encoded header against the shared ev_state, then
- * writes (outer yeet atom over header||blob) to g_out_fd with a
- * single raw_write call. Caller supplies the scalars + extras + blob;
- * we never copy the blob.
+ * Builds the v2 header (stream_id || delta-encoded base scalars +
+ * extras) against this process's *local* ev_state and emits the
+ * outer atom in a single syscall:
  *
- * A single event atom always fits: header (<= 160 B) + outer prefix
- * (<= 9 B) + blob, so the worst case is (blob_len + ~170). Our
- * output buffer is WIRE_EVENT_STACK_MAX and blobs up to ENV_MAX_READ
- * are copied inline — the whole event goes out in one write() for
- * atomicity on regular files.
+ *   - small payloads (header + blob ≤ WIRE_EVENT_STACK_MAX) are
+ *     packed into the static scratch buffer and shipped with one
+ *     raw_write().
+ *   - oversized blobs (only EV_ENV ever hits this) are emitted via
+ *     raw_writev() with three iovs (outer-atom prefix, header, blob).
+ *     writev is atomic per-call against other writers.
+ *
+ * No lock — the only cross-process state is the stream-id counter
+ * touched once at sud_wire_init() time.
  * ================================================================ */
 
 #define WIRE_EVENT_STACK_MAX  (ENV_MAX_READ + PATH_MAX * 8 + 256)
 
-/* Static scratch buffer reused across emits, protected by emit_lock. */
+/* Static scratch buffer reused across emits. Re-entrancy: a SIGSYS
+ * handler emit can't fire while we're inside a SIGSYS handler on the
+ * same thread (SIGSYS is blocked during its own handler), and we
+ * never longjmp out of an emit. So a single static is safe. */
 static char g_event_buf[WIRE_EVENT_STACK_MAX];
 
 static void emit_event(int32_t type, pid_t pid, pid_t tgid, pid_t ppid,
@@ -200,46 +232,58 @@ static void emit_event(int32_t type, pid_t pid, pid_t tgid, pid_t ppid,
                        const void *blob, size_t blen)
 {
     if (g_out_fd < 0) return;
+    /* Lazy init in case a stand-alone use forgot to call sud_wire_init. */
+    if (!g_stream_id_set) sud_wire_init();
 
-    emit_lock();
+    uint8_t hdr[EV_HEADER_V2_MAX];
+    int hlen = ev_build_header_v2(g_stream_id, &g_ev_state, hdr,
+                                  type, ts_ns,
+                                  pid, tgid, ppid,
+                                  /* nspid, nstgid: same as pid/tgid when not
+                                   * explicitly different — sud can't tell */
+                                  pid, tgid,
+                                  extras, n_extras);
+    if (hlen < 0) return;
 
-    uint8_t hdr[EV_HEADER_MAX];
-    int hlen = ev_build_header(&g_shared->st, hdr,
-                               type, ts_ns,
-                               pid, tgid, ppid,
-                               /* nspid, nstgid: same as pid/tgid when not
-                                * explicitly different — sud can't tell */
-                               pid, tgid,
-                               extras, n_extras);
-    if (hlen < 0) { emit_unlock(); return; }
-
-    /* If header+blob fits in the static scratch buffer, build the
-     * outer atom in-place for one write() call. Otherwise do a
-     * best-effort two-part emit. */
+    /* Common case: header + blob fits in the scratch buffer. Build
+     * the outer atom in-place, ship in one syscall. */
     uint8_t *w = (uint8_t *)g_event_buf;
     const uint8_t *end = w + WIRE_EVENT_STACK_MAX;
     if (yeet_pair(&w, end, hdr, hlen, blob, blen) == 0) {
-        emit_raw_locked(g_event_buf, (size_t)(w - (uint8_t *)g_event_buf));
-    } else {
-        /* Blob too large for scratch; emit the outer prefix + hdr,
-         * then the blob directly. Atomicity on regular files still
-         * holds for the individual write() calls in sequence under
-         * the spinlock, preserving ordering. */
-        uint8_t prefix[16];
-        uint8_t *pp = prefix;
-        uint64_t total = (uint64_t)hlen + blen;
-        uint8_t lenbuf[8]; uint8_t lensz = 0; uint64_t tmp = total;
-        while (tmp) { lenbuf[lensz++] = (uint8_t)(tmp & 0xFFu); tmp >>= 8; }
-        if (lensz <= 7u) {
-            *pp++ = (uint8_t)(0xF8u + lensz);
-            for (uint8_t i = 0; i < lensz; i++) *pp++ = lenbuf[i];
-            emit_raw_locked(prefix, (size_t)(pp - prefix));
-            emit_raw_locked(hdr, (size_t)hlen);
-            if (blen) emit_raw_locked(blob, blen);
-        }
+        emit_raw(g_event_buf, (size_t)(w - (uint8_t *)g_event_buf));
+        return;
     }
 
-    emit_unlock();
+    /* Oversized: build the outer-atom long-form prefix on the stack
+     * and writev (prefix, hdr, blob) in one atomic syscall. */
+    uint8_t prefix[16];
+    uint8_t *pp = prefix;
+    uint64_t total = (uint64_t)hlen + blen;
+    uint8_t lenbuf[8]; uint8_t lensz = 0; uint64_t tmp = total;
+    while (tmp) { lenbuf[lensz++] = (uint8_t)(tmp & 0xFFu); tmp >>= 8; }
+    if (lensz > 7u) return;
+    *pp++ = (uint8_t)(0xF8u + lensz);
+    for (uint8_t i = 0; i < lensz; i++) *pp++ = lenbuf[i];
+
+    struct sud_iovec iov[3];
+    int iovcnt = 0;
+    iov[iovcnt].iov_base = prefix;
+    iov[iovcnt].iov_len  = (size_t)(pp - prefix);
+    iovcnt++;
+    iov[iovcnt].iov_base = hdr;
+    iov[iovcnt].iov_len  = (size_t)hlen;
+    iovcnt++;
+    if (blen) {
+        iov[iovcnt].iov_base = blob;
+        iov[iovcnt].iov_len  = blen;
+        iovcnt++;
+    }
+    /* writev is atomic against other writers on regular files; on
+     * pipes it's atomic up to PIPE_BUF. We accept a partial write on
+     * a clogged pipe by short-emitting (the trace will look truncated
+     * but won't corrupt — the next event's stream_id resyncs the
+     * delta state at the decoder). */
+    (void)raw_writev(g_out_fd, iov, iovcnt);
 }
 
 /* ================================================================

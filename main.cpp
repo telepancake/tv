@@ -28,6 +28,7 @@
 #include <sys/time.h>
 #include <fcntl.h>
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>

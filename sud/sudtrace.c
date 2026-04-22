@@ -38,8 +38,8 @@
 
 /* Reserve two high FDs so children are unlikely to clobber them.
  *   SUD_OUTPUT_FD : the wire output file
- *   SUD_STATE_FD  : MAP_SHARED anon page with cross-process spinlock +
- *                   shared ev_state (see sud/event.c: struct sud_shared) */
+ *   SUD_STATE_FD  : MAP_SHARED anon page with the atomic stream-id
+ *                   counter (no lock — see sud/event.c). */
 #define SUD_OUTPUT_FD        1023
 #define SUD_STATE_FD         1022
 #define SUD_STATE_PAGE_SIZE  4096
@@ -152,19 +152,24 @@ static int detect_target_class(const char *path)
 /* ================================================================
  * Wire-format event emission.
  *
- * The launcher emits EXIT events for children it reaps. To keep
- * deltas consistent with the children's wire emissions, we share the
- * same `struct sud_shared { int lock; ev_state st; }` page that
- * sud/event.c uses — attached via SUD_STATE_FD, mmap'd MAP_SHARED.
+ * The launcher is itself a wire producer: it writes the version atom
+ * at the head of the stream and emits EXIT events for the children it
+ * reaps. With the new per-process delta design (see sud/event.c), the
+ * launcher gets its own stream_id from the same shared atomic counter
+ * the children use, and keeps its own process-local ev_state. No
+ * cross-process lock involved.
  * ================================================================ */
 
 static int g_out_fd = -1;
 
+/* Shared page layout — must match `struct sud_shared` in sud/event.c.
+ * Only one field, the atomic stream-id counter; no lock anywhere. */
 struct sud_shared_launcher {
-    volatile int lock;
-    ev_state     st;
+    volatile uint32_t next_stream_id;
 };
 static struct sud_shared_launcher *g_shared;  /* NULL until set up */
+static ev_state                    g_launcher_state;
+static uint32_t                    g_launcher_stream_id;
 
 static void get_timestamp(struct timespec *ts)
 {
@@ -214,16 +219,8 @@ static pid_t get_ppid_for(pid_t pid)
     return ppid;
 }
 
-static void shared_lock(void)
-{
-    while (__sync_lock_test_and_set(&g_shared->lock, 1))
-        sched_yield();
-}
-
-static void shared_unlock(void)
-{
-    __sync_lock_release(&g_shared->lock);
-}
+/* No more cross-process lock — emit_exit builds the v2 event into a
+ * stack buffer and writes it with one syscall. */
 
 static void write_all(int fd, const void *buf, size_t len)
 {
@@ -269,20 +266,19 @@ static void emit_exit(pid_t pid, int status)
         extras[3] = status;
     }
 
-    shared_lock();
-    uint8_t hdr[EV_HEADER_MAX];
-    int hlen = ev_build_header(&g_shared->st, hdr,
-                               EV_EXIT, ts_ns,
-                               pid, tgid, ppid, pid, tgid,
-                               extras, 4);
+    uint8_t hdr[EV_HEADER_V2_MAX];
+    int hlen = ev_build_header_v2(g_launcher_stream_id, &g_launcher_state,
+                                  hdr,
+                                  EV_EXIT, ts_ns,
+                                  pid, tgid, ppid, pid, tgid,
+                                  extras, 4);
     if (hlen > 0) {
-        uint8_t buf[EV_HEADER_MAX + 16];
+        uint8_t buf[EV_HEADER_V2_MAX + 16];
         uint8_t *w = buf;
         if (yeet_pair(&w, buf + sizeof buf, hdr, hlen, NULL, 0) == 0) {
             write_all(g_out_fd, buf, (size_t)(w - buf));
         }
     }
-    shared_unlock();
 }
 
 /* ================================================================
@@ -501,12 +497,11 @@ int sudtrace_main(int argc, char **argv)
     /* Set up the shared wire state page.
      *
      * memfd_create gives us an anonymous file that survives fork+exec.
-     * We size it to one page, mmap MAP_SHARED to zero it (ftruncate +
-     * MAP_SHARED => page starts zero which is exactly what ev_state
-     * and the spinlock want), and dup it to SUD_STATE_FD so every
-     * traced child inherits the fd and attaches to the same page via
-     * sud_wire_init(). Also do the initial mmap here so the launcher
-     * itself can emit wire events through the shared state. */
+     * The page now holds only an atomic stream-id counter (no lock, no
+     * shared ev_state — see sud/event.c). We dup it to SUD_STATE_FD
+     * so every traced child inherits the fd and grabs its own
+     * stream_id via sud_wire_init(). The launcher does the same so
+     * its own EXIT events sit on a distinct stream. */
     {
         int mfd = (int)syscall(SYS_memfd_create, "sud_wire_state", 0u);
         if (mfd < 0) {
@@ -527,15 +522,19 @@ int sudtrace_main(int argc, char **argv)
             exit(1);
         }
         g_shared = (struct sud_shared_launcher *)p;
-        /* zeroed by ftruncate */
+        /* ftruncate zero-fills, so next_stream_id starts at 0; first
+         * fetch-and-add returns 0 and we use the post-increment value
+         * (1) as our stream_id. Children then get 2, 3, … */
+        g_launcher_stream_id =
+            __sync_fetch_and_add(&g_shared->next_stream_id, 1u) + 1u;
     }
 
     /* Write the wire version atom once at the head of the output.
-     * Every consumer reads this first to validate format compatibility. */
+     * v2 because we use per-stream delta state with leading stream_id. */
     {
-        uint8_t buf[EV_HEADER_MAX];
+        uint8_t buf[EV_HEADER_V2_MAX];
         uint8_t *w = buf;
-        if (yeet_u64(&w, buf + sizeof buf, WIRE_VERSION) == 0) {
+        if (yeet_u64(&w, buf + sizeof buf, WIRE_VERSION_V2) == 0) {
             write_all(g_out_fd, buf, (size_t)(w - buf));
         }
     }

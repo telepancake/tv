@@ -68,10 +68,10 @@ public:
     bool ensure_proc_index(std::string *err);   /* tv_idx_proc */
     bool ensure_path_index(std::string *err);   /* tv_idx_path */
     bool ensure_edge_index(std::string *err);   /* tv_idx_edge (proc<->path)*/
-    /* Promote tv_idx_open_canon from a view to a real table (with
-     * indices). Only needed when callers want per-row access to canon
-     * (dep/rdep modes). Aggregating consumers (tv_idx_path,
-     * tv_idx_edge, proc-flag F/D filters) stream through the view. */
+    /* Kept for source compat; tv_idx_open_canon is now built as a
+     * real on-disk table by ensure_path_index() (the v3 view variant
+     * pushed the ASOF JOIN into every per-row query and made mode 2
+     * lag). This is now equivalent to ensure_path_index(). */
     bool ensure_canon_table(std::string *err);
 
     /* Path of the backing file (".tvdb" or ":memory:" for in-mem). */

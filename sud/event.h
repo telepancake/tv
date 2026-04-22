@@ -3,8 +3,9 @@
  *
  * Emits events in the binary wire format defined by wire/wire.h.
  * All emit_* functions are async-signal-safe: raw syscalls only,
- * static buffers, cross-process spinlock on a shared mmap page
- * (so `ev_state` deltas stay coherent across traced children).
+ * static buffers, no cross-process locking. Each process owns its
+ * own ev_state and stream_id (handed out from a shared atomic
+ * counter at sud_wire_init time), so emits are lock-free.
  */
 
 #ifndef SUD_EVENT_H
@@ -22,7 +23,7 @@
 /* Reserve two high FDs so children are unlikely to clobber them.
  *   SUD_OUTPUT_FD : the wire output file.
  *   SUD_STATE_FD  : a MAP_SHARED anonymous page holding the
- *                   cross-process emit spinlock + the shared ev_state. */
+ *                   atomic stream-id counter. No lock anywhere. */
 #define SUD_OUTPUT_FD        1023
 #define SUD_STATE_FD         1022
 #define SUDTRACE_OUTFILE_ENV "SUDTRACE_OUTFILE"
@@ -44,9 +45,11 @@ extern int        g_trace_exec_env;
  * Wire setup — must be called once per process after g_out_fd is set.
  *
  * sud_wire_init():
- *   Map SUD_STATE_FD as MAP_SHARED so the encoder's ev_state is
- *   shared across every traced child. Falls back to a process-local
- *   state if the FD isn't set up (stand-alone wrapper runs).
+ *   Map SUD_STATE_FD as MAP_SHARED so this process can read the
+ *   shared atomic stream-id counter, then atomically allocate this
+ *   process's own stream_id. ev_state is process-local and zeroed.
+ *   Falls back to a process-local counter if the FD isn't set up
+ *   (stand-alone wrapper runs).
  * ================================================================ */
 void sud_wire_init(void);
 

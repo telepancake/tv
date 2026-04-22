@@ -25,11 +25,16 @@
  * for the duration of the sink call. The `type` is the EV_* code
  * from wire/wire.h. `extras`/`n_extras` are type-specific i64 fields
  * (4 for EV_EXIT, 7 for EV_OPEN, 0 otherwise). `blob` is the
- * variable-length payload (may be empty / nullptr). */
+ * variable-length payload (may be empty / nullptr).
+ *
+ * `stream_id` identifies which producer stream the event was delta-
+ * encoded against. v1 streams always report 0; v2 streams report the
+ * stream_id the producer chose (0 = default / legacy stream). */
 struct WireEvent {
     int32_t  type;
     uint64_t ts_ns;
     int32_t  pid, tgid, ppid, nspid, nstgid;
+    uint32_t stream_id;
     const int64_t *extras;
     unsigned       n_extras;
     const char *blob;
