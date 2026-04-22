@@ -197,6 +197,16 @@ std::unique_ptr<TvDb> TvDb::open_with_path(const char *path,
         if (err) *err = "duckdb_connect failed";
         return nullptr;
     }
+    /* Memory-friendly defaults — let DuckDB spill to disk freely
+     * instead of clinging to multi-GB result sets. preserve_insertion_order
+     * lets the query planner stream large windowed/grouped queries
+     * (the path-canonicalisation builder benefits a lot). */
+    duckdb_result r0;
+    (void)duckdb_query(db->impl_->con,
+        "PRAGMA preserve_insertion_order=false;",
+        &r0);
+    duckdb_destroy_result(&r0);
+
     db->impl_->path_ = display;
     duckdb_result r;
     duckdb_state s = duckdb_query(db->impl_->con, kSchemaSQL, &r);
@@ -515,11 +525,10 @@ bool TvDb::ensure_path_index(std::string *err) {
     if (meta_get(impl_->con, "idx_path", val)) return true;
 
     /* Canonicalise relative open paths against the latest CWD for the
-     * tgid that precedes the open's ts_ns.  Without this, two tgids
-     * that opened "Makefile" from different cwds would be reported as
-     * the same file (and an absolute /home/x/proj/Makefile and a
-     * relative Makefile from the same cwd would be reported as two
-     * different files). */
+     * tgid that precedes the open's ts_ns. We *only* keep the
+     * canonicalised path column (no raw_path duplicate); on large
+     * traces (10^8 opens) raw_path was a 3-5 GB redundant copy of the
+     * data already in `open_`. */
     const char *canon_sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_open_canon AS "
         "WITH ranked AS ("
@@ -532,7 +541,7 @@ bool TvDb::ensure_path_index(std::string *err) {
         "  FROM open_ o "
         "  LEFT JOIN cwd c ON c.tgid = o.tgid AND c.ts_ns <= o.ts_ns "
         ") "
-        "SELECT ts_ns, tgid, fd, flags, err, raw_path, "
+        "SELECT ts_ns, tgid, fd, flags, err, "
         "       CASE "
         "         WHEN raw_path LIKE '/%' THEN raw_path "
         "         WHEN cwd IS NULL OR raw_path LIKE 'pipe:%' "

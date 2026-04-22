@@ -99,6 +99,9 @@ DUCKDB_OPT ?= -O0
 $(DUCKDB_CPP): tools/duckdb_amalgamate.py | $(DUCKDB_DIR)/scripts/amalgamation.py
 	python3 tools/duckdb_amalgamate.py
 
+$(DUCKDB_HPP): $(DUCKDB_CPP)
+	@true
+
 $(DUCKDB_OBJ): $(DUCKDB_CPP)
 	@mkdir -p build
 	$(DUCKDB_CXX) -std=c++17 $(DUCKDB_OPT) -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@

@@ -108,20 +108,14 @@ RowData mk_row(const std::string &id, const std::string &text,
 
 RowData mk_kv(const std::string &id, const std::string &key,
               const std::string &val, RowStyle style = RowStyle::Normal) {
-    /* The right pane is rendered as a single-column panel (the
-     * engine truncates extra columns), so we pre-format key+value
-     * into one cell with a fixed-width left part for alignment.
-     * Long values overflow the panel width and get ellipsised by
-     * the engine, which is what we want — at least the first chunk
-     * of the value is visible. */
+    /* Two-column row: the engine renders col[0] in a fixed-width key
+     * column and col[1] in the flex value column.  link_id carries the
+     * raw value for app-level navigation. */
     RowData r;
     r.id = id;
     r.style = style;
-    char prefix[24];
-    std::snprintf(prefix, sizeof prefix, "%-18s ", key.c_str());
-    r.cols.push_back(std::string(prefix) + val);
-    /* Carry the raw fields for app-level navigation (Enter on a row,
-     * value-based searches, etc.). */
+    r.cols.push_back(key);
+    r.cols.push_back(val);
     r.link_id = val;
     return r;
 }
@@ -158,6 +152,10 @@ DataSource TvDataSource::make_data_source() {
 
 void TvDataSource::invalidate() {
     built_lpane_ = false;
+    built_rpane_ = false;
+}
+
+void TvDataSource::invalidate_rpane() {
     built_rpane_ = false;
 }
 
@@ -225,6 +223,7 @@ RowData TvDataSource::row_next(int panel) {
 void TvDataSource::rebuild_lpane() {
     lpane_.clear();
     switch (state_.mode) {
+        case 0: lpane_outputs(); break;
         case 1: lpane_processes(); break;
         case 2: lpane_files(); break;
         case 3: lpane_events(); break;
@@ -259,16 +258,33 @@ struct ProcRow {
     bool             matches_search = true;
 };
 
-std::string proc_label(const ProcRow &p, bool show_basename_only,
-                       bool show_pid) {
+std::string proc_name_label(const ProcRow &p, bool show_basename_only,
+                            bool show_pid) {
     std::string label;
     if (show_pid) label = sfmt("[%d] ", p.tgid);
     label += show_basename_only ? p.name : p.exe;
     if (label.size() > 0 && p.exe.empty() && p.name.empty())
         label += "(no exec)";
-    std::string dur = format_duration_ns(p.start_ns, p.end_ns);
-    if (!dur.empty()) label += "  " + dur;
-    label += "  " + format_exit(p.exit_kind, p.exit_code, p.core_dumped, p.ended);
+    return label;
+}
+
+std::string proc_stats_label(const ProcRow &p) {
+    std::string s = format_duration_ns(p.start_ns, p.end_ns);
+    std::string ex = format_exit(p.exit_kind, p.exit_code, p.core_dumped, p.ended);
+    if (!ex.empty()) {
+        if (!s.empty()) s += "  ";
+        s += ex;
+    }
+    return s;
+}
+
+/* Back-compat: combined label (used by mode 7 dep cmds, which only has
+ * one column). */
+std::string proc_label(const ProcRow &p, bool show_basename_only,
+                       bool show_pid) {
+    std::string label = proc_name_label(p, show_basename_only, show_pid);
+    std::string st = proc_stats_label(p);
+    if (!st.empty()) label += "  " + st;
     return label;
 }
 } // namespace
@@ -286,6 +302,49 @@ void TvDataSource::lpane_processes() {
         "       start_ns, end_ns, "
         "       exit_kind, exit_code, core_dumped "
         "FROM tv_idx_proc";
+    /* Computed-flag filter for processes:
+     *   K  killed by signal OR still running when trace ended
+     *   F  exited != 0 with at least one file open for writing
+     *      (filters out grep/test/etc. with normal non-zero rc)
+     *   D  process exec'd a file that was written by another tgid
+     *      in the trace (i.e. ran a derived script/elf)
+     * The SQL uses semi-joins against open_/exec/tv_idx_open_canon to
+     * stay scalar-free — no rows are materialised in C++. */
+    auto add_clause = [&](std::string &where, const std::string &c) {
+        if (where.empty()) where = c;
+        else where = "(" + where + ") AND " + c;
+    };
+    std::string where;
+    bool need_canon_for_proc = false;
+    for (char ch : state_.flag_filter) {
+        switch (ch) {
+            case 'K': add_clause(where,
+                "exit_kind = 1 OR exit_kind IS NULL"); break;
+            case 'F': add_clause(where,
+                "((exit_kind = 0 AND exit_code <> 0) OR exit_kind = 1 "
+                " OR exit_kind IS NULL) "
+                "AND tgid IN (SELECT DISTINCT tgid FROM tv_idx_open_canon "
+                "             WHERE (flags & 3) <> 0 AND err = 0)");
+                need_canon_for_proc = true; break;
+            case 'D': add_clause(where,
+                "tgid IN ("
+                "  SELECT e.tgid FROM exec e "
+                "  WHERE EXISTS ("
+                "    SELECT 1 FROM tv_idx_open_canon w "
+                "    WHERE w.tgid <> e.tgid AND (w.flags & 3) <> 0 "
+                "      AND w.err = 0 AND w.path = CAST(e.exe AS VARCHAR) "
+                "      AND w.ts_ns < e.ts_ns))");
+                need_canon_for_proc = true; break;
+            default: break;   /* file-mode flags ignored on procs */
+        }
+    }
+    if (need_canon_for_proc) {
+        if (!db_.ensure_path_index(&err)) {
+            lpane_.push_back(mk_row("__err", err, RowStyle::Error));
+            return;
+        }
+    }
+    if (!where.empty()) sql += " WHERE " + where;
     auto rows = db_.query_strings(sql, &err);
     if (!err.empty()) {
         lpane_.push_back(mk_row("__err", err, RowStyle::Error));
@@ -369,8 +428,9 @@ void TvDataSource::lpane_processes() {
                 /* Note: roots are emitted with empty prefix and no glyph. */
             }
             std::string text = state_.grouped ? indent : "";
-            text += proc_label(p, /*basename_only=*/true,
-                               state_.show_pids);
+            text += proc_name_label(p, /*basename_only=*/true,
+                                    state_.show_pids);
+            std::string stats = proc_stats_label(p);
             RowStyle style = RowStyle::Normal;
             if (!p.ended)             style = RowStyle::Green;
             else if (p.exit_kind == "1") style = RowStyle::Error;
@@ -383,6 +443,9 @@ void TvDataSource::lpane_processes() {
             row.parent_id = std::to_string(p.ppid);
             row.has_children = !p.children.empty();
             row.cols.push_back(std::move(text));
+            row.cols.push_back("");          /* col 1: badge — unused for procs */
+            row.cols.push_back(std::move(stats));
+            row.style = style;
             row.style = style;
             lpane_.push_back(std::move(row));
             if (!state_.grouped) return;
@@ -401,6 +464,33 @@ void TvDataSource::lpane_processes() {
 
 /* ── Mode 2: file tree ────────────────────────────────────────────── */
 
+namespace {
+struct FileRow {
+    std::string path;
+    int opens=0, errors=0, procs=0, reads=0, writes=0;
+};
+
+RowData mk_file_row(const FileRow &r, const std::string &display_name,
+                    bool search_hit) {
+    /* 3-column row for the file pane: name | RWE badge | stats. */
+    std::string flags;
+    flags += r.reads  ? 'R' : '-';
+    flags += r.writes ? 'W' : '-';
+    flags += r.errors ? 'E' : '-';
+    std::string stats = r.errors
+        ? sfmt("%d opens, %d procs, %d errs", r.opens, r.procs, r.errors)
+        : sfmt("%d opens, %d procs",          r.opens, r.procs);
+    RowStyle st = r.errors ? RowStyle::Error :
+                  r.writes ? RowStyle::Yellow : RowStyle::Normal;
+    if (search_hit) st = RowStyle::Search;
+    RowData row;
+    row.id = r.path;
+    row.cols = { display_name, flags, stats };
+    row.style = st;
+    return row;
+}
+} // namespace
+
 void TvDataSource::lpane_files() {
     std::string err;
     if (!db_.ensure_path_index(&err)) {
@@ -413,20 +503,55 @@ void TvDataSource::lpane_files() {
     std::string where;
     if (!state_.search.empty())
         where += "path LIKE '%' || " + sql_escape(state_.search) + " || '%'";
-    /* Flag filter: an arbitrary subset of {R,W,E}; row must have ALL of
-     * the requested categories.  E.g. "WE" = files written AND with
-     * errors; "R" = files read.  Matches the visible "RWE" badge. */
+    /* Flag filter: any subset of {R,W,E,w,f,s,k}; row must satisfy ALL
+     * requested categories.
+     *   R/W/E: raw read/write/error (matches the visible badge)
+     *   w    : "written and not unlinked afterwards" (currently
+     *          approximated as writes>0; we don't track unlink yet)
+     *   f    : path was written by a process that exited != 0 / killed /
+     *          still running when trace ended ("written by a failure")
+     *   s    : path is outside common system/toolkit roots
+     *          (/usr, /bin, /sbin, /lib*, /opt, /srv)
+     *   k    : path is NOT a kernel/IPC pseudo-path (pipe:, socket:,
+     *          anon_inode:, /dev/, /sys/, /proc/) */
     auto add_clause = [&](const std::string &c) {
         if (where.empty()) where = c;
         else where = "(" + where + ") AND " + c;
     };
+    bool need_failed_writers = false;
     for (char ch : state_.flag_filter) {
         switch (ch) {
-            case 'R': case 'r': add_clause("reads  > 0");  break;
-            case 'W': case 'w': add_clause("writes > 0");  break;
-            case 'E': case 'e': add_clause("errors > 0");  break;
+            case 'R': add_clause("reads  > 0");  break;
+            case 'W': add_clause("writes > 0");  break;
+            case 'E': add_clause("errors > 0");  break;
+            case 'w': add_clause("writes > 0");  break;
+            case 'f': add_clause("path IN (SELECT path FROM tv_idx_path_failed_writers)");
+                      need_failed_writers = true; break;
+            case 's': add_clause(
+                "NOT (path LIKE '/usr/%' OR path LIKE '/bin/%' OR "
+                     "path LIKE '/sbin/%' OR path LIKE '/lib%' OR "
+                     "path LIKE '/opt/%' OR path LIKE '/srv/%')"); break;
+            case 'k': add_clause(
+                "NOT (path LIKE 'pipe:%' OR path LIKE 'socket:%' OR "
+                     "path LIKE 'anon_inode:%' OR path LIKE '/dev/%' OR "
+                     "path LIKE '/sys/%' OR path LIKE '/proc/%')"); break;
             default: break;
         }
+    }
+    if (need_failed_writers) {
+        if (!db_.ensure_proc_index(&err)) {
+            lpane_.push_back(mk_row("__err", err, RowStyle::Error));
+            return;
+        }
+        /* Built once per connection lifetime; cheap. */
+        (void)db_.query_strings(
+            "CREATE TEMP TABLE IF NOT EXISTS tv_idx_path_failed_writers AS "
+            "SELECT DISTINCT o.path "
+            "FROM tv_idx_open_canon o JOIN tv_idx_proc p USING (tgid) "
+            "WHERE (o.flags & 3) <> 0 "
+            "  AND (p.exit_kind = 1 OR p.exit_kind IS NULL OR "
+            "       (p.exit_kind = 0 AND p.exit_code <> 0))",
+            &err);
     }
     if (!where.empty()) sql += " WHERE " + where;
     sql += " ORDER BY path LIMIT 5000";
@@ -436,56 +561,48 @@ void TvDataSource::lpane_files() {
         return;
     }
 
-    auto fmt_row = [&](const std::vector<std::string> &r,
-                       const std::string &display_text) -> RowData {
-        const std::string &path = r[0];
-        int opens  = std::atoi(r[1].c_str());
-        int errors = std::atoi(r[2].c_str());
-        int procs  = std::atoi(r[3].c_str());
-        int reads  = std::atoi(r[4].c_str());
-        int writes = std::atoi(r[5].c_str());
-        std::string flags;
-        flags += reads  ? 'R' : '-';
-        flags += writes ? 'W' : '-';
-        flags += errors ? 'E' : '-';
-        std::string text = sfmt("%s  %s  [%d opens, %d procs%s]",
-            flags.c_str(), display_text.c_str(), opens, procs,
-            errors ? sfmt(", %d errs", errors).c_str() : "");
-        RowStyle st = errors ? RowStyle::Error :
-                      writes ? RowStyle::Yellow : RowStyle::Normal;
-        if (!state_.search.empty() &&
-            path.find(state_.search) != std::string::npos)
-            st = RowStyle::Search;
-        RowData row;
-        row.id = path;
-        row.cols.push_back(std::move(text));
-        row.style = st;
-        return row;
-    };
+    std::vector<FileRow> frows;
+    frows.reserve(rows.size());
+    for (auto &r : rows) {
+        FileRow f;
+        f.path   = r[0];
+        f.opens  = std::atoi(r[1].c_str());
+        f.errors = std::atoi(r[2].c_str());
+        f.procs  = std::atoi(r[3].c_str());
+        f.reads  = std::atoi(r[4].c_str());
+        f.writes = std::atoi(r[5].c_str());
+        frows.push_back(std::move(f));
+    }
 
     if (!state_.grouped) {
-        for (auto &r : rows) lpane_.push_back(fmt_row(r, r[0]));
+        for (auto &f : frows) {
+            bool hit = !state_.search.empty() &&
+                       f.path.find(state_.search) != std::string::npos;
+            lpane_.push_back(mk_file_row(f, f.path, hit));
+        }
         return;
     }
 
-    /* Tree mode: build a directory tree from the path list. Each
-     * directory node is a synthetic heading; leaf nodes are real
-     * files with their stats. */
+    /* Tree mode: build a directory tree from the path list and
+     * aggregate stats up the tree so directory rows still show
+     * meaningful badges/counts. */
     struct Node {
-        std::string component;          /* "" for root */
-        std::string full_path;          /* absolute or partial */
+        std::string component;
+        std::string full_path;
         bool        is_file = false;
-        int         row_idx = -1;       /* index into `rows` if is_file */
+        int         file_idx = -1;
+        FileRow     agg;                /* aggregated over subtree */
+        int         file_count = 0;
         std::map<std::string, std::unique_ptr<Node>> children;
     };
     Node root;
-    for (size_t i = 0; i < rows.size(); i++) {
-        const std::string &p = rows[i][0];
+    for (size_t i = 0; i < frows.size(); i++) {
+        const std::string &p = frows[i].path;
         if (p.empty()) continue;
         Node *cur = &root;
         size_t pos = 0;
-        if (p[0] == '/') pos = 1;
         std::string acc = (p[0] == '/') ? "/" : "";
+        if (p[0] == '/') pos = 1;
         while (pos <= p.size()) {
             size_t nx = p.find('/', pos);
             std::string comp = p.substr(pos, nx == std::string::npos
@@ -507,21 +624,57 @@ void TvDataSource::lpane_files() {
             pos = nx + 1;
         }
         cur->is_file = true;
-        cur->row_idx = (int)i;
+        cur->file_idx = (int)i;
     }
+
+    /* Recursive aggregation. */
+    std::function<void(Node *)> aggregate = [&](Node *n) {
+        if (n->is_file) {
+            n->agg = frows[n->file_idx];
+            n->file_count = 1;
+            return;
+        }
+        for (auto &kv : n->children) {
+            Node *c = kv.second.get();
+            aggregate(c);
+            n->agg.opens  += c->agg.opens;
+            n->agg.errors += c->agg.errors;
+            n->agg.procs  += c->agg.procs;   /* over-counts; ok for hint */
+            n->agg.reads  += c->agg.reads;
+            n->agg.writes += c->agg.writes;
+            n->file_count += c->file_count;
+        }
+    };
+    aggregate(&root);
 
     std::function<void(Node *, int)> emit = [&](Node *n, int depth) {
         for (auto &kv : n->children) {
             Node *c = kv.second.get();
             std::string indent(depth * 2, ' ');
             if (c->is_file) {
-                RowData rw = fmt_row(rows[c->row_idx], indent + c->component);
+                bool hit = !state_.search.empty() &&
+                           frows[c->file_idx].path.find(state_.search)
+                                != std::string::npos;
+                RowData rw = mk_file_row(frows[c->file_idx],
+                                         indent + c->component, hit);
                 lpane_.push_back(std::move(rw));
             } else {
+                /* Directory row: same column layout, with aggregated
+                 * RWE badge and a "(N files)" stats column. */
+                FileRow agg = c->agg;
+                agg.path = c->full_path + "/";
+                std::string flags;
+                flags += agg.reads  ? 'R' : '-';
+                flags += agg.writes ? 'W' : '-';
+                flags += agg.errors ? 'E' : '-';
+                std::string stats = sfmt("%d file%s, %d opens",
+                    c->file_count, c->file_count == 1 ? "" : "s", agg.opens);
                 RowData rw;
                 rw.id = c->full_path + "/";
-                rw.cols.push_back(indent + c->component + "/");
-                rw.style = RowStyle::CyanBold;
+                rw.cols = { indent + c->component + "/", flags, stats };
+                /* Directories get cyan; failed-error directories take
+                 * priority colouring to draw the eye. */
+                rw.style = agg.errors ? RowStyle::Error : RowStyle::CyanBold;
                 rw.has_children = true;
                 lpane_.push_back(std::move(rw));
             }
@@ -529,6 +682,73 @@ void TvDataSource::lpane_files() {
         }
     };
     emit(&root, 0);
+}
+
+/* ── Mode 0: output (stdout/stderr) view ──────────────────────────── */
+
+void TvDataSource::lpane_outputs() {
+    /* Chronological merged stdout+stderr stream.  When subtree_only is
+     * set (s in mode 1 then switch to 0), restrict to the subtree
+     * rooted at subtree_root. */
+    std::string err;
+    /* CAST ts_ns and tgid to VARCHAR explicitly: duckdb_value_varchar
+     * on a UBIGINT/INTEGER column projected through UNION ALL can
+     * return empty in this DuckDB build. */
+    std::string sql =
+        "SELECT 'O' AS k, CAST(ts_ns AS VARCHAR) AS ts, "
+        "       CAST(tgid AS VARCHAR) AS tg, CAST(data AS VARCHAR) AS d "
+        "FROM stdout_ UNION ALL "
+        "SELECT 'E', CAST(ts_ns AS VARCHAR), CAST(tgid AS VARCHAR), "
+        "       CAST(data AS VARCHAR) FROM stderr_";
+    std::string where;
+    if (!state_.search.empty())
+        where = "d LIKE '%' || " + sql_escape(state_.search) + " || '%'";
+    /* Flag filter: O = stdout, E = stderr.  Both ⇒ both. */
+    bool want_o = state_.flag_filter.find('O') != std::string::npos;
+    bool want_e = state_.flag_filter.find('E') != std::string::npos;
+    if (want_o && !want_e) {
+        if (!where.empty()) where = "(" + where + ") AND k = 'O'";
+        else where = "k = 'O'";
+    } else if (want_e && !want_o) {
+        if (!where.empty()) where = "(" + where + ") AND k = 'E'";
+        else where = "k = 'E'";
+    }
+    sql = "SELECT * FROM (" + sql + ")";
+    if (!where.empty()) sql += " WHERE " + where;
+    sql += " ORDER BY CAST(ts AS UBIGINT) LIMIT 5000";
+    auto rows = db_.query_strings(sql, &err);
+    if (!err.empty()) {
+        lpane_.push_back(mk_row("__err", err, RowStyle::Error));
+        return;
+    }
+    int64_t base_ns = 0;
+    if (!rows.empty() && !rows[0][1].empty()) base_ns = std::stoll(rows[0][1]);
+    for (auto &r : rows) {
+        const std::string &k = r[0];
+        int64_t ts_ns = r[1].empty() ? 0 : std::stoll(r[1]);
+        const std::string &tgid = r[2];
+        std::string data = r[3];
+        for (auto &c : data) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        if (data.size() > 200) data = data.substr(0, 197) + "...";
+        double rel = (ts_ns - base_ns) / 1e9;
+        std::string text = sfmt("+%6.3fs  [%s]  %s", rel, tgid.c_str(),
+                                data.c_str());
+        RowStyle st = (k == "E") ? RowStyle::Error : RowStyle::Normal;
+        if (!state_.search.empty() &&
+            data.find(state_.search) != std::string::npos)
+            st = RowStyle::Search;
+        RowData row;
+        /* id encodes tgid:ts_ns:k so the rpane can re-locate the event. */
+        row.id = tgid + ":" + std::to_string(ts_ns) + ":" + k;
+        row.cols.push_back(std::move(text));
+        row.cols.push_back(k);                     /* O / E badge */
+        row.cols.push_back("");                    /* unused */
+        row.style = st;
+        /* Enter on a row → jump to the producing process in mode 1. */
+        row.link_mode = 1;
+        row.link_id   = tgid;
+        lpane_.push_back(std::move(row));
+    }
 }
 
 /* ── Mode 3: event log ────────────────────────────────────────────── */
@@ -734,6 +954,9 @@ void TvDataSource::rebuild_rpane() {
         return;
     }
     switch (state_.mode) {
+        case 0:
+            rpane_output_detail(cid);
+            break;
         case 1:
         case 6:
         case 7:
@@ -889,6 +1112,87 @@ void TvDataSource::rpane_process_detail(const std::string &tgid_s) {
             RowStyle::Heading));
         for (auto &e : env)
             rpane_.push_back(mk_kv("env_" + e[0], e[1], e[2]));
+    }
+}
+
+/* ── rpane: output (mode 0) — show the producing process's events ─ */
+
+void TvDataSource::rpane_output_detail(const std::string &id) {
+    /* id format: "tgid:ts_ns:k" where k is O (stdout) or E (stderr).
+     * Right pane lists every event from the producing tgid in
+     * chronological order, with the source output event preselected
+     * (cursor will land on it because we use the same "tgid:ts_ns" id
+     * convention as mode 3). */
+    auto p1 = id.find(':');
+    if (p1 == std::string::npos) return;
+    auto p2 = id.find(':', p1 + 1);
+    std::string tgid_s = id.substr(0, p1);
+    std::string ts_s   = (p2 == std::string::npos)
+        ? id.substr(p1 + 1)
+        : id.substr(p1 + 1, p2 - p1 - 1);
+    for (char c : tgid_s) if (c < '0' || c > '9') return;
+
+    std::string err;
+    /* Process header. */
+    auto pr = db_.query_strings(
+        "SELECT CAST(exe AS VARCHAR), start_ns, end_ns, "
+        "       exit_kind, exit_code "
+        "FROM tv_idx_proc WHERE tgid = " + tgid_s, &err);
+    if (!pr.empty()) {
+        rpane_.push_back(mk_row("__hp", "── Process ──", RowStyle::Heading));
+        rpane_.push_back(mk_kv("tgid", "tgid", tgid_s));
+        rpane_.push_back(mk_kv("name", "name", basename_of(pr.front()[0])));
+        rpane_.push_back(mk_kv("exe",  "exe",  pr.front()[0]));
+    }
+
+    /* Event list for this tgid (UNION ALL across event tables).
+     * We CAST ts_ns to VARCHAR explicitly because the deprecated
+     * duckdb_value_varchar API on a column whose union-projected type
+     * is UBIGINT can sometimes return empty. */
+    rpane_.push_back(mk_row("__he", "── Events ──", RowStyle::Heading));
+    std::string sql =
+        "SELECT * FROM ("
+        "  SELECT 'EXEC'   AS kind, CAST(ts_ns AS VARCHAR) AS ts, CAST(exe AS VARCHAR) AS info "
+        "  FROM exec WHERE tgid = " + tgid_s +
+        "  UNION ALL "
+        "  SELECT 'CWD',    CAST(ts_ns AS VARCHAR), CAST(cwd AS VARCHAR) "
+        "  FROM cwd WHERE tgid = " + tgid_s +
+        "  UNION ALL "
+        "  SELECT 'OPEN',   CAST(ts_ns AS VARCHAR), CAST(path AS VARCHAR) "
+        "  FROM open_ WHERE tgid = " + tgid_s +
+        "  UNION ALL "
+        "  SELECT 'EXIT',   CAST(ts_ns AS VARCHAR), "
+        "    CASE WHEN status_kind=1 THEN 'sig ' || code_or_sig "
+        "         ELSE 'code ' || code_or_sig END "
+        "  FROM exit_ WHERE tgid = " + tgid_s +
+        "  UNION ALL "
+        "  SELECT 'STDOUT', CAST(ts_ns AS VARCHAR), CAST(data AS VARCHAR) "
+        "  FROM stdout_ WHERE tgid = " + tgid_s +
+        "  UNION ALL "
+        "  SELECT 'STDERR', CAST(ts_ns AS VARCHAR), CAST(data AS VARCHAR) "
+        "  FROM stderr_ WHERE tgid = " + tgid_s +
+        ") ORDER BY CAST(ts AS UBIGINT) LIMIT 5000";
+    auto rows = db_.query_strings(sql, &err);
+    int64_t base_ns = 0;
+    if (!rows.empty() && !rows[0][1].empty()) base_ns = std::stoll(rows[0][1]);
+    for (auto &r : rows) {
+        const std::string &kind = r[0];
+        int64_t ts_ns = r[1].empty() ? 0 : std::stoll(r[1]);
+        std::string info = r[2];
+        if (kind == "STDOUT" || kind == "STDERR") {
+            for (auto &c : info)
+                if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            if (info.size() > 90) info = info.substr(0, 87) + "...";
+        }
+        double rel = (ts_ns - base_ns) / 1e9;
+        std::string lhs = sfmt("+%6.3fs %-6s", rel, kind.c_str());
+        RowStyle st = (kind == "STDERR" || kind == "EXIT")
+            ? RowStyle::Error
+            : (kind == "EXEC" ? RowStyle::CyanBold : RowStyle::Normal);
+        /* Highlight the event the user clicked on. */
+        std::string row_id = "ev_" + std::to_string(ts_ns);
+        if (std::to_string(ts_ns) == ts_s) st = RowStyle::Search;
+        rpane_.push_back(mk_kv(row_id, lhs, info, st));
     }
 }
 

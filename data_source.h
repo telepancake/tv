@@ -26,7 +26,13 @@ struct AppState {
     int          mode = 1;
     std::string  cursor_id;        /* current cursor row id (mode-dependent) */
     std::string  search;           /* /search query — substring/glob filter */
-    std::string  flag_filter;      /* mode 2: "R"/"W"/"E"/"RW" etc. (any-of) */
+    /* Flag filter — string of one-letter category codes that must ALL
+     * be satisfied by a row. Vocabulary is mode-dependent:
+     *   mode 2 (files): R W E w f s k   (see lpane_files for meaning)
+     *   mode 1 (procs): K F D            (see lpane_processes for meaning)
+     * The string syntax keeps composing simple: "WE" = writes AND errors.
+     */
+    std::string  flag_filter;
     std::string  subject_file;     /* anchor for modes 4..7 */
     bool         grouped = true;   /* tree (true) vs flat (false) view */
     bool         subtree_only = false;  /* mode 1: restrict to subtree of cursor */
@@ -41,7 +47,8 @@ public:
     explicit TvDataSource(TvDb &db, AppState &state);
 
     DataSource make_data_source();
-    void invalidate();
+    void invalidate();         /* both panes — for live data updates */
+    void invalidate_rpane();   /* cursor change — keep lpane cache */
 
 private:
     void row_begin(int panel);
@@ -52,6 +59,7 @@ private:
     void rebuild_rpane();
 
     /* Mode-specific lpane builders. */
+    void lpane_outputs();             /* mode 0: stdout/stderr stream */
     void lpane_processes();
     void lpane_files();
     void lpane_events();
@@ -62,6 +70,7 @@ private:
     void rpane_process_detail(const std::string &tgid);
     void rpane_file_detail(const std::string &path);
     void rpane_event_detail(const std::string &id);
+    void rpane_output_detail(const std::string &id); /* mode 0 cursor */
 
     TvDb     &db_;
     AppState &state_;
