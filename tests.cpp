@@ -261,6 +261,109 @@ void test_data_source_mode1_query() {
     }
 }
 
+/* ── lazy index materialisation ────────────────────────────────────── */
+
+void test_proc_index_built_and_persisted() {
+    std::string err;
+    char path[64]; std::snprintf(path, sizeof path, "/tmp/tv_idx_%d.tvdb",
+                                 (int)::getpid());
+    ::unlink(path);
+    {
+        auto db = TvDb::open_file(path, &err);
+        if (!db) { ::unlink(path); g_fail++; return; }
+        WireBuilder w; build_fixture(w);
+        WireDecoder dec([&](const WireEvent &ev){ std::string e; (void)db->append(ev, &e); });
+        dec.feed(w.buf.data(), w.buf.size());
+        db->flush(&err);
+        EXPECT(db->ensure_proc_index(&err));
+        if (!err.empty()) std::fprintf(stderr, "ensure_proc_index: %s\n", err.c_str());
+
+        auto rows = db->query_strings(
+            "SELECT tgid, ppid, CAST(exe AS VARCHAR), exit_code "
+            "FROM tv_idx_proc ORDER BY tgid", &err);
+        EXPECT_EQ((size_t)2, rows.size());
+        if (rows.size() == 2) {
+            EXPECT_STR(rows[0][0], "100");
+            EXPECT_STR(rows[0][1], "1");
+            EXPECT_STR(rows[0][2], "/usr/bin/make");
+            EXPECT_STR(rows[1][0], "200");
+            EXPECT_STR(rows[1][1], "100");
+            EXPECT_STR(rows[1][2], "/bin/false");
+            EXPECT_STR(rows[1][3], "1");
+        }
+
+        /* Calling ensure_*() again must be a no-op (already in tv_meta). */
+        EXPECT(db->ensure_proc_index(&err));
+        auto meta = db->query_strings(
+            "SELECT value FROM tv_meta WHERE key='idx_proc'", &err);
+        EXPECT_EQ((size_t)1, meta.size());
+    }
+    /* Reopen — index must still be there. */
+    {
+        auto db = TvDb::open_file(path, &err);
+        if (!db) { ::unlink(path); g_fail++; return; }
+        auto rows = db->query_int64("SELECT COUNT(*) FROM tv_idx_proc", &err);
+        EXPECT_EQ((int64_t)2, rows.empty() ? -1 : rows[0]);
+    }
+    ::unlink(path);
+}
+
+void test_path_index_summary() {
+    std::string err;
+    auto db = TvDb::open_memory(&err);
+    if (!db) { g_fail++; return; }
+    WireBuilder w; build_fixture(w);
+    WireDecoder dec([&](const WireEvent &ev){ std::string e; (void)db->append(ev, &e); });
+    dec.feed(w.buf.data(), w.buf.size());
+    db->flush(&err);
+    EXPECT(db->ensure_path_index(&err));
+    if (!err.empty()) std::fprintf(stderr, "ensure_path_index: %s\n", err.c_str());
+
+    auto rows = db->query_strings(
+        "SELECT path, opens, reads, writes "
+        "FROM tv_idx_path ORDER BY path", &err);
+    EXPECT_EQ((size_t)2, rows.size());
+    if (rows.size() == 2) {
+        EXPECT_STR(rows[0][0], "/etc/passwd");
+        EXPECT_STR(rows[0][1], "1");
+        EXPECT_STR(rows[0][2], "1");
+        EXPECT_STR(rows[0][3], "0");
+        EXPECT_STR(rows[1][0], "/tmp/out");
+        EXPECT_STR(rows[1][3], "1");
+    }
+}
+
+void test_edge_index_dep_closure() {
+    /* Build a synthetic graph:  proc 100 reads /etc/passwd, writes /tmp/out.
+     * deps(/tmp/out) must therefore include /etc/passwd. */
+    std::string err;
+    auto db = TvDb::open_memory(&err);
+    if (!db) { g_fail++; return; }
+    WireBuilder w; build_fixture(w);
+    WireDecoder dec([&](const WireEvent &ev){ std::string e; (void)db->append(ev, &e); });
+    dec.feed(w.buf.data(), w.buf.size());
+    db->flush(&err);
+    EXPECT(db->ensure_edge_index(&err));
+
+    /* dep closure: start at /tmp/out (write), find files read by procs
+     * that wrote it. */
+    auto rows = db->query_strings(
+        "WITH RECURSIVE closure(path, depth) AS ("
+        "  SELECT '/tmp/out', 0"
+        "  UNION "
+        "  SELECT e2.path, c.depth + 1 "
+        "  FROM closure c "
+        "  JOIN tv_idx_edge e1 ON e1.path = c.path AND e1.mode = 1 "
+        "  JOIN tv_idx_edge e2 ON e2.tgid = e1.tgid AND e2.mode = 0 "
+        "                    AND e2.path <> c.path "
+        "  WHERE c.depth < 8 "
+        ") SELECT DISTINCT path FROM closure ORDER BY path", &err);
+    EXPECT(rows.size() >= 2);
+    bool saw_passwd = false;
+    for (auto &r : rows) if (r[0] == "/etc/passwd") saw_passwd = true;
+    EXPECT(saw_passwd);
+}
+
 } /* namespace */
 
 int run_tests() {
@@ -270,6 +373,9 @@ int run_tests() {
     test_tvdb_ingest_and_query();
     test_tvdb_persists_across_open();
     test_data_source_mode1_query();
+    test_proc_index_built_and_persisted();
+    test_path_index_summary();
+    test_edge_index_dep_closure();
 
     std::fprintf(stderr, "tv tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
