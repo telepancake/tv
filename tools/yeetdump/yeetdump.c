@@ -54,7 +54,10 @@ static const char *ev_name(int32_t t) {
 
 /* ─── decode one whole event from the outer atom payload ────────── */
 
+/* For v2, decode the leading stream_id varint and tell the caller how
+ * many bytes were consumed; for v1 callers pass NULL/0 and skip. */
 static int print_event(ev_state *st,
+                       uint32_t stream_id,
                        const uint8_t *atom, uint64_t alen) {
     int32_t  type, pid, tgid, ppid, nspid, nstgid;
     uint64_t ts;
@@ -66,10 +69,18 @@ static int print_event(ev_state *st,
     const uint8_t *p   = atom + hbytes;
     const uint8_t *end = atom + alen;
 
-    printf("[%lu.%09lu] %-6s tgid=%d pid=%d ppid=%d ns=%d/%d ",
-           (unsigned long)(ts / 1000000000ull),
-           (unsigned long)(ts % 1000000000ull),
-           ev_name(type), tgid, pid, ppid, nstgid, nspid);
+    if (stream_id) {
+        printf("[%lu.%09lu] s%-3u %-6s tgid=%d pid=%d ppid=%d ns=%d/%d ",
+               (unsigned long)(ts / 1000000000ull),
+               (unsigned long)(ts % 1000000000ull),
+               (unsigned)stream_id,
+               ev_name(type), tgid, pid, ppid, nstgid, nspid);
+    } else {
+        printf("[%lu.%09lu] %-6s tgid=%d pid=%d ppid=%d ns=%d/%d ",
+               (unsigned long)(ts / 1000000000ull),
+               (unsigned long)(ts % 1000000000ull),
+               ev_name(type), tgid, pid, ppid, nstgid, nspid);
+    }
 
     switch (type) {
     case EV_EXIT: {
@@ -118,6 +129,32 @@ static int print_event(ev_state *st,
 
 /* ─── stream walker ─────────────────────────────────────────────── */
 
+/* Open-addressed table of per-stream ev_state. v2 streams are sparse
+ * (one per emitting process), and we don't need ordered iteration -
+ * a tiny linear-probe table is plenty for what `tv dump` does. */
+struct stream_tab_entry {
+    uint32_t id;     /* 0 = empty slot */
+    ev_state st;
+};
+#define STREAM_TAB_SLOTS 1024
+static struct stream_tab_entry g_streams[STREAM_TAB_SLOTS];
+
+static ev_state *stream_state_for(uint32_t id) {
+    /* id 0 is reserved as "no stream id" sentinel; v2 ids start at 1. */
+    if (id == 0) return NULL;
+    uint32_t h = id * 2654435761u;
+    for (uint32_t i = 0; i < STREAM_TAB_SLOTS; i++) {
+        struct stream_tab_entry *e = &g_streams[(h + i) % STREAM_TAB_SLOTS];
+        if (e->id == id) return &e->st;
+        if (e->id == 0) {
+            e->id = id;
+            memset(&e->st, 0, sizeof(e->st));
+            return &e->st;
+        }
+    }
+    return NULL;
+}
+
 static int walk_stream(const uint8_t *buf, uint64_t len) {
     const uint8_t *p   = buf;
     const uint8_t *end = buf + len;
@@ -128,15 +165,18 @@ static int walk_stream(const uint8_t *buf, uint64_t len) {
         fprintf(stderr, "yeetdump: missing version atom\n");
         return -1;
     }
-    if (ver != WIRE_VERSION) {
-        fprintf(stderr, "yeetdump: unsupported wire version %lu (this build: %u)\n",
-                (unsigned long)ver, WIRE_VERSION);
+    if (ver != WIRE_VERSION_V1 && ver != WIRE_VERSION_V2) {
+        fprintf(stderr, "yeetdump: unsupported wire version %lu\n",
+                (unsigned long)ver);
         return -1;
     }
     fprintf(stderr, "-- wire version %lu, %lu bytes --\n",
             (unsigned long)ver, (unsigned long)len);
 
-    ev_state st = {0};
+    /* v1: one global ev_state. v2: one per stream_id, looked up lazily. */
+    ev_state v1_st = {0};
+    memset(g_streams, 0, sizeof g_streams);
+
     while (p < end) {
         const uint8_t *atom; uint64_t alen;
         if (yeet_get(&p, end, &atom, &alen) < 0) {
@@ -144,7 +184,27 @@ static int walk_stream(const uint8_t *buf, uint64_t len) {
                     (long)(p - buf));
             return -1;
         }
-        if (print_event(&st, atom, alen) < 0) {
+        ev_state *st;
+        uint32_t  sid = 0;
+        const uint8_t *hdr_atom = atom;
+        uint64_t       hdr_alen = alen;
+        if (ver == WIRE_VERSION_V2) {
+            int sidlen = ev_decode_stream_id(atom, alen, &sid);
+            if (sidlen < 0) {
+                fprintf(stderr, "yeetdump: malformed stream_id\n");
+                return -1;
+            }
+            hdr_atom = atom + sidlen;
+            hdr_alen = alen - (uint64_t)sidlen;
+            st = stream_state_for(sid);
+            if (!st) {
+                fprintf(stderr, "yeetdump: too many concurrent streams\n");
+                return -1;
+            }
+        } else {
+            st = &v1_st;
+        }
+        if (print_event(st, sid, hdr_atom, hdr_alen) < 0) {
             fprintf(stderr, "yeetdump: malformed event\n");
             return -1;
         }
@@ -236,7 +296,7 @@ static int test_stream(void) {
     uint8_t *w   = buf;
     const uint8_t *end = buf + sizeof buf;
 
-    ASSERT(yeet_u64(&w, end, WIRE_VERSION) == 0);
+    ASSERT(yeet_u64(&w, end, WIRE_VERSION_V1) == 0);
 
     ev_state enc = {0};
     uint8_t hdr[EV_HEADER_MAX];
