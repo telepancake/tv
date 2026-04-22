@@ -40,6 +40,13 @@ struct AppState {
     bool         show_pids = false;     /* mode 1: prefix labels with [tgid] */
     /* Right-pane section collapsing: heading id (e.g. "__ho") -> collapsed. */
     std::vector<std::string> collapsed_sections;
+    /* Time-range cutoffs (0 = no cutoff). Applied to ts_ns columns in
+     * modes 0/1/2/3. Bound to keys '<' (before) and '>' (after) in the
+     * UI: first press seeds the cutoff from the cursor's timestamp,
+     * second press clears it. Lets you slice a long trace down to a
+     * window without losing the rest of the filter state. */
+    int64_t      ts_after_ns  = 0;
+    int64_t      ts_before_ns = 0;
 };
 
 class TvDataSource {
@@ -106,4 +113,6 @@ private:
     std::string built_for_subtree_root_;
     bool   built_for_show_pids_ = false;
     std::vector<std::string> built_for_collapsed_;
+    int64_t built_for_ts_after_ns_  = 0;
+    int64_t built_for_ts_before_ns_ = 0;
 };

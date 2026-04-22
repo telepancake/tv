@@ -53,7 +53,7 @@ public:
     std::vector<int64_t> query_int64(const std::string &sql,
                                      std::string *err);
 
-    /* Run a query, return matrix of strings (rows × cols).
+    /* Run a query, return matrix of strings (rows x cols).
      * BLOB columns are converted to lossy UTF-8. */
     std::vector<std::vector<std::string>>
     query_strings(const std::string &sql, std::string *err);
@@ -67,7 +67,7 @@ public:
      * after the first call (per-process) or first build (per-file). */
     bool ensure_proc_index(std::string *err);   /* tv_idx_proc */
     bool ensure_path_index(std::string *err);   /* tv_idx_path */
-    bool ensure_edge_index(std::string *err);   /* tv_idx_edge (proc⇄path)*/
+    bool ensure_edge_index(std::string *err);   /* tv_idx_edge (proc<->path)*/
 
     /* Path of the backing file (".tvdb" or ":memory:" for in-mem). */
     const std::string &path() const;
