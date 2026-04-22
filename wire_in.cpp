@@ -3,6 +3,7 @@
 #include "wire_in.h"
 
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -35,7 +36,12 @@ static size_t yeet_atom_len(const uint8_t *p, size_t n) {
 struct WireDecoder::Impl {
     Sink sink;
     std::vector<uint8_t> buf;       /* unconsumed bytes carried across feeds */
-    ev_state state{};               /* delta-decoder state */
+    /* v1: single global delta state. v2: one ev_state per producer
+     * stream_id. We always keep both - which one is used depends on
+     * the version atom we read at the head of the stream. */
+    ev_state v1_state{};
+    std::unordered_map<uint32_t, ev_state> v2_states;
+    uint32_t version = 0;           /* 0 = not yet read */
     bool got_version = false;
     bool error = false;
     bool any_input = false;
@@ -60,12 +66,15 @@ struct WireDecoder::Impl {
             const uint8_t *vp = p;
             uint64_t v = 0;
             if (yeet_get_u64(&vp, p + alen, &v) < 0) { error = true; return (size_t)-1; }
-            if (v != WIRE_VERSION) { error = true; return (size_t)-1; }
+            if (v != WIRE_VERSION_V1 && v != WIRE_VERSION_V2) {
+                error = true; return (size_t)-1;
+            }
+            version = (uint32_t)v;
             got_version = true;
             return alen;
         }
 
-        /* outer atom = hdr || blob */
+        /* outer atom = (v2: stream_id + ) hdr || blob */
         size_t alen = yeet_atom_len(p, n);
         if (alen == 0) return 0;
         if (alen == (size_t)-1) { error = true; return (size_t)-1; }
@@ -77,16 +86,30 @@ struct WireDecoder::Impl {
         uint64_t plen = 0;
         if (yeet_get(&ap, aend, &payload, &plen) < 0) { error = true; return (size_t)-1; }
 
+        const uint8_t *hdr_bytes = payload;
+        uint64_t       hdr_len   = plen;
+        uint32_t       stream_id = 0;
+        ev_state      *st        = &v1_state;
+
+        if (version == WIRE_VERSION_V2) {
+            int sidlen = ev_decode_stream_id(payload, plen, &stream_id);
+            if (sidlen < 0) { error = true; return (size_t)-1; }
+            hdr_bytes = payload + sidlen;
+            hdr_len   = plen - (uint64_t)sidlen;
+            /* operator[] auto-zero-inits a fresh ev_state for new ids */
+            st = &v2_states[stream_id];
+        }
+
         /* decode 7 base scalars */
         int32_t type, pid, tgid, ppid, nspid, nstgid;
         uint64_t ts_ns;
-        int hlen = ev_decode_header(&state, payload, plen,
+        int hlen = ev_decode_header(st, hdr_bytes, hdr_len,
                                     &type, &ts_ns,
                                     &pid, &tgid, &ppid, &nspid, &nstgid);
         if (hlen < 0) { error = true; return (size_t)-1; }
 
-        const uint8_t *xp  = payload + hlen;
-        const uint8_t *xend = payload + plen;
+        const uint8_t *xp  = hdr_bytes + hlen;
+        const uint8_t *xend = hdr_bytes + hdr_len;
 
         int64_t extras[7] = {0};
         unsigned n_extras = 0;
@@ -100,17 +123,18 @@ struct WireDecoder::Impl {
         }
 
         WireEvent ev{};
-        ev.type   = type;
-        ev.ts_ns  = ts_ns;
-        ev.pid    = pid;
-        ev.tgid   = tgid;
-        ev.ppid   = ppid;
-        ev.nspid  = nspid;
-        ev.nstgid = nstgid;
-        ev.extras   = extras;
-        ev.n_extras = n_extras;
-        ev.blob   = (const char *)xp;
-        ev.blen   = (size_t)(xend - xp);
+        ev.type      = type;
+        ev.ts_ns     = ts_ns;
+        ev.pid       = pid;
+        ev.tgid      = tgid;
+        ev.ppid      = ppid;
+        ev.nspid     = nspid;
+        ev.nstgid    = nstgid;
+        ev.stream_id = stream_id;
+        ev.extras    = extras;
+        ev.n_extras  = n_extras;
+        ev.blob      = (const char *)xp;
+        ev.blen      = (size_t)(xend - xp);
         if (sink) sink(ev);
         return alen;
     }

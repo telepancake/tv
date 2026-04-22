@@ -132,6 +132,20 @@ static inline ssize_t raw_write(int fd, const void *buf, size_t count)
     return (ssize_t)raw_syscall6(SYS_write, fd, (long)buf, count, 0, 0, 0);
 }
 
+/* writev: emit `iovcnt` (≤ IOV_MAX) (iov_base, iov_len) fragments
+ * to `fd` as a single atomic operation against other writers, with
+ * no in-band copying. We use `struct iovec` from the host headers
+ * via sud/libc.h's narrow forward decl, but wire only the syscall;
+ * the kernel reads the iovec array directly. */
+struct sud_iovec { const void *iov_base; size_t iov_len; };
+
+static inline ssize_t raw_writev(int fd, const struct sud_iovec *iov,
+                                 int iovcnt)
+{
+    return (ssize_t)raw_syscall6(SYS_writev, fd, (long)iov, iovcnt,
+                                  0, 0, 0);
+}
+
 static inline int raw_close(int fd)
 {
     return (int)raw_syscall6(SYS_close, fd, 0, 0, 0, 0, 0);

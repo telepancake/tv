@@ -666,6 +666,92 @@ void TvDataSource::lpane_processes() {
     } else {
         for (int t : roots) emit(t, "", true);
     }
+
+    /* Proc-tree hat. Same idea as emit_path_hat() in mode 2: when
+     * every visible row shares a chain of ancestors, surface that
+     * chain once at the top as a Heading row so the user sees what
+     * subtree they're scrolling without having to chase indent.
+     *
+     * Walk parent_id chains starting from each emitted process row
+     * (reading parents from the `procs` map collected above). The
+     * longest common SUFFIX of those chains - i.e. the deepest
+     * ancestor shared by every visible proc - is the hat. */
+    if (!state_.subtree_only && lpane_.size() >= 2) {
+        std::vector<std::vector<int>> chains;
+        chains.reserve(lpane_.size());
+        for (const auto &row : lpane_) {
+            if (row.id.empty() || row.id[0] == '_') continue;
+            int t = std::atoi(row.id.c_str());
+            if (!procs.count(t)) continue;
+            std::vector<int> chain;
+            int cur = procs[t].ppid;
+            /* Bound the walk to avoid worst-case cycles - real ppid
+             * chains never exceed a few dozen levels. */
+            for (int depth = 0; depth < 256; depth++) {
+                if (cur <= 0) break;
+                auto it = procs.find(cur);
+                if (it == procs.end()) break;
+                chain.push_back(cur);
+                if (it->second.ppid == cur) break;   /* self-loop guard */
+                cur = it->second.ppid;
+            }
+            if (chain.empty()) { chains.clear(); break; }
+            chains.push_back(std::move(chain));
+        }
+        /* Need ≥ 2 chains to factor anything; with one row the hat is
+         * just that row's parent and adds noise. */
+        if (chains.size() >= 2) {
+            /* Common suffix: walk both lists from the back. */
+            std::vector<int> common;
+            size_t k = 0;
+            for (;; k++) {
+                int candidate = -1;
+                bool ok = true;
+                for (auto &c : chains) {
+                    if (k >= c.size()) { ok = false; break; }
+                    int v = c[c.size() - 1 - k];
+                    if (candidate < 0) candidate = v;
+                    else if (v != candidate) { ok = false; break; }
+                }
+                if (!ok) break;
+                common.push_back(candidate);
+            }
+            /* `common` is now root → … → deepest shared ancestor.
+             * Skip the synthetic "PID 1" / "init" root if present;
+             * that's noise, not a useful hat. */
+            while (!common.empty() && common.front() <= 1)
+                common.erase(common.begin());
+            if (!common.empty()) {
+                /* Render as one Heading row showing the chain. */
+                std::string label;
+                for (size_t i = 0; i < common.size(); i++) {
+                    auto it = procs.find(common[i]);
+                    if (it == procs.end()) continue;
+                    if (!label.empty()) label += " › ";
+                    label += basename_of(it->second.exe);
+                    if (state_.show_pids) {
+                        label += "[";
+                        label += std::to_string(common[i]);
+                        label += "]";
+                    }
+                }
+                if (!label.empty()) {
+                    RowData hat;
+                    hat.id = "__hat_proc";
+                    hat.style = RowStyle::Heading;
+                    /* 4-column row to match k_lpane_cols_procs:
+                     *   name | pid | exit | duration */
+                    hat.cols = {label, "", "", ""};
+                    RowData sep;
+                    sep.id = "__hat_sep";
+                    sep.style = RowStyle::Dim;
+                    sep.cols = {"", "", "", ""};
+                    lpane_.insert(lpane_.begin(), std::move(sep));
+                    lpane_.insert(lpane_.begin(), std::move(hat));
+                }
+            }
+        }
+    }
 }
 
 /* -- Mode 2: file tree ---------------------------------------------- */
@@ -800,6 +886,14 @@ void TvDataSource::lpane_files() {
             bool hit = !state_.search.empty() &&
                        f.path.find(state_.search) != std::string::npos;
             lpane_.push_back(mk_file_row(f, f.path, hit));
+        }
+        /* Same hat treatment as the tree view. The reviewer flagged
+         * that all-items-share-a-parent flat lists weren't getting
+         * a hat at all - that was because the call below was only
+         * inside the tree branch. Move it out so flat lists factor
+         * out the common prefix too. */
+        if (!state_.subtree_only && lpane_.size() >= 2) {
+            emit_path_hat();
         }
         return;
     }

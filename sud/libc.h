@@ -27,6 +27,7 @@
  * ================================================================ */
 #define SYS_read           __NR_read
 #define SYS_write          __NR_write
+#define SYS_writev         __NR_writev
 #define SYS_openat         __NR_openat
 #define SYS_close          __NR_close
 #define SYS_pread64        __NR_pread64

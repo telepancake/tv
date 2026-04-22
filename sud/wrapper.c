@@ -232,9 +232,10 @@ int main(int argc, char **argv)
     /* Set up output fd */
     init_output_fd();
 
-    /* Attach to the shared wire ev_state (cross-process spinlock +
-     * delta-state) set up by the launcher on SUD_STATE_FD. Falls back
-     * to process-local state if the fd isn't present. */
+    /* Attach to the shared wire state page set up by the launcher on
+     * SUD_STATE_FD and grab this process's own stream_id from it
+     * (atomic — no lock). Falls back to a process-local counter if
+     * the fd isn't present (stand-alone wrapper runs). */
     sud_wire_init();
 
     /* Record stdout stat for fd1_is_creator_stdout */

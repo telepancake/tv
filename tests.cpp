@@ -166,6 +166,69 @@ void test_wire_decoder_rejects_wrong_version() {
     EXPECT_EQ(evs, 0);
 }
 
+/* v2 wire format: two producers (stream_id 1 and stream_id 2) emit
+ * interleaved events into the same output. The decoder must keep one
+ * ev_state per stream_id; if it accidentally shares state, the deltas
+ * desync and the second stream's pid/tgid/ts come out wrong. */
+void test_wire_decoder_v2_multi_stream() {
+    std::vector<uint8_t> buf;
+    /* version atom = v2 */
+    {
+        uint8_t v[2]; uint8_t *p = v;
+        if (yeet_u64(&p, v + sizeof v, WIRE_VERSION_V2) < 0) std::abort();
+        buf.insert(buf.end(), v, p);
+    }
+    auto emit = [&](uint32_t sid, ev_state *st, int32_t type, uint64_t ts,
+                    int32_t pid, int32_t tgid, int32_t ppid,
+                    const int64_t *extras, unsigned n_extras,
+                    const void *blob, size_t blen) {
+        uint8_t hdr[EV_HEADER_V2_MAX];
+        int hlen = ev_build_header_v2(sid, st, hdr, type, ts,
+                                      pid, tgid, ppid, pid, tgid,
+                                      extras, n_extras);
+        if (hlen < 0) std::abort();
+        std::vector<uint8_t> ev(EV_HEADER_V2_MAX + 16 + blen);
+        uint8_t *p = ev.data();
+        if (yeet_pair(&p, ev.data() + ev.size(),
+                      hdr, (uint64_t)hlen, blob, (uint64_t)blen) < 0) std::abort();
+        buf.insert(buf.end(), ev.data(), p);
+    };
+
+    ev_state st1{}, st2{};
+    /* Interleave events from two producers. Different pid families on
+     * purpose so that a state mix-up shows up immediately as a wrong
+     * decoded pid. */
+    emit(1, &st1, EV_EXEC, 1000, 100, 100, 1, nullptr, 0, "/bin/sh", 7);
+    emit(2, &st2, EV_EXEC, 2000, 500, 500, 1, nullptr, 0, "/bin/cat", 8);
+    emit(1, &st1, EV_EXEC, 1100, 101, 101, 100, nullptr, 0, "/bin/ls", 7);
+    emit(2, &st2, EV_EXEC, 2100, 501, 501, 500, nullptr, 0, "/bin/awk", 8);
+    int64_t ex[4] = {EV_EXIT_EXITED, 0, 0, 0};
+    emit(1, &st1, EV_EXIT, 1200, 100, 100, 1,   ex, 4, nullptr, 0);
+    emit(2, &st2, EV_EXIT, 2200, 500, 500, 1,   ex, 4, nullptr, 0);
+
+    struct Got { uint32_t sid; int32_t pid; int32_t type; uint64_t ts; };
+    std::vector<Got> got;
+    WireDecoder dec([&](const WireEvent &ev) {
+        got.push_back({ev.stream_id, ev.pid, ev.type, ev.ts_ns});
+    });
+    EXPECT(dec.feed(buf.data(), buf.size()));
+    EXPECT_EQ((size_t)6, got.size());
+    if (got.size() == 6) {
+        /* Stream 1 events keep stream_id=1 and the original pids/ts;
+         * stream 2 events keep stream_id=2. A shared-state bug would
+         * scramble at least one of these. */
+        EXPECT_EQ((int)got[0].sid, 1); EXPECT_EQ((int)got[0].pid, 100);
+        EXPECT_EQ((int)got[1].sid, 2); EXPECT_EQ((int)got[1].pid, 500);
+        EXPECT_EQ((int)got[2].sid, 1); EXPECT_EQ((int)got[2].pid, 101);
+        EXPECT_EQ((int)got[3].sid, 2); EXPECT_EQ((int)got[3].pid, 501);
+        EXPECT_EQ((int)got[4].sid, 1); EXPECT_EQ((int)got[4].pid, 100);
+        EXPECT_EQ((int)got[5].sid, 2); EXPECT_EQ((int)got[5].pid, 500);
+        EXPECT_EQ((long long)got[0].ts, 1000LL);
+        EXPECT_EQ((long long)got[1].ts, 2000LL);
+        EXPECT_EQ((long long)got[5].ts, 2200LL);
+    }
+}
+
 void test_tvdb_ingest_and_query() {
     std::string err;
     auto db = TvDb::open_memory(&err);
@@ -370,6 +433,7 @@ int run_tests() {
     test_wire_decoder_parses_all_events();
     test_wire_decoder_byte_at_a_time();
     test_wire_decoder_rejects_wrong_version();
+    test_wire_decoder_v2_multi_stream();
     test_tvdb_ingest_and_query();
     test_tvdb_persists_across_open();
     test_data_source_mode1_query();

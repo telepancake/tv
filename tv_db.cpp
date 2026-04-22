@@ -12,6 +12,7 @@ extern "C" {
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <unordered_map>
 
 namespace {
@@ -215,13 +216,27 @@ std::unique_ptr<TvDb> TvDb::open_with_path(const char *path,
         "PRAGMA memory_limit='2GB';",
         &r0);
     duckdb_destroy_result(&r0);
-    /* Default DuckDB threading is one-thread-per-core. On a fat host
-     * that adds up - each thread holds its own per-operator state.
-     * Cap to a sensible 4 unless the user overrides via env. */
-    (void)duckdb_query(db->impl_->con,
-        "PRAGMA threads=4;",
-        &r0);
-    duckdb_destroy_result(&r0);
+    /* Thread count. Reviewer pushed back on hardcoding 4 ("are we
+     * hardcoding core counts now?") - they're right. Honour a
+     * TV_DUCKDB_THREADS env override; otherwise default to
+     * min(4, hardware_concurrency) so we still parallelise on small
+     * hosts without grabbing every core on a fat one (each DuckDB
+     * thread holds its own per-operator state). */
+    {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 1;
+        unsigned threads = (hw < 4u) ? hw : 4u;
+        if (const char *env = std::getenv("TV_DUCKDB_THREADS")) {
+            char *endp = nullptr;
+            unsigned long v = std::strtoul(env, &endp, 10);
+            if (endp && endp != env && v >= 1 && v <= 1024)
+                threads = (unsigned)v;
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "PRAGMA threads=%u;", threads);
+        (void)duckdb_query(db->impl_->con, buf, &r0);
+        duckdb_destroy_result(&r0);
+    }
 
     db->impl_->path_ = display;
     duckdb_result r;
@@ -547,20 +562,25 @@ bool TvDb::ensure_path_index(std::string *err) {
      *   v1: window function over a regular LEFT JOIN. Row explosion -
      *       opens X cwds_per_tgid intermediates (29 GB on 14 GB trace).
      *   v2: ASOF JOIN materialised into a table. Correct algorithm but
-     *       still allocated and stored ~6M rows even though the only
-     *       *per-row* consumers are dep/rdep traversals (built lazily
-     *       in ensure_edge_index). The user re-tested with a build
-     *       trace and saw 24 GB peak just from this materialisation.
-     *   v3 (here): canon is a *view*. tv_idx_path aggregates straight
-     *       through the ASOF JOIN; no row is held in memory beyond
-     *       what the streaming aggregate needs. tv_idx_edge upgrades
-     *       canon to a real table only when dep/rdep modes are used.
+     *       the COUNT(DISTINCT tgid) GROUP BY downstream materialised
+     *       every (path, tgid) pair in its hash table - that was the
+     *       24 GB peak the reviewer hit, not the canon table itself.
+     *   v3: switched canon to a view to "save memory". That was wrong:
+     *       it pushed the ASOF JOIN into every per-row consumer, which
+     *       made mode 2 lag heavily because the join re-ran on every
+     *       interaction. Reviewer flagged this directly: stop moving
+     *       work into runtime, write derived data to disk.
+     *   v4 (here): canon is a real on-disk TABLE again, built once.
+     *       The downstream GROUP BY uses approx_count_distinct (HLL,
+     *       ~12 KB/group, ~1.5% error - fine for a UI count hint) so
+     *       it doesn't materialise the (path, tgid) pair set. We get
+     *       both: bounded build memory and O(rows) per-row queries.
      *
      * Open paths get canonicalised by gluing the cwd in front of any
      * non-absolute path; pseudo-paths (pipe:, socket:, anon_inode:)
      * are passed through unchanged. */
     const char *canon_sql =
-        "CREATE OR REPLACE VIEW tv_idx_open_canon AS "
+        "CREATE TABLE IF NOT EXISTS tv_idx_open_canon AS "
         "SELECT ts_ns, tgid, fd, flags, err, "
         "       CASE "
         "         WHEN raw_path LIKE '/%' THEN raw_path "
@@ -579,6 +599,12 @@ bool TvDb::ensure_path_index(std::string *err) {
         "    ON o.tgid = c.tgid AND o.ts_ns >= c.ts_ns "
         ")";
     if (!run_query(impl_->con, canon_sql, err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_path "
+                   "ON tv_idx_open_canon(path)", err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_tgid "
+                   "ON tv_idx_open_canon(tgid)", err)) return false;
 
     /* Per-canonical-path stats; flags & 3 == 0  -> read-only open.
      * approx_count_distinct (HLL) is used for proc count instead of
@@ -606,46 +632,13 @@ bool TvDb::ensure_path_index(std::string *err) {
     return true;
 }
 
-/* Materialise tv_idx_open_canon as a real table the first time someone
- * needs per-row access (dep/rdep modes). For mode 2 / mode 1 / process
- * stats we stay on the view. Done as a separate function so the path
- * index build path stays cheap. */
+/* tv_idx_open_canon is now built once as a real on-disk table by
+ * ensure_path_index() (reverted from the v3 view experiment - that
+ * pushed the ASOF JOIN into every per-row query and made mode 2 lag).
+ * Kept as a public no-op so existing call sites stay valid; everything
+ * the function used to set up is already there after ensure_path_index. */
 bool TvDb::ensure_canon_table(std::string *err) {
-    if (!ensure_path_index(err)) return false;
-    std::string val;
-    if (meta_get(impl_->con, "idx_canon_table", val)) return true;
-    /* Drop the view, swap in a table backed by the same query. */
-    if (!run_query(impl_->con, "DROP VIEW IF EXISTS tv_idx_open_canon", err))
-        return false;
-    const char *materialise =
-        "CREATE TABLE tv_idx_open_canon AS "
-        "SELECT ts_ns, tgid, fd, flags, err, "
-        "       CASE "
-        "         WHEN raw_path LIKE '/%' THEN raw_path "
-        "         WHEN cwd IS NULL OR raw_path LIKE 'pipe:%' "
-        "              OR raw_path LIKE 'socket:%' OR raw_path LIKE 'anon_inode:%' "
-        "           THEN raw_path "
-        "         WHEN cwd = '/' THEN '/' || raw_path "
-        "         ELSE cwd || '/' || raw_path "
-        "       END AS path "
-        "FROM ( "
-        "  SELECT o.ts_ns, o.tgid, o.fd, o.flags, o.err, "
-        "         CAST(o.path AS VARCHAR) AS raw_path, "
-        "         CAST(c.cwd  AS VARCHAR) AS cwd "
-        "  FROM open_ o "
-        "  ASOF LEFT JOIN cwd c "
-        "    ON o.tgid = c.tgid AND o.ts_ns >= c.ts_ns "
-        ")";
-    if (!run_query(impl_->con, materialise, err)) return false;
-    if (!run_query(impl_->con,
-                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_path "
-                   "ON tv_idx_open_canon(path)", err)) return false;
-    if (!run_query(impl_->con,
-                   "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_tgid "
-                   "ON tv_idx_open_canon(tgid)", err)) return false;
-    if (!meta_set(impl_->con, "idx_canon_table", "1", err)) return false;
-    impl_->dirty = true;
-    return true;
+    return ensure_path_index(err);
 }
 
 bool TvDb::ensure_edge_index(std::string *err) {
