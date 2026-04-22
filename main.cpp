@@ -1,18 +1,18 @@
-/* main.cpp — tv top-level: arg parsing, ingest, and TUI wiring.
+/* main.cpp - tv top-level: arg parsing, ingest, and TUI wiring.
  *
  * The whole pipeline:
  *
- *   wire bytes   ───►  WireDecoder  ───►  TvDb (DuckDB Appender)  ───►  .tvdb file
- *      ▲                                                                  │
- *      │                                                                  ▼
+ *   wire bytes  --->  WireDecoder  --->  TvDb (DuckDB Appender)  --->  .tvdb file
+ *      ^                                                                  |
+ *      |                                                                  v
  *   uproctrace child / `--trace foo.wire`                  TvDataSource (SQL queries)
- *                                                                          │
- *                                                                          ▼
+ *                                                                          |
+ *                                                                          v
  *                                                                    Tui (engine.h)
  *
  * No in-memory aggregation, no JSONL, one wire decoder, one storage
  * format. Trace files on disk are DuckDB native (`foo.tvdb`); they
- * are mmaped on open and queried directly — no "load" step.
+ * are mmaped on open and queried directly - no "load" step.
  */
 
 #include <cstdio>
@@ -76,7 +76,7 @@ const char *USAGE =
     "  tv test                     run built-in self-tests\n"
     "  tv ingest <wire> [-o OUT]   convert wire to .tvdb without UI\n";
 
-/* ── ingest helpers ───────────────────────────────────────────────── */
+/* -- ingest helpers ------------------------------------------------- */
 
 bool has_suffix(const char *s, const char *suf) {
     size_t n = std::strlen(s), k = std::strlen(suf);
@@ -173,7 +173,7 @@ bool file_exists(const char *path) {
     return ::stat(path, &st) == 0;
 }
 
-/* ── live-trace pipe glue ──────────────────────────────────────────── */
+/* -- live-trace pipe glue -------------------------------------------- */
 
 struct LiveTrace {
     pid_t          child_pid = 0;
@@ -199,7 +199,7 @@ void on_trace_fd_cb(Tui &tui, int fd, LiveTrace &lt) {
     tui.dirty();
 }
 
-/* ── TUI key handling ──────────────────────────────────────────────── */
+/* -- TUI key handling ------------------------------------------------ */
 
 const char *HELP_LINES[] = {
     "",
@@ -264,7 +264,7 @@ void update_status(UiCtx &c) {
     if (!c.state->subject_file.empty() && m >= 4 && m <= 7)
         n += std::snprintf(buf + n, sizeof buf - n, " | subj=%s",
                            c.state->subject_file.c_str());
-    /* Composed filter list — every active filter shown.  Order:
+    /* Composed filter list - every active filter shown.  Order:
      * subtree, glob, flags. */
     if (c.state->subtree_only && !c.state->subtree_root.empty())
         n += std::snprintf(buf + n, sizeof buf - n, " | subtree=%s",
@@ -310,7 +310,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         tui.dirty();
         update_status(c);
     };
-    /* Right after every key (and at idle ticks) make sure cur is set —
+    /* Right after every key (and at idle ticks) make sure cur is set -
      * the lpane has just been (re)built and we know its first row. */
     if (key == TUI_K_NONE) {
         seed_cursor_if_unset(c);
@@ -321,7 +321,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         /* When entering a dep mode (4..7) from the file view (mode 2),
          * pin the current cursor as the subject file so the closure
          * traversal has an anchor. From mode 1, the cursor is a tgid
-         * and isn't a file — the user should pick a file first. */
+         * and isn't a file - the user should pick a file first. */
         if (new_mode >= 4 && new_mode <= 7) {
             if (c.state->mode == 2 && !c.state->cursor_id.empty())
                 c.state->subject_file = c.state->cursor_id;
@@ -330,6 +330,9 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         c.state->cursor_id.clear();
         c.have_pending = false;          /* mode switch invalidates pending */
         c.pending_cursor_id.clear();
+        /* Push the new mode's column layout (and column-header title)
+         * to the engine before the next render. */
+        c.src->apply_layout(tui, c.lpane, c.rpane);
         invalidate_and_redraw();
         return TUI_HANDLED;
     }
@@ -429,7 +432,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         }
         return TUI_HANDLED;
     }
-    /* Enter on rpane row → navigate using link metadata. */
+    /* Enter on rpane row -> navigate using link metadata. */
     if (key == TUI_K_ENTER && panel == c.rpane && row_id) {
         int cur = tui.get_cursor(c.rpane);
         const RowData *r = tui.get_cached_row(c.rpane, cur);
@@ -438,6 +441,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
             std::string target_id = r->link_id;
             c.state->mode = target_mode;
             c.state->cursor_id = target_id;
+            c.src->apply_layout(tui, c.lpane, c.rpane);
             c.tui->focus(c.lpane);
             invalidate_and_redraw();
             c.tui->set_cursor(c.lpane, target_id.c_str());
@@ -456,7 +460,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
     return TUI_DEFAULT;
 }
 
-/* ── --dump[=MODE] : non-interactive dump of an lpane (for tests) ──── */
+/* -- --dump[=MODE] : non-interactive dump of an lpane (for tests) ---- */
 
 int dump_mode(TvDb &db, int mode, const std::string &subject) {
     AppState st;
@@ -753,6 +757,9 @@ int main(int argc, char **argv) {
                                        TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
     ui.lpane = tui->add_panel(lpane_def);
     ui.rpane = tui->add_panel(rpane_def);
+    /* Push the per-mode column layout to the engine immediately so the
+     * initial render uses the right shape (mode 1 by default). */
+    src.apply_layout(*tui, ui.lpane, ui.rpane);
     static Box lbox = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
     static Box rbox = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
     static Box hbox = {TUI_BOX_HBOX,  1, 0, 0, -1, {&lbox, &rbox}};
@@ -791,7 +798,7 @@ int main(int argc, char **argv) {
     }
 
     /* Idle auto-select: every 100 ms check whether the lpane cursor
-     * has been stable for ≥ 300 ms; if so, commit it as state.cursor_id
+     * has been stable for >= 300 ms; if so, commit it as state.cursor_id
      * and rebuild the rpane.  Without this the rpane only updated on
      * Enter, which the user found jarring. */
     tui->add_timer(100, [&ui](Tui &t) {

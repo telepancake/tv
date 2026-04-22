@@ -5,16 +5,16 @@
  *
  * Layout:
  *   ┌──────┬──────┬──────┐
- *   │ d0   │ d1   │ d2   │   <- dir columns (engine auto-scrolls via HSCROLL)
- *   ├──────┴──────┴──────┤
- *   │ content            │   <- file content (text or hex)
+ *   | d0   | d1   | d2   |   <- dir columns (engine auto-scrolls via HSCROLL)
+ *   +------+------+------+
+ *   | content            |   <- file content (text or hex)
  *   └────────────────────┘
  *   status bar
  *
  * Keys:
- *   ↑ ↓ j k  PgUp PgDn  Home/g End   Navigate within a column
- *   ←  h                              Focus left column / go to parent dir
- *   →  Enter                          Enter dir / focus content pane
+ *   ^ v j k  PgUp PgDn  Home/g End   Navigate within a column
+ *   <-  h                              Focus left column / go to parent dir
+ *   ->  Enter                          Enter dir / focus content pane
  *   Tab                               Cycle all panels
  *   H                                 Toggle hex mode
  *   .                                 Toggle hidden files
@@ -47,7 +47,7 @@
 static constexpr int FV_MAX_DEPTH = 16;
 static constexpr int FV_READ_MAX  = 4 * 1024 * 1024;
 
-/* ── Data types ──────────────────────────────────────────────────────── */
+/* -- Data types -------------------------------------------------------- */
 
 struct FvEntry {
     char name[256];
@@ -71,13 +71,13 @@ struct FvState {
 
 static FvState g;
 
-/* ── Layout: static box tree ─────────────────────────────────────────── */
+/* -- Layout: static box tree ------------------------------------------- */
 
 static Box   dir_boxes[FV_MAX_DEPTH];
 static Box   content_box;
 static Box   top_hbox, root_vbox;
 
-/* ── Helpers ──────────────────────────────────────────────────────────── */
+/* -- Helpers ------------------------------------------------------------ */
 
 static std::string child_path(const std::string &parent, const char *name)
 {
@@ -93,7 +93,7 @@ static int panel_depth(int panel)
     return -1;
 }
 
-/* ── Directory loading ────────────────────────────────────────────────── */
+/* -- Directory loading -------------------------------------------------- */
 
 static void load_dir(int depth)
 {
@@ -126,7 +126,7 @@ static void load_dir(int depth)
               });
 }
 
-/* ── Content (file) loading ───────────────────────────────────────────── */
+/* -- Content (file) loading --------------------------------------------- */
 
 static void free_lines()
 {
@@ -212,7 +212,7 @@ static void load_content(const std::string &path)
     }
 }
 
-/* ── Data source callbacks ────────────────────────────────────────────── */
+/* -- Data source callbacks ---------------------------------------------- */
 
 /* Per-panel iterator state (only one panel is iterated at a time). */
 static struct {
@@ -268,7 +268,7 @@ static RowData fv_row_next(int panel)
     return rd;
 }
 
-/* ── Sync helpers ─────────────────────────────────────────────────────── */
+/* -- Sync helpers ------------------------------------------------------- */
 
 static void sync_right_of(int d)
 {
@@ -313,7 +313,7 @@ static void go_to_parent()
     if (cur.empty() || cur == "/") return;
 
     auto pos = cur.rfind('/');
-    if (pos == std::string::npos) return; /* relative path without '/' — shouldn't happen */
+    if (pos == std::string::npos) return; /* relative path without '/' - shouldn't happen */
     std::string child_name = cur.substr(pos + 1);
     std::string parent = (pos == 0) ? "/" : cur.substr(0, pos);
 
@@ -342,7 +342,7 @@ static void go_to_parent()
     sync_right_of(0);
 }
 
-/* ── Status bar ───────────────────────────────────────────────────────── */
+/* -- Status bar --------------------------------------------------------- */
 
 static void update_status()
 {
@@ -366,7 +366,7 @@ static void update_status()
     g.tui->set_status(status.c_str());
 }
 
-/* ── Key callback ─────────────────────────────────────────────────────── */
+/* -- Key callback ------------------------------------------------------- */
 
 static const char *HELP[] = {
     "",
@@ -471,7 +471,7 @@ static int on_key(Tui &tui, int key, int panel,
     return TUI_DEFAULT;
 }
 
-/* ── Layout: fill the static box tree ─────────────────────────────────── */
+/* -- Layout: fill the static box tree ----------------------------------- */
 
 static ColDef  s_dir_col{-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS};
 static ColDef  s_content_col{-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_TRUNCATE};
@@ -497,7 +497,7 @@ static void build_layout()
     root_vbox = Box{TUI_BOX_VBOX, 1, 0, 0, -1, {&top_hbox, &content_box}};
 }
 
-/* ── main ─────────────────────────────────────────────────────────────── */
+/* -- main --------------------------------------------------------------- */
 
 int fv_main(int argc, char **argv)
 {

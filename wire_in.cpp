@@ -1,4 +1,4 @@
-/* wire_in.cpp — implements wire_in.h. See header for design notes. */
+/* wire_in.cpp - implements wire_in.h. See header for design notes. */
 
 #include "wire_in.h"
 
@@ -9,7 +9,7 @@ extern "C" {
 #include "wire/wire.h"
 }
 
-/* ── per-atom length probe (without consuming) ────────────────────── */
+/* -- per-atom length probe (without consuming) ---------------------- */
 
 /* yeet's long-form length prefix can be up to 7 bytes (0xF8..0xFE);
  * 0xFF is reserved. */
@@ -30,7 +30,7 @@ static size_t yeet_atom_len(const uint8_t *p, size_t n) {
     return 1u + (size_t)lensz + (size_t)len;
 }
 
-/* ── implementation ───────────────────────────────────────────────── */
+/* -- implementation ------------------------------------------------- */
 
 struct WireDecoder::Impl {
     Sink sink;

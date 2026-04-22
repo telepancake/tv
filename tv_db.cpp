@@ -1,4 +1,4 @@
-/* tv_db.cpp — DuckDB-backed storage and query layer. */
+/* tv_db.cpp - DuckDB-backed storage and query layer. */
 
 #include "tv_db.h"
 #include "wire_in.h"
@@ -197,7 +197,7 @@ std::unique_ptr<TvDb> TvDb::open_with_path(const char *path,
         if (err) *err = "duckdb_connect failed";
         return nullptr;
     }
-    /* Memory-friendly defaults — let DuckDB spill to disk freely
+    /* Memory-friendly defaults - let DuckDB spill to disk freely
      * instead of clinging to multi-GB result sets. preserve_insertion_order
      * lets the query planner stream large windowed/grouped queries
      * (the path-canonicalisation builder benefits a lot). */
@@ -413,7 +413,7 @@ int64_t TvDb::total_event_count() {
     return v.empty() ? -1 : v[0];
 }
 
-/* ── Lazy index materialisation ───────────────────────────────────────
+/* -- Lazy index materialisation ---------------------------------------
  * Each ensure_*() runs CREATE TABLE AS SELECT once, then records its
  * existence in tv_meta. The check-and-build is gated by tv_meta so
  * subsequent opens of the same .tvdb reuse the materialised table. */
@@ -476,7 +476,7 @@ bool TvDb::ensure_proc_index(std::string *err) {
 
     /* One row per tgid: ppid (last exec), exe (last exec), start_ns,
      * end_ns (exit if recorded, else last exec ts), exit info.
-     * Avoid FIRST(... ORDER BY ...) and regex — neither is in the
+     * Avoid FIRST(... ORDER BY ...) and regex - neither is in the
      * vendored DuckDB amalgamation; use window functions and assume
      * one EXIT per tgid (true in practice). Basename of exe is computed
      * in C++ at view time. */
@@ -559,7 +559,7 @@ bool TvDb::ensure_path_index(std::string *err) {
                    "CREATE INDEX IF NOT EXISTS tv_idx_open_canon_tgid "
                    "ON tv_idx_open_canon(tgid)", err)) return false;
 
-    /* Per-canonical-path stats; flags & 3 == 0  → read-only open. */
+    /* Per-canonical-path stats; flags & 3 == 0  -> read-only open. */
     const char *sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_path AS "
         "SELECT path, "
@@ -590,7 +590,7 @@ bool TvDb::ensure_edge_index(std::string *err) {
     if (!ensure_path_index(err)) return false;
 
     /* (tgid, path, mode) where mode = 0 read, 1 write. Successful opens
-     * only — failures (err != 0) don't create dependencies. */
+     * only - failures (err != 0) don't create dependencies. */
     const char *sql =
         "CREATE TABLE IF NOT EXISTS tv_idx_edge AS "
         "SELECT DISTINCT tgid, path, "

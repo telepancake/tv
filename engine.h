@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-/* ── Key constants ─────────────────────────────────────────────────── */
+/* -- Key constants --------------------------------------------------- */
 
 enum {
     TUI_K_NONE  = -1,
@@ -50,7 +50,7 @@ inline constexpr int TUI_BOX_HSCROLL = 0x01;
 /* Sentinel: dirty/focus all panels */
 inline constexpr int TUI_ALL_PANELS = -1;
 
-/* ── Layout types ──────────────────────────────────────────────────── */
+/* -- Layout types ---------------------------------------------------- */
 
 struct ColDef {
     int         width;
@@ -86,7 +86,7 @@ struct RowData {
     bool        has_children = false;
 };
 
-/* ── Tui class ─────────────────────────────────────────────────────── */
+/* -- Tui class ------------------------------------------------------- */
 
 class Tui;
 
@@ -97,7 +97,7 @@ using TimerCallback = std::function<int(Tui &tui)>;
 
 /* Iterator-based data source.  The engine calls row_begin() once, then
    loops row_has_more() / row_next() to read every row lazily.  All rows
-   are cached by the engine—the app just provides a forward iterator. */
+   are cached by the engine-the app just provides a forward iterator. */
 struct DataSource {
     std::function<void(int panel)>     row_begin;
     std::function<bool(int panel)>     row_has_more;
@@ -114,14 +114,22 @@ public:
     Tui(const Tui &) = delete;
     Tui &operator=(const Tui &) = delete;
 
-    /* Panels — add before set_layout */
+    /* Panels - add before set_layout */
     int  add_panel(PanelDef def);
     int  panel_count() const;
+
+    /* Reconfigure a panel's columns at runtime - used to give each
+       app mode (process tree, file tree, event log, output stream, ...)
+       its own column layout instead of forcing all modes to share one
+       shape baked in at add_panel time. Pass title=nullptr to leave
+       the panel title unchanged. */
+    void set_panel_columns(int panel, const ColDef *cols, int ncols,
+                           const char *title = nullptr);
 
     /* Layout */
     void set_layout(Box *root);
 
-    /* Panel state — panel index, or TUI_ALL_PANELS for dirty */
+    /* Panel state - panel index, or TUI_ALL_PANELS for dirty */
     void        dirty(int panel = TUI_ALL_PANELS);
     void        focus(int panel);
     int         get_focus() const;

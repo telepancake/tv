@@ -1,4 +1,4 @@
-/* data_source.h — SQL-backed row iterators for tv's panels.
+/* data_source.h - SQL-backed row iterators for tv's panels.
  *
  * Each panel mode runs SQL against the .tvdb. The DataSource exposed
  * to the engine is just an iterator wrapper. Heavy aggregations are
@@ -25,8 +25,8 @@ class TvDb;
 struct AppState {
     int          mode = 1;
     std::string  cursor_id;        /* current cursor row id (mode-dependent) */
-    std::string  search;           /* /search query — substring/glob filter */
-    /* Flag filter — string of one-letter category codes that must ALL
+    std::string  search;           /* /search query - substring/glob filter */
+    /* Flag filter - string of one-letter category codes that must ALL
      * be satisfied by a row. Vocabulary is mode-dependent:
      *   mode 2 (files): R W E w f s k   (see lpane_files for meaning)
      *   mode 1 (procs): K F D            (see lpane_processes for meaning)
@@ -38,7 +38,7 @@ struct AppState {
     bool         subtree_only = false;  /* mode 1: restrict to subtree of cursor */
     std::string  subtree_root;     /* mode 1: tgid of subtree root */
     bool         show_pids = false;     /* mode 1: prefix labels with [tgid] */
-    /* Right-pane section collapsing: heading id (e.g. "__ho") → collapsed. */
+    /* Right-pane section collapsing: heading id (e.g. "__ho") -> collapsed. */
     std::vector<std::string> collapsed_sections;
 };
 
@@ -47,8 +47,23 @@ public:
     explicit TvDataSource(TvDb &db, AppState &state);
 
     DataSource make_data_source();
-    void invalidate();         /* both panes — for live data updates */
-    void invalidate_rpane();   /* cursor change — keep lpane cache */
+    void invalidate();         /* both panes - for live data updates */
+    void invalidate_rpane();   /* cursor change - keep lpane cache */
+
+    /* Per-mode column layout for the left pane. Returned ColDef
+     * pointer is owned by the data source (stable across calls).
+     * The engine receives this via Tui::set_panel_columns() on every
+     * mode change - see apply_layout(). */
+    struct PanelLayout {
+        const ColDef *cols;
+        int           ncols;
+        const char   *title;   /* used as a column-header row in the title bar */
+    };
+    PanelLayout lpane_layout() const;
+    PanelLayout rpane_layout() const;
+    /* Convenience: push both layouts to the engine. Call after every
+     * mode change so cols/title match the new mode's row shape. */
+    void apply_layout(class Tui &tui, int lpane, int rpane) const;
 
 private:
     void row_begin(int panel);
