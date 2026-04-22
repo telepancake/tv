@@ -97,11 +97,16 @@ void sud_wire_init(void)
         void *p = raw_mmap(NULL, SUD_SHARED_PAGE_SIZE,
                            PROT_READ | PROT_WRITE, MAP_SHARED,
                            SUD_STATE_FD, 0);
-        if (p != MAP_FAILED && p)
+        /* raw_mmap returns the raw kernel return value cast to a
+         * pointer; on failure that's a small negative errno (e.g.
+         * (void *)-9 for EBADF), which is *not* MAP_FAILED. Treat
+         * anything in the top 4 KiB of the address space as an error.
+         * Otherwise we'd happily write through a junk pointer below. */
+        if ((uintptr_t)p < (uintptr_t)-4096L)
             g_shared = (struct sud_shared *)p;
         /* Atomic grab. __sync_fetch_and_add is async-signal-safe
          * (single instruction lock-prefixed on x86) and works on the
-         * shared page. */
+         * shared page (or on the process-local fallback). */
         g_stream_id = __sync_fetch_and_add(&g_shared->next_stream_id, 1u) + 1u;
         g_stream_id_set = 1;
     }

@@ -667,26 +667,36 @@ void TvDataSource::lpane_processes() {
         for (int t : roots) emit(t, "", true);
     }
 
-    /* Proc-tree hat. Same idea as emit_path_hat() in mode 2: when
-     * every visible row shares a chain of ancestors, surface that
-     * chain once at the top as a Heading row so the user sees what
-     * subtree they're scrolling without having to chase indent.
+    /* Proc-tree hat. Same idea as emit_path_hat() in mode 2: surface
+     * the common ancestor chain as a Heading row at the top so the
+     * user sees what subtree they're scrolling without having to chase
+     * indent.
      *
-     * Walk parent_id chains starting from each emitted process row
-     * (reading parents from the `procs` map collected above). The
-     * longest common SUFFIX of those chains - i.e. the deepest
-     * ancestor shared by every visible proc - is the hat. */
-    if (!state_.subtree_only && lpane_.size() >= 2) {
+     * Algorithm:
+     *  - For each visible (non-synthetic) row, walk parent_id back
+     *    through the procs map to build a chain of in-trace ancestors,
+     *    ordered child→parent (chain[0] is the row's immediate parent).
+     *  - Common ancestor sequence = longest suffix shared across every
+     *    non-empty chain (i.e. starting from the highest-reachable
+     *    ancestor and walking down until chains diverge). Rows whose
+     *    chain is empty (their parent isn't in the trace) don't
+     *    constrain the common chain at all - they just don't
+     *    contribute. This matches what the reviewer asked for: when
+     *    the topmost row is itself nested, its ancestors still show
+     *    up as a hat even if some sibling roots have no in-trace
+     *    parent.
+     *  - Drop a leading PID ≤ 1 (init) so we don't stutter "init › …"
+     *    on every trace. */
+    if (!state_.subtree_only && !lpane_.empty()) {
         std::vector<std::vector<int>> chains;
         chains.reserve(lpane_.size());
         for (const auto &row : lpane_) {
             if (row.id.empty() || row.id[0] == '_') continue;
             int t = std::atoi(row.id.c_str());
-            if (!procs.count(t)) continue;
+            auto pit = procs.find(t);
+            if (pit == procs.end()) continue;
             std::vector<int> chain;
-            int cur = procs[t].ppid;
-            /* Bound the walk to avoid worst-case cycles - real ppid
-             * chains never exceed a few dozen levels. */
+            int cur = pit->second.ppid;
             for (int depth = 0; depth < 256; depth++) {
                 if (cur <= 0) break;
                 auto it = procs.find(cur);
@@ -695,16 +705,19 @@ void TvDataSource::lpane_processes() {
                 if (it->second.ppid == cur) break;   /* self-loop guard */
                 cur = it->second.ppid;
             }
-            if (chain.empty()) { chains.clear(); break; }
             chains.push_back(std::move(chain));
         }
-        /* Need ≥ 2 chains to factor anything; with one row the hat is
-         * just that row's parent and adds noise. */
-        if (chains.size() >= 2) {
-            /* Common suffix: walk both lists from the back. */
+        /* Drop chains that are empty - they tell us nothing about the
+         * common ancestor (the row simply has no in-trace parent). */
+        chains.erase(std::remove_if(chains.begin(), chains.end(),
+                         [](const std::vector<int> &c){ return c.empty(); }),
+                     chains.end());
+        if (!chains.empty()) {
+            /* Common suffix walk: chains are child→parent ordered, so
+             * the deepest common ancestor sits at some index from the
+             * back. With one chain, "common" is the whole chain. */
             std::vector<int> common;
-            size_t k = 0;
-            for (;; k++) {
+            for (size_t k = 0;; k++) {
                 int candidate = -1;
                 bool ok = true;
                 for (auto &c : chains) {
@@ -716,13 +729,11 @@ void TvDataSource::lpane_processes() {
                 if (!ok) break;
                 common.push_back(candidate);
             }
-            /* `common` is now root → … → deepest shared ancestor.
-             * Skip the synthetic "PID 1" / "init" root if present;
-             * that's noise, not a useful hat. */
+            /* Skip the synthetic init root if reachable; it adds noise
+             * without information. */
             while (!common.empty() && common.front() <= 1)
                 common.erase(common.begin());
             if (!common.empty()) {
-                /* Render as one Heading row showing the chain. */
                 std::string label;
                 for (size_t i = 0; i < common.size(); i++) {
                     auto it = procs.find(common[i]);
@@ -736,11 +747,11 @@ void TvDataSource::lpane_processes() {
                     }
                 }
                 if (!label.empty()) {
+                    /* 4-column row to match k_lpane_cols_procs:
+                     *   name | pid | exit | duration */
                     RowData hat;
                     hat.id = "__hat_proc";
                     hat.style = RowStyle::Heading;
-                    /* 4-column row to match k_lpane_cols_procs:
-                     *   name | pid | exit | duration */
                     hat.cols = {label, "", "", ""};
                     RowData sep;
                     sep.id = "__hat_sep";
@@ -887,12 +898,13 @@ void TvDataSource::lpane_files() {
                        f.path.find(state_.search) != std::string::npos;
             lpane_.push_back(mk_file_row(f, f.path, hit));
         }
-        /* Same hat treatment as the tree view. The reviewer flagged
-         * that all-items-share-a-parent flat lists weren't getting
-         * a hat at all - that was because the call below was only
-         * inside the tree branch. Move it out so flat lists factor
-         * out the common prefix too. */
-        if (!state_.subtree_only && lpane_.size() >= 2) {
+        /* Hat treatment for the flat list. The reviewer flagged that
+         * all-items-share-a-parent flat lists weren't getting a hat at
+         * all (the call below used to live only inside the tree
+         * branch), and that a single deeply-nested top row also got
+         * nothing. emit_path_hat() now handles both cases - we just
+         * need at least one leaf row. */
+        if (!state_.subtree_only && !lpane_.empty()) {
             emit_path_hat();
         }
         return;
@@ -1020,13 +1032,13 @@ void TvDataSource::lpane_files() {
      *   - the prefix is just "/" or "" (already flush-left visually)
      *   - the user pinned a subtree (state_.subtree_only) - then the
      *     existing subtree banner is the hat, no duplicate. */
-    if (!state_.subtree_only && lpane_.size() >= 2) {
+    if (!state_.subtree_only && !lpane_.empty()) {
         emit_path_hat();
     }
 }
 
-/* Find longest common path-segment prefix across lpane_ rows whose id
- * is a path. Mutates the rows to strip the prefix and inserts a hat
+/* Find the longest common path-segment prefix across lpane_ rows whose
+ * id is a path. Mutates the rows to strip the prefix and inserts a hat
  * row at the front. Path-segment-aware: "/usr/include/dir_0/" and
  * "/usr/include/dir_0/sub_0/file.h" share "/usr/include/dir_0/", but
  * "/usr/inc/" and "/usr/include/" only share "/usr/".
@@ -1035,7 +1047,13 @@ void TvDataSource::lpane_files() {
  * the prefix calculation. Directory-aggregate rows that are strict
  * prefixes of the hat get folded into the hat (hidden). This is what
  * factors out the giant left-margin indent the user complained about
- * in deep trees - the dir rows merge into the header. */
+ * in deep trees - the dir rows merge into the header.
+ *
+ * Special case: if there is only ONE visible leaf, the "common prefix"
+ * is just that leaf, which we then back off by one segment to show its
+ * parent directory. This is the "topmost item is nested" case the
+ * reviewer asked for - a single deeply-nested row still gets a hat
+ * naming the directory it lives in. */
 void TvDataSource::emit_path_hat() {
     auto is_path_row = [](const RowData &r) {
         return !r.id.empty() && r.id[0] == '/' &&
@@ -1044,26 +1062,28 @@ void TvDataSource::emit_path_hat() {
     auto is_leaf = [&](const RowData &r) {
         return is_path_row(r) && r.id.back() != '/';
     };
-    /* Need at least 2 leaves to factor anything; with one leaf the
-     * hat would simply be that leaf's parent and we'd hide nothing
-     * useful. */
     int n_leaves = 0;
     const std::string *first_leaf = nullptr;
     for (const auto &r : lpane_) {
         if (!is_leaf(r)) continue;
         if (!first_leaf) first_leaf = &r.id;
-        if (++n_leaves >= 2) break;
+        n_leaves++;
     }
-    if (n_leaves < 2 || !first_leaf) return;
+    if (n_leaves < 1 || !first_leaf) return;
     std::string prefix = *first_leaf;
-    for (const auto &r : lpane_) {
-        if (!is_leaf(r)) continue;
-        size_t i = 0;
-        while (i < prefix.size() && i < r.id.size() && prefix[i] == r.id[i])
-            i++;
-        prefix.resize(i);
-        if (prefix.empty()) return;
+    if (n_leaves >= 2) {
+        for (const auto &r : lpane_) {
+            if (!is_leaf(r)) continue;
+            size_t i = 0;
+            while (i < prefix.size() && i < r.id.size() && prefix[i] == r.id[i])
+                i++;
+            prefix.resize(i);
+            if (prefix.empty()) return;
+        }
     }
+    /* Single-leaf or multi-leaf: cut back to the last '/' so the hat is
+     * always a directory. With one leaf this strips the filename; with
+     * many leaves it strips back to the first divergence. */
     size_t slash = prefix.rfind('/');
     if (slash == std::string::npos || slash == 0) return;
     prefix.resize(slash + 1);

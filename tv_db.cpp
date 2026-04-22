@@ -216,16 +216,16 @@ std::unique_ptr<TvDb> TvDb::open_with_path(const char *path,
         "PRAGMA memory_limit='2GB';",
         &r0);
     duckdb_destroy_result(&r0);
-    /* Thread count. Reviewer pushed back on hardcoding 4 ("are we
-     * hardcoding core counts now?") - they're right. Honour a
-     * TV_DUCKDB_THREADS env override; otherwise default to
-     * min(4, hardware_concurrency) so we still parallelise on small
-     * hosts without grabbing every core on a fat one (each DuckDB
-     * thread holds its own per-operator state). */
+    /* Thread count. Reviewer pushed back, twice, on the previous
+     * `min(4, hardware_concurrency)` cap. Right call - DuckDB already
+     * scales sub-linearly past the operator count, so capping it just
+     * leaves cores idle on big machines. Default is now plain
+     * hardware_concurrency. The TV_DUCKDB_THREADS env still wins for
+     * users who want to box DuckDB in (e.g. running tv alongside a
+     * build). */
     {
-        unsigned hw = std::thread::hardware_concurrency();
-        if (hw == 0) hw = 1;
-        unsigned threads = (hw < 4u) ? hw : 4u;
+        unsigned threads = std::thread::hardware_concurrency();
+        if (threads == 0) threads = 4;
         if (const char *env = std::getenv("TV_DUCKDB_THREADS")) {
             char *endp = nullptr;
             unsigned long v = std::strtoul(env, &endp, 10);
