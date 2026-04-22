@@ -1,5 +1,7 @@
 obj-m += proctrace.o
 
+CC ?= cc
+CXX ?= g++
 KDIR    ?= /lib/modules/$(shell uname -r)/build
 PWD     := $(shell pwd)
 SIGN    := $(KDIR)/scripts/sign-file
@@ -78,28 +80,28 @@ $(DUCKDB_CPP): | $(DUCKDB_DIR)/scripts/amalgamation.py
 
 $(DUCKDB_OBJ): $(DUCKDB_CPP)
 	@mkdir -p build
-	g++ -std=c++17 -O2 -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
+	$(CXX) -std=c++17 -O2 -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
 
 TV_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp wire_in.cpp tv_db.cpp data_source.cpp
 TV_HDRS := engine.h wire_in.h tv_db.h data_source.h wire/wire.h $(DUCKDB_HPP)
 
 tv: $(TV_SRCS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
-	g++ $(CXXFLAGS) -o tv $(TV_SRCS) $(DUCKDB_OBJ) $(TV_LIBS)
+	$(CXX) $(CXXFLAGS) -o tv $(TV_SRCS) $(DUCKDB_OBJ) $(TV_LIBS)
 
 fv: fv.cpp engine.cpp engine.h
-	g++ $(CXXFLAGS) -o fv fv.cpp engine.cpp
+	$(CXX) $(CXXFLAGS) -o fv fv.cpp engine.cpp
 
 sud64: $(SUD_SRCS) sudtrace.lds
-	cc -m64 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sud64 $(SUD_SRCS) -lgcc
+	$(CC) -m64 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sud64 $(SUD_SRCS) -lgcc
 
 sud32: $(SUD_SRCS) sudtrace.lds
-	cc -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_SRCS) -lgcc
+	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_SRCS) -lgcc
 
 sudtrace: sud/sudtrace.c sud32 sud64 wire/wire.h
-	cc -O2 -I. -static -o sudtrace sud/sudtrace.c
+	$(CC) -O2 -I. -static -o sudtrace sud/sudtrace.c
 
 yeetdump: tools/yeetdump/yeetdump.c wire/wire.h
-	cc -std=c99 -O2 -Wall -Wextra -I. -o yeetdump tools/yeetdump/yeetdump.c
+	$(CC) -std=c99 -O2 -Wall -Wextra -I. -o yeetdump tools/yeetdump/yeetdump.c
 
 .PHONY: wire-test
 wire-test: yeetdump
