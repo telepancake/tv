@@ -225,37 +225,56 @@ struct UiCtx {
 
 void update_status(UiCtx &c) {
     if (!c.tui) return;
-    char buf[256];
-    std::snprintf(buf, sizeof buf,
-        "tv (DuckDB) | mode %d | %s%s | 1..7 mode  /  search  ?  help",
-        c.state->mode,
-        c.state->cursor_id.empty() ? "no-cursor" : ("cursor=" + c.state->cursor_id).c_str(),
-        c.state->search.empty() ? "" : (" /" + c.state->search).c_str());
+    static const char *MN[] = {
+        "?", "1:proc", "2:file", "3:event",
+        "4:dep", "5:rdep", "6:dcmd", "7:rcmd"
+    };
+    int m = c.state->mode;
+    const char *mn = (m >= 1 && m <= 7) ? MN[m] : "?";
+    char buf[512];
+    int n = std::snprintf(buf, sizeof buf, "tv | %s%s",
+        mn, c.state->grouped ? " tree" : " flat");
+    if (!c.state->cursor_id.empty())
+        n += std::snprintf(buf + n, sizeof buf - n, " | cur=%s",
+                           c.state->cursor_id.c_str());
+    if (!c.state->subject_file.empty() && m >= 4 && m <= 7)
+        n += std::snprintf(buf + n, sizeof buf - n, " | subj=%s",
+                           c.state->subject_file.c_str());
+    if (!c.state->search.empty())
+        n += std::snprintf(buf + n, sizeof buf - n, " | /%s",
+                           c.state->search.c_str());
+    n += std::snprintf(buf + n, sizeof buf - n,
+        " | 1..7 mode  t tree/flat  s subtree  / search  ? help");
+    (void)n;
     c.tui->set_status(buf);
 }
 
 int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
               UiCtx &c) {
-    auto refresh = [&]() {
-        if (row_id) c.state->cursor_id = row_id;
+    auto invalidate_and_redraw = [&]() {
         c.src->invalidate();
         tui.dirty();
         update_status(c);
     };
     if (key >= '1' && key <= '7') {
-        c.state->mode = key - '0';
+        int new_mode = key - '0';
+        /* When entering a dep mode (4..7) from the file view (mode 2),
+         * pin the current cursor as the subject file so the closure
+         * traversal has an anchor. From mode 1, the cursor is a tgid
+         * and isn't a file — the user should pick a file first. */
+        if (new_mode >= 4 && new_mode <= 7) {
+            if (c.state->mode == 2 && !c.state->cursor_id.empty())
+                c.state->subject_file = c.state->cursor_id;
+        }
+        c.state->mode = new_mode;
         c.state->cursor_id.clear();
-        c.src->invalidate();
-        tui.dirty();
-        update_status(c);
+        invalidate_and_redraw();
         return TUI_HANDLED;
     }
     if (key == 'q' || key == TUI_K_ESC) {
         if (key == TUI_K_ESC && !c.state->search.empty()) {
             c.state->search.clear();
-            c.src->invalidate();
-            tui.dirty();
-            update_status(c);
+            invalidate_and_redraw();
             return TUI_HANDLED;
         }
         tui.quit();
@@ -269,10 +288,26 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         char buf[128] = {};
         if (tui.line_edit("search: ", buf, sizeof buf) >= 0) {
             c.state->search = buf;
-            c.src->invalidate();
-            tui.dirty();
-            update_status(c);
+            invalidate_and_redraw();
         }
+        return TUI_HANDLED;
+    }
+    /* Tree/flat toggle (mode 1, mode 2). */
+    if (key == 't') {
+        c.state->grouped = !c.state->grouped;
+        invalidate_and_redraw();
+        return TUI_HANDLED;
+    }
+    /* Subtree-only toggle in mode 1: pin current cursor as root. */
+    if (key == 's' && c.state->mode == 1) {
+        if (c.state->subtree_only) {
+            c.state->subtree_only = false;
+            c.state->subtree_root.clear();
+        } else if (!c.state->cursor_id.empty()) {
+            c.state->subtree_only = true;
+            c.state->subtree_root = c.state->cursor_id;
+        }
+        invalidate_and_redraw();
         return TUI_HANDLED;
     }
     /* Cursor changes update the rpane. */
@@ -282,15 +317,15 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
         tui.dirty(c.rpane);
         update_status(c);
     }
-    (void)refresh;
     return TUI_DEFAULT;
 }
 
-/* ── --dump : non-interactive dump of mode 1 lpane (for tests) ─────── */
+/* ── --dump[=MODE] : non-interactive dump of an lpane (for tests) ──── */
 
-int dump_mode1(TvDb &db) {
+int dump_mode(TvDb &db, int mode, const std::string &subject) {
     AppState st;
-    st.mode = 1;
+    st.mode = mode;
+    st.subject_file = subject;
     TvDataSource ts(db, st);
     auto srcfn = ts.make_data_source();
     srcfn.row_begin(0);
@@ -349,6 +384,8 @@ int main(int argc, char **argv) {
     const char *open_file  = nullptr;
     const char *out_db     = nullptr;
     bool dump = false;
+    int  dump_mode_n = 1;
+    std::string dump_subject;
     char **cmd = nullptr;
 
     for (int i = 1; i < argc; i++) {
@@ -356,6 +393,13 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--open")  && i + 1 < argc) open_file  = argv[++i];
         else if (!std::strcmp(argv[i], "-o")      && i + 1 < argc) out_db     = argv[++i];
         else if (!std::strcmp(argv[i], "--dump")) dump = true;
+        else if (!std::strncmp(argv[i], "--dump=", 7)) {
+            dump = true;
+            dump_mode_n = std::atoi(argv[i] + 7);
+            if (dump_mode_n < 1 || dump_mode_n > 7) dump_mode_n = 1;
+        }
+        else if (!std::strcmp(argv[i], "--subject") && i + 1 < argc)
+            dump_subject = argv[++i];
         else if (!std::strcmp(argv[i], "--no-env")) no_env = 1;
         else if (!std::strcmp(argv[i], "--module"))  live_backend = LIVE_TRACE_BACKEND_MODULE;
         else if (!std::strcmp(argv[i], "--sud"))     live_backend = LIVE_TRACE_BACKEND_SUD;
@@ -459,7 +503,7 @@ int main(int argc, char **argv) {
             ::waitpid(lt.child_pid, nullptr, 0);
             db->flush(&err);
         }
-        return dump_mode1(*db);
+        return dump_mode(*db, dump_mode_n, dump_subject);
     }
 
     /* TUI. */

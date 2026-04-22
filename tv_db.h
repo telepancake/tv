@@ -61,6 +61,14 @@ public:
     /* Total number of rows across all event tables (for sanity / tests). */
     int64_t total_event_count();
 
+    /* Lazy indices. Each ensure_*() materialises a small derived table
+     * the first time it is called for a given .tvdb, then records the
+     * fact in tv_meta so subsequent opens skip the work. They are no-ops
+     * after the first call (per-process) or first build (per-file). */
+    bool ensure_proc_index(std::string *err);   /* tv_idx_proc */
+    bool ensure_path_index(std::string *err);   /* tv_idx_path */
+    bool ensure_edge_index(std::string *err);   /* tv_idx_edge (proc⇄path)*/
+
     /* Path of the backing file (".tvdb" or ":memory:" for in-mem). */
     const std::string &path() const;
 

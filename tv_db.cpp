@@ -63,7 +63,12 @@ const char *const kSchemaSQL =
     "CREATE TABLE IF NOT EXISTS stderr_("
     "  ts_ns UBIGINT, pid INTEGER, tgid INTEGER, ppid INTEGER,"
     "  nspid INTEGER, nstgid INTEGER,"
-    "  data BLOB);";
+    "  data BLOB);"
+
+    /* Lazy index metadata. tv_meta records which derived tables have
+     * been materialised for this .tvdb so subsequent opens reuse them. */
+    "CREATE TABLE IF NOT EXISTS tv_meta("
+    "  key VARCHAR PRIMARY KEY, value VARCHAR);";
 
 /* exit/open/stdout/stderr collide with SQL keywords; tables use trailing
  * underscore. The data_source layer aliases them in queries. */
@@ -396,6 +401,174 @@ int64_t TvDb::total_event_count() {
         " + (SELECT COUNT(*) FROM cwd) + (SELECT COUNT(*) FROM stdout_)"
         " + (SELECT COUNT(*) FROM stderr_)", &err);
     return v.empty() ? -1 : v[0];
+}
+
+/* ── Lazy index materialisation ───────────────────────────────────────
+ * Each ensure_*() runs CREATE TABLE AS SELECT once, then records its
+ * existence in tv_meta. The check-and-build is gated by tv_meta so
+ * subsequent opens of the same .tvdb reuse the materialised table. */
+
+namespace {
+bool meta_get(duckdb_connection con, const char *key, std::string &out) {
+    std::string sql = std::string("SELECT value FROM tv_meta WHERE key='") +
+                      key + "'";
+    duckdb_result r;
+    if (duckdb_query(con, sql.c_str(), &r) != DuckDBSuccess) {
+        duckdb_destroy_result(&r);
+        return false;
+    }
+    bool found = duckdb_row_count(&r) > 0;
+    if (found) {
+        char *v = duckdb_value_varchar(&r, 0, 0);
+        out = v ? v : "";
+        if (v) duckdb_free(v);
+    }
+    duckdb_destroy_result(&r);
+    return found;
+}
+
+bool meta_set(duckdb_connection con, const char *key, const char *value,
+              std::string *err) {
+    std::string sql = std::string("INSERT OR REPLACE INTO tv_meta VALUES('") +
+                      key + "','" + value + "')";
+    duckdb_result r;
+    if (duckdb_query(con, sql.c_str(), &r) != DuckDBSuccess) {
+        if (err) {
+            const char *e = duckdb_result_error(&r);
+            *err = std::string("meta_set: ") + (e ? e : "?");
+        }
+        duckdb_destroy_result(&r);
+        return false;
+    }
+    duckdb_destroy_result(&r);
+    return true;
+}
+
+bool run_query(duckdb_connection con, const char *sql, std::string *err) {
+    duckdb_result r;
+    if (duckdb_query(con, sql, &r) != DuckDBSuccess) {
+        if (err) {
+            const char *e = duckdb_result_error(&r);
+            *err = std::string("query: ") + (e ? e : "?") + " :: " + sql;
+        }
+        duckdb_destroy_result(&r);
+        return false;
+    }
+    duckdb_destroy_result(&r);
+    return true;
+}
+} // namespace
+
+bool TvDb::ensure_proc_index(std::string *err) {
+    if (!impl_->flush(err)) return false;
+    std::string val;
+    if (meta_get(impl_->con, "idx_proc", val)) return true;
+
+    /* One row per tgid: ppid (last exec), exe (last exec), start_ns,
+     * end_ns (exit if recorded, else last exec ts), exit info.
+     * Avoid FIRST(... ORDER BY ...) and regex — neither is in the
+     * vendored DuckDB amalgamation; use window functions and assume
+     * one EXIT per tgid (true in practice). Basename of exe is computed
+     * in C++ at view time. */
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS tv_idx_proc AS "
+        "WITH e_ranked AS ("
+        "  SELECT tgid, ppid, exe, ts_ns, "
+        "         ROW_NUMBER() OVER (PARTITION BY tgid ORDER BY ts_ns DESC) AS rn"
+        "  FROM exec"
+        "), e_last AS ("
+        "  SELECT tgid, ppid, exe FROM e_ranked WHERE rn = 1"
+        "), p_span AS ("
+        "  SELECT tgid, MIN(ts_ns) AS start_ns, MAX(ts_ns) AS exec_end_ns"
+        "  FROM exec GROUP BY tgid"
+        "), x_dedup AS ("
+        "  SELECT tgid, status_kind AS exit_kind, code_or_sig AS exit_code,"
+        "         core_dumped, ts_ns AS exit_ns,"
+        "         ROW_NUMBER() OVER (PARTITION BY tgid ORDER BY ts_ns) AS rn"
+        "  FROM exit_"
+        "), x_first AS ("
+        "  SELECT tgid, exit_kind, exit_code, core_dumped, exit_ns"
+        "  FROM x_dedup WHERE rn = 1"
+        ") "
+        "SELECT e.tgid, e.ppid, e.exe, "
+        "       p.start_ns AS start_ns, "
+        "       COALESCE(x.exit_ns, p.exec_end_ns) AS end_ns, "
+        "       x.exit_kind, x.exit_code, x.core_dumped "
+        "FROM e_last e "
+        "JOIN p_span p USING (tgid) "
+        "LEFT JOIN x_first x USING (tgid)";
+    if (!run_query(impl_->con, sql, err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_proc_tgid "
+                   "ON tv_idx_proc(tgid)", err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_proc_ppid "
+                   "ON tv_idx_proc(ppid)", err)) return false;
+    if (!meta_set(impl_->con, "idx_proc", "1", err)) return false;
+    impl_->dirty = true;
+    return true;
+}
+
+bool TvDb::ensure_path_index(std::string *err) {
+    if (!impl_->flush(err)) return false;
+    std::string val;
+    if (meta_get(impl_->con, "idx_path", val)) return true;
+
+    /* Per-path stats; flags % 4 == 0  → read-only open. The vendored
+     * DuckDB amalgamation is missing the core_functions extension —
+     * which means SUM, AVG, FIRST, LAST, COUNT(DISTINCT), bitwise & ,
+     * and regex_* are all unavailable. Stick to COUNT/MIN/MAX (which
+     * live in the always-on built-in catalog) and use the standard
+     * `COUNT(CASE WHEN cond THEN 1 END)` NULL trick to count
+     * conditionally. */
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS tv_idx_path AS "
+        "WITH base AS ("
+        "  SELECT CAST(path AS VARCHAR) AS path, tgid, err, flags FROM open_"
+        "), pp AS ("
+        "  SELECT DISTINCT path, tgid FROM base"
+        "), procs AS ("
+        "  SELECT path, COUNT(*) AS procs FROM pp GROUP BY path"
+        ") "
+        "SELECT b.path, "
+        "       COUNT(*) AS opens, "
+        "       COUNT(CASE WHEN b.err <> 0 THEN 1 END) AS errors, "
+        "       MAX(p.procs) AS procs, "
+        "       COUNT(CASE WHEN (b.flags % 4) = 0 THEN 1 END) AS reads, "
+        "       COUNT(CASE WHEN (b.flags % 4) <> 0 THEN 1 END) AS writes "
+        "FROM base b JOIN procs p USING (path) "
+        "GROUP BY b.path";
+    if (!run_query(impl_->con, sql, err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_path_path "
+                   "ON tv_idx_path(path)", err)) return false;
+    if (!meta_set(impl_->con, "idx_path", "1", err)) return false;
+    impl_->dirty = true;
+    return true;
+}
+
+bool TvDb::ensure_edge_index(std::string *err) {
+    if (!impl_->flush(err)) return false;
+    std::string val;
+    if (meta_get(impl_->con, "idx_edge", val)) return true;
+
+    /* (tgid, path, mode) where mode = 0 read, 1 write. Successful opens
+     * only — failures (err != 0) don't create dependencies. */
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS tv_idx_edge AS "
+        "SELECT DISTINCT tgid, CAST(path AS VARCHAR) AS path, "
+        "       CASE WHEN (flags % 4) = 0 THEN 0 ELSE 1 END AS mode "
+        "FROM open_ WHERE err = 0";
+    if (!run_query(impl_->con, sql, err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_edge_path "
+                   "ON tv_idx_edge(path)", err)) return false;
+    if (!run_query(impl_->con,
+                   "CREATE INDEX IF NOT EXISTS tv_idx_edge_tgid "
+                   "ON tv_idx_edge(tgid)", err)) return false;
+    if (!meta_set(impl_->con, "idx_edge", "1", err)) return false;
+    impl_->dirty = true;
+    return true;
 }
 
 const std::string &TvDb::path() const { return impl_->path_; }
