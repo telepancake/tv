@@ -88,10 +88,16 @@ $(ZSTD_LIB):
 DUCKDB_CXX ?= clang++
 DUCKDB_OPT ?= -O0
 
-# DuckDB is vendored as a single ~25 MB amalgamation file. The amalgamation
-# script is run on demand.
-$(DUCKDB_CPP): | $(DUCKDB_DIR)/scripts/amalgamation.py
-	cd $(DUCKDB_DIR) && python3 scripts/amalgamation.py
+# DuckDB is vendored as a single ~25 MB amalgamation file. We build it
+# ourselves through tools/duckdb_amalgamate.py instead of running the
+# upstream scripts/amalgamation.py directly because the upstream default
+# bakes in the *dummy* extension loader — which silently strips out the
+# core_functions extension where SUM, AVG, COUNT(DISTINCT), bitwise &,
+# regexp_*, FIRST(... ORDER BY ...) and ~hundreds of other operators
+# actually live. Our wrapper relinks the real loader and concatenates
+# extension/core_functions into the amalgamation.
+$(DUCKDB_CPP): tools/duckdb_amalgamate.py | $(DUCKDB_DIR)/scripts/amalgamation.py
+	python3 tools/duckdb_amalgamate.py
 
 $(DUCKDB_OBJ): $(DUCKDB_CPP)
 	@mkdir -p build

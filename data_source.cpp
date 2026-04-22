@@ -743,8 +743,8 @@ void TvDataSource::rpane_file_detail(const std::string &path) {
         return;
     }
     auto pr = db_.query_strings(
-        "SELECT opens, errors, procs, reads, writes "
-        "FROM tv_idx_path "
+        "SELECT opens, errors, procs, reads, writes, "
+        "       first_ns, last_ns FROM tv_idx_path "
         "WHERE path = " + sql_escape(path), &err);
     if (pr.empty()) {
         rpane_.push_back(mk_row("__none", "(no path " + path + ")", RowStyle::Dim));
