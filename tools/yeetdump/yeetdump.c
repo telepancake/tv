@@ -370,14 +370,14 @@ static int selftest(void) {
     return 0;
 }
 
-int main(int argc, char **argv) {
+int yeetdump_main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) {
         return selftest();
     }
     if (argc < 2) {
         fprintf(stderr,
-                "usage: yeetdump --selftest\n"
-                "       yeetdump trace.bin [trace.bin ...]\n");
+                "usage: tv dump --selftest\n"
+                "       tv dump trace.bin [trace.bin ...]\n");
         return 2;
     }
     int rc = 0;

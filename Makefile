@@ -8,8 +8,12 @@ SIGN    := $(KDIR)/scripts/sign-file
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv fv sudtrace yeetdump
+all: tv sud-bins
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+.PHONY: sud-bins
+sud-bins:
+	$(MAKE) $(SUD_NATIVE)
 
 # Generate a MOK keypair (one-time).  After this, run:
 #   sudo mokutil --import MOK.der
@@ -54,7 +58,11 @@ DUCKDB_INC := $(DUCKDB_DIR)/src/include
 DUCKDB_OBJ := build/duckdb.o
 
 CXXFLAGS := -std=c++23 -O2 -I. -I$(ZSTD_DIR) -I$(DUCKDB_INC)
+CFLAGS   := -std=c11   -O2 -I. -I$(ZSTD_DIR)
 TV_LIBS := -lm -pthread -ldl $(ZSTD_LIB)
+# Static link works fine even though duckdb pulls in dlopen/getaddrinfo
+# (those code paths exist for extensions / network reads we don't use).
+TV_LDFLAGS := -static
 SUD_CFLAGS  := -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -fomit-frame-pointer -I.
 SUD_LDFLAGS := -nostdlib -static -no-pie -Wl,--build-id=none
 
@@ -72,24 +80,39 @@ SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 $(ZSTD_LIB):
 	$(MAKE) -C $(ZSTD_DIR) libzstd.a
 
+# DuckDB amalgamation is huge. Default to clang -O0 because it's
+# noticeably faster (~2-3 min vs 7+ min with g++ -O2) and uses ~5 GB
+# RAM vs ~14 GB. The resulting .o is ~150 MB but only re-linking is
+# needed when you change tv sources, not the duckdb source. For release
+# builds, override:  make DUCKDB_CXX=g++ DUCKDB_OPT=-O2
+DUCKDB_CXX ?= clang++
+DUCKDB_OPT ?= -O0
+
 # DuckDB is vendored as a single ~25 MB amalgamation file. The amalgamation
-# script is run on demand. The resulting object is ~60 MB and takes ~7 min /
-# ~14 GB RAM to build; subsequent tv recompiles only re-link.
+# script is run on demand.
 $(DUCKDB_CPP): | $(DUCKDB_DIR)/scripts/amalgamation.py
 	cd $(DUCKDB_DIR) && python3 scripts/amalgamation.py
 
 $(DUCKDB_OBJ): $(DUCKDB_CPP)
 	@mkdir -p build
-	$(CXX) -std=c++17 -O2 -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
+	$(DUCKDB_CXX) -std=c++17 $(DUCKDB_OPT) -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
 
-TV_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp wire_in.cpp tv_db.cpp data_source.cpp
+# Single statically-linked tv binary with subcommands. Folds in what
+# used to be separate sudtrace/yeetdump/fv binaries — see main.cpp's
+# subcommand dispatch (sud, dump, fv, module, ptrace, uproctrace, test).
+TV_CXX_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp wire_in.cpp \
+               tv_db.cpp data_source.cpp fv.cpp
+TV_C_SRCS   := sud/sudtrace.c tools/yeetdump/yeetdump.c
+TV_C_OBJS   := $(patsubst %.c,build/%.o,$(TV_C_SRCS))
 TV_HDRS := engine.h wire_in.h tv_db.h data_source.h wire/wire.h $(DUCKDB_HPP)
 
-tv: $(TV_SRCS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
-	$(CXX) $(CXXFLAGS) -o tv $(TV_SRCS) $(DUCKDB_OBJ) $(TV_LIBS)
+build/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
 
-fv: fv.cpp engine.cpp engine.h
-	$(CXX) $(CXXFLAGS) -o fv fv.cpp engine.cpp
+tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
+	$(CXX) $(CXXFLAGS) $(TV_LDFLAGS) -o tv $(TV_CXX_SRCS) $(TV_C_OBJS) \
+	    $(DUCKDB_OBJ) $(TV_LIBS)
 
 sud64: $(SUD_SRCS) sudtrace.lds
 	$(CC) -m64 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x40000000 -T sudtrace.lds -o sud64 $(SUD_SRCS) -lgcc
@@ -97,20 +120,14 @@ sud64: $(SUD_SRCS) sudtrace.lds
 sud32: $(SUD_SRCS) sudtrace.lds
 	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_SRCS) -lgcc
 
-sudtrace: sud/sudtrace.c sud32 sud64 wire/wire.h
-	$(CC) -O2 -I. -static -o sudtrace sud/sudtrace.c
-
-yeetdump: tools/yeetdump/yeetdump.c wire/wire.h
-	$(CC) -std=c99 -O2 -Wall -Wextra -I. -o yeetdump tools/yeetdump/yeetdump.c
-
 .PHONY: wire-test
-wire-test: yeetdump
-	./yeetdump --selftest
+wire-test: tv
+	./tv dump --selftest
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv
-	./tv --test
+	./tv test
 
 clean-bins:
-	rm -f tv fv yeetdump
+	rm -f tv sud32 sud64
 	-$(MAKE) -C $(ZSTD_DIR) clean
