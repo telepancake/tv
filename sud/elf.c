@@ -303,7 +303,7 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
             return args;
 
         char *dup = sud_arena_strdup(a, resolved);
-        if (!dup) return NULL;  /* arena full → caller forwards original */
+        if (!dup) return NULL;  /* arena exhausted → caller returns -ENOMEM */
         args[0] = dup;
 
         char interp[PATH_MAX], interp_arg[256];
