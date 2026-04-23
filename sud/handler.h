@@ -49,6 +49,7 @@ struct kernel_sigaction_raw {
 #define UC_ARG4(uc) ((long)(uc)->uc_mcontext.gregs[REG_R8])
 #define UC_ARG5(uc) ((long)(uc)->uc_mcontext.gregs[REG_R9])
 #define UC_SET_RET(uc, v) ((uc)->uc_mcontext.gregs[REG_RAX] = (v))
+#define UC_PC(uc) ((unsigned long)(uc)->uc_mcontext.gregs[REG_RIP])
 #else
 #define UC_SYSCALL_NR(uc) ((long)(uc)->uc_mcontext.gregs[REG_EAX])
 #define UC_ARG0(uc) ((long)(uc)->uc_mcontext.gregs[REG_EBX])
@@ -58,7 +59,33 @@ struct kernel_sigaction_raw {
 #define UC_ARG4(uc) ((long)(uc)->uc_mcontext.gregs[REG_EDI])
 #define UC_ARG5(uc) ((long)(uc)->uc_mcontext.gregs[REG_EBP])
 #define UC_SET_RET(uc, v) ((uc)->uc_mcontext.gregs[REG_EAX] = (v))
+#define UC_PC(uc) ((unsigned long)(uc)->uc_mcontext.gregs[REG_EIP])
 #endif
+
+/* ================================================================
+ * Recent-syscalls ring buffer — dumped by the SIGSEGV/SIGBUS crash
+ * diagnostic so the post-mortem shows what the program was doing
+ * when it crashed. Per-tid lock-free single-writer (each tid only
+ * writes its own SIGSYS handler) so the log is coherent without
+ * locking; the crash dumper accepts that concurrent writers from
+ * other threads may interleave.
+ * ================================================================ */
+#define SUD_SYSLOG_SIZE 32   /* power of two */
+struct sud_syslog_entry {
+    long nr;          /* syscall number; -1 = unused slot */
+    unsigned long pc; /* PC saved in ucontext at SIGSYS entry */
+    long ret;         /* syscall return (negative = -errno); LONG_MIN = no-ret */
+    int  tid;         /* kernel tid that recorded this entry */
+};
+
+extern struct sud_syslog_entry g_sud_syslog[SUD_SYSLOG_SIZE];
+extern volatile unsigned int g_sud_syslog_head;
+
+/* Sentinel for entries whose handler hasn't yet completed (so the
+ * syscall return value is unknown). Any real -errno is > -4096, and
+ * any positive return is bounded by typical sizes; this value is a
+ * deliberately rare bit pattern that cannot occur as a real return. */
+#define SUD_SYSLOG_NORETURN ((long)0xDEADBEEFCAFEBABEULL)
 
 /* ================================================================
  * Function declarations

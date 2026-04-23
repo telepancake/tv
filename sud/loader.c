@@ -18,170 +18,362 @@
  * crash_diagnostic_handler — SIGSEGV handler for debugging.
  *
  * When the loaded binary crashes, this handler prints the faulting address,
- * instruction pointer, and register state to stderr.  This output helps
- * diagnose ELF loader issues (wrong segment mapping, bad auxv, etc.)
- * without needing an external debugger.
+ * instruction pointer, register state, and a memory/stack/syscall window to
+ * stderr.  This output helps diagnose ELF loader issues (wrong segment
+ * mapping, bad auxv, etc.) without needing an external debugger.
  *
  * The handler uses only raw_write (via write to fd 2) which is async-signal-safe.
  */
-static void fmt_hex_long(char *buf, unsigned long val)
+
+/*
+ * crash_diagnostic_handler — SIGSEGV/SIGBUS handler that dumps everything
+ * needed to diagnose a crash in a stripped production build:
+ *
+ *   - Signal name, si_code (SI_KERNEL vs SEGV_MAPERR/ACCERR vs BUS_*)
+ *   - Fault address (si_addr) and PID/TID
+ *   - Full GPRs and segment registers
+ *   - 64 bytes around the faulting IP, read via /proc/self/mem so an
+ *     unmapped IP doesn't recursively SEGV the dumper
+ *   - 16 stack words at and above the faulting SP
+ *   - Thread count (entries in /proc/self/task)
+ *   - Last ~16 syscalls dispatched by the SUD handler with PC + return,
+ *     so we can see what the program was doing leading up to the fault
+ *   - /proc/self/maps so RIP/fault addr can be resolved to a module
+ *     without rebuilding with the same toolchain
+ *
+ * Async-signal-safe: only uses raw_syscall6, no malloc/printf/locale.
+ */
+
+/* Append a NUL-terminated string. */
+static int append_str(char *buf, int pos, int max, const char *s)
 {
-    static const char hex[] = "0123456789abcdef";
-    for (int i = (int)(sizeof(unsigned long) * 2 - 1); i >= 0; i--) {
-        buf[i] = hex[val & 0xf];
-        val >>= 4;
-    }
-    buf[sizeof(unsigned long) * 2] = '\0';
+    while (*s && pos < max) buf[pos++] = *s++;
+    return pos;
 }
 
-static void fmt_int_dec(char *buf, int *len, int val)
+/* Append a single char. */
+static int append_ch(char *buf, int pos, int max, char c)
 {
-    char tmp[12];
-    int neg = val < 0;
-    unsigned int u = neg ? (unsigned int)(-val) : (unsigned int)val;
-    int i = 0;
-    do { tmp[i++] = '0' + (u % 10); u /= 10; } while (u);
-    if (neg) tmp[i++] = '-';
-    *len = i;
-    for (int j = 0; j < i; j++) buf[j] = tmp[i - 1 - j];
+    if (pos < max) buf[pos++] = c;
+    return pos;
 }
+
+/* Append a fixed-width hex value (digits chars). */
+static int append_hex_w(char *buf, int pos, int max,
+                       unsigned long val, int digits)
+{
+    static const char hx[] = "0123456789abcdef";
+    if (pos + digits > max) return pos;
+    for (int i = digits - 1; i >= 0; i--) {
+        buf[pos + i] = hx[val & 0xf];
+        val >>= 4;
+    }
+    return pos + digits;
+}
+
+/* Append a decimal value (signed). */
+static int append_dec(char *buf, int pos, int max, long val)
+{
+    char tmp[24];
+    int neg = val < 0, n = 0;
+    unsigned long u = neg ? (unsigned long)(-val) : (unsigned long)val;
+    do { tmp[n++] = '0' + (u % 10); u /= 10; } while (u);
+    if (neg && pos < max) buf[pos++] = '-';
+    for (int i = 0; i < n && pos < max; i++) buf[pos++] = tmp[n - 1 - i];
+    return pos;
+}
+
+/* Width of a pointer in hex digits for the running architecture. */
+#define PTR_HEX (int)(sizeof(unsigned long) * 2)
+
+static int append_ptr(char *buf, int pos, int max, unsigned long val)
+{
+    pos = append_str(buf, pos, max, "0x");
+    return append_hex_w(buf, pos, max, val, PTR_HEX);
+}
+
+/* Flush partial buffer to stderr and reset. */
+static int flush_buf(char *buf, int *pos)
+{
+    if (*pos > 0) raw_write(2, buf, (size_t)*pos);
+    *pos = 0;
+    return 0;
+}
+
+/* pread of /proc/self/mem with a full unsigned 64-bit offset. The
+ * raw_pread() helper takes off_t which is signed 32-bit on i386; an
+ * address above 2 GiB (typical libc/altstack range) would sign-extend
+ * to a negative 64-bit offset and the kernel returns -EINVAL. */
+static ssize_t pread_addr(int fd, void *buf, size_t count, unsigned long addr)
+{
+#if defined(__x86_64__)
+    return (ssize_t)raw_syscall6(SYS_pread64, fd, (long)buf, count,
+                                 (long)addr, 0, 0);
+#else
+    unsigned long long off = (unsigned long long)addr;
+    return (ssize_t)raw_syscall6(SYS_pread64, fd, (long)buf, count,
+                                 (uint32_t)off, (uint32_t)(off >> 32), 0);
+#endif
+}
+
+/* Dump 16-byte hex+ASCII rows of `len` bytes starting at `base`,
+ * read via /proc/self/mem so an unmapped page returns -EIO/-EFAULT
+ * rather than crashing the dumper. mem_fd may be -1 (skip dump). */
+static void dump_mem(char *buf, int *pos, int max, int mem_fd,
+                     unsigned long base, size_t len, const char *label)
+{
+    *pos = append_str(buf, *pos, max, "  ");
+    *pos = append_str(buf, *pos, max, label);
+    *pos = append_str(buf, *pos, max, " @ ");
+    *pos = append_ptr(buf, *pos, max, base);
+    *pos = append_ch(buf, *pos, max, '\n');
+    if (mem_fd < 0) {
+        *pos = append_str(buf, *pos, max,
+                          "    (cannot open /proc/self/mem)\n");
+        return;
+    }
+    unsigned char row[16];
+    for (size_t off = 0; off < len; off += 16) {
+        if (max - *pos < 80) flush_buf(buf, pos);
+        ssize_t n = pread_addr(mem_fd, row, 16, base + off);
+        *pos = append_str(buf, *pos, max, "    ");
+        *pos = append_ptr(buf, *pos, max, base + off);
+        *pos = append_str(buf, *pos, max, ": ");
+        if (n <= 0) {
+            *pos = append_str(buf, *pos, max, "<unreadable>\n");
+            continue;
+        }
+        for (ssize_t i = 0; i < n; i++) {
+            *pos = append_hex_w(buf, *pos, max, row[i], 2);
+            *pos = append_ch(buf, *pos, max, ' ');
+        }
+        for (ssize_t i = n; i < 16; i++)
+            *pos = append_str(buf, *pos, max, "   ");
+        *pos = append_ch(buf, *pos, max, '|');
+        for (ssize_t i = 0; i < n; i++) {
+            char c = (row[i] >= 0x20 && row[i] < 0x7f) ? (char)row[i] : '.';
+            *pos = append_ch(buf, *pos, max, c);
+        }
+        *pos = append_str(buf, *pos, max, "|\n");
+    }
+}
+
+/* Count entries (excluding . and ..) in a directory via getdents64.
+ * Returns -1 on open failure. */
+static int count_dir_entries(const char *path)
+{
+    int fd = raw_open(path, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return -1;
+    char buf[4096];
+    int count = 0;
+    for (;;) {
+        long n = raw_getdents64(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        long off = 0;
+        while (off < n) {
+            /* dirent64: ino(8) off(8) reclen(2) type(1) name[] */
+            unsigned short reclen = *(unsigned short *)(buf + off + 16);
+            const char *name = buf + off + 19;
+            if (!(name[0] == '.' &&
+                  (name[1] == '\0' ||
+                   (name[1] == '.' && name[2] == '\0'))))
+                count++;
+            if (reclen == 0) break;
+            off += reclen;
+        }
+    }
+    raw_close(fd);
+    return count;
+}
+
+/* Copy the contents of /proc/self/maps to fd 2 in chunks. */
+static void dump_maps(void)
+{
+    int fd = raw_open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) {
+        const char m[] = "  /proc/self/maps: <unreadable>\n";
+        raw_write(2, m, sizeof(m) - 1);
+        return;
+    }
+    const char hdr[] = "  /proc/self/maps:\n";
+    raw_write(2, hdr, sizeof(hdr) - 1);
+    char buf[4096];
+    for (;;) {
+        ssize_t n = raw_read(fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        raw_write(2, buf, (size_t)n);
+    }
+    raw_close(fd);
+}
+
+/* Dump the recent-syscalls ring. We print up to SUD_SYSLOG_SIZE
+ * most-recent entries, oldest-first. */
+static void dump_syslog(char *buf, int *pos, int max)
+{
+    *pos = append_str(buf, *pos, max, "  Recent syscalls (oldest first):\n");
+    unsigned int head = __atomic_load_n(&g_sud_syslog_head, __ATOMIC_RELAXED);
+    /* If head < SIZE we have head valid entries; otherwise SIZE. */
+    unsigned int n = head < SUD_SYSLOG_SIZE ? head : SUD_SYSLOG_SIZE;
+    unsigned int start = head - n;
+    for (unsigned int i = 0; i < n; i++) {
+        if (max - *pos < 96) flush_buf(buf, pos);
+        unsigned int idx = (start + i) & (SUD_SYSLOG_SIZE - 1);
+        struct sud_syslog_entry e = g_sud_syslog[idx];
+        if (e.nr < 0) continue;  /* never-written slot */
+        *pos = append_str(buf, *pos, max, "    [");
+        *pos = append_dec(buf, *pos, max, (long)i);
+        *pos = append_str(buf, *pos, max, "] tid=");
+        *pos = append_dec(buf, *pos, max, (long)e.tid);
+        *pos = append_str(buf, *pos, max, " nr=");
+        *pos = append_dec(buf, *pos, max, e.nr);
+        *pos = append_str(buf, *pos, max, " pc=");
+        *pos = append_ptr(buf, *pos, max, e.pc);
+        *pos = append_str(buf, *pos, max, " ret=");
+        if (e.ret == SUD_SYSLOG_NORETURN)
+            *pos = append_str(buf, *pos, max, "<in-progress>");
+        else
+            *pos = append_dec(buf, *pos, max, e.ret);
+        *pos = append_ch(buf, *pos, max, '\n');
+    }
+}
+
+/* Recursion guard: if the diagnostic handler itself faults, _exit. */
+static volatile int g_in_crash_dumper = 0;
 
 static void crash_diagnostic_handler(int sig, siginfo_t *info, void *uctx_raw)
 {
+    /* If the dumper itself crashed (e.g. /proc/self/mem read of a bad
+     * stack address recursively faulted), bail out immediately. */
+    if (__atomic_exchange_n(&g_in_crash_dumper, 1, __ATOMIC_ACQ_REL)) {
+        _exit(128 + sig);
+    }
+
     ucontext_t *uc = (ucontext_t *)uctx_raw;
-    char msg[768];
+    char buf[4096];
     int pos = 0;
-    char hex[sizeof(unsigned long) * 2 + 1];
+    const int max = (int)sizeof(buf);
 
-    /* Header with signal name */
-    {
-        const char hdr[] = "\nsudtrace: CRASH DIAGNOSTIC\n  Signal: ";
-        memcpy(msg + pos, hdr, sizeof(hdr) - 1);
-        pos += sizeof(hdr) - 1;
-        const char *name = (sig == SIGSEGV) ? "SIGSEGV" : "SIGBUS";
-        int nlen = (sig == SIGSEGV) ? 7 : 6;
-        memcpy(msg + pos, name, nlen); pos += nlen;
-        msg[pos++] = '\n';
+    /* Header */
+    pos = append_str(buf, pos, max,
+                     "\nsudtrace: CRASH DIAGNOSTIC\n  Signal: ");
+    pos = append_str(buf, pos, max,
+                     sig == SIGSEGV ? "SIGSEGV" :
+                     sig == SIGBUS  ? "SIGBUS"  : "?");
+    pos = append_ch(buf, pos, max, '\n');
+
+    /* si_code */
+    pos = append_str(buf, pos, max, "  si_code: ");
+    pos = append_dec(buf, pos, max, info->si_code);
+    if (info->si_code == SI_KERNEL)
+        pos = append_str(buf, pos, max, " (SI_KERNEL)");
+    else if (sig == SIGSEGV) {
+        if (info->si_code == 1) pos = append_str(buf, pos, max, " (SEGV_MAPERR)");
+        else if (info->si_code == 2) pos = append_str(buf, pos, max, " (SEGV_ACCERR)");
     }
+    pos = append_ch(buf, pos, max, '\n');
 
-    /* si_code — critical for distinguishing SI_KERNEL from SEGV_MAPERR etc. */
-    {
-        const char s[] = "  si_code: ";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        int dlen;
-        fmt_int_dec(msg + pos, &dlen, info->si_code);
-        pos += dlen;
-        if (info->si_code == SI_KERNEL) {
-            const char t[] = " (SI_KERNEL)";
-            memcpy(msg + pos, t, sizeof(t) - 1); pos += sizeof(t) - 1;
-        }
-        msg[pos++] = '\n';
-    }
+    /* PID/TID + fault addr */
+    pos = append_str(buf, pos, max, "  pid=");
+    pos = append_dec(buf, pos, max,
+                     raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0));
+    pos = append_str(buf, pos, max, " tid=");
+    pos = append_dec(buf, pos, max, raw_gettid());
+    pos = append_str(buf, pos, max, " threads=");
+    pos = append_dec(buf, pos, max, count_dir_entries("/proc/self/task"));
+    pos = append_ch(buf, pos, max, '\n');
 
-    /* Fault address (si_addr) */
-    {
-        const char s[] = "  Fault addr: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)info->si_addr);
-        memcpy(msg + pos, hex, sizeof(unsigned long) * 2);
-        pos += sizeof(unsigned long) * 2;
-        msg[pos++] = '\n';
-    }
+    pos = append_str(buf, pos, max, "  Fault addr: ");
+    pos = append_ptr(buf, pos, max, (unsigned long)info->si_addr);
+    pos = append_ch(buf, pos, max, '\n');
 
+    /* Registers — full GPR + segment dump */
 #if defined(__x86_64__)
-    {
-        const char s[] = "  RIP: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        unsigned long rip = (unsigned long)uc->uc_mcontext.gregs[REG_RIP];
-        for (int i = 15; i >= 0; i--) {
-            hex[i] = "0123456789abcdef"[rip & 0xf]; rip >>= 4;
+    static const struct { const char *name; int idx; } gp[] = {
+        {"RIP", REG_RIP}, {"RSP", REG_RSP}, {"RBP", REG_RBP},
+        {"RAX", REG_RAX}, {"RBX", REG_RBX}, {"RCX", REG_RCX}, {"RDX", REG_RDX},
+        {"RDI", REG_RDI}, {"RSI", REG_RSI},
+        {"R8 ", REG_R8 }, {"R9 ", REG_R9 }, {"R10", REG_R10}, {"R11", REG_R11},
+        {"R12", REG_R12}, {"R13", REG_R13}, {"R14", REG_R14}, {"R15", REG_R15},
+    };
+    for (unsigned i = 0; i < sizeof(gp)/sizeof(gp[0]); i++) {
+        if ((i & 3) == 0) {
+            if (i) pos = append_ch(buf, pos, max, '\n');
+            pos = append_str(buf, pos, max, "  ");
+        } else {
+            pos = append_ch(buf, pos, max, ' ');
         }
-        memcpy(msg + pos, hex, 16); pos += 16;
-        msg[pos++] = '\n';
+        pos = append_str(buf, pos, max, gp[i].name);
+        pos = append_ch(buf, pos, max, '=');
+        pos = append_ptr(buf, pos, max,
+                         (unsigned long)uc->uc_mcontext.gregs[gp[i].idx]);
     }
-    {
-        const char s[] = "  RSP: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        unsigned long rsp = (unsigned long)uc->uc_mcontext.gregs[REG_RSP];
-        for (int i = 15; i >= 0; i--) {
-            hex[i] = "0123456789abcdef"[rsp & 0xf]; rsp >>= 4;
-        }
-        memcpy(msg + pos, hex, 16); pos += 16;
-        msg[pos++] = '\n';
-    }
+    pos = append_ch(buf, pos, max, '\n');
+    unsigned long pc_ul = (unsigned long)uc->uc_mcontext.gregs[REG_RIP];
+    unsigned long sp_ul = (unsigned long)uc->uc_mcontext.gregs[REG_RSP];
 #else
-    /* i386 registers */
-    {
-        const char s[] = "  EIP: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EIP]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        msg[pos++] = '\n';
+    static const struct { const char *name; int idx; } gp[] = {
+        {"EIP", REG_EIP}, {"ESP", REG_ESP}, {"EBP", REG_EBP},
+        {"EAX", REG_EAX}, {"EBX", REG_EBX}, {"ECX", REG_ECX}, {"EDX", REG_EDX},
+        {"ESI", REG_ESI}, {"EDI", REG_EDI},
+        {"GS ", REG_GS }, {"FS ", REG_FS }, {"ES ", REG_ES }, {"DS ", REG_DS },
+    };
+    for (unsigned i = 0; i < sizeof(gp)/sizeof(gp[0]); i++) {
+        if ((i & 3) == 0) {
+            if (i) pos = append_ch(buf, pos, max, '\n');
+            pos = append_str(buf, pos, max, "  ");
+        } else {
+            pos = append_ch(buf, pos, max, ' ');
+        }
+        pos = append_str(buf, pos, max, gp[i].name);
+        pos = append_ch(buf, pos, max, '=');
+        pos = append_ptr(buf, pos, max,
+                         (unsigned long)uc->uc_mcontext.gregs[gp[i].idx]);
     }
-    {
-        const char s[] = "  ESP: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_ESP]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        msg[pos++] = '\n';
-    }
-    {
-        const char s[] = "  EAX: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EAX]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        const char s2[] = "  EBX: 0x";
-        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EBX]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        msg[pos++] = '\n';
-    }
-    {
-        const char s[] = "  ECX: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_ECX]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        const char s2[] = "  EDX: 0x";
-        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EDX]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        msg[pos++] = '\n';
-    }
-    {
-        const char s[] = "  ESI: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_ESI]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        const char s2[] = "  EDI: 0x";
-        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EDI]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        msg[pos++] = '\n';
-    }
-    {
-        const char s[] = "  EBP: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_EBP]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        msg[pos++] = '\n';
-    }
-    /* Segment registers — SI_KERNEL often means a bad segment value */
-    {
-        const char s[] = "  GS: 0x";
-        memcpy(msg + pos, s, sizeof(s) - 1); pos += sizeof(s) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_GS]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        const char s2[] = "  FS: 0x";
-        memcpy(msg + pos, s2, sizeof(s2) - 1); pos += sizeof(s2) - 1;
-        fmt_hex_long(hex, (unsigned long)uc->uc_mcontext.gregs[REG_FS]);
-        memcpy(msg + pos, hex, 8); pos += 8;
-        msg[pos++] = '\n';
-    }
+    pos = append_ch(buf, pos, max, '\n');
+    /* CS/SS aren't named in the i386 REG_ enum; their gregs indices
+     * are 15 and 18 (see sud/libc.h). */
+    pos = append_str(buf, pos, max, "  CS=");
+    pos = append_ptr(buf, pos, max,
+                     (unsigned long)uc->uc_mcontext.gregs[15]);
+    pos = append_str(buf, pos, max, " SS=");
+    pos = append_ptr(buf, pos, max,
+                     (unsigned long)uc->uc_mcontext.gregs[18]);
+    pos = append_ch(buf, pos, max, '\n');
+    unsigned long pc_ul = (unsigned long)uc->uc_mcontext.gregs[REG_EIP];
+    unsigned long sp_ul = (unsigned long)uc->uc_mcontext.gregs[REG_ESP];
 #endif
 
-    raw_write(2, msg, pos);
+    flush_buf(buf, &pos);
 
-    /* Re-raise with default handler to get core dump */
+    /* Open /proc/self/mem for safe pointer reads. */
+    int mem_fd = raw_open("/proc/self/mem", O_RDONLY);
+
+    /* Bytes around the faulting instruction — 16 before, 48 after.
+     * On most x86 mispredictions/jumps the offending instruction is at
+     * RIP itself; reading a small window before helps when it's the
+     * tail of a longer instruction or when RIP landed mid-prologue. */
+    {
+        unsigned long start = pc_ul >= 16 ? pc_ul - 16 : 0;
+        dump_mem(buf, &pos, max, mem_fd, start, 64, "Code window");
+    }
+    flush_buf(buf, &pos);
+
+    /* Stack window — the next few qwords/dwords at RSP. */
+    dump_mem(buf, &pos, max, mem_fd, sp_ul,
+             16 * sizeof(unsigned long), "Stack window");
+    flush_buf(buf, &pos);
+
+    if (mem_fd >= 0) raw_close(mem_fd);
+
+    /* Recent syscalls dispatched by the SUD handler. */
+    dump_syslog(buf, &pos, max);
+    flush_buf(buf, &pos);
+
+    /* Process memory map — last so it doesn't push everything else
+     * off-screen if the user's terminal scrollback is small. */
+    dump_maps();
+
+    /* Re-raise with default handler to get a core dump. */
     {
         struct kernel_sigaction_raw dfl;
         memset(&dfl, 0, sizeof(dfl));
