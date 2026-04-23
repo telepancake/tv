@@ -298,9 +298,14 @@ void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
     sigsys_handler_inner(sig, info, uctx_raw);
 
     /* Record the final return value the handler placed into the ucontext.
-     * For execve(2) on success this is unreachable (kernel never returns),
-     * which is fine — the slot stays NORETURN and the dumper labels it. */
-    g_sud_syslog[slot].ret = (long)UC_SYSCALL_NR(uc);  /* EAX/RAX overwritten by UC_SET_RET */
+     * The inner handler ends with `UC_SET_RET(uc, ret)` which writes the
+     * syscall return into REG_RAX/REG_EAX — i.e. into the same gregs slot
+     * that originally held the syscall number. So reading UC_SYSCALL_NR
+     * here yields the return value, not the syscall number we entered with.
+     * For execve(2) on success this code is unreachable (kernel never
+     * returns to us), and the slot stays NORETURN — which the dumper
+     * labels as `<in-progress>`. */
+    g_sud_syslog[slot].ret = (long)UC_SYSCALL_NR(uc);
 }
 
 static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
