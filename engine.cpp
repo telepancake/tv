@@ -258,10 +258,7 @@ static int p_count_pinned(const Panel *p) {
     int n = 0;
     while (n < p->row_count) {
         const auto &r = p->rows[n];
-        if (r.id.size() < 5 ||
-            r.id[0] != '_' || r.id[1] != '_' ||
-            r.id[2] != 'h' || r.id[3] != 'a' || r.id[4] != 't')
-            break;
+        if (r.id.compare(0, 5, "__hat") != 0) break;
         n++;
     }
     return n;
