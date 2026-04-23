@@ -441,6 +441,33 @@ void load_and_run_elf(const char *path, int argc, char **argv,
         }
     }
 
+    /* Set up an alternate signal stack *before* installing SIGSYS.
+     *
+     * SIGSYS fires for every syscall the traced program makes (SUD's
+     * whole point), and the handler does non-trivial work — easily a
+     * few KiB of stack frame on i386 once nested raw_syscall6 calls,
+     * tracing emits and the diagnostic path are accounted for. The
+     * default of running on the program's own stack overflows or
+     * corrupts the program's segment state on 32-bit (the kernel
+     * reports it as SI_KERNEL SIGSEGV at iret).
+     *
+     * Size it large enough for several nested SIGSYS deliveries
+     * (signal handlers re-using the same alt stack don't get a fresh
+     * region — the stack pointer just keeps walking down). A single
+     * generous mapping is shared with the SIGSEGV/SIGBUS diagnostic
+     * handler set up later. */
+#define SUD_ALTSTACK_SIZE (256 * 1024)
+    void *altstack = mmap(NULL, SUD_ALTSTACK_SIZE,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (altstack != MAP_FAILED) {
+        struct { void *ss_sp; int ss_flags; size_t ss_size; } ss;
+        ss.ss_sp    = altstack;
+        ss.ss_flags = 0;
+        ss.ss_size  = SUD_ALTSTACK_SIZE;
+        raw_syscall6(SYS_sigaltstack, (long)&ss, 0, 0, 0, 0, 0);
+    }
+
     /* Install SIGSYS handler */
     install_sigsys_handler_raw();
 
@@ -622,24 +649,12 @@ void load_and_run_elf(const char *path, int argc, char **argv,
      *
      * SA_ONSTACK: use an alternate signal stack so the handler can run
      * even when the main stack is corrupted (which is common for
-     * SI_KERNEL crashes where iret fails due to bad segment state). */
+     * SI_KERNEL crashes where iret fails due to bad segment state).
+     *
+     * Note: the alt sigstack is set up earlier (before SUD is enabled,
+     * for the SIGSYS handler) and is generously sized; SIGSEGV/SIGBUS
+     * happen rarely enough that sharing it is fine. */
     {
-#define DIAG_ALTSTACK_SIZE 16384
-        /* Set up an alternate signal stack. */
-        void *altstack = mmap(NULL, DIAG_ALTSTACK_SIZE,
-                              PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS,
-                              -1, 0);
-        if (altstack != MAP_FAILED) {
-            /* sigaltstack expects a stack_t: { void *ss_sp; int ss_flags; size_t ss_size } */
-            struct { void *ss_sp; int ss_flags; size_t ss_size; } ss;
-            ss.ss_sp = altstack;
-            ss.ss_flags = 0;
-            ss.ss_size = DIAG_ALTSTACK_SIZE;
-            raw_syscall6(SYS_sigaltstack, (long)&ss, 0, 0, 0, 0, 0);
-        }
-#undef DIAG_ALTSTACK_SIZE
-
         struct kernel_sigaction_raw segv_sa;
         memset(&segv_sa, 0, sizeof(segv_sa));
         segv_sa.handler = (void (*)(int))crash_diagnostic_handler;

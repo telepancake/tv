@@ -245,6 +245,28 @@ static void p_ensure_rows(Tui::Impl *m, Panel *p, int need) {
 }
 
 
+/* Count leading rows that are pinned-hat rows (id begins with
+ * "__hat"). These render at the top of the panel and stay visible
+ * while the rest of the rows scroll underneath, so the user always
+ * sees the hat — the common ancestor or path prefix that summarises
+ * what they're scrolling through — even after they've scrolled past
+ * the natural top of the list.
+ *
+ * Only "__hat..." rows pin; other synthetic rows (e.g. "__hint",
+ * "__empty", "__err") scroll like normal rows. */
+static int p_count_pinned(const Panel *p) {
+    int n = 0;
+    while (n < p->row_count) {
+        const auto &r = p->rows[n];
+        if (r.id.size() < 5 ||
+            r.id[0] != '_' || r.id[1] != '_' ||
+            r.id[2] != 'h' || r.id[3] != 'a' || r.id[4] != 't')
+            break;
+        n++;
+    }
+    return n;
+}
+
 static void p_clamp(Tui::Impl *m, Panel *p) {
     /* Ensure we have enough rows for the cursor position. */
     if (p->cursor > 0)
@@ -259,6 +281,13 @@ static void p_clamp(Tui::Impl *m, Panel *p) {
     if (p->cursor < 0) p->cursor = 0;
     int vh = p->h - (p->def.title ? 1 : 0);
     if (vh < 1) vh = 1;
+    /* Reserve space for pinned hat rows at the top of the panel so
+     * the cursor doesn't get hidden behind them when scrolled past
+     * the natural top. p_count_pinned() returns 0 when there are no
+     * hat rows, so this is a no-op for views that don't have a hat. */
+    int pinned = p_count_pinned(p);
+    if (pinned > 0 && vh > pinned + 1)
+        vh -= pinned;
     if (p->cursor < p->scroll) p->scroll = p->cursor;
     if (p->cursor >= p->scroll + vh) p->scroll = p->cursor - vh + 1;
     if (p->scroll < 0) p->scroll = 0;
@@ -458,7 +487,30 @@ static void render_panel(Tui::Impl *m, Panel *p) {
     resolve_col_widths(d, pw, cw);
     int nc = std::min(d->ncols, PANEL_NCOLS_MAX);
     int row = 0;
-    for (int rn = p->scroll; row < ch; rn++, row++) {
+    /* Render pinned hat rows at the top when the user has scrolled
+     * past them; this keeps the path/ancestor summary visible while
+     * the rest of the list scrolls underneath. When p->scroll <= the
+     * number of hat rows, the natural in-stream rendering already
+     * shows them at the right place, so no special-casing is needed. */
+    int pinned = p_count_pinned(p);
+    int rn = p->scroll;
+    if (pinned > 0 && p->scroll > pinned) {
+        for (int hi = 0; hi < pinned && row < ch; hi++, row++) {
+            int sr = cy + row + 1, sc = p->x + 1;
+            if (d->flags & TUI_PANEL_BORDER) sc++;
+            sf(m, "\x1b[%d;%dH", sr, sc);
+            auto &r = p->rows[hi];
+            sp(m, style_ansi(r.style));
+            for (int c = 0; c < nc; c++) {
+                const char *cell = (c < static_cast<int>(r.cols.size())) ? r.cols[c].c_str() : "";
+                sput_field(m, cell, cw[c], d->cols[c].align, d->cols[c].overflow);
+            }
+            sp(m, "\x1b[0m");
+        }
+        /* p->scroll already skips the hat rows we just pinned (it's
+         * > pinned), so rn = p->scroll continues with content rows. */
+    }
+    for (; row < ch; rn++, row++) {
         int sr = cy + row + 1, sc = p->x + 1;
         if (d->flags & TUI_PANEL_BORDER) sc++;
         sf(m, "\x1b[%d;%dH", sr, sc);
