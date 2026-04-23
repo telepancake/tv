@@ -42,7 +42,7 @@ static void die(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, "sud_stress: ", ap);
+    fputs("sud_stress: ", stderr);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
@@ -158,13 +158,16 @@ static int t_shebang_chain(int depth, const char *tmpdir)
     for (int i = 0; i < depth; i++) {
         char path[512];
         snprintf(path, sizeof(path), "%s/sb_%d.sh", tmpdir, i);
-        FILE *f = fopen(path, "w");
-        if (!f) die("fopen %s", path);
+        /* Open with mode 0755 directly to avoid a TOCTOU race between
+         * fopen() and chmod() (CodeQL cpp/toctou-race-condition). */
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        if (fd < 0) die("open %s", path);
+        FILE *f = fdopen(fd, "w");
+        if (!f) { close(fd); die("fdopen %s", path); }
         /* Each script execs the next via shebang, with a few padding
          * args to keep the arena under pressure. */
         fprintf(f, "#!%s\nexit 0\n", prev);
         fclose(f);
-        chmod(path, 0755);
         snprintf(prev, sizeof(prev), "%s", path);
     }
 

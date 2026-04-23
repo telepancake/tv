@@ -5,6 +5,7 @@ proctrace.ko
 tv_sql.h
 gen_sql_h
 build/
+tests/sud_stress
 deps/duckdb/src/amalgamation/
 # kernel module build artifacts
 *.o
