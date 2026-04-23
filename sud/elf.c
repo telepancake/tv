@@ -275,23 +275,28 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
     int nargs = 0;
     for (int i = 0; i < orig_argc; i++) {
         char *dup = sud_arena_strdup(a, orig_argv[i]);
-        /* Arena exhaustion: signal caller to forward the original execve
-         * unchanged so the program is not broken by sud's per-handler
-         * 64 KiB arena.  Without this, mid-vector NULLs end up in argv
-         * and the kernel either truncates the vector early or rejects
-         * the call (the user reported this as silent build failures
-         * that work fine without sud). */
+        /* sud_arena_strdup(NULL) returns NULL legitimately (preserving
+         * a NULL slot in the source argv). Distinguish that from arena
+         * exhaustion: only the latter (non-NULL src → NULL dup) is a
+         * failure that requires falling back to forwarding the
+         * original execve unchanged. Without this, mid-vector NULLs
+         * end up in argv and the kernel either truncates the vector
+         * early or rejects the call (the user reported this as silent
+         * build failures that work fine without sud). */
         if (orig_argv[i] && !dup) return NULL;
         args[nargs++] = dup;
     }
     args[nargs] = NULL;
 
-    /* If the caller didn't give us a usable argv[0] (e.g. execve(NULL,...)
-     * the kernel will reject), there's nothing for us to resolve and
-     * shebang/ELF-classify. Hand the original argv back so the syscall
-     * forwards as-is and lets the kernel produce -EFAULT/-ENOENT. */
+    /* If after the strdup loop we still don't have a usable argv[0]
+     * (e.g. the caller passed an empty argv, or argv[0] is the empty
+     * string), there is nothing to resolve or shebang-classify. Return
+     * NULL so the caller forwards the original execve unchanged — the
+     * kernel will then produce its canonical -EFAULT/-ENOENT. This is
+     * consistent with the "NULL means forward original" convention
+     * established for arena exhaustion above. */
     if (nargs == 0 || !args[0] || !args[0][0])
-        return args;
+        return NULL;
 
     int drop_count = 0;
 
