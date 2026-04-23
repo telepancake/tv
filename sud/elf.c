@@ -153,6 +153,13 @@ int check_elf_dynamic(const char *path, char *interp, int interp_sz,
 
 int resolve_path(const char *cmd, char *out, int out_sz)
 {
+    /* Defensive: traced programs can reach the SIGSYS execve handler with
+     * a NULL or empty filename (e.g. execve(NULL, argv, envp), or an argv
+     * whose first slot is NULL after sud_arena_strdup of a NULL fn). The
+     * kernel would normally answer -EFAULT/-ENOENT; we must not crash
+     * trying to dereference cmd[0] before forwarding the syscall. */
+    if (!cmd || !cmd[0] || out_sz <= 0) return 0;
+
     if (cmd[0] == '/' || cmd[0] == '.') {
         size_t clen = strlen(cmd);
         if (clen >= (size_t)out_sz) clen = (size_t)out_sz - 1;
@@ -269,6 +276,13 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
     for (int i = 0; i < orig_argc; i++)
         args[nargs++] = sud_arena_strdup(a, orig_argv[i]);
     args[nargs] = NULL;
+
+    /* If the caller didn't give us a usable argv[0] (e.g. execve(NULL,...)
+     * the kernel will reject), there's nothing for us to resolve and
+     * shebang/ELF-classify. Hand the original argv back so the syscall
+     * forwards as-is and lets the kernel produce -EFAULT/-ENOENT. */
+    if (nargs == 0 || !args[0] || !args[0][0])
+        return args;
 
     int drop_count = 0;
 
