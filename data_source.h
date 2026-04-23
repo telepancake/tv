@@ -68,9 +68,19 @@ public:
     };
     PanelLayout lpane_layout() const;
     PanelLayout rpane_layout() const;
-    /* Convenience: push both layouts to the engine. Call after every
-     * mode change so cols/title match the new mode's row shape. */
+    PanelLayout hat_layout() const;   /* shared by both hat panels */
+    /* Convenience: push lpane/rpane layouts to the engine. Call after
+     * every mode change so cols/title match the new mode's row shape.
+     * Hat panels have a single full-width column in every mode. */
     void apply_layout(class Tui &tui, int lpane, int rpane) const;
+    void apply_hat_layout(class Tui &tui, int hat_top, int hat_bot) const;
+
+    /* Number of rows the hat panes will produce for the current state.
+     * Used by the app to size the hat boxes (weight=0, min_size=N) so
+     * that an empty hat takes zero screen rows. Both helpers build
+     * lazily on first call after invalidate(). */
+    int hat_top_row_count();
+    int hat_bot_row_count();
 
 private:
     void row_begin(int panel);
@@ -79,6 +89,7 @@ private:
 
     void rebuild_lpane();
     void rebuild_rpane();
+    void ensure_hats_built(); /* rebuild stale hat caches */
 
     /* Mode-specific lpane builders. */
     void lpane_outputs();             /* mode 0: stdout/stderr stream */
@@ -87,13 +98,11 @@ private:
     void lpane_events();
     void lpane_deps(int reverse);     /* 0=deps, 1=rdeps */
     void lpane_dep_cmds(int reverse); /* 0=dcmds, 1=rcmds */
-    /* Common-prefix "hat" row(s) inserted at the top of list views
-     * when all visible rows share a deep parent path / chain.
-     *   - emit_path_hat(): mode 2 (file lists). Longest common
-     *     path-segment prefix.
-     *   - mode 1 (proc trees) does its own variant inline inside
-     *     lpane_processes() because it needs access to the procs map
-     *     to walk parent_id chains. */
+    /* Common-prefix detection helper for mode 2 (file lists).
+     * Mutates lpane_ to strip the common path prefix and feeds the
+     * prefix line into hat_bot_. The mode-1 (proc tree) variant is
+     * inlined in lpane_processes() because it needs the procs map to
+     * walk parent_id chains. */
     void emit_path_hat();
 
     /* Mode-specific rpane builders. */
@@ -107,10 +116,16 @@ private:
 
     std::vector<RowData> lpane_;
     std::vector<RowData> rpane_;
+    std::vector<RowData> hat_top_;
+    std::vector<RowData> hat_bot_;
     size_t lpane_idx_ = 0;
     size_t rpane_idx_ = 0;
+    size_t hat_top_idx_ = 0;
+    size_t hat_bot_idx_ = 0;
     bool   built_lpane_ = false;
     bool   built_rpane_ = false;
+    bool   built_hat_top_ = false;
+    bool   built_hat_bot_ = false;
     std::string built_for_cursor_;
     std::string built_for_subject_;
     int    built_for_mode_ = -1;

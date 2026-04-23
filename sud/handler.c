@@ -184,6 +184,14 @@ static void sigsys_diag_dump(const char *tag, ucontext_t *uc,
     /* Header */
     p = fmt_str(p, "\nsudtrace: SIGSYS_DIAG ");
     p = fmt_str(p, tag);
+    /* PID/TID — multi-process traces interleave diagnostics from
+     * many tracees on the same fd, so identifying which one produced
+     * each line is essential. raw_gettid() returns the LWP (kernel
+     * tid); raw_syscall6(SYS_getpid) returns the thread-group leader. */
+    p = fmt_str(p, " pid=");
+    p = fmt_int(p, (int)raw_syscall6(SYS_getpid, 0, 0, 0, 0, 0, 0));
+    p = fmt_str(p, " tid=");
+    p = fmt_int(p, (int)raw_gettid());
     p = fmt_ch(p, '\n');
 
     /* uc pointer and live stack pointer */

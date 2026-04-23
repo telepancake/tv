@@ -237,6 +237,13 @@ struct UiCtx {
     Tui          *tui = nullptr;
     int           lpane = -1;
     int           rpane = -1;
+    int           hat_top = -1;
+    int           hat_bot = -1;
+    /* Box pointers for the hat panes — their min_size is mutated each
+     * render to match the data source's hat row count, so an empty
+     * hat takes zero rows on screen. */
+    Box          *hat_top_box = nullptr;
+    Box          *hat_bot_box = nullptr;
     AppState     *state = nullptr;
     TvDataSource *src = nullptr;
     TvDb         *db = nullptr;       /* for direct lookups (e.g. ts seed) */
@@ -253,6 +260,25 @@ struct UiCtx {
 int64_t now_ms() {
     struct timeval tv; ::gettimeofday(&tv, nullptr);
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Update the hat-pane Box.min_size values to match the data source's
+ * current hat row counts and mark the hat panels dirty. Called after
+ * any state change that invalidates lpane (the hats are built as a
+ * side-effect of building lpane).
+ *
+ * Why this exists: the hat panels are weight=0 fixed-size boxes; the
+ * engine takes their height from min_size. When a hat has no rows we
+ * want its panel to occupy zero screen rows (engine.cpp allows this
+ * for weight=0,min_size=0). Per-mode the hat may be 0 or 1 rows. */
+void sync_hats(UiCtx &c) {
+    if (!c.src || !c.tui || !c.hat_top_box || !c.hat_bot_box) return;
+    int t = c.src->hat_top_row_count();
+    int b = c.src->hat_bot_row_count();
+    if (c.hat_top_box->min_size != t) c.hat_top_box->min_size = t;
+    if (c.hat_bot_box->min_size != b) c.hat_bot_box->min_size = b;
+    c.tui->dirty(c.hat_top);
+    c.tui->dirty(c.hat_bot);
 }
 
 void update_status(UiCtx &c) {
@@ -311,6 +337,7 @@ void seed_cursor_if_unset(UiCtx &c) {
         c.state->cursor_id = r->id;
         c.tui->set_cursor_idx(c.lpane, i);
         c.src->invalidate();
+        sync_hats(c);
         c.tui->dirty(c.rpane);
         update_status(c);
         return;
@@ -321,6 +348,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
               UiCtx &c) {
     auto invalidate_and_redraw = [&]() {
         c.src->invalidate();
+        sync_hats(c);
         tui.dirty();
         update_status(c);
     };
@@ -507,6 +535,7 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
             if (it == v.end()) v.push_back(heading_id);
             else v.erase(it);
             c.src->invalidate();
+            sync_hats(c);
             tui.dirty(c.rpane);
         }
         return TUI_HANDLED;
@@ -845,21 +874,45 @@ int main(int argc, char **argv) {
     };
     static const PanelDef rpane_def = {nullptr, rpane_cols, 2,
                                        TUI_PANEL_CURSOR | TUI_PANEL_BORDER};
-    ui.lpane = tui->add_panel(lpane_def);
-    ui.rpane = tui->add_panel(rpane_def);
+    /* Hat panels: single full-width column, no cursor (Tab skips
+     * them), no title bar. The data source decides per-mode what
+     * goes in each; see TvDataSource::hat_layout(). */
+    static const ColDef hat_cols[] = {
+        {-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS},
+    };
+    static const PanelDef hat_def = {nullptr, hat_cols, 1, 0};
+    ui.lpane   = tui->add_panel(lpane_def);
+    ui.rpane   = tui->add_panel(rpane_def);
+    ui.hat_top = tui->add_panel(hat_def);
+    ui.hat_bot = tui->add_panel(hat_def);
     /* Push the per-mode column layout to the engine immediately so the
      * initial render uses the right shape (mode 1 by default). */
     src.apply_layout(*tui, ui.lpane, ui.rpane);
-    static Box lbox = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
-    static Box rbox = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
-    static Box hbox = {TUI_BOX_HBOX,  1, 0, 0, -1, {&lbox, &rbox}};
-    lbox.panel = ui.lpane; rbox.panel = ui.rpane;
+    src.apply_hat_layout(*tui, ui.hat_top, ui.hat_bot);
+    /* Layout: hbox( vbox(hat_top, hat_bot, lpane), rpane ).
+     *   hat_top / hat_bot are weight=0 — fixed-height. min_size is
+     *   updated each render to the data source's reported row count
+     *   for that hat (0 → the hat collapses entirely). The list takes
+     *   all remaining vertical space (weight=1). */
+    static Box hat_top_box = {TUI_BOX_PANEL, 0, 0, 0, 0, {}};
+    static Box hat_bot_box = {TUI_BOX_PANEL, 0, 0, 0, 0, {}};
+    static Box lbox        = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
+    static Box lvbox       = {TUI_BOX_VBOX,  1, 0, 0, -1, {&hat_top_box, &hat_bot_box, &lbox}};
+    static Box rbox        = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
+    static Box hbox        = {TUI_BOX_HBOX,  1, 0, 0, -1, {&lvbox, &rbox}};
+    hat_top_box.panel = ui.hat_top;
+    hat_bot_box.panel = ui.hat_bot;
+    lbox.panel = ui.lpane;
+    rbox.panel = ui.rpane;
+    ui.hat_top_box = &hat_top_box;
+    ui.hat_bot_box = &hat_bot_box;
     tui->set_layout(&hbox);
 
     tui->on_key([&ui](Tui &t, int key, int panel, int cur, const char *id) {
         return on_key_cb(t, key, panel, cur, id, ui);
     });
     update_status(ui);
+    sync_hats(ui);
     tui->dirty();
 
     /* Force the lpane to materialise so we can pick its first row id
@@ -876,12 +929,14 @@ int main(int argc, char **argv) {
             break;
         }
         src.invalidate();
+        sync_hats(ui);
     }
 
     if (lt.fd >= 0) {
         WireDecoder dec([&](const WireEvent &ev) {
             std::string e; (void)db->append(ev, &e);
             src.invalidate();
+            sync_hats(ui);
         });
         lt.dec = &dec;
         tui->watch_fd(lt.fd, [&](Tui &t, int fd){ on_trace_fd_cb(t, fd, lt); });

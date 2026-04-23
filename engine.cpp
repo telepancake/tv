@@ -245,24 +245,7 @@ static void p_ensure_rows(Tui::Impl *m, Panel *p, int need) {
 }
 
 
-/* Count leading rows that are pinned-hat rows (id begins with
- * "__hat"). These render at the top of the panel and stay visible
- * while the rest of the rows scroll underneath, so the user always
- * sees the hat — the common ancestor or path prefix that summarises
- * what they're scrolling through — even after they've scrolled past
- * the natural top of the list.
- *
- * Only "__hat..." rows pin; other synthetic rows (e.g. "__hint",
- * "__empty", "__err") scroll like normal rows. */
-static int p_count_pinned(const Panel *p) {
-    int n = 0;
-    while (n < p->row_count) {
-        const auto &r = p->rows[n];
-        if (r.id.compare(0, 5, "__hat") != 0) break;
-        n++;
-    }
-    return n;
-}
+/* -- Cursor position and scroll clamping -------------------------- */
 
 static void p_clamp(Tui::Impl *m, Panel *p) {
     /* Ensure we have enough rows for the cursor position. */
@@ -278,13 +261,6 @@ static void p_clamp(Tui::Impl *m, Panel *p) {
     if (p->cursor < 0) p->cursor = 0;
     int vh = p->h - (p->def.title ? 1 : 0);
     if (vh < 1) vh = 1;
-    /* Reserve space for pinned hat rows at the top of the panel so
-     * the cursor doesn't get hidden behind them when scrolled past
-     * the natural top. p_count_pinned() returns 0 when there are no
-     * hat rows, so this is a no-op for views that don't have a hat. */
-    int pinned = p_count_pinned(p);
-    if (pinned > 0 && vh > pinned + 1)
-        vh -= pinned;
     if (p->cursor < p->scroll) p->scroll = p->cursor;
     if (p->cursor >= p->scroll + vh) p->scroll = p->cursor - vh + 1;
     if (p->scroll < 0) p->scroll = 0;
@@ -339,7 +315,14 @@ static void resolve_box(Tui::Impl *m, Box *b, int x, int y, int w, int h) {
     if (!b) return;
     if (b->type == TUI_BOX_PANEL) {
         auto *p = pget(m, b->panel);
-        if (p) { p->x = x; p->y = y; p->w = std::max(w, 1); p->h = std::max(h, 1); }
+        if (p) {
+            p->x = x; p->y = y;
+            p->w = std::max(w, 1);
+            /* Allow h == 0 for panels intentionally hidden by the
+             * layout (weight=0, min_size=0 box). render_panel skips
+             * those, so they take no screen space. */
+            p->h = std::max(h, 0);
+        }
         return;
     }
     bool is_hbox = (b->type == TUI_BOX_HBOX);
@@ -392,7 +375,11 @@ static void resolve_box(Tui::Impl *m, Box *b, int x, int y, int w, int h) {
                 sz = remaining - tail_fixed;
             }
         }
-        if (sz < 1) sz = 1;
+        if (sz < 0) sz = 0;
+        /* Flex children must occupy at least one cell so they remain
+         * visible; fixed-size children (weight==0) honour min_size as
+         * given, including 0 for layout slots that are currently empty. */
+        if (c->weight > 0 && sz < 1) sz = 1;
         if (is_hbox) resolve_box(m, c, pos, y, sz, h);
         else         resolve_box(m, c, x, pos, w, sz);
         pos += sz;
@@ -462,6 +449,7 @@ static int read_key(Tui::Impl *m) {
 
 static void render_panel(Tui::Impl *m, Panel *p) {
     if (p->x < -9000) return;
+    if (p->h <= 0) return;          /* hidden layout slot — nothing to draw */
     const auto *d = &p->def;
     bool focused = (m->focus >= 0 && &m->panels[m->focus] == p);
     int cy = p->y, ch = p->h;
@@ -484,29 +472,7 @@ static void render_panel(Tui::Impl *m, Panel *p) {
     resolve_col_widths(d, pw, cw);
     int nc = std::min(d->ncols, PANEL_NCOLS_MAX);
     int row = 0;
-    /* Render pinned hat rows at the top when the user has scrolled
-     * past them; this keeps the path/ancestor summary visible while
-     * the rest of the list scrolls underneath. When p->scroll <= the
-     * number of hat rows, the natural in-stream rendering already
-     * shows them at the right place, so no special-casing is needed. */
-    int pinned = p_count_pinned(p);
     int rn = p->scroll;
-    if (pinned > 0 && p->scroll > pinned) {
-        for (int hi = 0; hi < pinned && row < ch; hi++, row++) {
-            int sr = cy + row + 1, sc = p->x + 1;
-            if (d->flags & TUI_PANEL_BORDER) sc++;
-            sf(m, "\x1b[%d;%dH", sr, sc);
-            auto &r = p->rows[hi];
-            sp(m, style_ansi(r.style));
-            for (int c = 0; c < nc; c++) {
-                const char *cell = (c < static_cast<int>(r.cols.size())) ? r.cols[c].c_str() : "";
-                sput_field(m, cell, cw[c], d->cols[c].align, d->cols[c].overflow);
-            }
-            sp(m, "\x1b[0m");
-        }
-        /* p->scroll already skips the hat rows we just pinned (it's
-         * > pinned), so rn = p->scroll continues with content rows. */
-    }
     for (; row < ch; rn++, row++) {
         int sr = cy + row + 1, sc = p->x + 1;
         if (d->flags & TUI_PANEL_BORDER) sc++;

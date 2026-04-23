@@ -2,15 +2,23 @@
 # tests/sudtrace_test.sh — integration tests for sudtrace
 #
 # Tests that sudtrace correctly traces programs, including multithreaded
-# ones, and produces valid JSONL output.
+# ones, and produces a valid binary wire stream. Assertions are made
+# against `tv dump`'s textual rendering of the wire file, so they are
+# stable across binary-format revisions as long as the dump output
+# stays human-readable.
 set -eo pipefail
 
 cd "$(dirname "$0")/.."
-SUDTRACE=./sudtrace
-SUD32=./sud32
 TV=./tv
+SUDTRACE="$TV sud"
+SUD32=./sud32
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
+
+# Render a wire file as text via `tv dump`. Returns the dump output on
+# stdout. Wire files don't grep cleanly (zstd/binary framing), so all
+# event-shape assertions go through this.
+dump() { "$TV" dump "$1" 2>/dev/null; }
 
 PASS=0 FAIL=0 TOTAL=0
 
@@ -556,100 +564,100 @@ fi
 
 # ── Test: basic single-threaded tracing ────────────────────────────────
 
-if [ -x "$SUDTRACE" ]; then
+if [ -x "$TV" ]; then
 
-OUT=$("$SUDTRACE" -o "$TMPDIR/hello.jsonl" -- "$TMPDIR/hello" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/hello.wire" -- "$TMPDIR/hello" 2>&1)
 run_test "basic: hello world traced" \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/hello.jsonl"' \
-    'grep -q "\"event\":\"EXIT\"" "$TMPDIR/hello.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/hello.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/hello.jsonl"'
+    'dump "$TMPDIR/hello.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/hello.wire" | grep -q " EXIT "' \
+    'dump "$TMPDIR/hello.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/hello.wire" | grep -q "signaled code/sig="'
 
 run_test "basic: stderr captured" \
-    'grep -q "STDERR" "$TMPDIR/hello.jsonl"' \
-    'grep -q "hello world" "$TMPDIR/hello.jsonl"'
+    'dump "$TMPDIR/hello.wire" | grep -q " STDERR "' \
+    'dump "$TMPDIR/hello.wire" | grep -q "hello world"'
 
-OUT=$("$SUDTRACE" -o "$TMPDIR/shebang_args.jsonl" -- "$TMPDIR/shebang_args.sh" v045 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/shebang_args.wire" -- "$TMPDIR/shebang_args.sh" v045 2>&1)
 run_test "basic: shebang script keeps interpreter argv aligned" \
     'printf "%s\n" "$OUT" | grep -F -q -- "argv0:$TMPDIR/shebang_args.sh"' \
     'printf "%s\n" "$OUT" | grep -F -q -- "arg1:v045"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/shebang_args.jsonl"' \
-    'grep -q "\"exit_code\":0" "$TMPDIR/shebang_args.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/shebang_args.jsonl"'
+    'dump "$TMPDIR/shebang_args.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/shebang_args.wire" | grep -q "exited code/sig=0 "' \
+    '! dump "$TMPDIR/shebang_args.wire" | grep -q "signaled code/sig="'
 
 # ── Test: multithreaded tracing ────────────────────────────────────────
 
 # Run 3 times to detect race conditions — the clone3 child/parent
 # synchronization and signal handler re-entrancy are timing-sensitive.
 for attempt in 1 2 3; do
-    OUT=$("$SUDTRACE" -o "$TMPDIR/threads_${attempt}.jsonl" -- "$TMPDIR/threads" 2>&1)
+    OUT=$($SUDTRACE -o "$TMPDIR/threads_${attempt}.wire" -- "$TMPDIR/threads" 2>&1)
     run_test "threads attempt $attempt: no crash" \
-        '! grep -q "\"signal\"" "$TMPDIR/threads_${attempt}.jsonl"' \
-        'grep -q "\"status\":\"exited\"" "$TMPDIR/threads_${attempt}.jsonl"'
+        '! dump "$TMPDIR/threads_${attempt}.wire" | grep -q "signaled code/sig="' \
+        'dump "$TMPDIR/threads_${attempt}.wire" | grep -q "exited code/sig="'
     run_test "threads attempt $attempt: stderr captured" \
-        'grep -q "done" "$TMPDIR/threads_${attempt}.jsonl"'
+        'dump "$TMPDIR/threads_${attempt}.wire" | grep -q "done"'
 done
 
-OUT=$("$SUDTRACE" -o "$TMPDIR/make.jsonl" -- make -f "$TMPDIR/Makefile" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/make.wire" -- make -f "$TMPDIR/Makefile" 2>&1)
 run_test "make: external command traced without SIGSYS crash" \
     'printf "%s\n" "$OUT" | grep -q "build-ok"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/make.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/make.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/make.jsonl"'
+    'dump "$TMPDIR/make.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/make.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/make.wire" | grep -q "signaled code/sig="'
 
 # ── Test: parallel make (SIGCHLD + jobserver pipe interaction) ─────────
 
-OUT=$(timeout 30 "$SUDTRACE" -o "$TMPDIR/pmake.jsonl" -- \
+OUT=$(timeout 30 $SUDTRACE -o "$TMPDIR/pmake.wire" -- \
     make -j4 -f "$TMPDIR/Makefile.parallel" 2>&1)
 run_test "make -j4: parallel build completes (SIGCHLD not blocked)" \
     'printf "%s\n" "$OUT" | grep -q "parallel-build-ok"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/pmake.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/pmake.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/pmake.jsonl"'
+    'dump "$TMPDIR/pmake.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/pmake.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/pmake.wire" | grep -q "signaled code/sig="'
 
 # ── Test: seccomp filter via seccomp() syscall ────────────────────────
 
 if [ "$HAVE_SECCOMP_FILTER" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_filter.jsonl" -- "$TMPDIR/seccomp_filter" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/seccomp_filter.wire" -- "$TMPDIR/seccomp_filter" 2>&1)
 run_test "seccomp: filter via seccomp() syscall doesn't crash" \
     'printf "%s\n" "$OUT" | grep -q "seccomp-filter-ok"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_filter.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_filter.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/seccomp_filter.jsonl"'
+    'dump "$TMPDIR/seccomp_filter.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/seccomp_filter.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/seccomp_filter.wire" | grep -q "signaled code/sig="'
 fi
 
 # ── Test: seccomp strict mode via prctl() ─────────────────────────────
 
 if [ "$HAVE_SECCOMP_STRICT" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_strict.jsonl" -- "$TMPDIR/seccomp_strict" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/seccomp_strict.wire" -- "$TMPDIR/seccomp_strict" 2>&1)
 run_test "seccomp: strict mode via prctl doesn't crash" \
     'printf "%s\n" "$OUT" | grep -q "seccomp-strict-ok"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_strict.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_strict.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/seccomp_strict.jsonl"'
+    'dump "$TMPDIR/seccomp_strict.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/seccomp_strict.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/seccomp_strict.wire" | grep -q "signaled code/sig="'
 fi
 
 # ── Test: seccomp filter via prctl(PR_SET_SECCOMP) ────────────────────
 
 if [ "$HAVE_SECCOMP_PRCTL" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_prctl.jsonl" -- "$TMPDIR/seccomp_prctl" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/seccomp_prctl.wire" -- "$TMPDIR/seccomp_prctl" 2>&1)
 run_test "seccomp: filter via prctl(PR_SET_SECCOMP) doesn't crash" \
     'printf "%s\n" "$OUT" | grep -q "seccomp-prctl-ok"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_prctl.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_prctl.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/seccomp_prctl.jsonl"'
+    'dump "$TMPDIR/seccomp_prctl.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/seccomp_prctl.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/seccomp_prctl.wire" | grep -q "signaled code/sig="'
 fi
 
 # ── Test: seccomp with fork (simulates complex build) ─────────────────
 
 if [ "$HAVE_SECCOMP_BUILD" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/seccomp_build.jsonl" -- "$TMPDIR/seccomp_build" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/seccomp_build.wire" -- "$TMPDIR/seccomp_build" 2>&1)
 run_test "seccomp: filter + fork (complex build simulation) works" \
     'printf "%s\n" "$OUT" | grep -q "seccomp-build-ok"' \
     'printf "%s\n" "$OUT" | grep -q "child-ok"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/seccomp_build.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/seccomp_build.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/seccomp_build.jsonl"'
+    'dump "$TMPDIR/seccomp_build.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/seccomp_build.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/seccomp_build.wire" | grep -q "signaled code/sig="'
 fi
 
 # ── Test: nested signal (root cause of LTO/distrobox crashes) ─────────
@@ -658,14 +666,14 @@ if [ "$HAVE_NESTED_SIGNAL" -eq 1 ]; then
 # Run 3 times — the crash is timing-dependent (signal must interrupt
 # the SIGSYS handler while it's executing a syscall).
 for attempt in 1 2 3; do
-    OUT=$("$SUDTRACE" -o "$TMPDIR/nested_signal_${attempt}.jsonl" -- "$TMPDIR/nested_signal" 2>&1)
+    OUT=$($SUDTRACE -o "$TMPDIR/nested_signal_${attempt}.wire" -- "$TMPDIR/nested_signal" 2>&1)
     run_test "nested signal attempt $attempt: no Bad system call" \
         'printf "%s\n" "$OUT" | grep -q "nested-signal-ok"' \
         'printf "%s\n" "$OUT" | grep -q "alarms="' \
         '! printf "%s\n" "$OUT" | grep -q "alarms=0)"' \
-        'grep -q "\"event\":\"EXEC\"" "$TMPDIR/nested_signal_${attempt}.jsonl"' \
-        'grep -q "\"status\":\"exited\"" "$TMPDIR/nested_signal_${attempt}.jsonl"' \
-        '! grep -q "\"signal\"" "$TMPDIR/nested_signal_${attempt}.jsonl"'
+        'dump "$TMPDIR/nested_signal_${attempt}.wire" | grep -q " EXEC "' \
+        'dump "$TMPDIR/nested_signal_${attempt}.wire" | grep -q "exited code/sig="' \
+        '! dump "$TMPDIR/nested_signal_${attempt}.wire" | grep -q "signaled code/sig="'
 done
 fi
 
@@ -675,88 +683,88 @@ if [ "$HAVE_LTO" -eq 1 ]; then
 # Build the LTO test program UNDER sudtrace — this exercises the exact
 # codepath that triggers SIGCHLD during the SIGSYS handler (parallel
 # lto1/cc1plus workers terminate and signal the parent).
-OUT=$("$SUDTRACE" -o "$TMPDIR/lto_build.jsonl" -- \
+OUT=$($SUDTRACE -o "$TMPDIR/lto_build.wire" -- \
     g++ -std=c++17 -O2 -flto=auto -o "$TMPDIR/lto_build_out" \
         "$TMPDIR/lto_main.cpp" "$TMPDIR/lto_helper.cpp" 2>&1)
 run_test "LTO build: g++ -flto=auto under sudtrace doesn't crash" \
     'test -x "$TMPDIR/lto_build_out"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/lto_build.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/lto_build.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/lto_build.jsonl"'
+    'dump "$TMPDIR/lto_build.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/lto_build.wire" | grep -q "exited code/sig="' \
+    '! dump "$TMPDIR/lto_build.wire" | grep -q "signaled code/sig="'
 fi
 
 if [ "$HAVE_STATIC32" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/static32.jsonl" -- "$TMPDIR/static32" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/static32.wire" -- "$TMPDIR/static32" 2>&1)
 run_test "static32: traced through sud32 wrapper" \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/static32.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/static32.jsonl"' \
-    'grep -q "\"STDERR\"" "$TMPDIR/static32.jsonl"' \
-    'grep -q "hi32" "$TMPDIR/static32.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/static32.jsonl"'
+    'dump "$TMPDIR/static32.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/static32.wire" | grep -q "exited code/sig="' \
+    'dump "$TMPDIR/static32.wire" | grep -q " STDERR "' \
+    'dump "$TMPDIR/static32.wire" | grep -q "hi32"' \
+    '! dump "$TMPDIR/static32.wire" | grep -q "signaled code/sig="'
 
 if [ -x "$TV" ]; then
-OUT=$("$TV" --uproctrace --sud -o "$TMPDIR/up_static32.jsonl" -- "$TMPDIR/static32" 2>&1)
+OUT=$("$TV" --uproctrace --sud -o "$TMPDIR/up_static32.wire" -- "$TMPDIR/static32" 2>&1)
 run_test "uproctrace --sud: static32 uses matching sud launcher" \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/up_static32.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/up_static32.jsonl"' \
-    'grep -q "\"STDERR\"" "$TMPDIR/up_static32.jsonl"' \
-    'grep -q "hi32" "$TMPDIR/up_static32.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/up_static32.jsonl"'
+    'dump "$TMPDIR/up_static32.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/up_static32.wire" | grep -q "exited code/sig="' \
+    'dump "$TMPDIR/up_static32.wire" | grep -q " STDERR "' \
+    'dump "$TMPDIR/up_static32.wire" | grep -q "hi32"' \
+    '! dump "$TMPDIR/up_static32.wire" | grep -q "signaled code/sig="'
 fi
 fi
 
 if [ -x "$SUD32" ]; then
-OUT=$("$SUD32" -o "$TMPDIR/sud32_hello.jsonl" -- "$TMPDIR/hello" 2>&1)
+OUT=$("$SUD32" -o "$TMPDIR/sud32_hello.wire" -- "$TMPDIR/hello" 2>&1)
 run_test "sud32: mixed-arch launch selects traceable wrapper" \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/sud32_hello.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/sud32_hello.jsonl"' \
-    'grep -q "\"STDERR\"" "$TMPDIR/sud32_hello.jsonl"' \
-    'grep -q "hello world" "$TMPDIR/sud32_hello.jsonl"' \
-    '! grep -q "\"signal\"" "$TMPDIR/sud32_hello.jsonl"'
+    'dump "$TMPDIR/sud32_hello.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/sud32_hello.wire" | grep -q "exited code/sig="' \
+    'dump "$TMPDIR/sud32_hello.wire" | grep -q " STDERR "' \
+    'dump "$TMPDIR/sud32_hello.wire" | grep -q "hello world"' \
+    '! dump "$TMPDIR/sud32_hello.wire" | grep -q "signaled code/sig="'
 fi
 
 # ── Test: identity masking — /proc/self/exe ───────────────────────────
 
 if [ "$HAVE_CHECK_PROC_EXE" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/proc_exe.jsonl" -- "$TMPDIR/check_proc_exe" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/proc_exe.wire" -- "$TMPDIR/check_proc_exe" 2>&1)
 run_test "identity: /proc/self/exe doesn't leak sudtrace" \
     'printf "%s\n" "$OUT" | grep -q "proc-exe-ok"' \
     '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/proc_exe.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/proc_exe.jsonl"'
+    'dump "$TMPDIR/proc_exe.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/proc_exe.wire" | grep -q "exited code/sig="'
 fi
 
 # ── Test: identity masking — /proc/<pid>/exe ──────────────────────────
 
 if [ "$HAVE_CHECK_PID_EXE" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/pid_exe.jsonl" -- "$TMPDIR/check_pid_exe" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/pid_exe.wire" -- "$TMPDIR/check_pid_exe" 2>&1)
 run_test "identity: /proc/<pid>/exe doesn't leak sudtrace" \
     'printf "%s\n" "$OUT" | grep -q "pid-exe-ok"' \
     '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/pid_exe.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/pid_exe.jsonl"'
+    'dump "$TMPDIR/pid_exe.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/pid_exe.wire" | grep -q "exited code/sig="'
 fi
 
 # ── Test: identity masking — AT_EXECFN ────────────────────────────────
 
 if [ "$HAVE_CHECK_EXECFN" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/execfn.jsonl" -- "$TMPDIR/check_execfn" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/execfn.wire" -- "$TMPDIR/check_execfn" 2>&1)
 run_test "identity: AT_EXECFN doesn't leak sudtrace" \
     'printf "%s\n" "$OUT" | grep -q "execfn-ok"' \
     '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/execfn.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/execfn.jsonl"'
+    'dump "$TMPDIR/execfn.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/execfn.wire" | grep -q "exited code/sig="'
 fi
 
 # ── Test: identity masking — /proc/self/comm ──────────────────────────
 
 if [ "$HAVE_CHECK_COMM" -eq 1 ]; then
-OUT=$("$SUDTRACE" -o "$TMPDIR/comm.jsonl" -- "$TMPDIR/check_comm" 2>&1)
+OUT=$($SUDTRACE -o "$TMPDIR/comm.wire" -- "$TMPDIR/check_comm" 2>&1)
 run_test "identity: /proc/self/comm doesn't leak sudtrace" \
     'printf "%s\n" "$OUT" | grep -q "comm-ok"' \
     '! printf "%s\n" "$OUT" | grep -q "FAIL"' \
-    'grep -q "\"event\":\"EXEC\"" "$TMPDIR/comm.jsonl"' \
-    'grep -q "\"status\":\"exited\"" "$TMPDIR/comm.jsonl"'
+    'dump "$TMPDIR/comm.wire" | grep -q " EXEC "' \
+    'dump "$TMPDIR/comm.wire" | grep -q "exited code/sig="'
 fi
 
 # ── UNLINK event test ──────────────────────────────────────────────────
@@ -776,9 +784,9 @@ int main(void) {
 }
 EOF
 if cc -static -o "$TMPDIR/unlink_test" "$TMPDIR/unlink_test.c" 2>/dev/null; then
-    OUT=$($SUDTRACE -o "$TMPDIR/unlink.jsonl" -- "$TMPDIR/unlink_test" 2>&1 || true)
+    OUT=$($SUDTRACE -o "$TMPDIR/unlink.wire" -- "$TMPDIR/unlink_test" 2>&1 || true)
     run_test "unlink: UNLINK event emitted" \
-        'grep -q "\"event\":\"UNLINK\"" "$TMPDIR/unlink.jsonl"'
+        'dump "$TMPDIR/unlink.wire" | grep -q " UNLINK "'
 fi
 
 else

@@ -446,16 +446,27 @@ void load_and_run_elf(const char *path, int argc, char **argv,
      * SIGSYS fires for every syscall the traced program makes (SUD's
      * whole point), and the handler does non-trivial work — easily a
      * few KiB of stack frame on i386 once nested raw_syscall6 calls,
-     * tracing emits and the diagnostic path are accounted for. The
-     * default of running on the program's own stack overflows or
-     * corrupts the program's segment state on 32-bit (the kernel
-     * reports it as SI_KERNEL SIGSEGV at iret).
+     * tracing emits and the diagnostic path are accounted for.
+     * Without an alternate signal stack the kernel delivers the
+     * signal on the traced program's own stack; SIGSYS_DIAG output
+     * has confirmed at least one 32-bit failure mode where this
+     * leaves the user thread in a state the kernel rejects at
+     * sigreturn (reported as SI_KERNEL SIGSEGV).
+     *
+     * Status (be honest): SA_ONSTACK + this altstack reliably moves
+     * the handler off the user stack — the SIGSYS_DIAG dumps from
+     * @kchanging show ss_sp/sp_now landing inside this mapping, as
+     * intended. However, that change alone has NOT been observed to
+     * eliminate the residual i386 SI_KERNEL SIGSEGV that arrives
+     * after a long run of successful SIGSYS handlings; reproducing
+     * that in CI here was not achieved, so any further claim about
+     * "the" 32-bit crash being fixed by this code is unverified.
      *
      * Size it large enough for several nested SIGSYS deliveries
      * (signal handlers re-using the same alt stack don't get a fresh
-     * region — the stack pointer just keeps walking down). A single
-     * generous mapping is shared with the SIGSEGV/SIGBUS diagnostic
-     * handler set up later. */
+     * region — the stack pointer just keeps walking down). The same
+     * mapping is shared with the SIGSEGV/SIGBUS diagnostic handler
+     * installed later. */
 #define SUD_ALTSTACK_SIZE (256 * 1024)
     void *altstack = mmap(NULL, SUD_ALTSTACK_SIZE,
                           PROT_READ | PROT_WRITE,
