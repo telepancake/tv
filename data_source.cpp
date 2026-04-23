@@ -245,6 +245,8 @@ DataSource TvDataSource::make_data_source() {
 void TvDataSource::invalidate() {
     built_lpane_ = false;
     built_rpane_ = false;
+    built_hat_top_ = false;
+    built_hat_bot_ = false;
 }
 
 void TvDataSource::invalidate_rpane() {
@@ -349,6 +351,73 @@ void TvDataSource::apply_layout(Tui &tui, int lpane, int rpane) const {
     tui.set_panel_columns(rpane, r.cols, r.ncols, r.title);
 }
 
+namespace {
+/* Hat panels use a single full-width column; their content is one
+ * line of summary text (a path prefix or an ancestor chain) per row.
+ * No title bar — the hat is its own banner. */
+const ColDef k_hat_cols[] = {
+    {-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS},
+};
+} // namespace
+
+TvDataSource::PanelLayout TvDataSource::hat_layout() const {
+    return {k_hat_cols, 1, nullptr};
+}
+
+void TvDataSource::apply_hat_layout(Tui &tui, int hat_top, int hat_bot) const {
+    auto h = hat_layout();
+    tui.set_panel_columns(hat_top, h.cols, h.ncols, h.title);
+    tui.set_panel_columns(hat_bot, h.cols, h.ncols, h.title);
+}
+
+void TvDataSource::ensure_hats_built() {
+    /* Forward decl: dirty_for_lpane is defined just below. */
+    extern bool dirty_for_lpane(const AppState &s,
+                     int prev_mode, const std::string &prev_search,
+                     const std::string &prev_flag_filter,
+                     bool prev_grouped, bool prev_subtree_only,
+                     const std::string &prev_subtree_root,
+                     const std::string &prev_subject,
+                     bool prev_show_pids,
+                     int64_t prev_ts_after, int64_t prev_ts_before);
+    /* Hats are produced as a side-effect of rebuild_lpane() (the
+     * builders need the same per-mode data anyway). Force lpane to
+     * rebuild if stale, which refreshes hat_top_ and hat_bot_ too. */
+    bool stale = !built_lpane_ ||
+        dirty_for_lpane(state_, built_for_mode_, built_for_search_,
+                        built_for_flag_filter_,
+                        built_for_grouped_, built_for_subtree_only_,
+                        built_for_subtree_root_, built_for_subject_,
+                        built_for_show_pids_,
+                        built_for_ts_after_ns_, built_for_ts_before_ns_);
+    if (stale) {
+        rebuild_lpane();
+        built_for_mode_ = state_.mode;
+        built_for_search_ = state_.search;
+        built_for_flag_filter_ = state_.flag_filter;
+        built_for_grouped_ = state_.grouped;
+        built_for_subtree_only_ = state_.subtree_only;
+        built_for_subtree_root_ = state_.subtree_root;
+        built_for_subject_ = state_.subject_file;
+        built_for_show_pids_ = state_.show_pids;
+        built_for_ts_after_ns_ = state_.ts_after_ns;
+        built_for_ts_before_ns_ = state_.ts_before_ns;
+        built_lpane_ = true;
+        built_hat_top_ = true;
+        built_hat_bot_ = true;
+    }
+}
+
+int TvDataSource::hat_top_row_count() {
+    ensure_hats_built();
+    return static_cast<int>(hat_top_.size());
+}
+
+int TvDataSource::hat_bot_row_count() {
+    ensure_hats_built();
+    return static_cast<int>(hat_bot_.size());
+}
+
 bool dirty_for_lpane(const AppState &s,
                      int prev_mode, const std::string &prev_search,
                      const std::string &prev_flag_filter,
@@ -369,28 +438,14 @@ bool dirty_for_lpane(const AppState &s,
 
 void TvDataSource::row_begin(int panel) {
     if (panel == 0) {
-        bool stale = !built_lpane_ ||
-            dirty_for_lpane(state_, built_for_mode_, built_for_search_,
-                            built_for_flag_filter_,
-                            built_for_grouped_, built_for_subtree_only_,
-                            built_for_subtree_root_, built_for_subject_,
-                            built_for_show_pids_,
-                            built_for_ts_after_ns_, built_for_ts_before_ns_);
-        if (stale) {
-            rebuild_lpane();
-            built_for_mode_ = state_.mode;
-            built_for_search_ = state_.search;
-            built_for_flag_filter_ = state_.flag_filter;
-            built_for_grouped_ = state_.grouped;
-            built_for_subtree_only_ = state_.subtree_only;
-            built_for_subtree_root_ = state_.subtree_root;
-            built_for_subject_ = state_.subject_file;
-            built_for_show_pids_ = state_.show_pids;
-            built_for_ts_after_ns_ = state_.ts_after_ns;
-            built_for_ts_before_ns_ = state_.ts_before_ns;
-            built_lpane_ = true;
-        }
+        ensure_hats_built();
         lpane_idx_ = 0;
+    } else if (panel == 2) {
+        ensure_hats_built();
+        hat_top_idx_ = 0;
+    } else if (panel == 3) {
+        ensure_hats_built();
+        hat_bot_idx_ = 0;
     } else {
         if (!built_rpane_ || built_for_cursor_ != state_.cursor_id ||
             built_for_mode_ != state_.mode ||
@@ -406,11 +461,15 @@ void TvDataSource::row_begin(int panel) {
 
 bool TvDataSource::row_has_more(int panel) {
     if (panel == 0) return lpane_idx_ < lpane_.size();
+    if (panel == 2) return hat_top_idx_ < hat_top_.size();
+    if (panel == 3) return hat_bot_idx_ < hat_bot_.size();
     return rpane_idx_ < rpane_.size();
 }
 
 RowData TvDataSource::row_next(int panel) {
     if (panel == 0) return lpane_.at(lpane_idx_++);
+    if (panel == 2) return hat_top_.at(hat_top_idx_++);
+    if (panel == 3) return hat_bot_.at(hat_bot_idx_++);
     return rpane_.at(rpane_idx_++);
 }
 
@@ -418,6 +477,11 @@ RowData TvDataSource::row_next(int panel) {
 
 void TvDataSource::rebuild_lpane() {
     lpane_.clear();
+    /* Hat caches are produced as a side-effect of building lpane —
+     * the proc-tree and file-tree builders fill hat_top_ / hat_bot_
+     * directly when a common ancestor / path prefix is detected. */
+    hat_top_.clear();
+    hat_bot_.clear();
     switch (state_.mode) {
         case 0: lpane_outputs(); break;
         case 1: lpane_processes(); break;
@@ -667,24 +731,21 @@ void TvDataSource::lpane_processes() {
         for (int t : roots) emit(t, "", true);
     }
 
-    /* Proc-tree hat. Same idea as emit_path_hat() in mode 2: surface
-     * the common ancestor chain as a Heading row at the top so the
-     * user sees what subtree they're scrolling without having to chase
-     * indent.
+    /* Proc-tree hat. Surfaces the common ancestor chain as a one-row
+     * Heading in the dedicated hat panel (above the list). When there
+     * is no common ancestor, hat_top_ stays empty and the hat panel
+     * shrinks to zero rows.
      *
      * Algorithm:
      *  - For each visible (non-synthetic) row, walk parent_id back
      *    through the procs map to build a chain of in-trace ancestors,
      *    ordered child→parent (chain[0] is the row's immediate parent).
      *  - Common ancestor sequence = longest suffix shared across every
-     *    non-empty chain (i.e. starting from the highest-reachable
-     *    ancestor and walking down until chains diverge). Rows whose
-     *    chain is empty (their parent isn't in the trace) don't
-     *    constrain the common chain at all - they just don't
-     *    contribute. This matches what the reviewer asked for: when
-     *    the topmost row is itself nested, its ancestors still show
-     *    up as a hat even if some sibling roots have no in-trace
-     *    parent.
+     *    non-empty chain. Rows whose chain is empty (their parent
+     *    isn't in the trace) don't constrain the common chain — they
+     *    just don't contribute. So when the topmost row is itself
+     *    nested, its ancestors still show up as a hat even if some
+     *    sibling roots have no in-trace parent.
      *  - Drop a leading PID ≤ 1 (init) so we don't stutter "init › …"
      *    on every trace. */
     if (!state_.subtree_only && !lpane_.empty()) {
@@ -747,18 +808,11 @@ void TvDataSource::lpane_processes() {
                     }
                 }
                 if (!label.empty()) {
-                    /* 4-column row to match k_lpane_cols_procs:
-                     *   name | pid | exit | duration */
                     RowData hat;
-                    hat.id = "__hat_proc";
+                    hat.id = "hat_proc";
                     hat.style = RowStyle::Heading;
-                    hat.cols = {label, "", "", ""};
-                    RowData sep;
-                    sep.id = "__hat_sep";
-                    sep.style = RowStyle::Dim;
-                    sep.cols = {"", "", "", ""};
-                    lpane_.insert(lpane_.begin(), std::move(sep));
-                    lpane_.insert(lpane_.begin(), std::move(hat));
+                    hat.cols = {label};
+                    hat_top_.push_back(std::move(hat));
                 }
             }
         }
@@ -1097,7 +1151,7 @@ void TvDataSource::emit_path_hat() {
         if (!is_path_row(r)) return false;
         if (r.id.empty() || r.id.back() != '/') return false;
         return prefix.size() >= r.id.size() &&
-               prefix.compare(0, r.id.size(), r.id) == 0;
+               prefix.starts_with(r.id);
     };
     lpane_.erase(std::remove_if(lpane_.begin(), lpane_.end(),
                                 is_subsumed_dir),
@@ -1124,20 +1178,14 @@ void TvDataSource::emit_path_hat() {
         r.cols[1] = indent + leaf + (is_dir ? "/" : "");
     }
 
-    /* Hat row, prepended. Style as Heading; flush-left in the path
-     * column. Display the prefix with a trailing arrow so it's
-     * obvious the body rows continue below it. */
+    /* Hat row, fed to the dedicated hat panel above the list (not
+     * prepended to lpane_). Empty hat_bot_ → the panel collapses to
+     * zero rows. */
     RowData hat;
-    hat.id = "__hat_prefix";
+    hat.id = "hat_prefix";
     hat.style = RowStyle::Heading;
-    hat.cols = {"", prefix, "", "", "", ""};
-    /* A blank separator row visually divides hat from list. */
-    RowData sep;
-    sep.id = "__hat_sep";
-    sep.style = RowStyle::Dim;
-    sep.cols = {"", "", "", "", "", ""};
-    lpane_.insert(lpane_.begin(), std::move(sep));
-    lpane_.insert(lpane_.begin(), std::move(hat));
+    hat.cols = {prefix};
+    hat_bot_.push_back(std::move(hat));
 }
 
 /* -- Mode 0: output (stdout/stderr) view ---------------------------- */
