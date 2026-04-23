@@ -4,9 +4,8 @@
  * Each subtest is selected by argv[1].  The harness's only job is to
  * exercise the SIGSYS handler in ways that real builds actually do:
  * concurrent fork/exec/posix_spawn, signal storms during exec, vfork
- * emulation, deep shebang/exec chains, and argv shapes that stress the
- * 64 KiB per-handler arena in build_exec_argv (the only realistic way
- * args[0] becomes NULL in the depth loop).
+ * emulation, deep shebang/exec chains, and argv shapes (up to and
+ * near ARG_MAX) that stress the per-handler arena in build_exec_argv.
  *
  * The acceptance criterion is the user's:  if the harness can't produce
  * a "sudtrace: CRASH DIAGNOSTIC" from sud64 on bug-prone code, the
@@ -122,10 +121,11 @@ static int t_argv_near_argmax(void)
 /* ─────────────────────────────────────────────────────────────────────
  * Subtest: argv-single-huge
  *
- * One single argv entry larger than the per-handler arena.  This single
- * sud_arena_strdup of argv[1] returns NULL all by itself, but the test
- * is here mainly to confirm the kernel rejects with E2BIG and sud
- * doesn't crash trying to copy the megabyte string into its arena.
+ * One single argv entry of 1 MiB.  Verifies sud handles extremely
+ * large single arguments without crashing — whether the new
+ * dynamically-sized arena accommodates the string or the kernel
+ * rejects the exec with -E2BIG, the only unacceptable outcome is a
+ * crash inside the SIGSYS handler.
  * ───────────────────────────────────────────────────────────────────── */
 static int t_argv_single_huge(void)
 {
