@@ -273,8 +273,17 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
     if (!args) return NULL;
 
     int nargs = 0;
-    for (int i = 0; i < orig_argc; i++)
-        args[nargs++] = sud_arena_strdup(a, orig_argv[i]);
+    for (int i = 0; i < orig_argc; i++) {
+        char *dup = sud_arena_strdup(a, orig_argv[i]);
+        /* Arena exhaustion: signal caller to forward the original execve
+         * unchanged so the program is not broken by sud's per-handler
+         * 64 KiB arena.  Without this, mid-vector NULLs end up in argv
+         * and the kernel either truncates the vector early or rejects
+         * the call (the user reported this as silent build failures
+         * that work fine without sud). */
+        if (orig_argv[i] && !dup) return NULL;
+        args[nargs++] = dup;
+    }
     args[nargs] = NULL;
 
     /* If the caller didn't give us a usable argv[0] (e.g. execve(NULL,...)
@@ -291,19 +300,26 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
         if (!resolve_path(args[0], resolved, sizeof(resolved)))
             return args;
 
-        args[0] = sud_arena_strdup(a, resolved);
+        char *dup = sud_arena_strdup(a, resolved);
+        if (!dup) return NULL;  /* arena full → caller forwards original */
+        args[0] = dup;
 
         char interp[PATH_MAX], interp_arg[256];
         if (check_shebang(resolved, interp, sizeof(interp),
                            interp_arg, sizeof(interp_arg))) {
             int extra = interp_arg[0] ? 2 : 1;
             char **na = ensure_args(a, args, nargs, extra, &max_args);
-            if (!na) return args;
+            if (!na) return NULL;
             args = na;
             memmove(args + extra, args, ((size_t)nargs + 1) * sizeof(char *));
-            args[0] = sud_arena_strdup(a, interp);
-            if (interp_arg[0])
-                args[1] = sud_arena_strdup(a, interp_arg);
+            char *d_int = sud_arena_strdup(a, interp);
+            if (!d_int) return NULL;
+            args[0] = d_int;
+            if (interp_arg[0]) {
+                char *d_arg = sud_arena_strdup(a, interp_arg);
+                if (!d_arg) return NULL;
+                args[1] = d_arg;
+            }
             nargs += extra;
             continue;
         }
@@ -315,10 +331,12 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
 
         if (dyn == 1) {
             char **na = ensure_args(a, args, nargs, 1, &max_args);
-            if (!na) return args;
+            if (!na) return NULL;
             args = na;
             memmove(args + 1, args, ((size_t)nargs + 1) * sizeof(char *));
-            args[0] = sud_arena_strdup(a, elf_interp);
+            char *d = sud_arena_strdup(a, elf_interp);
+            if (!d) return NULL;
+            args[0] = d;
             nargs++;
             drop_count++;
             continue;
@@ -329,32 +347,39 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
             if (!self_exe)
                 return args;
             char **na = ensure_args(a, args, nargs, 1, &max_args);
-            if (!na) return args;
+            if (!na) return NULL;
             args = na;
             memmove(args + 1, args, ((size_t)nargs + 1) * sizeof(char *));
-            args[0] = sud_arena_strdup(a, self_exe);
+            char *d_self = sud_arena_strdup(a, self_exe);
+            if (!d_self) return NULL;
+            args[0] = d_self;
             nargs++;
             if (!g_trace_exec_env) {
                 na = ensure_args(a, args, nargs, 1, &max_args);
-                if (!na) return args;
+                if (!na) return NULL;
                 args = na;
                 memmove(args + 2, args + 1,
                         (size_t)nargs * sizeof(char *));
-                args[1] = sud_arena_strdup(a, "--no-env");
+                char *d_ne = sud_arena_strdup(a, "--no-env");
+                if (!d_ne) return NULL;
+                args[1] = d_ne;
                 nargs++;
             }
             /* Insert --drop-argv N after sudtrace's own flags */
             if (drop_count > 0) {
                 int insert_pos = g_trace_exec_env ? 1 : 2;
                 na = ensure_args(a, args, nargs, 2, &max_args);
-                if (!na) return args;
+                if (!na) return NULL;
                 args = na;
                 memmove(args + insert_pos + 2, args + insert_pos,
                         ((size_t)(nargs - insert_pos) + 1) * sizeof(char *));
-                args[insert_pos] = sud_arena_strdup(a, "--drop-argv");
+                char *d_drop = sud_arena_strdup(a, "--drop-argv");
                 char drop_buf[16];
                 fmt_int(drop_buf, drop_count);
-                args[insert_pos + 1] = sud_arena_strdup(a, drop_buf);
+                char *d_n = sud_arena_strdup(a, drop_buf);
+                if (!d_drop || !d_n) return NULL;
+                args[insert_pos] = d_drop;
+                args[insert_pos + 1] = d_n;
                 nargs += 2;
             }
             break;

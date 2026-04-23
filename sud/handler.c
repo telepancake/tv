@@ -557,10 +557,16 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
                 /* If exec succeeded, we never reach here.
                  * On failure the arena is discarded with this stack frame. */
             } else {
-                ret = -ENOMEM;
+                /* Arena exhaustion (e.g. very large argv).  Forward the
+                 * original execve unchanged so we don't break programs
+                 * that work fine without sud — they just won't get the
+                 * sudtrace shim/argv rewriting for this exec.  Found by
+                 * tests/sud_stress.c::argv-huge. */
+                ret = raw_syscall6(SYS_execve, a0, a1, a2, 0, 0, 0);
             }
         } else {
-            ret = -ENOMEM;
+            /* Same fallback for the (very unlikely) top-level alloc failure. */
+            ret = raw_syscall6(SYS_execve, a0, a1, a2, 0, 0, 0);
         }
 
         UC_SET_RET(uc, ret);
@@ -616,10 +622,11 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
                 ret = raw_syscall6(SYS_execve, (long)new_argv[0],
                                    (long)new_argv, a3, 0, 0, 0);
             } else {
-                ret = -ENOMEM;
+                /* Arena exhaustion: forward original execveat unchanged. */
+                ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
             }
         } else {
-            ret = -ENOMEM;
+            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
         }
 
         UC_SET_RET(uc, ret);
