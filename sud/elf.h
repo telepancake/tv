@@ -30,6 +30,12 @@ int resolve_execveat_path(int dirfd, const char *path, long flags,
 char **build_exec_argv(struct sud_arena *a, int argc, char **argv);
 void free_exec_argv(char **args);
 
+/* Compute a sufficient arena size for build_exec_argv() given the
+ * inputs.  Used by the SIGSYS handler to mmap a per-call arena large
+ * enough that strdup never returns NULL — sud must produce a correctly
+ * rewritten argv, never silently fall back. */
+size_t exec_arena_size_for(const char *fn, char **argv, int argc);
+
 /* Self exe helper */
 const char *self_exe_for_class(int elf_class);
 

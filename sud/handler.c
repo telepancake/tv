@@ -533,41 +533,51 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
         if (orig_argv)
             while (orig_argv[orig_argc]) orig_argc++;
 
-        /* Per-call arena on the alt-stack (which is per-task — see
-         * ensure_sud_altstack() and prepare_child_sud()). No sharing
-         * between concurrent SIGSYS handlers in different tasks. */
-        char arena_buf[64 * 1024] __attribute__((aligned(16)));
+        /* Per-call arena, sized to fit any conforming argv (bounded by
+         * ARG_MAX and our own prepend headroom).  mmap rather than a
+         * fixed stack buffer — the previous 64 KiB stack arena
+         * silently truncated argv on large execs (e.g. linker command
+         * lines), which then either failed in the kernel or NULL-deref'd
+         * inside the handler.  See tests/sud_stress.c::argv-huge. */
+        size_t arena_size = exec_arena_size_for(fn, orig_argv, orig_argc);
+        void *arena_buf = raw_mmap(NULL, arena_size,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if ((unsigned long)arena_buf >= (unsigned long)-4095) {
+            /* True OOM — there is no fallback that would let sud do its
+             * job here.  Surface the kernel's own error to the caller. */
+            UC_SET_RET(uc, -ENOMEM);
+            return;
+        }
+
         struct sud_arena arena;
-        sud_arena_init(&arena, arena_buf, sizeof(arena_buf));
+        sud_arena_init(&arena, arena_buf, arena_size);
 
         int build_argc = orig_argc > 0 ? orig_argc : 1;
         char **build_argv = sud_arena_alloc(&arena,
                                 ((size_t)build_argc + 1) * sizeof(char *));
+        char **new_argv = NULL;
         if (build_argv) {
             build_argv[0] = sud_arena_strdup(&arena, fn);
             for (int i = 1; i < orig_argc; i++)
                 build_argv[i] = sud_arena_strdup(&arena, orig_argv[i]);
             build_argv[build_argc] = NULL;
 
-            char **new_argv = build_exec_argv(&arena, build_argc, build_argv);
-
-            if (new_argv) {
-                ret = raw_syscall6(SYS_execve, (long)new_argv[0],
-                                   (long)new_argv, a2, 0, 0, 0);
-                /* If exec succeeded, we never reach here.
-                 * On failure the arena is discarded with this stack frame. */
-            } else {
-                /* Arena exhaustion (e.g. very large argv).  Forward the
-                 * original execve unchanged so we don't break programs
-                 * that work fine without sud — they just won't get the
-                 * sudtrace shim/argv rewriting for this exec.  Found by
-                 * tests/sud_stress.c::argv-huge. */
-                ret = raw_syscall6(SYS_execve, a0, a1, a2, 0, 0, 0);
-            }
-        } else {
-            /* Same fallback for the (very unlikely) top-level alloc failure. */
-            ret = raw_syscall6(SYS_execve, a0, a1, a2, 0, 0, 0);
+            new_argv = build_exec_argv(&arena, build_argc, build_argv);
         }
+
+        if (new_argv) {
+            ret = raw_syscall6(SYS_execve, (long)new_argv[0],
+                               (long)new_argv, a2, 0, 0, 0);
+            /* On success exec replaces the process; we only reach here
+             * on failure.  Unmap the arena before returning. */
+        } else {
+            /* Arena was sized by exec_arena_size_for() to fit, so
+             * build_exec_argv returning NULL here means a sizing bug.
+             * Surface ENOMEM rather than silently breaking the exec. */
+            ret = -ENOMEM;
+        }
+        raw_syscall6(SYS_munmap, (long)arena_buf, arena_size, 0, 0, 0, 0);
 
         UC_SET_RET(uc, ret);
         return;
@@ -604,30 +614,39 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
         if (orig_argv)
             while (orig_argv[orig_argc]) orig_argc++;
 
-        char arena_buf[64 * 1024] __attribute__((aligned(16)));
+        size_t arena_size = exec_arena_size_for(resolved_fn, orig_argv, orig_argc);
+        void *arena_buf = raw_mmap(NULL, arena_size,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if ((unsigned long)arena_buf >= (unsigned long)-4095) {
+            UC_SET_RET(uc, -ENOMEM);
+            return;
+        }
+
         struct sud_arena arena;
-        sud_arena_init(&arena, arena_buf, sizeof(arena_buf));
+        sud_arena_init(&arena, arena_buf, arena_size);
 
         int build_argc = orig_argc > 0 ? orig_argc : 1;
         char **build_argv = sud_arena_alloc(&arena,
                                 ((size_t)build_argc + 1) * sizeof(char *));
+        char **new_argv = NULL;
         if (build_argv) {
             build_argv[0] = sud_arena_strdup(&arena, resolved_fn);
             for (int i = 1; i < orig_argc; i++)
                 build_argv[i] = sud_arena_strdup(&arena, orig_argv[i]);
             build_argv[build_argc] = NULL;
 
-            char **new_argv = build_exec_argv(&arena, build_argc, build_argv);
-            if (new_argv) {
-                ret = raw_syscall6(SYS_execve, (long)new_argv[0],
-                                   (long)new_argv, a3, 0, 0, 0);
-            } else {
-                /* Arena exhaustion: forward original execveat unchanged. */
-                ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
-            }
-        } else {
-            ret = raw_syscall6(SYS_execveat, a0, a1, a2, a3, a4, 0);
+            new_argv = build_exec_argv(&arena, build_argc, build_argv);
         }
+
+        if (new_argv) {
+            ret = raw_syscall6(SYS_execve, (long)new_argv[0],
+                               (long)new_argv, a3, 0, 0, 0);
+        } else {
+            /* Arena was sized to fit; NULL here means a sizing bug. */
+            ret = -ENOMEM;
+        }
+        raw_syscall6(SYS_munmap, (long)arena_buf, arena_size, 0, 0, 0, 0);
 
         UC_SET_RET(uc, ret);
         return;

@@ -60,6 +60,7 @@ fi
 # Format: "name|expected_exit|args..."
 TESTS=(
     "argv-huge|0|"
+    "argv-near-argmax|0|"
     "argv-single-huge|0|"
     "shebang-chain|0|10"
     "thread-exec-storm|0|6 30"
