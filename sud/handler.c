@@ -42,13 +42,17 @@ void install_sigsys_handler_raw(void)
     struct kernel_sigaction_raw sa;
     memset(&sa, 0, sizeof(sa));
     sa.handler = (void (*)(int))sigsys_handler;
-    /* SA_ONSTACK: SIGSYS fires for every syscall the traced program
-     * makes. The handler does non-trivial work (a few KiB per frame
-     * on i386). On 32-bit programs with default 8 MiB stacks already
-     * partly consumed by the program, running the handler in-line on
-     * the program's stack overflows or corrupts segment state, which
-     * the kernel reports as SI_KERNEL SIGSEGV. Use the alternate
-     * signal stack set up by ensure_sud_altstack() instead. */
+    /* SA_ONSTACK: run the SIGSYS handler on the alternate signal stack
+     * installed by ensure_sud_altstack(). The handler is invoked for
+     * every syscall the traced program makes and uses several KiB of
+     * stack per frame; running in-line on the program's stack risks
+     * overflow when the program is already deep (recursive code, large
+     * locals, etc.). The exact failure mode of running without
+     * SA_ONSTACK has not been characterised here — any SI_KERNEL
+     * SIGSEGV reproducer should be captured with the diagnostic
+     * handler in sud/loader.c (which dumps registers, code window,
+     * recent syscalls, and /proc/self/maps) before drawing
+     * conclusions. */
     sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER | SA_ONSTACK;
     sa.restorer = sud_rt_sigreturn_restorer;
     /*
@@ -268,7 +272,38 @@ static void sigsys_diag_dump(const char *tag, ucontext_t *uc,
  * Since the handler runs in the traced process itself, we have direct
  * access to its memory (no ptrace or /proc/mem needed for pointers).
  * ================================================================ */
+static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw);
+
 void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw)
+{
+    ucontext_t *uc = (ucontext_t *)uctx_raw;
+    long nr = UC_SYSCALL_NR(uc);
+    unsigned long pc = UC_PC(uc);
+    int tid = (int)raw_gettid();
+
+    /* Allocate a ring slot up-front and mark it "in progress" so that
+     * if the inner handler crashes (bad pointer, etc.) the crash
+     * dumper can still see what syscall we were processing. */
+    unsigned int slot =
+        __atomic_fetch_add(&g_sud_syslog_head, 1, __ATOMIC_RELAXED)
+        & (SUD_SYSLOG_SIZE - 1);
+    g_sud_syslog[slot].nr  = nr;
+    g_sud_syslog[slot].pc  = pc;
+    g_sud_syslog[slot].tid = tid;
+    g_sud_syslog[slot].ret = SUD_SYSLOG_NORETURN;
+    /* Make the new entry visible to a crash on another thread before
+     * we run any user-pointer-touching code. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    sigsys_handler_inner(sig, info, uctx_raw);
+
+    /* Record the final return value the handler placed into the ucontext.
+     * For execve(2) on success this is unreachable (kernel never returns),
+     * which is fine — the slot stays NORETURN and the dumper labels it. */
+    g_sud_syslog[slot].ret = (long)UC_SYSCALL_NR(uc);  /* EAX/RAX overwritten by UC_SET_RET */
+}
+
+static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
 {
     ucontext_t *uc = (ucontext_t *)uctx_raw;
     (void)sig;

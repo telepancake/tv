@@ -286,3 +286,16 @@ _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EIP]) == 76,
  * ================================================================ */
 char  g_arena_buf[ARENA_SIZE] __attribute__((aligned(16)));
 size_t g_arena_pos = 0;
+
+/* ================================================================
+ * Recent-syscalls ring buffer — definition; declared in handler.h.
+ *
+ * Initialised so every entry's nr is -1 ("unused") so the crash
+ * dumper can suppress unused slots when the program crashes very
+ * early before the ring has wrapped.
+ * ================================================================ */
+#include "sud/handler.h"
+struct sud_syslog_entry g_sud_syslog[SUD_SYSLOG_SIZE] = {
+    [0 ... SUD_SYSLOG_SIZE - 1] = { -1, 0, 0, 0 }
+};
+volatile unsigned int g_sud_syslog_head = 0;
