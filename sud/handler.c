@@ -518,6 +518,17 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
     if (nr == SYS_execve) {
         const char *fn = (const char *)a0;
         char **orig_argv = (char **)a1;
+
+        /* If the program handed us a NULL or empty filename, we have no
+         * binary to classify or shebang-resolve.  Forwarding to the kernel
+         * lets it produce the canonical -EFAULT/-ENOENT instead of us
+         * crashing in resolve_path() trying to dereference cmd[0]. */
+        if (!fn || !fn[0]) {
+            ret = raw_syscall6(SYS_execve, a0, a1, a2, 0, 0, 0);
+            UC_SET_RET(uc, ret);
+            return;
+        }
+
         int orig_argc = 0;
         if (orig_argv)
             while (orig_argv[orig_argc]) orig_argc++;
