@@ -215,11 +215,18 @@ static inline long raw_getdents64(int fd, void *buf, size_t count)
 #endif
 }
 
-/* mmap. i386 uses mmap2 (offset in pages); x86_64 uses mmap (offset in bytes). */
+/* mmap. i386 uses mmap2 (offset in pages); x86_64 uses mmap (offset in bytes).
+ *
+ * NOTE: cannot key off `#ifdef SYS_mmap` — on i386, both SYS_mmap (== __NR_mmap,
+ * 90) and SYS_mmap2 (192) are defined, but the former is the legacy
+ * sys_old_mmap which expects a single pointer to a `struct mmap_arg_struct`
+ * in ebx, NOT 6 GPR args. Calling it with the new-style 6-arg convention
+ * silently returns -EFAULT (kernel reads our `addr` as a NULL struct ptr).
+ * Switch on the architecture instead, matching the libc.c mmap() wrapper. */
 static inline void *raw_mmap(void *addr, size_t length, int prot, int flags,
                              int fd, off_t offset)
 {
-#ifdef SYS_mmap
+#if defined(__x86_64__)
     long r = raw_syscall6(SYS_mmap, (long)addr, (long)length, prot, flags,
                           fd, (long)offset);
 #else

@@ -158,10 +158,19 @@ void prepare_child_sud(void)
 #define SUD_ALTSTACK_SIZE (256 * 1024)
 void ensure_sud_altstack(void)
 {
-    void *altstack = (void *)raw_syscall6(SYS_mmap, 0, SUD_ALTSTACK_SIZE,
-                                          PROT_READ | PROT_WRITE,
-                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if ((long)altstack < 0 && (long)altstack > -4096) return;
+    /* Use raw_mmap rather than raw_syscall6(SYS_mmap, ...) directly: on
+     * i386 the latter would invoke the legacy sys_old_mmap (which expects
+     * a `struct mmap_arg_struct *` in ebx, not 6 GPR args) and silently
+     * return -EFAULT, leaving us with no alt-stack on 32-bit. Then with
+     * SA_ONSTACK set on the SIGSYS handler the kernel falls back to the
+     * program's regular stack, where the handler's per-call 64 KiB arena
+     * (sigsys_handler_inner's `arena_buf`) overflows the program's
+     * stack guard page and the recursive fault during signal-frame
+     * setup gets force-killed: a silent SIGSEGV with no diagnostic. */
+    void *altstack = raw_mmap(NULL, SUD_ALTSTACK_SIZE,
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((unsigned long)altstack >= (unsigned long)-4095) return;
     struct { void *ss_sp; int ss_flags; size_t ss_size; } ss;
     ss.ss_sp    = altstack;
     ss.ss_flags = 0;
