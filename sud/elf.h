@@ -27,7 +27,7 @@ int resolve_execveat_path(int dirfd, const char *path, long flags,
                           char *out, int out_sz);
 
 /* Exec argv building */
-char **build_exec_argv(int argc, char **argv);
+char **build_exec_argv(struct sud_arena *a, int argc, char **argv);
 void free_exec_argv(char **args);
 
 /* Self exe helper */
