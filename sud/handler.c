@@ -42,7 +42,14 @@ void install_sigsys_handler_raw(void)
     struct kernel_sigaction_raw sa;
     memset(&sa, 0, sizeof(sa));
     sa.handler = (void (*)(int))sigsys_handler;
-    sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER;
+    /* SA_ONSTACK: SIGSYS fires for every syscall the traced program
+     * makes. The handler does non-trivial work (a few KiB per frame
+     * on i386). On 32-bit programs with default 8 MiB stacks already
+     * partly consumed by the program, running the handler in-line on
+     * the program's stack overflows or corrupts segment state, which
+     * the kernel reports as SI_KERNEL SIGSEGV. Use the alternate
+     * signal stack set up by ensure_sud_altstack() instead. */
+    sa.flags = SA_SIGINFO | SA_RESTART | SA_RESTORER | SA_ONSTACK;
     sa.restorer = sud_rt_sigreturn_restorer;
     /*
      * Block ALL signals while the SIGSYS handler is active.
@@ -121,6 +128,10 @@ void prepare_child_sud(void)
     install_sigsys_handler_raw();
     reset_sigmask_raw();
     reenable_sud_in_child();
+    /* Grab a fresh wire stream_id and reset the delta encoder so this
+     * child doesn't share encoding state with its parent — see
+     * sud_wire_postfork() for the full rationale. */
+    sud_wire_postfork();
 }
 
 /* ================================================================

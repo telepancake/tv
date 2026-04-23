@@ -53,6 +53,15 @@ extern int        g_trace_exec_env;
  * ================================================================ */
 void sud_wire_init(void);
 
+/* Reset and re-init the wire stream after fork.
+ *
+ * Must be called from the child process after a fork (or non-CLONE_VM
+ * clone) so that the child gets its own stream_id from the shared
+ * counter and starts the per-stream delta encoder fresh. Without this,
+ * parent and child both emit events with the same stream_id and the
+ * decoder produces garbage deltas. */
+void sud_wire_postfork(void);
+
 /* ================================================================
  * Proc helpers
  * ================================================================ */

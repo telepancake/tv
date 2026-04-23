@@ -562,22 +562,36 @@ int sudtrace_main(int argc, char **argv)
         free(exec_argv[i]);
     free(exec_argv);
 
-    /* Main wait loop — emit EXIT events for reaped children */
+    /* Main wait loop — emit EXIT events for reaped children.
+     *
+     * waitpid(-1, ..., __WALL) blocks until any descendant changes
+     * state. We only care about real terminations (WIFEXITED /
+     * WIFSIGNALED); anything else (WIFSTOPPED, WIFCONTINUED, the
+     * occasional 0 return some kernels produce on tracee races) is
+     * a no-op — keep waiting.
+     *
+     * If we treat non-terminating events as terminations the launcher
+     * either spins (the kernel keeps re-delivering the same stop
+     * notification while we re-check the same condition) or, worse,
+     * exits before the original child has actually finished. */
     for (;;) {
-        int wstatus;
+        int wstatus = 0;
         pid_t wpid = waitpid(-1, &wstatus, __WALL);
         if (wpid < 0) {
             if (errno == EINTR) continue;
+            /* ECHILD = nothing left to reap; any other errno is a
+             * permanent failure. Either way, exit the loop. */
             break;
         }
+        if (wpid == 0) continue;            /* should not happen without WNOHANG */
+        if (!WIFEXITED(wstatus) && !WIFSIGNALED(wstatus))
+            continue;                       /* WIFSTOPPED / WIFCONTINUED */
 
-        if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
-            pid_t tgid = get_tgid_for(wpid);
-            if (wpid == tgid || wpid == child)
-                emit_exit(wpid, wstatus);
+        pid_t tgid = get_tgid_for(wpid);
+        if (wpid == tgid || wpid == child)
+            emit_exit(wpid, wstatus);
 
-            if (wpid == child) break;
-        }
+        if (wpid == child) break;
     }
 
     if (g_out_fd >= 0 && g_out_fd != STDOUT_FILENO &&

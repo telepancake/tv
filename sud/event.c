@@ -94,22 +94,51 @@ void sud_wire_init(void)
      * wants. If the fd isn't present the mmap fails and we keep the
      * process-local fallback (single-stream stand-alone runs). */
     if (!g_stream_id_set) {
-        void *p = raw_mmap(NULL, SUD_SHARED_PAGE_SIZE,
-                           PROT_READ | PROT_WRITE, MAP_SHARED,
-                           SUD_STATE_FD, 0);
-        /* raw_mmap returns the raw kernel return value cast to a
-         * pointer; on failure that's a small negative errno (e.g.
-         * (void *)-9 for EBADF), which is *not* MAP_FAILED. Treat
-         * anything in the top 4 KiB of the address space as an error.
-         * Otherwise we'd happily write through a junk pointer below. */
-        if ((uintptr_t)p < (uintptr_t)-4096L)
-            g_shared = (struct sud_shared *)p;
+        /* Only attempt the mmap if g_shared still points at the
+         * process-local fallback (i.e. we haven't already grabbed
+         * the shared page in a previous lifetime — see
+         * sud_wire_postfork()). The shared page is a MAP_SHARED
+         * mapping of SUD_STATE_FD; it survives fork (the kernel
+         * mapping is inherited) so the post-fork child can keep
+         * using it without re-mmap. */
+        if (g_shared == &g_local_shared) {
+            void *p = raw_mmap(NULL, SUD_SHARED_PAGE_SIZE,
+                               PROT_READ | PROT_WRITE, MAP_SHARED,
+                               SUD_STATE_FD, 0);
+            /* raw_mmap returns the raw kernel return value cast to a
+             * pointer; on failure that's a small negative errno (e.g.
+             * (void *)-9 for EBADF), which is *not* MAP_FAILED. Treat
+             * anything in the top 4 KiB of the address space as an error.
+             * Otherwise we'd happily write through a junk pointer below. */
+            if ((uintptr_t)p < (uintptr_t)-4096L)
+                g_shared = (struct sud_shared *)p;
+        }
         /* Atomic grab. __sync_fetch_and_add is async-signal-safe
          * (single instruction lock-prefixed on x86) and works on the
          * shared page (or on the process-local fallback). */
         g_stream_id = __sync_fetch_and_add(&g_shared->next_stream_id, 1u) + 1u;
         g_stream_id_set = 1;
     }
+}
+
+void sud_wire_postfork(void)
+{
+    /* After fork(), the child inherits the parent's g_stream_id and
+     * delta-encoder state (g_ev_state) via copy-on-write. If we don't
+     * reset them, both processes will emit events tagged with the same
+     * stream_id but with diverging local ev_state — the decoder uses a
+     * single per-stream-id ev_state and would apply parent's deltas to
+     * child's encoded values (or vice-versa), producing nonsense type/
+     * pid/ts numbers ("unknown event type -124xxx" on ingest).
+     *
+     * The shared atomic counter (g_shared->next_stream_id) sits on a
+     * MAP_SHARED page that fork inherits, so __sync_fetch_and_add still
+     * sees every sibling's allocation. We just need to clear the local
+     * "already initialised" flag and zero the ev_state, then re-init. */
+    g_stream_id_set = 0;
+    g_stream_id = 0;
+    __builtin_memset(&g_ev_state, 0, sizeof(g_ev_state));
+    sud_wire_init();
 }
 
 /* ================================================================
