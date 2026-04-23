@@ -278,23 +278,20 @@ char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
         /* sud_arena_strdup(NULL) returns NULL legitimately (preserving
          * a NULL slot in the source argv). Distinguish that from arena
          * exhaustion: only the latter (non-NULL src → NULL dup) is a
-         * failure that requires falling back to forwarding the
-         * original execve unchanged. Without this, mid-vector NULLs
-         * end up in argv and the kernel either truncates the vector
-         * early or rejects the call (the user reported this as silent
-         * build failures that work fine without sud). */
+         * failure. The caller is expected to size the arena via
+         * exec_arena_size_for() so this never happens; if it does, it
+         * is a sizing bug, not something to silently paper over. */
         if (orig_argv[i] && !dup) return NULL;
         args[nargs++] = dup;
     }
     args[nargs] = NULL;
 
-    /* If after the strdup loop we still don't have a usable argv[0]
-     * (e.g. the caller passed an empty argv, or argv[0] is the empty
-     * string), there is nothing to resolve or shebang-classify. Return
-     * NULL so the caller forwards the original execve unchanged — the
-     * kernel will then produce its canonical -EFAULT/-ENOENT. This is
-     * consistent with the "NULL means forward original" convention
-     * established for arena exhaustion above. */
+    /* No usable argv[0] (e.g. raw execve(NULL, …)) — nothing to
+     * resolve or shebang-classify. The caller (sigsys_handler_inner)
+     * already guards execve(NULL,…) before we get here for SYS_execve;
+     * for the execveat path, fn is resolved via resolve_execveat_path
+     * before we're called.  This is a defensive NULL return so that
+     * resolve_path is never invoked with NULL. */
     if (nargs == 0 || !args[0] || !args[0][0])
         return NULL;
 
@@ -400,4 +397,70 @@ void free_exec_argv(char **args)
 {
     /* No-op: storage lives in the caller's stack-local arena. */
     (void)args;
+}
+
+/*
+ * Compute a sufficient arena size for build_exec_argv().
+ *
+ * The arena holds:
+ *   • a strdup of every input arg (orig_argv[0..orig_argc-1]) plus fn
+ *   • the build_argv vector (orig_argc + 1 entries) initially copied
+ *     into the arena before build_exec_argv re-allocates its own
+ *   • build_exec_argv's own args[] vector, which can grow up to
+ *     orig_argc + 20 + (16 prepends * 2) = orig_argc + 52 entries
+ *     after ensure_args() reallocs (each realloc consumes a fresh
+ *     vector since the bump arena cannot resize in place)
+ *   • depth-loop prepends: up to 16 iterations, each may add a
+ *     PATH_MAX interpreter string + a small interp_arg / "--no-env" /
+ *     "--drop-argv N" string
+ *
+ * Each sud_arena_alloc rounds up to 16 bytes, which we account for.
+ * Final result is rounded to a page so mmap is happy.
+ *
+ * Sized generously: it is far better to mmap a few hundred KiB extra
+ * (lazy-faulted, costs nothing until written) than to truncate.
+ */
+size_t exec_arena_size_for(const char *fn, char **argv, int argc)
+{
+    /* round-up-to-16 helper, matches sud_arena_alloc's rounding. */
+    #define R16(x) (((size_t)(x) + 15u) & ~(size_t)15u)
+
+    size_t need = 0;
+
+    /* fn strdup */
+    if (fn) need += R16(strlen(fn) + 1);
+
+    /* every original argv string */
+    if (argv) {
+        for (int i = 0; i < argc; i++) {
+            if (argv[i]) need += R16(strlen(argv[i]) + 1);
+        }
+    }
+
+    /* build_argv vector (one allocation) */
+    need += R16(((size_t)argc + 1) * sizeof(char *));
+
+    /* build_exec_argv's args[] vector — count every grow as a fresh
+     * arena allocation since the bump allocator can't resize in place.
+     * Worst case: initial alloc + (16 depth iterations) * (up to 2
+     * grows each) = ~33 allocations.  Bound generously. */
+    {
+        size_t worst_entries = (size_t)argc + 64;
+        /* 33 allocations, each at most worst_entries entries. */
+        need += 33 * R16((worst_entries + 1) * sizeof(char *));
+    }
+
+    /* Depth-loop prepends: 16 * (PATH_MAX interp + 256 small string +
+     * a couple of duplicates of the resolved path). */
+    need += 16 * (R16(PATH_MAX) + R16(256) + R16(PATH_MAX));
+
+    /* Page-round (mmap requires it). */
+    need = (need + 4095u) & ~(size_t)4095u;
+
+    /* Hard floor — even the smallest exec needs room for the prepend
+     * machinery. */
+    if (need < 64 * 1024) need = 64 * 1024;
+
+    #undef R16
+    return need;
 }

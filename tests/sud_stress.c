@@ -58,12 +58,13 @@ static void ok(const char *name)
 /* ─────────────────────────────────────────────────────────────────────
  * Subtest: argv-huge
  *
- * Exec /bin/true with N args totalling > 96 KiB.  build_exec_argv on
- * the SIGSYS path arenas every arg with sud_arena_strdup into a 64 KiB
- * stack buffer; the call sites at sud/elf.c:294,304,321,335 NEVER check
- * the strdup return.  When the arena fills, args[0] becomes NULL and
- * the next iteration calls resolve_path(NULL,...) → SIGSEGV inside the
- * SUD handler — exactly the dump the user reported.
+ * Exec /bin/true with a large argv.  Default ~96 KiB, configurable up
+ * to (and beyond) the kernel's ARG_MAX.  Without sud, the kernel
+ * accepts argvs up to ~2 MiB (ARG_MAX); sud must accept the same set
+ * of inputs that the bare kernel does.  A previous fixed 64 KiB stack
+ * arena in the SIGSYS execve handler silently truncated argv around
+ * 60 KiB and either NULL-deref'd in resolve_path or produced a
+ * malformed argv that the kernel then rejected with -E2BIG/-EFAULT.
  *
  * If sud is healthy, /bin/true runs and we read the wait status.
  * If the handler crashes, we get killed by the kernel re-raising
@@ -103,6 +104,19 @@ static int t_argv_huge(int total_argv_bytes)
 
     ok("argv-huge");
     return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Subtest: argv-near-argmax
+ *
+ * Same shape as argv-huge but pushes argv near the kernel's ARG_MAX
+ * (typically 2 MiB on Linux).  Verifies the arena scales — sud must
+ * accept the same inputs that the bare kernel accepts.
+ * ───────────────────────────────────────────────────────────────────── */
+static int t_argv_near_argmax(void)
+{
+    /* Try ~1.5 MiB.  Safely below the 2 MiB ARG_MAX with envp + alignment. */
+    return t_argv_huge(1536 * 1024);
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -482,6 +496,7 @@ static void list_tests(void)
 {
     static const char *names[] = {
         "argv-huge [bytes]",
+        "argv-near-argmax",
         "argv-single-huge",
         "shebang-chain [depth] [tmpdir]",
         "thread-exec-storm [threads] [iters]",
@@ -505,6 +520,8 @@ int main(int argc, char **argv)
     const char *t = argv[1];
     if (!strcmp(t, "argv-huge"))
         return t_argv_huge(argc > 2 ? atoi(argv[2]) : 0);
+    if (!strcmp(t, "argv-near-argmax"))
+        return t_argv_near_argmax();
     if (!strcmp(t, "argv-single-huge"))
         return t_argv_single_huge();
     if (!strcmp(t, "shebang-chain"))
