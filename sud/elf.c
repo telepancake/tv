@@ -247,26 +247,27 @@ const char *self_exe_for_class(int elf_class)
  * ================================================================ */
 
 /* Ensure room for additional entries; returns (possibly new) args pointer. */
-static char **ensure_args(char **args, int nargs, int need, int *max_args)
+static char **ensure_args(struct sud_arena *a, char **args, int nargs,
+                          int need, int *max_args)
 {
     if (nargs + need < *max_args)
         return args;
     *max_args = nargs + need + 8;
-    char **new_args = arena_alloc(((size_t)*max_args + 1) * sizeof(char *));
+    char **new_args = sud_arena_alloc(a, ((size_t)*max_args + 1) * sizeof(char *));
     if (!new_args) return NULL;
     memcpy(new_args, args, ((size_t)nargs + 1) * sizeof(char *));
     return new_args;
 }
 
-char **build_exec_argv(int orig_argc, char **orig_argv)
+char **build_exec_argv(struct sud_arena *a, int orig_argc, char **orig_argv)
 {
     int max_args = orig_argc + 20;
-    char **args = arena_alloc(((size_t)max_args + 1) * sizeof(char *));
+    char **args = sud_arena_alloc(a, ((size_t)max_args + 1) * sizeof(char *));
     if (!args) return NULL;
 
     int nargs = 0;
     for (int i = 0; i < orig_argc; i++)
-        args[nargs++] = arena_strdup(orig_argv[i]);
+        args[nargs++] = sud_arena_strdup(a, orig_argv[i]);
     args[nargs] = NULL;
 
     int drop_count = 0;
@@ -276,19 +277,19 @@ char **build_exec_argv(int orig_argc, char **orig_argv)
         if (!resolve_path(args[0], resolved, sizeof(resolved)))
             return args;
 
-        args[0] = arena_strdup(resolved);
+        args[0] = sud_arena_strdup(a, resolved);
 
         char interp[PATH_MAX], interp_arg[256];
         if (check_shebang(resolved, interp, sizeof(interp),
                            interp_arg, sizeof(interp_arg))) {
             int extra = interp_arg[0] ? 2 : 1;
-            char **na = ensure_args(args, nargs, extra, &max_args);
+            char **na = ensure_args(a, args, nargs, extra, &max_args);
             if (!na) return args;
             args = na;
             memmove(args + extra, args, ((size_t)nargs + 1) * sizeof(char *));
-            args[0] = arena_strdup(interp);
+            args[0] = sud_arena_strdup(a, interp);
             if (interp_arg[0])
-                args[1] = arena_strdup(interp_arg);
+                args[1] = sud_arena_strdup(a, interp_arg);
             nargs += extra;
             continue;
         }
@@ -299,11 +300,11 @@ char **build_exec_argv(int orig_argc, char **orig_argv)
                                      sizeof(elf_interp), &elf_class);
 
         if (dyn == 1) {
-            char **na = ensure_args(args, nargs, 1, &max_args);
+            char **na = ensure_args(a, args, nargs, 1, &max_args);
             if (!na) return args;
             args = na;
             memmove(args + 1, args, ((size_t)nargs + 1) * sizeof(char *));
-            args[0] = arena_strdup(elf_interp);
+            args[0] = sud_arena_strdup(a, elf_interp);
             nargs++;
             drop_count++;
             continue;
@@ -313,33 +314,33 @@ char **build_exec_argv(int orig_argc, char **orig_argv)
             const char *self_exe = self_exe_for_class(elf_class);
             if (!self_exe)
                 return args;
-            char **na = ensure_args(args, nargs, 1, &max_args);
+            char **na = ensure_args(a, args, nargs, 1, &max_args);
             if (!na) return args;
             args = na;
             memmove(args + 1, args, ((size_t)nargs + 1) * sizeof(char *));
-            args[0] = arena_strdup(self_exe);
+            args[0] = sud_arena_strdup(a, self_exe);
             nargs++;
             if (!g_trace_exec_env) {
-                na = ensure_args(args, nargs, 1, &max_args);
-                if (!na) return NULL;
+                na = ensure_args(a, args, nargs, 1, &max_args);
+                if (!na) return args;
                 args = na;
                 memmove(args + 2, args + 1,
                         (size_t)nargs * sizeof(char *));
-                args[1] = arena_strdup("--no-env");
+                args[1] = sud_arena_strdup(a, "--no-env");
                 nargs++;
             }
             /* Insert --drop-argv N after sudtrace's own flags */
             if (drop_count > 0) {
                 int insert_pos = g_trace_exec_env ? 1 : 2;
-                na = ensure_args(args, nargs, 2, &max_args);
-                if (!na) return NULL;
+                na = ensure_args(a, args, nargs, 2, &max_args);
+                if (!na) return args;
                 args = na;
                 memmove(args + insert_pos + 2, args + insert_pos,
                         ((size_t)(nargs - insert_pos) + 1) * sizeof(char *));
-                args[insert_pos] = arena_strdup("--drop-argv");
+                args[insert_pos] = sud_arena_strdup(a, "--drop-argv");
                 char drop_buf[16];
                 fmt_int(drop_buf, drop_count);
-                args[insert_pos + 1] = arena_strdup(drop_buf);
+                args[insert_pos + 1] = sud_arena_strdup(a, drop_buf);
                 nargs += 2;
             }
             break;
@@ -353,6 +354,6 @@ char **build_exec_argv(int orig_argc, char **orig_argv)
 
 void free_exec_argv(char **args)
 {
+    /* No-op: storage lives in the caller's stack-local arena. */
     (void)args;
-    arena_reset();
 }

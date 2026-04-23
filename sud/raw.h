@@ -230,42 +230,55 @@ static inline void *raw_mmap(void *addr, size_t length, int prot, int flags,
 }
 
 /* ================================================================
- * Signal-safe bump allocator — data in raw.c, inline interface here.
+ * Signal-safe bump allocator.
+ *
+ * Per-call (stack-local) arena: each SIGSYS handler invocation
+ * declares its own backing buffer and an `sud_arena` struct on its
+ * own stack.  The handler runs on a per-task alt-stack (installed
+ * by ensure_sud_altstack() in the main loader and by
+ * prepare_child_sud() in every CLONE_VM child), so the arena is
+ * naturally isolated between concurrent handlers in different tasks.
+ *
+ * A previous version used a single process-wide `g_arena_buf`/
+ * `g_arena_pos`, which races between tasks that share VM (posix_spawn
+ * helpers, pthreads, parallel LTO workers): two handlers calling
+ * arena_reset()/arena_alloc() concurrently would produce overlapping
+ * `args` pointers, and `build_exec_argv` would then return a garbage
+ * pointer (e.g. the leftover RAX from a recent clone()) and segfault
+ * dereferencing it.
  * ================================================================ */
-#define ARENA_SIZE (256 * 1024)
+struct sud_arena {
+    char  *buf;
+    size_t pos;
+    size_t size;
+};
 
-extern char  g_arena_buf[ARENA_SIZE];
-extern size_t g_arena_pos;
-
-static inline void arena_reset(void)
+static inline void sud_arena_init(struct sud_arena *a, void *buf, size_t size)
 {
-    g_arena_pos = 0;
+    a->buf  = (char *)buf;
+    a->pos  = 0;
+    a->size = size;
 }
 
-static inline void *arena_alloc(size_t size)
+static inline void *sud_arena_alloc(struct sud_arena *a, size_t size)
 {
     size = (size + 15) & ~(size_t)15;
-    if (g_arena_pos + size > ARENA_SIZE) return NULL;
-    void *p = g_arena_buf + g_arena_pos;
-    g_arena_pos += size;
+    if (a->pos + size > a->size) return NULL;
+    void *p = a->buf + a->pos;
+    a->pos += size;
     __builtin_memset(p, 0, size);
     return p;
 }
 
-static inline char *arena_strdup(const char *s)
+static inline char *sud_arena_strdup(struct sud_arena *a, const char *s)
 {
     if (!s) return NULL;
     size_t len = 0;
     while (s[len]) len++;
     len++;
-    char *p = arena_alloc(len);
+    char *p = sud_arena_alloc(a, len);
     if (p) __builtin_memcpy(p, s, len);
     return p;
-}
-
-static inline void arena_free(void *p)
-{
-    (void)p;
 }
 
 #endif /* SUD_RAW_H */

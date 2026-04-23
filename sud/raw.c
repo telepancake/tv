@@ -282,12 +282,6 @@ _Static_assert(__builtin_offsetof(ucontext_t, uc_mcontext.gregs[REG_EIP]) == 76,
 #endif
 
 /* ================================================================
- * Arena allocator — signal-safe bump allocator
- * ================================================================ */
-char  g_arena_buf[ARENA_SIZE] __attribute__((aligned(16)));
-size_t g_arena_pos = 0;
-
-/* ================================================================
  * Recent-syscalls ring buffer — definition; declared in handler.h.
  *
  * Initialised so every entry's nr is -1 ("unused") so the crash

@@ -127,8 +127,62 @@ void reenable_sud_in_child(void)
 void prepare_child_sud(void)
     __attribute__((noinline));
 
+/* ================================================================
+ * ensure_sud_altstack — install a fresh per-task alternate signal
+ *                        stack via mmap + sigaltstack.
+ *
+ * SIGSYS fires for every syscall the traced program makes, and the
+ * handler does non-trivial work (build_exec_argv with multiple
+ * PATH_MAX buffers, the per-call exec arena, nested raw_syscall6
+ * calls, the wire emitter, etc.).  Without an alt-stack the kernel
+ * delivers the signal on the program's own stack — easily corrupted
+ * by deep recursion or large user frames.
+ *
+ * CRITICAL: each task that may take SIGSYS needs ITS OWN alt-stack
+ * mapping.  Children created with CLONE_VM (posix_spawn helpers,
+ * pthread workers) share the parent's address space, so they share
+ * the parent's alt-stack mmap.  When parent and child both run a
+ * SIGSYS handler concurrently — which is the steady state for
+ * posix_spawn (CLONE_VM | CLONE_VFORK keeps the parent suspended in
+ * its own SIGSYS handler while the child execs) — both kernels
+ * write signal frames at the top of the same physical pages.  The
+ * child's frame overwrites the parent's saved RIP/registers; on
+ * sigreturn the parent jumps to garbage with leftover registers
+ * (e.g. RAX = the child PID returned by clone()) and crashes.
+ *
+ * The fix is to re-mmap and re-sigaltstack from prepare_child_sud()
+ * for every child created by clone_raw / clone3_raw / fork.  fork()
+ * children would otherwise just COW the parent's mapping, but
+ * re-installing one keeps the policy uniform and harmless.
+ * ================================================================ */
+#define SUD_ALTSTACK_SIZE (256 * 1024)
+void ensure_sud_altstack(void)
+{
+    void *altstack = (void *)raw_syscall6(SYS_mmap, 0, SUD_ALTSTACK_SIZE,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((long)altstack < 0 && (long)altstack > -4096) return;
+    struct { void *ss_sp; int ss_flags; size_t ss_size; } ss;
+    ss.ss_sp    = altstack;
+    ss.ss_flags = 0;
+    ss.ss_size  = SUD_ALTSTACK_SIZE;
+    raw_syscall6(SYS_sigaltstack, (long)&ss, 0, 0, 0, 0, 0);
+}
+
 void prepare_child_sud(void)
 {
+    /* Each CLONE_VM child shares its parent's alt-stack mapping.  If
+     * we don't install a fresh one here, two tasks running SIGSYS
+     * handlers concurrently — typical for posix_spawn (CLONE_VM |
+     * CLONE_VFORK) and for pthread workers — both write signal
+     * frames at the top of the same alt-stack memory.  The kernel
+     * does not coordinate this between tasks, so the second
+     * delivery overwrites the first task's saved RIP/registers; on
+     * sigreturn the first task resumes with garbage state and
+     * crashes (often manifests as RIP somewhere inside the SIGSYS
+     * dispatch with RAX = the leftover return value of the most
+     * recent clone()). */
+    ensure_sud_altstack();
     install_sigsys_handler_raw();
     reset_sigmask_raw();
     reenable_sud_in_child();
@@ -459,23 +513,29 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
         if (orig_argv)
             while (orig_argv[orig_argc]) orig_argc++;
 
-        arena_reset();
+        /* Per-call arena on the alt-stack (which is per-task — see
+         * ensure_sud_altstack() and prepare_child_sud()). No sharing
+         * between concurrent SIGSYS handlers in different tasks. */
+        char arena_buf[64 * 1024] __attribute__((aligned(16)));
+        struct sud_arena arena;
+        sud_arena_init(&arena, arena_buf, sizeof(arena_buf));
 
         int build_argc = orig_argc > 0 ? orig_argc : 1;
-        char **build_argv = arena_alloc((build_argc + 1) * sizeof(char *));
+        char **build_argv = sud_arena_alloc(&arena,
+                                ((size_t)build_argc + 1) * sizeof(char *));
         if (build_argv) {
-            build_argv[0] = arena_strdup(fn);
+            build_argv[0] = sud_arena_strdup(&arena, fn);
             for (int i = 1; i < orig_argc; i++)
-                build_argv[i] = arena_strdup(orig_argv[i]);
+                build_argv[i] = sud_arena_strdup(&arena, orig_argv[i]);
             build_argv[build_argc] = NULL;
 
-            char **new_argv = build_exec_argv(build_argc, build_argv);
+            char **new_argv = build_exec_argv(&arena, build_argc, build_argv);
 
             if (new_argv) {
                 ret = raw_syscall6(SYS_execve, (long)new_argv[0],
                                    (long)new_argv, a2, 0, 0, 0);
                 /* If exec succeeded, we never reach here.
-                 * If it failed, arena will be reset on next execve. */
+                 * On failure the arena is discarded with this stack frame. */
             } else {
                 ret = -ENOMEM;
             }
@@ -483,7 +543,6 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
             ret = -ENOMEM;
         }
 
-        arena_reset();
         UC_SET_RET(uc, ret);
         return;
     }
@@ -519,17 +578,20 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
         if (orig_argv)
             while (orig_argv[orig_argc]) orig_argc++;
 
-        arena_reset();
+        char arena_buf[64 * 1024] __attribute__((aligned(16)));
+        struct sud_arena arena;
+        sud_arena_init(&arena, arena_buf, sizeof(arena_buf));
 
         int build_argc = orig_argc > 0 ? orig_argc : 1;
-        char **build_argv = arena_alloc((build_argc + 1) * sizeof(char *));
+        char **build_argv = sud_arena_alloc(&arena,
+                                ((size_t)build_argc + 1) * sizeof(char *));
         if (build_argv) {
-            build_argv[0] = arena_strdup(resolved_fn);
+            build_argv[0] = sud_arena_strdup(&arena, resolved_fn);
             for (int i = 1; i < orig_argc; i++)
-                build_argv[i] = arena_strdup(orig_argv[i]);
+                build_argv[i] = sud_arena_strdup(&arena, orig_argv[i]);
             build_argv[build_argc] = NULL;
 
-            char **new_argv = build_exec_argv(build_argc, build_argv);
+            char **new_argv = build_exec_argv(&arena, build_argc, build_argv);
             if (new_argv) {
                 ret = raw_syscall6(SYS_execve, (long)new_argv[0],
                                    (long)new_argv, a3, 0, 0, 0);
@@ -540,7 +602,6 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
             ret = -ENOMEM;
         }
 
-        arena_reset();
         UC_SET_RET(uc, ret);
         return;
     }

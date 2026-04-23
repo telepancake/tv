@@ -93,6 +93,7 @@ extern volatile unsigned int g_sud_syslog_head;
 void install_sigsys_handler_raw(void);
 void reset_sigmask_raw(void);
 void reenable_sud_in_child(void);
+void ensure_sud_altstack(void);
 void prepare_child_sud(void);
 void sigsys_handler(int sig, siginfo_t *info, void *uctx_raw);
 
