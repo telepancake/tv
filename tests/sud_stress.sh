@@ -1,8 +1,10 @@
 #!/bin/bash
 # tests/sud_stress.sh — driver for the sud_stress harness.
 #
-# Builds tests/sud_stress and runs each subtest under sud64 (and sud32
-# when a 32-bit toolchain is available).  Failure conditions:
+# Builds tests/sud_stress64 and tests/sud_stress32 as freestanding
+# (no-libc) ELFs and runs each subtest under sud64+stress64 and,
+# when a 32-bit clang target is available, sud32+stress32.
+# Failure conditions:
 #   • subtest exit ≠ expected
 #   • timeout
 #   • any line containing "sudtrace: CRASH DIAGNOSTIC" on stderr
@@ -12,8 +14,7 @@
 #   tests/sud_stress.sh                  # one pass of every subtest
 #   tests/sud_stress.sh --soak 20        # 20 passes (catch races)
 #   tests/sud_stress.sh --only NAME      # one subtest, repeated
-#   tests/sud_stress.sh --no-build       # reuse existing binary
-#   tests/sud_stress.sh --32             # also exercise sud32
+#   tests/sud_stress.sh --no-build       # reuse existing binaries
 
 set -uo pipefail
 
@@ -22,7 +23,6 @@ cd "$(dirname "$0")/.."
 SOAK=1
 ONLY=""
 NO_BUILD=0
-WANT_32=0
 TIMEOUT=60
 
 while [ $# -gt 0 ]; do
@@ -30,26 +30,42 @@ while [ $# -gt 0 ]; do
         --soak)     SOAK="$2"; shift 2;;
         --only)     ONLY="$2"; shift 2;;
         --no-build) NO_BUILD=1; shift;;
-        --32)       WANT_32=1; shift;;
         --timeout)  TIMEOUT="$2"; shift 2;;
         -h|--help)
-            sed -n '2,17p' "$0"; exit 0;;
+            sed -n '2,18p' "$0"; exit 0;;
         *) echo "unknown arg: $1" >&2; exit 2;;
     esac
 done
 
-# ── Build harness ─────────────────────────────────────────────────────
-HARNESS=tests/sud_stress
-if [ "$NO_BUILD" -eq 0 ] || [ ! -x "$HARNESS" ]; then
-    echo "[build] $HARNESS"
-    cc -O2 -Wall -Wextra -pthread -o "$HARNESS" tests/sud_stress.c \
-        || { echo "build failed" >&2; exit 2; }
+# ── Build freestanding harness (64-bit and 32-bit) ─────────────────────
+HARNESS64=tests/sud_stress64
+HARNESS32=tests/sud_stress32
+
+FREESTANDING_FLAGS="-O2 -ffreestanding -fno-builtin -fno-stack-protector
+    -fno-pie -fomit-frame-pointer -nostdlib -static -I."
+ISYSTEM32="-isystem /usr/include/x86_64-linux-gnu"
+
+build_harness() {
+    local out="$1" bits="$2" extra="$3"
+    echo "[build] $out (${bits}-bit freestanding)"
+    # shellcheck disable=SC2086
+    clang -m"${bits}" $FREESTANDING_FLAGS $extra \
+        -o "$out" tests/sud_stress.c 2>&1
+}
+
+if [ "$NO_BUILD" -eq 0 ] || [ ! -x "$HARNESS64" ]; then
+    build_harness "$HARNESS64" 64 "" \
+        || { echo "build64 failed" >&2; exit 2; }
+fi
+if [ "$NO_BUILD" -eq 0 ] || [ ! -x "$HARNESS32" ]; then
+    build_harness "$HARNESS32" 32 "$ISYSTEM32" \
+        || { echo "build32 failed (skipping 32-bit tests)" >&2; HARNESS32=""; }
 fi
 
 # Build sud64/sud32 if not already present.
 if [ "$NO_BUILD" -eq 0 ]; then
     [ -x sud64 ] || make sud64 >/dev/null 2>&1 || true
-    [ "$WANT_32" -eq 1 ] && [ ! -x sud32 ] && make sud32 >/dev/null 2>&1 || true
+    [ -n "$HARNESS32" ] && [ ! -x sud32 ] && make sud32 >/dev/null 2>&1 || true
 fi
 
 if [ ! -x sud64 ]; then
@@ -81,6 +97,7 @@ FAILED_NAMES=()
 
 run_one() {
     local launcher="$1"; shift
+    local harness="$1"; shift
     local label="$1"; shift
     local name="$1"; shift
     local expect="$1"; shift
@@ -91,7 +108,7 @@ run_one() {
     local wire="$TMPDIR/$label.$name.wire"
 
     SUDTRACE_OUTFILE="$wire" timeout --kill-after=5 "$TIMEOUT" \
-        "$launcher" "$PWD/$HARNESS" "$name" "$@" \
+        "$launcher" "$harness" "$name" "$@" \
         >"$out" 2>"$err"
     local rc=$?
 
@@ -139,12 +156,13 @@ run_one() {
 }
 
 # ── Iterate ───────────────────────────────────────────────────────────
-LAUNCHERS=("sud64:$PWD/sud64")
-if [ "$WANT_32" -eq 1 ] && [ -x sud32 ]; then
-    LAUNCHERS+=("sud32:$PWD/sud32")
+# Each entry: "label:launcher:harness"
+RUNS=("sud64:$PWD/sud64:$PWD/$HARNESS64")
+if [ -n "$HARNESS32" ] && [ -x sud32 ]; then
+    RUNS+=("sud32:$PWD/sud32:$PWD/$HARNESS32")
 fi
 
-echo "==> sud_stress: soak=$SOAK launchers=${#LAUNCHERS[@]}"
+echo "==> sud_stress: soak=$SOAK runs=${#RUNS[@]}"
 
 for soak in $(seq 1 "$SOAK"); do
     [ "$SOAK" -gt 1 ] && echo "--- pass $soak/$SOAK ---"
@@ -152,10 +170,12 @@ for soak in $(seq 1 "$SOAK"); do
         IFS='|' read -r name expect rest <<<"$entry"
         if [ -n "$ONLY" ] && [ "$ONLY" != "$name" ]; then continue; fi
         # shellcheck disable=SC2086
-        for L in "${LAUNCHERS[@]}"; do
-            label="${L%%:*}"
-            launcher="${L#*:}"
-            run_one "$launcher" "$label" "$name" "$expect" $rest
+        for R in "${RUNS[@]}"; do
+            label="${R%%:*}"
+            tmp="${R#*:}"
+            launcher="${tmp%%:*}"
+            harness="${tmp#*:}"
+            run_one "$launcher" "$harness" "$label" "$name" "$expect" $rest
         done
     done
 done
