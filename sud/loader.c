@@ -140,7 +140,7 @@ static void dump_mem(char *buf, int *pos, int max, int mem_fd,
         *pos = append_ptr(buf, *pos, max, base + off);
         *pos = append_str(buf, *pos, max, ": ");
         if (n <= 0) {
-            *pos = append_str(buf, *pos, max, "<unreadable>\n");
+            *pos = append_str(buf, *pos, max, "(unreadable)\n");
             continue;
         }
         for (ssize_t i = 0; i < n; i++) {
@@ -191,7 +191,7 @@ static void dump_maps(void)
 {
     int fd = raw_open("/proc/self/maps", O_RDONLY);
     if (fd < 0) {
-        const char m[] = "  /proc/self/maps: <unreadable>\n";
+        const char m[] = "  /proc/self/maps: (unreadable)\n";
         raw_write(2, m, sizeof(m) - 1);
         return;
     }
@@ -230,7 +230,7 @@ static void dump_syslog(char *buf, int *pos, int max)
         *pos = append_ptr(buf, *pos, max, e.pc);
         *pos = append_str(buf, *pos, max, " ret=");
         if (e.ret == SUD_SYSLOG_NORETURN)
-            *pos = append_str(buf, *pos, max, "<in-progress>");
+            *pos = append_str(buf, *pos, max, "(in-progress)");
         else
             *pos = append_dec(buf, *pos, max, e.ret);
         *pos = append_ch(buf, *pos, max, '\n');
