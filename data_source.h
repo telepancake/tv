@@ -18,6 +18,7 @@
 #include "engine.h"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 class TvDb;
@@ -82,6 +83,23 @@ public:
     int hat_top_row_count();
     int hat_bot_row_count();
 
+    /* Recompute the hat panes from a *window* of lpane rows (cached
+     * since the last rebuild). Used by the main loop to make the hats
+     * behave like sticky breadcrumbs: as you scroll the lpane, the
+     * proc-tree hat (mode 1) shows the common-ancestor chain of the
+     * rows currently in view, and the file-tree hat (mode 2) shows the
+     * common path prefix of the visible rows. Cheap - no SQL.
+     *
+     *   first_row  - index of the topmost visible lpane row (>= 0)
+     *   n_rows     - number of visible rows (must be > 0; clamped)
+     *
+     * No-op outside modes 1/2 (other modes don't have hats), and a
+     * no-op while the lpane cache itself is dirty (the next ensure
+     * pass will recompute hats globally as before). Returns true if
+     * hat_top_/hat_bot_ contents changed (so the caller can mark only
+     * the hat panels dirty). */
+    bool recompute_hats_for_window(int first_row, int n_rows);
+
 private:
     void row_begin(int panel);
     bool row_has_more(int panel);
@@ -118,6 +136,16 @@ private:
     std::vector<RowData> rpane_;
     std::vector<RowData> hat_top_;
     std::vector<RowData> hat_bot_;
+    /* Cached per-rebuild-of-lpane: tgid -> in-trace ancestor chain
+     * (child→parent ordered, init filtered out). Lets the proc-tree hat
+     * be recomputed for any lpane row window without re-running SQL.
+     * Populated by lpane_processes(); empty in other modes. */
+    std::unordered_map<int, std::vector<int>> proc_chain_;
+    /* Same per-rebuild snapshot, for proc display labels in the hat
+     * (basename of exe, plus optional [tgid]). Mirrors the procs map
+     * built inside lpane_processes() but kept tiny - just what the hat
+     * label needs. */
+    std::unordered_map<int, std::string> proc_label_;
     size_t lpane_idx_ = 0;
     size_t rpane_idx_ = 0;
     size_t hat_top_idx_ = 0;

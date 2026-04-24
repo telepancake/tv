@@ -945,8 +945,44 @@ int main(int argc, char **argv) {
     /* Idle auto-select: every 100 ms check whether the lpane cursor
      * has been stable for >= 300 ms; if so, commit it as state.cursor_id
      * and rebuild the rpane.  Without this the rpane only updated on
-     * Enter, which the user found jarring. */
+     * Enter, which the user found jarring.
+     *
+     * The same tick also drives the sticky-hat behaviour: if the lpane
+     * scroll position changed since last tick, ask the data source to
+     * recompute hat content from the rows currently in view (so the
+     * proc-tree hat shows the common ancestor of the visible window
+     * rather than of the entire trace).  Cheap; pure C++ over a cached
+     * map - no SQL. */
     tui->add_timer(100, [&ui](Tui &t) {
+        /* Sticky hats: detect lpane scroll change and refresh hat
+         * panels from the visible window.  Done first so it runs even
+         * during the 300 ms grace window for cursor commits. */
+        static int last_scroll = -1;
+        static int last_mode   = -1;
+        int scroll = t.get_scroll(ui.lpane);
+        int mode   = ui.state ? ui.state->mode : -1;
+        if (scroll != last_scroll || mode != last_mode) {
+            last_scroll = scroll;
+            last_mode   = mode;
+            /* Estimate viewport height from the lpane Box; box height is
+             * resolved each render so we just rely on the data source
+             * clamping to the cached row count. ~64 is a safe upper
+             * bound for typical terminals; smaller windows just see a
+             * common ancestor over fewer rows, which is fine. */
+            if (ui.src && ui.src->recompute_hats_for_window(scroll, 64)) {
+                if (ui.hat_top_box && ui.hat_bot_box) {
+                    int top = ui.src->hat_top_row_count();
+                    int bot = ui.src->hat_bot_row_count();
+                    if (ui.hat_top_box->min_size != top)
+                        ui.hat_top_box->min_size = top;
+                    if (ui.hat_bot_box->min_size != bot)
+                        ui.hat_bot_box->min_size = bot;
+                }
+                t.dirty(ui.hat_top);
+                t.dirty(ui.hat_bot);
+            }
+        }
+
         if (!ui.have_pending) return 1;
         if (now_ms() - ui.last_cursor_change_ms < 300) return 1;
         if (ui.pending_cursor_id == ui.state->cursor_id) {
