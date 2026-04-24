@@ -136,7 +136,7 @@ struct stream_tab_entry {
     uint32_t id;     /* 0 = empty slot */
     ev_state st;
 };
-#define STREAM_TAB_SLOTS 1024
+#define STREAM_TAB_SLOTS 65536
 static struct stream_tab_entry g_streams[STREAM_TAB_SLOTS];
 
 static ev_state *stream_state_for(uint32_t id) {
