@@ -129,30 +129,86 @@ static int print_event(ev_state *st,
 
 /* ─── stream walker ─────────────────────────────────────────────── */
 
-/* Open-addressed table of per-stream ev_state. v2 streams are sparse
- * (one per emitting process), and we don't need ordered iteration -
- * a tiny linear-probe table is plenty for what `tv dump` does. */
+/* Open-addressed, dynamically-grown table of per-stream ev_state.
+ * v2 streams are sparse (one per emitting process) but their count is
+ * unbounded in principle - a fork-bomby workload can produce millions
+ * over the life of a trace. Grow on demand at ~75% load instead of
+ * pinning a fixed multi-megabyte array. */
 struct stream_tab_entry {
     uint32_t id;     /* 0 = empty slot */
     ev_state st;
 };
-#define STREAM_TAB_SLOTS 65536
-static struct stream_tab_entry g_streams[STREAM_TAB_SLOTS];
+struct stream_tab {
+    struct stream_tab_entry *slots;
+    uint32_t cap;    /* always a power of two, or 0 when empty */
+    uint32_t count;  /* occupied slots */
+};
+static struct stream_tab g_streams;
+
+#define STREAM_TAB_INIT_CAP 64u
+
+static void stream_tab_reset(struct stream_tab *t) {
+    free(t->slots);
+    t->slots = NULL;
+    t->cap   = 0;
+    t->count = 0;
+}
+
+/* Insert id into `slots` (cap power of two, must have a free slot).
+ * Returns the entry; assumes id is not already present. */
+static struct stream_tab_entry *stream_tab_insert_raw(
+        struct stream_tab_entry *slots, uint32_t cap, uint32_t id) {
+    uint32_t mask = cap - 1u;
+    uint32_t h = id * 2654435761u;
+    for (uint32_t i = 0; i < cap; i++) {
+        struct stream_tab_entry *e = &slots[(h + i) & mask];
+        if (e->id == 0) {
+            e->id = id;
+            memset(&e->st, 0, sizeof(e->st));
+            return e;
+        }
+    }
+    return NULL; /* unreachable when cap > count */
+}
+
+static int stream_tab_grow(struct stream_tab *t) {
+    uint32_t new_cap = t->cap ? t->cap * 2u : STREAM_TAB_INIT_CAP;
+    if (new_cap < t->cap) { return -1; } /* overflow */
+    struct stream_tab_entry *ns = calloc(new_cap, sizeof(*ns));
+    if (!ns) { return -1; }
+    for (uint32_t i = 0; i < t->cap; i++) {
+        if (t->slots[i].id != 0) {
+            struct stream_tab_entry *e =
+                stream_tab_insert_raw(ns, new_cap, t->slots[i].id);
+            e->st = t->slots[i].st;
+        }
+    }
+    free(t->slots);
+    t->slots = ns;
+    t->cap   = new_cap;
+    return 0;
+}
 
 static ev_state *stream_state_for(uint32_t id) {
     /* id 0 is reserved as "no stream id" sentinel; v2 ids start at 1. */
     if (id == 0) return NULL;
+    /* Grow before we'd exceed 75% load (also handles the empty case). */
+    if ((uint64_t)(g_streams.count + 1u) * 4u > (uint64_t)g_streams.cap * 3u) {
+        if (stream_tab_grow(&g_streams) < 0) { return NULL; }
+    }
+    uint32_t mask = g_streams.cap - 1u;
     uint32_t h = id * 2654435761u;
-    for (uint32_t i = 0; i < STREAM_TAB_SLOTS; i++) {
-        struct stream_tab_entry *e = &g_streams[(h + i) % STREAM_TAB_SLOTS];
+    for (uint32_t i = 0; i < g_streams.cap; i++) {
+        struct stream_tab_entry *e = &g_streams.slots[(h + i) & mask];
         if (e->id == id) return &e->st;
         if (e->id == 0) {
             e->id = id;
             memset(&e->st, 0, sizeof(e->st));
+            g_streams.count++;
             return &e->st;
         }
     }
-    return NULL;
+    return NULL; /* unreachable: we just ensured slack */
 }
 
 static int walk_stream(const uint8_t *buf, uint64_t len) {
@@ -175,7 +231,7 @@ static int walk_stream(const uint8_t *buf, uint64_t len) {
 
     /* v1: one global ev_state. v2: one per stream_id, looked up lazily. */
     ev_state v1_st = {0};
-    memset(g_streams, 0, sizeof g_streams);
+    stream_tab_reset(&g_streams);
 
     while (p < end) {
         const uint8_t *atom; uint64_t alen;
@@ -198,7 +254,7 @@ static int walk_stream(const uint8_t *buf, uint64_t len) {
             hdr_alen = alen - (uint64_t)sidlen;
             st = stream_state_for(sid);
             if (!st) {
-                fprintf(stderr, "yeetdump: too many concurrent streams\n");
+                fprintf(stderr, "yeetdump: out of memory growing stream table\n");
                 return -1;
             }
         } else {
