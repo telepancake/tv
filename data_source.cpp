@@ -227,6 +227,82 @@ std::string flags_text(int flags) {
     return s;
 }
 
+/* Sanitize a captured stdout/stderr blob for inline display in a single
+ * row.
+ *
+ * Three things matter, all reported as bugs:
+ *   1. A single trailing '\n' (or "\r\n") is not interesting and showing
+ *      it as " " stutters at the right edge of every line.  Strip one.
+ *   2. CSI / SGR escape sequences (\x1b[...m, \x1b[K, etc.) shouldn't
+ *      show as literal "^[[..." text - the engine's sput_field already
+ *      ignores ANSI when measuring visible length, so we just have to
+ *      let them through unmodified instead of mangling the leading ESC.
+ *   3. Other control characters (LF/CR/TAB inside the line, plus C0
+ *      controls) still wreck single-row layout, so those get folded to
+ *      a single space.
+ *
+ * Visible truncation honours `max_visible` glyphs (UTF-8 leading bytes,
+ * SGR escapes don't count).  When we cut, we emit a SGR reset before the
+ * ellipsis so a colour from a half-included escape can't bleed into the
+ * next column. */
+std::string sanitize_output_line(const std::string &in,
+                                 size_t max_visible) {
+    std::string s = in;
+    /* Strip exactly one trailing newline (and a CR before it if any). */
+    if (!s.empty() && s.back() == '\n') s.pop_back();
+    if (!s.empty() && s.back() == '\r') s.pop_back();
+
+    std::string out;
+    out.reserve(s.size());
+    size_t visible = 0;
+    bool truncated = false;
+    bool saw_sgr = false;
+    for (size_t i = 0; i < s.size(); ) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        /* CSI: ESC [ ... <final 0x40-0x7e>.  Pass through verbatim;
+         * sput_field already skips it for length accounting.  We also
+         * accept lone ESC + final byte (Fp/Fe) as a courtesy. */
+        if (c == 0x1b && i + 1 < s.size()) {
+            size_t j = i + 1;
+            if (s[j] == '[') {
+                j++;
+                while (j < s.size()) {
+                    unsigned char fb = static_cast<unsigned char>(s[j]);
+                    if (fb >= 0x40 && fb <= 0x7e) { j++; break; }
+                    j++;
+                }
+            } else {
+                j++; /* skip the second byte of the 2-char escape */
+            }
+            out.append(s, i, j - i);
+            saw_sgr = true;
+            i = j;
+            continue;
+        }
+        if (c == '\n' || c == '\r' || c == '\t') {
+            out += ' ';
+            visible++;
+            i++;
+        } else if (c < 0x20 || c == 0x7f) {
+            /* drop other control bytes */
+            i++;
+        } else if ((c & 0xc0) == 0x80) {
+            /* utf-8 continuation: append without bumping visible count */
+            out += s[i++];
+        } else {
+            out += s[i++];
+            visible++;
+        }
+        if (visible >= max_visible && i < s.size()) {
+            truncated = true;
+            break;
+        }
+    }
+    if (truncated || saw_sgr) out += "\x1b[0m";
+    if (truncated) out += "…";
+    return out;
+}
+
 } // namespace
 
 /* -- ctor / DataSource wiring --------------------------------------- */
@@ -263,11 +339,14 @@ namespace {
  * emission in the matching lpane_*() builder. */
 
 /* Mode 0 - output stream:
- *   col 0 time(8r) | col 1 k(2) | col 2 tgid(7r) | col 3 data(flex) */
+ *   col 0 time(9r) | col 1 k(3) | col 2 tgid(9r) | col 3 data(flex)
+ * Right-aligned cells include a trailing space in their content so the
+ * eye gets a visible gap before the next column (otherwise a 7-char
+ * timestamp would butt up against the kind letter). */
 const ColDef k_lpane_cols_outputs[] = {
-    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 9, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
     { 3, TUI_ALIGN_LEFT,  TUI_OVERFLOW_TRUNCATE},
-    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 9, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
     {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
 };
 
@@ -293,11 +372,13 @@ const ColDef k_lpane_cols_files[] = {
 };
 
 /* Mode 3 - event log:
- *   col 0 time(8r) | col 1 kind(7) | col 2 tgid(8r) | col 3 info(flex) */
+ *   col 0 time(9r) | col 1 kind(8) | col 2 tgid(9r) | col 3 info(flex)
+ * Same trailing-space convention as mode 0 (see above) so the columns
+ * read as four distinct strips, not one run-on chunk. */
 const ColDef k_lpane_cols_events[] = {
-    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
-    { 7, TUI_ALIGN_LEFT,  TUI_OVERFLOW_TRUNCATE},
-    { 8, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 9, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
+    { 8, TUI_ALIGN_LEFT,  TUI_OVERFLOW_TRUNCATE},
+    { 9, TUI_ALIGN_RIGHT, TUI_OVERFLOW_TRUNCATE},
     {-1, TUI_ALIGN_LEFT,  TUI_OVERFLOW_ELLIPSIS},
 };
 
@@ -325,11 +406,11 @@ const ColDef k_rpane_cols[] = {
 TvDataSource::PanelLayout TvDataSource::lpane_layout() const {
     switch (state_.mode) {
         case 0: return {k_lpane_cols_outputs, 4,
-            "  time      k    tgid  output"};
+            "  time      k    tgid   output"};
         case 2: return {k_lpane_cols_files, 6,
             "  flag  path                                 opens  procs  reads writes"};
         case 3: return {k_lpane_cols_events, 4,
-            "  time     kind        tgid  event"};
+            "  time      kind      tgid   event"};
         case 4: case 5: return {k_lpane_cols_deps, 2,
             "  path                                        opens"};
         case 6: case 7: return {k_lpane_cols_dep_cmds, 2,
@@ -482,6 +563,8 @@ void TvDataSource::rebuild_lpane() {
      * directly when a common ancestor / path prefix is detected. */
     hat_top_.clear();
     hat_bot_.clear();
+    proc_chain_.clear();
+    proc_label_.clear();
     switch (state_.mode) {
         case 0: lpane_outputs(); break;
         case 1: lpane_processes(); break;
@@ -499,6 +582,141 @@ void TvDataSource::rebuild_lpane() {
     if (lpane_.empty()) {
         lpane_.push_back(mk_row("__empty", "(no rows)", RowStyle::Dim));
     }
+}
+
+/* Recompute hat_top_ / hat_bot_ from a window of cached lpane rows.
+ * Called both during the global rebuild (with first=0, n=lpane.size())
+ * and from the main loop after the user scrolls (with the topmost
+ * visible row + viewport height).
+ *
+ * Modes 1 and 2 are the only ones with hats, and they have very
+ * different shapes:
+ *   - Mode 1: walk each visible non-synthetic row's cached ancestor
+ *     chain (proc_chain_), then compute the longest common suffix
+ *     across non-empty chains.  Drop init (PID ≤ 1) so we don't
+ *     stutter "init › …".  Render as basename[›basename]…
+ *   - Mode 2: collect leaf-file row ids (which are full paths), find
+ *     the longest common path-segment prefix across them, back off to
+ *     the last '/' so the hat names a directory.  When there is just
+ *     one visible leaf, back off one segment (so its parent dir shows).
+ * Returns true if hat_top_ or hat_bot_ contents actually changed. */
+bool TvDataSource::recompute_hats_for_window(int first_row, int n_rows) {
+    if (state_.mode != 1 && state_.mode != 2) return false;
+    if (!built_lpane_ || lpane_.empty()) return false;
+    if (state_.subtree_only) return false;
+    if (first_row < 0) first_row = 0;
+    if (n_rows <= 0)   n_rows = static_cast<int>(lpane_.size());
+    int last = first_row + n_rows;
+    if (last > static_cast<int>(lpane_.size()))
+        last = static_cast<int>(lpane_.size());
+    if (first_row >= last) return false;
+
+    /* -- Mode 1: process tree -- */
+    if (state_.mode == 1) {
+        std::vector<std::vector<int>> chains;
+        chains.reserve(static_cast<size_t>(last - first_row));
+        for (int i = first_row; i < last; i++) {
+            const auto &row = lpane_[i];
+            if (row.id.empty() || row.id[0] == '_') continue;
+            int t = std::atoi(row.id.c_str());
+            auto it = proc_chain_.find(t);
+            if (it == proc_chain_.end()) continue;
+            chains.push_back(it->second);
+        }
+        chains.erase(std::remove_if(chains.begin(), chains.end(),
+                         [](const std::vector<int> &c){ return c.empty(); }),
+                     chains.end());
+        std::vector<RowData> new_top;
+        if (!chains.empty()) {
+            std::vector<int> common;
+            for (size_t k = 0;; k++) {
+                int candidate = -1;
+                bool ok = true;
+                for (auto &c : chains) {
+                    if (k >= c.size()) { ok = false; break; }
+                    int v = c[c.size() - 1 - k];
+                    if (candidate < 0) candidate = v;
+                    else if (v != candidate) { ok = false; break; }
+                }
+                if (!ok) break;
+                common.push_back(candidate);
+            }
+            while (!common.empty() && common.front() <= 1)
+                common.erase(common.begin());
+            if (!common.empty()) {
+                std::string label;
+                for (size_t i = 0; i < common.size(); i++) {
+                    auto lit = proc_label_.find(common[i]);
+                    std::string nm = (lit != proc_label_.end()) ? lit->second
+                                                                : std::string();
+                    if (nm.empty()) continue;
+                    if (!label.empty()) label += " › ";
+                    label += nm;
+                    if (state_.show_pids) {
+                        label += "[";
+                        label += std::to_string(common[i]);
+                        label += "]";
+                    }
+                }
+                if (!label.empty()) {
+                    RowData hat;
+                    hat.id    = "hat_proc";
+                    hat.style = RowStyle::Heading;
+                    hat.cols  = {label};
+                    new_top.push_back(std::move(hat));
+                }
+            }
+        }
+        bool changed = (new_top.size() != hat_top_.size()) ||
+                       (!new_top.empty() && !hat_top_.empty() &&
+                        new_top[0].cols[0] != hat_top_[0].cols[0]);
+        hat_top_ = std::move(new_top);
+        return changed;
+    }
+
+    /* -- Mode 2: file tree -- */
+    auto is_path_id = [](const std::string &s) {
+        return !s.empty() && s[0] == '/' &&
+               !(s.size() >= 2 && s[0] == '_' && s[1] == '_');
+    };
+    /* Leaf ids = paths not ending in '/' (directory aggregate ids end
+     * in '/'). The original emit_path_hat() also keys off this. */
+    std::vector<const std::string *> leaves;
+    for (int i = first_row; i < last; i++) {
+        const auto &id = lpane_[i].id;
+        if (!is_path_id(id)) continue;
+        if (id.back() == '/') continue;
+        leaves.push_back(&id);
+    }
+    std::vector<RowData> new_bot;
+    if (!leaves.empty()) {
+        std::string prefix = *leaves.front();
+        if (leaves.size() >= 2) {
+            for (auto *p : leaves) {
+                size_t i = 0;
+                while (i < prefix.size() && i < p->size() && prefix[i] == (*p)[i])
+                    i++;
+                prefix.resize(i);
+                if (prefix.empty()) break;
+            }
+        }
+        size_t slash = prefix.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            prefix.resize(slash + 1);
+            if (prefix.size() > 1) {
+                RowData hat;
+                hat.id    = "hat_prefix";
+                hat.style = RowStyle::Heading;
+                hat.cols  = {prefix};
+                new_bot.push_back(std::move(hat));
+            }
+        }
+    }
+    bool changed = (new_bot.size() != hat_bot_.size()) ||
+                   (!new_bot.empty() && !hat_bot_.empty() &&
+                    new_bot[0].cols[0] != hat_bot_[0].cols[0]);
+    hat_bot_ = std::move(new_bot);
+    return changed;
 }
 
 /* -- Mode 1: process tree ------------------------------------------- */
@@ -621,6 +839,31 @@ void TvDataSource::lpane_processes() {
         return;
     }
 
+    /* Search-match set: a tgid matches the search if its exe, name,
+     * any argv element, or any env key/val contains the query string.
+     * The exe/name match is checked inline below; the argv/env match is
+     * resolved via two extra SQL lookups so a search like `/PATH=` or
+     * `/--verbose` actually surfaces the right processes (the user
+     * reported that hits in env/argv were silently missing). */
+    std::unordered_set<int> argv_env_match_tgids;
+    if (!state_.search.empty()) {
+        std::string esc = sql_escape(state_.search);
+        std::string mq =
+            "SELECT DISTINCT tgid FROM argv "
+            "  WHERE CAST(arg AS VARCHAR) LIKE '%' || " + esc + " || '%' "
+            "UNION "
+            "SELECT DISTINCT tgid FROM env "
+            "  WHERE CAST(key AS VARCHAR) LIKE '%' || " + esc + " || '%' "
+            "     OR CAST(val AS VARCHAR) LIKE '%' || " + esc + " || '%'";
+        std::string e2;
+        auto mr = db_.query_strings(mq, &e2);
+        if (e2.empty()) {
+            for (auto &row : mr)
+                if (!row.empty() && !row[0].empty())
+                    argv_env_match_tgids.insert(std::atoi(row[0].c_str()));
+        }
+    }
+
     std::unordered_map<int, ProcRow> procs;
     procs.reserve(rows.size());
     for (auto &r : rows) {
@@ -637,7 +880,8 @@ void TvDataSource::lpane_processes() {
         p.ended = !r[5].empty();
         if (!state_.search.empty()) {
             p.matches_search = (p.exe.find(state_.search) != std::string::npos) ||
-                               (p.name.find(state_.search) != std::string::npos);
+                               (p.name.find(state_.search) != std::string::npos) ||
+                               argv_env_match_tgids.count(p.tgid) > 0;
         }
         procs.emplace(p.tgid, std::move(p));
     }
@@ -749,15 +993,13 @@ void TvDataSource::lpane_processes() {
      *  - Drop a leading PID ≤ 1 (init) so we don't stutter "init › …"
      *    on every trace. */
     if (!state_.subtree_only && !lpane_.empty()) {
-        std::vector<std::vector<int>> chains;
-        chains.reserve(lpane_.size());
-        for (const auto &row : lpane_) {
-            if (row.id.empty() || row.id[0] == '_') continue;
-            int t = std::atoi(row.id.c_str());
-            auto pit = procs.find(t);
-            if (pit == procs.end()) continue;
+        /* Cache per-tgid ancestor chain and display label so the hat
+         * can be recomputed cheaply for any lpane window when the user
+         * scrolls (sticky-breadcrumb behaviour). */
+        for (auto &kv : procs) {
+            const ProcRow &pp = kv.second;
             std::vector<int> chain;
-            int cur = pit->second.ppid;
+            int cur = pp.ppid;
             for (int depth = 0; depth < 256; depth++) {
                 if (cur <= 0) break;
                 auto it = procs.find(cur);
@@ -766,56 +1008,10 @@ void TvDataSource::lpane_processes() {
                 if (it->second.ppid == cur) break;   /* self-loop guard */
                 cur = it->second.ppid;
             }
-            chains.push_back(std::move(chain));
+            proc_chain_[pp.tgid] = std::move(chain);
+            proc_label_[pp.tgid] = basename_of(pp.exe);
         }
-        /* Drop chains that are empty - they tell us nothing about the
-         * common ancestor (the row simply has no in-trace parent). */
-        chains.erase(std::remove_if(chains.begin(), chains.end(),
-                         [](const std::vector<int> &c){ return c.empty(); }),
-                     chains.end());
-        if (!chains.empty()) {
-            /* Common suffix walk: chains are child→parent ordered, so
-             * the deepest common ancestor sits at some index from the
-             * back. With one chain, "common" is the whole chain. */
-            std::vector<int> common;
-            for (size_t k = 0;; k++) {
-                int candidate = -1;
-                bool ok = true;
-                for (auto &c : chains) {
-                    if (k >= c.size()) { ok = false; break; }
-                    int v = c[c.size() - 1 - k];
-                    if (candidate < 0) candidate = v;
-                    else if (v != candidate) { ok = false; break; }
-                }
-                if (!ok) break;
-                common.push_back(candidate);
-            }
-            /* Skip the synthetic init root if reachable; it adds noise
-             * without information. */
-            while (!common.empty() && common.front() <= 1)
-                common.erase(common.begin());
-            if (!common.empty()) {
-                std::string label;
-                for (size_t i = 0; i < common.size(); i++) {
-                    auto it = procs.find(common[i]);
-                    if (it == procs.end()) continue;
-                    if (!label.empty()) label += " › ";
-                    label += basename_of(it->second.exe);
-                    if (state_.show_pids) {
-                        label += "[";
-                        label += std::to_string(common[i]);
-                        label += "]";
-                    }
-                }
-                if (!label.empty()) {
-                    RowData hat;
-                    hat.id = "hat_proc";
-                    hat.style = RowStyle::Heading;
-                    hat.cols = {label};
-                    hat_top_.push_back(std::move(hat));
-                }
-            }
-        }
+        recompute_hats_for_window(0, static_cast<int>(lpane_.size()));
     }
 }
 
@@ -1191,9 +1387,15 @@ void TvDataSource::emit_path_hat() {
 /* -- Mode 0: output (stdout/stderr) view ---------------------------- */
 
 void TvDataSource::lpane_outputs() {
-    /* Chronological merged stdout+stderr stream.  When subtree_only is
-     * set (s in mode 1 then switch to 0), restrict to the subtree
-     * rooted at subtree_root. */
+    /* Merged stdout+stderr stream.  Two presentations are supported,
+     * toggled with `t` (state_.grouped):
+     *   - flat:  chronological interleave (default; the original mode 0).
+     *   - tree:  events bucketed by tgid, with a process header row in
+     *            front of each group.  Within a group rows stay in
+     *            chronological order; groups are sorted by their first
+     *            event's timestamp.
+     * Subtree filter, search, flag filter and time cutoffs apply the
+     * same way in both modes. */
     std::string err;
     /* CAST ts_ns and tgid to VARCHAR explicitly: duckdb_value_varchar
      * on a UBIGINT/INTEGER column projected through UNION ALL can
@@ -1240,45 +1442,123 @@ void TvDataSource::lpane_outputs() {
     }
     int64_t base_ns = 0;
     if (!rows.empty() && !rows[0][1].empty()) base_ns = std::stoll(rows[0][1]);
-    for (auto &r : rows) {
+
+    /* For grouped mode we need the exe path of each producing tgid so
+     * the group header reads as "[1234] /usr/bin/cat" rather than just
+     * a number.  Pull from tv_idx_proc on demand. */
+    std::unordered_map<std::string, std::string> tgid_exe;
+    if (state_.grouped && !rows.empty()) {
+        std::set<std::string> tgids;
+        for (auto &r : rows) tgids.insert(r[2]);
+        if (!tgids.empty()) {
+            std::string in_list;
+            for (auto &t : tgids) {
+                if (!in_list.empty()) in_list += ",";
+                in_list += t;
+            }
+            std::string e2;
+            (void)db_.ensure_proc_index(&e2);
+            auto exe_rows = db_.query_strings(
+                "SELECT CAST(tgid AS VARCHAR), CAST(exe AS VARCHAR) "
+                "FROM tv_idx_proc WHERE tgid IN (" + in_list + ")", &e2);
+            for (auto &er : exe_rows) tgid_exe[er[0]] = er[1];
+        }
+    }
+
+    auto build_event_row = [&](const std::vector<std::string> &r) {
         const std::string &k = r[0];
         int64_t ts_ns = r[1].empty() ? 0 : std::stoll(r[1]);
         const std::string &tgid = r[2];
-        std::string data = r[3];
-        for (auto &c : data) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-        if (data.size() > 200) data = data.substr(0, 197) + "...";
+        std::string data = sanitize_output_line(r[3], 200);
         double rel = (ts_ns - base_ns) / 1e9;
-        std::string time_s = sfmt("%6.3fs", rel);
+        std::string time_s = sfmt("%6.3fs ", rel);  /* trailing space = column gap */
         RowStyle st = (k == "E") ? RowStyle::Error : RowStyle::Normal;
         if (!state_.search.empty() &&
-            data.find(state_.search) != std::string::npos)
+            r[3].find(state_.search) != std::string::npos)
             st = RowStyle::Search;
         RowData row;
         /* id encodes tgid:ts_ns:k so the rpane can re-locate the event. */
         row.id = tgid + ":" + std::to_string(ts_ns) + ":" + k;
         /* 4-column row matching k_lpane_cols_outputs:
-         *   time | k | tgid | data */
+         *   time | k | tgid | data
+         * The trailing " " on the right-aligned cells gives a visible
+         * gap before the next column - otherwise the cells run together
+         * (the engine itself emits no inter-column padding). */
         row.cols.push_back(std::move(time_s));
         row.cols.push_back(k);
-        row.cols.push_back(tgid);
+        row.cols.push_back(tgid + " ");
         row.cols.push_back(std::move(data));
         row.style = st;
         /* Enter on a row -> jump to the producing process in mode 1. */
         row.link_mode = 1;
         row.link_id   = tgid;
-        lpane_.push_back(std::move(row));
+        return row;
+    };
+
+    if (!state_.grouped) {
+        for (auto &r : rows) lpane_.push_back(build_event_row(r));
+        return;
+    }
+
+    /* Grouped mode: bucket rows by tgid, preserving chronological order
+     * inside each group.  Group order is by first-row ts_ns so the
+     * earliest-emitting process appears first - which mirrors how the
+     * proc tree (mode 1) tends to be ordered. */
+    struct Bucket {
+        std::string tgid;
+        int64_t     first_ns = 0;
+        std::vector<size_t> idxs;
+    };
+    std::unordered_map<std::string, size_t> bucket_idx;
+    std::vector<Bucket> buckets;
+    for (size_t i = 0; i < rows.size(); i++) {
+        const std::string &tgid = rows[i][2];
+        auto it = bucket_idx.find(tgid);
+        if (it == bucket_idx.end()) {
+            Bucket b;
+            b.tgid = tgid;
+            b.first_ns = rows[i][1].empty() ? 0 : std::stoll(rows[i][1]);
+            bucket_idx[tgid] = buckets.size();
+            buckets.push_back(std::move(b));
+            it = bucket_idx.find(tgid);
+        }
+        buckets[it->second].idxs.push_back(i);
+    }
+    std::sort(buckets.begin(), buckets.end(),
+              [](const Bucket &a, const Bucket &b){ return a.first_ns < b.first_ns; });
+    for (auto &b : buckets) {
+        std::string exe = tgid_exe.count(b.tgid) ? tgid_exe[b.tgid] : std::string("?");
+        std::string label = "[" + b.tgid + "] " + basename_of(exe) +
+                            "  (" + std::to_string(b.idxs.size()) + " line" +
+                            (b.idxs.size() == 1 ? "" : "s") + ")";
+        RowData hdr;
+        hdr.id        = "__grp_" + b.tgid;
+        hdr.style     = RowStyle::Heading;
+        hdr.cols      = {"", "", "", label};
+        hdr.has_children = true;
+        lpane_.push_back(std::move(hdr));
+        for (size_t i : b.idxs) lpane_.push_back(build_event_row(rows[i]));
     }
 }
 
 /* -- Mode 3: event log ---------------------------------------------- */
 
 void TvDataSource::lpane_events() {
-    /* UNION ALL across event tables. We omit ARGV/ENV/AUXV; those are
-     * shown in the right-pane process detail. */
+    /* UNION ALL across event tables.  Argv/env/auxv used to be omitted
+     * (the rationale was "see the right pane for those") but that meant
+     * `/foo` couldn't find a string that only appears as a CLI flag or
+     * in PATH=... - reported as a real surprise.  We now surface them
+     * as their own event kinds so a search hits them naturally. */
     std::string err;
     std::string sql =
         "SELECT 'EXEC'   AS kind, ts_ns, tgid, CAST(exe AS VARCHAR) AS info "
         "FROM exec UNION ALL "
+        "SELECT 'ARGV'   AS kind, ts_ns, tgid, "
+        "       'argv[' || idx || ']=' || CAST(arg AS VARCHAR) "
+        "FROM argv UNION ALL "
+        "SELECT 'ENV'    AS kind, ts_ns, tgid, "
+        "       CAST(key AS VARCHAR) || '=' || CAST(val AS VARCHAR) "
+        "FROM env UNION ALL "
         "SELECT 'CWD'    AS kind, ts_ns, tgid, CAST(cwd AS VARCHAR) "
         "FROM cwd UNION ALL "
         "SELECT 'OPEN'   AS kind, ts_ns, tgid, CAST(path AS VARCHAR) "
@@ -1319,27 +1599,29 @@ void TvDataSource::lpane_events() {
         int64_t ts_ns = r[1].empty() ? 0 : std::stoll(r[1]);
         const std::string &tgid = r[2];
         std::string info = r[3];
-        /* Strip control chars in stdout/stderr previews. */
+        std::string raw_info = info;   /* search match check uses the raw */
         if (kind == "STDOUT" || kind == "STDERR") {
-            for (auto &c : info) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-            if (info.size() > 120) info = info.substr(0, 117) + "...";
+            info = sanitize_output_line(info, 120);
         }
         double rel = (ts_ns - base_ns) / 1e9;
-        std::string time_s = sfmt("%6.3fs", rel);
+        std::string time_s = sfmt("%6.3fs ", rel);   /* trailing space = column gap */
         RowStyle st = RowStyle::Normal;
         if      (kind == "STDERR" || kind == "EXIT") st = RowStyle::Error;
         else if (kind == "EXEC")                     st = RowStyle::CyanBold;
         else if (kind == "CWD")                      st = RowStyle::Cyan;
+        else if (kind == "ARGV" || kind == "ENV")    st = RowStyle::Dim;
         if (!state_.search.empty() &&
-            info.find(state_.search) != std::string::npos)
+            raw_info.find(state_.search) != std::string::npos)
             st = RowStyle::Search;
         RowData row;
-        row.id = tgid + ":" + std::to_string(ts_ns);
+        row.id = tgid + ":" + std::to_string(ts_ns) + ":" + kind;
         /* 4-column row matching k_lpane_cols_events:
-         *   time | kind | tgid | info */
+         *   time | kind | tgid | info
+         * Trailing space on right-aligned cells gives a visible gap to
+         * the next column. */
         row.cols.push_back(std::move(time_s));
         row.cols.push_back(kind);
-        row.cols.push_back(tgid);
+        row.cols.push_back(tgid + " ");
         row.cols.push_back(std::move(info));
         row.style = st;
         lpane_.push_back(std::move(row));
