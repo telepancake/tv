@@ -225,7 +225,8 @@ const char *HELP_LINES[] = {
     "  <  >        Time cutoff (before/after) seeded from cursor;",
     "              press the same key again to clear.",
     "  s           Subtree-only (mode 1)     p   Show pid prefix (mode 1)",
-    "  t           Tree / flat toggle (modes 1, 2)",
+    "  t           Tree / flat toggle (modes 1, 2; group output by tgid in mode 0)",
+    "  T           Toggle htop-style snapshot column (process tree at cursor moment)",
     "",
     "  0  Output stream    1  Process tree    2  File tree    3  Event log",
     "  4  Deps             5  Reverse deps    6  Dep cmds     7  RDep cmds",
@@ -239,11 +240,18 @@ struct UiCtx {
     int           rpane = -1;
     int           hat_top = -1;
     int           hat_bot = -1;
+    int           htop_pane = -1;
     /* Box pointers for the hat panes — their min_size is mutated each
      * render to match the data source's hat row count, so an empty
      * hat takes zero rows on screen. */
     Box          *hat_top_box = nullptr;
     Box          *hat_bot_box = nullptr;
+    /* Box pointer for the htop snapshot column - toggled visible by
+     * the `T` key.  When invisible we set both weight and min_size to
+     * 0 so it occupies no horizontal space; visible we set weight=1
+     * and min_size=24 so it claims roughly a third of the screen but
+     * never collapses below something readable. */
+    Box          *htop_box = nullptr;
     AppState     *state = nullptr;
     TvDataSource *src = nullptr;
     TvDb         *db = nullptr;       /* for direct lookups (e.g. ts seed) */
@@ -260,6 +268,85 @@ struct UiCtx {
 int64_t now_ms() {
     struct timeval tv; ::gettimeofday(&tv, nullptr);
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+/* Resolve the timestamp (in ns) corresponding to the cursor's row in
+ * the current mode.  Used by the time-cutoff `</>` keys *and* by the
+ * htop snapshot column to anchor "the moment in time we want to look
+ * at".  Returns 0 when no timestamp can be derived (no cursor, or the
+ * mode has no notion of per-row time - modes 4..7).  Also fills out
+ * *focus_tgid (when non-null) with the row's producing tgid as a
+ * string, so the htop column can highlight that process inside the
+ * snapshot tree. */
+int64_t cursor_ts_ns(UiCtx &c, std::string *focus_tgid = nullptr) {
+    if (focus_tgid) focus_tgid->clear();
+    if (!c.state || c.state->cursor_id.empty() || !c.db) return 0;
+    const std::string &cur = c.state->cursor_id;
+    if (c.state->mode == 0 || c.state->mode == 3) {
+        /* cursor id is "tgid:ts_ns[:k]" - both modes use the same id
+         * shape so the htop anchor follows wherever the user lands. */
+        auto p1 = cur.find(':');
+        if (p1 == std::string::npos) return 0;
+        if (focus_tgid) *focus_tgid = cur.substr(0, p1);
+        auto p2 = cur.find(':', p1 + 1);
+        std::string ts_s = (p2 == std::string::npos)
+            ? cur.substr(p1 + 1)
+            : cur.substr(p1 + 1, p2 - p1 - 1);
+        try { return std::stoll(ts_s); } catch (...) { return 0; }
+    }
+    if (c.state->mode == 1) {
+        std::string e;
+        auto rows = c.db->query_strings(
+            "SELECT start_ns FROM tv_idx_proc WHERE tgid = " +
+            cur + " LIMIT 1", &e);
+        if (focus_tgid) *focus_tgid = cur;
+        if (!rows.empty() && !rows[0][0].empty())
+            try { return std::stoll(rows[0][0]); } catch (...) {}
+        return 0;
+    }
+    if (c.state->mode == 2) {
+        std::string esc = "'";
+        for (char ch : cur) { if (ch == '\'') esc += "''"; else esc += ch; }
+        esc += "'";
+        std::string e;
+        auto rows = c.db->query_strings(
+            "SELECT first_ns FROM tv_idx_path WHERE path = " +
+            esc + " LIMIT 1", &e);
+        if (!rows.empty() && !rows[0][0].empty())
+            try { return std::stoll(rows[0][0]); } catch (...) {}
+        return 0;
+    }
+    return 0;
+}
+
+/* Mark the htop snapshot column visible/invisible by toggling its
+ * box's weight + min_size.  Wrapped in a helper because the same
+ * mutation runs from the `T` key handler and from the layout setup. */
+void apply_htop_visibility(UiCtx &c) {
+    if (!c.htop_box) return;
+    if (c.state && c.state->show_htop_col) {
+        c.htop_box->weight   = 1;
+        c.htop_box->min_size = 24;
+    } else {
+        c.htop_box->weight   = 0;
+        c.htop_box->min_size = 0;
+    }
+    if (c.tui && c.htop_pane >= 0) c.tui->dirty(c.htop_pane);
+}
+
+/* Refresh the htop anchor from the current cursor and mark the htop
+ * panel dirty.  No-op when the column is hidden.  Called when the
+ * cursor commits (idle timer) and when `T` toggles the column on. */
+void refresh_htop_anchor(UiCtx &c) {
+    if (!c.state || !c.state->show_htop_col || !c.src) return;
+    std::string focus;
+    int64_t ts = cursor_ts_ns(c, &focus);
+    /* Update focus tgid even when ts is 0 - the htop builder will
+     * surface a "(no anchor)" hint and the user gets the toggle
+     * feedback either way. */
+    if (c.state->htop_focus_tgid != focus) c.state->htop_focus_tgid = focus;
+    c.src->set_htop_anchor_ns(ts);
+    if (c.tui && c.htop_pane >= 0) c.tui->dirty(c.htop_pane);
 }
 
 /* Update the hat-pane Box.min_size values to match the data source's
@@ -318,7 +405,7 @@ void update_status(UiCtx &c) {
     if (c.state->show_pids)
         n += std::snprintf(buf + n, sizeof buf - n, " | pids");
     n += std::snprintf(buf + n, sizeof buf - n,
-        " | 1..7 mode  t tree  s subtree  </> time  / glob  f flags  ? help");
+        " | 1..7 mode  t tree  T htop  s subtree  </> time  / glob  f flags  ? help");
     (void)n;
     c.tui->set_status(buf);
 }
@@ -438,6 +525,21 @@ int on_key_cb(Tui &tui, int key, int panel, int /*cursor*/, const char *row_id,
     if (key == 't') {
         c.state->grouped = !c.state->grouped;
         invalidate_and_redraw();
+        return TUI_HANDLED;
+    }
+    /* Toggle the htop-style snapshot column (third column).  When
+     * turned on, the column shows the process tree as it stood at
+     * the cursor's event timestamp - green = just spawned, red = just
+     * died, the producer of the selected event highlighted as the
+     * focus.  Refreshes whenever the cursor commits.  No-op (but
+     * still toggles state) in modes that have no per-row timestamp;
+     * the column will just show "(no anchor)". */
+    if (key == 'T') {
+        c.state->show_htop_col = !c.state->show_htop_col;
+        apply_htop_visibility(c);
+        if (c.state->show_htop_col) refresh_htop_anchor(c);
+        tui.dirty();
+        update_status(c);
         return TUI_HANDLED;
     }
     /* Show/hide pid prefix in mode 1. */
@@ -885,27 +987,41 @@ int main(int argc, char **argv) {
     ui.rpane   = tui->add_panel(rpane_def);
     ui.hat_top = tui->add_panel(hat_def);
     ui.hat_bot = tui->add_panel(hat_def);
+    /* Htop snapshot column - read-only, no cursor (Tab won't land on
+     * it), single full-width column.  The data source supplies its
+     * column array and title via apply_htop_layout(). */
+    static const ColDef htop_cols[] = {
+        {-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS},
+    };
+    static const PanelDef htop_def = {nullptr, htop_cols, 1, TUI_PANEL_BORDER};
+    ui.htop_pane = tui->add_panel(htop_def);
     /* Push the per-mode column layout to the engine immediately so the
      * initial render uses the right shape (mode 1 by default). */
     src.apply_layout(*tui, ui.lpane, ui.rpane);
     src.apply_hat_layout(*tui, ui.hat_top, ui.hat_bot);
-    /* Layout: hbox( vbox(hat_top, hat_bot, lpane), rpane ).
+    src.apply_htop_layout(*tui, ui.htop_pane);
+    /* Layout: hbox( vbox(hat_top, hat_bot, lpane), rpane, htop ).
      *   hat_top / hat_bot are weight=0 — fixed-height. min_size is
      *   updated each render to the data source's reported row count
      *   for that hat (0 → the hat collapses entirely). The list takes
-     *   all remaining vertical space (weight=1). */
+     *   all remaining vertical space (weight=1).
+     *   htop is weight=0,min_size=0 by default (collapses to nothing);
+     *   `T` toggles it to weight=1,min_size=24. */
     static Box hat_top_box = {TUI_BOX_PANEL, 0, 0, 0, 0, {}};
     static Box hat_bot_box = {TUI_BOX_PANEL, 0, 0, 0, 0, {}};
     static Box lbox        = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
     static Box lvbox       = {TUI_BOX_VBOX,  1, 0, 0, -1, {&hat_top_box, &hat_bot_box, &lbox}};
     static Box rbox        = {TUI_BOX_PANEL, 1, 0, 0, 0, {}};
-    static Box hbox        = {TUI_BOX_HBOX,  1, 0, 0, -1, {&lvbox, &rbox}};
+    static Box htop_box    = {TUI_BOX_PANEL, 0, 0, 0, 0, {}};
+    static Box hbox        = {TUI_BOX_HBOX,  1, 0, 0, -1, {&lvbox, &rbox, &htop_box}};
     hat_top_box.panel = ui.hat_top;
     hat_bot_box.panel = ui.hat_bot;
     lbox.panel = ui.lpane;
     rbox.panel = ui.rpane;
+    htop_box.panel = ui.htop_pane;
     ui.hat_top_box = &hat_top_box;
     ui.hat_bot_box = &hat_bot_box;
+    ui.htop_box    = &htop_box;
     tui->set_layout(&hbox);
 
     tui->on_key([&ui](Tui &t, int key, int panel, int cur, const char *id) {
@@ -993,6 +1109,7 @@ int main(int argc, char **argv) {
         ui.have_pending = false;
         ui.src->invalidate_rpane();
         t.dirty(ui.rpane);
+        refresh_htop_anchor(ui);
         update_status(ui);
         return 1;
     });

@@ -298,7 +298,12 @@ std::string sanitize_output_line(const std::string &in,
             break;
         }
     }
-    if (truncated || saw_sgr) out += "\x1b[0m";
+    /* Only emit a SGR reset on the way out when we actually let one
+     * through (so a half-included colour from the truncated tail can't
+     * bleed into the next column).  When the cell contained no SGR at
+     * all, skip the reset - it would be visible noise in some weak
+     * terminals. */
+    if (saw_sgr) out += "\x1b[0m";
     if (truncated) out += "…";
     return out;
 }
@@ -323,10 +328,18 @@ void TvDataSource::invalidate() {
     built_rpane_ = false;
     built_hat_top_ = false;
     built_hat_bot_ = false;
+    built_htop_ = false;
 }
 
 void TvDataSource::invalidate_rpane() {
     built_rpane_ = false;
+}
+
+void TvDataSource::set_htop_anchor_ns(int64_t ts_ns) {
+    if (state_.htop_anchor_ns != ts_ns) {
+        state_.htop_anchor_ns = ts_ns;
+        built_htop_ = false;
+    }
 }
 
 /* -- per-mode column layouts ---------------------------------------- */
@@ -451,6 +464,26 @@ void TvDataSource::apply_hat_layout(Tui &tui, int hat_top, int hat_bot) const {
     tui.set_panel_columns(hat_bot, h.cols, h.ncols, h.title);
 }
 
+namespace {
+/* htop column: a single flex column.  Rows are rendered with their own
+ * style (Green = just-spawned, Error = just-died, Search = the focus
+ * tgid, Dim = passive ancestor) so the colouring tells the lifecycle
+ * story.  The column gets a one-line title that is updated on each
+ * rebuild to show the snapshot anchor's relative time. */
+const ColDef k_htop_cols[] = {
+    {-1, TUI_ALIGN_LEFT, TUI_OVERFLOW_ELLIPSIS},
+};
+} // namespace
+
+TvDataSource::PanelLayout TvDataSource::htop_layout() const {
+    return {k_htop_cols, 1, "  procs at cursor (T to toggle)"};
+}
+
+void TvDataSource::apply_htop_layout(Tui &tui, int htop_pane) const {
+    auto h = htop_layout();
+    tui.set_panel_columns(htop_pane, h.cols, h.ncols, h.title);
+}
+
 void TvDataSource::ensure_hats_built() {
     /* Forward decl: dirty_for_lpane is defined just below. */
     extern bool dirty_for_lpane(const AppState &s,
@@ -527,6 +560,19 @@ void TvDataSource::row_begin(int panel) {
     } else if (panel == 3) {
         ensure_hats_built();
         hat_bot_idx_ = 0;
+    } else if (panel == 4) {
+        /* htop snapshot column.  Cache key is (anchor_ns, focus_tgid).
+         * Rebuild lazily; the main loop calls set_htop_anchor_ns()
+         * whenever the cursor commits to a new event. */
+        if (!built_htop_ ||
+            built_htop_for_ns_     != state_.htop_anchor_ns ||
+            built_htop_focus_tgid_ != state_.htop_focus_tgid) {
+            rebuild_htop();
+            built_htop_for_ns_     = state_.htop_anchor_ns;
+            built_htop_focus_tgid_ = state_.htop_focus_tgid;
+            built_htop_ = true;
+        }
+        htop_idx_ = 0;
     } else {
         if (!built_rpane_ || built_for_cursor_ != state_.cursor_id ||
             built_for_mode_ != state_.mode ||
@@ -544,6 +590,7 @@ bool TvDataSource::row_has_more(int panel) {
     if (panel == 0) return lpane_idx_ < lpane_.size();
     if (panel == 2) return hat_top_idx_ < hat_top_.size();
     if (panel == 3) return hat_bot_idx_ < hat_bot_.size();
+    if (panel == 4) return htop_idx_ < htop_.size();
     return rpane_idx_ < rpane_.size();
 }
 
@@ -551,6 +598,7 @@ RowData TvDataSource::row_next(int panel) {
     if (panel == 0) return lpane_.at(lpane_idx_++);
     if (panel == 2) return hat_top_.at(hat_top_idx_++);
     if (panel == 3) return hat_bot_.at(hat_bot_idx_++);
+    if (panel == 4) return htop_.at(htop_idx_++);
     return rpane_.at(rpane_idx_++);
 }
 
@@ -670,6 +718,12 @@ bool TvDataSource::recompute_hats_for_window(int first_row, int n_rows) {
         bool changed = (new_top.size() != hat_top_.size()) ||
                        (!new_top.empty() && !hat_top_.empty() &&
                         new_top[0].cols[0] != hat_top_[0].cols[0]);
+        /* Don't drop the hat just because the visible window happened
+         * to contain no real proc rows (e.g. only the synthetic "(no
+         * processes)" placeholder, or the user scrolled past the end).
+         * Keep whatever was last shown until a window with proc rows
+         * comes back into view. */
+        if (new_top.empty() && !hat_top_.empty()) return false;
         hat_top_ = std::move(new_top);
         return changed;
     }
@@ -715,6 +769,9 @@ bool TvDataSource::recompute_hats_for_window(int first_row, int n_rows) {
     bool changed = (new_bot.size() != hat_bot_.size()) ||
                    (!new_bot.empty() && !hat_bot_.empty() &&
                     new_bot[0].cols[0] != hat_bot_[0].cols[0]);
+    /* Same conservatism as the proc-tree branch: a window with no leaf
+     * paths leaves the previous hat in place rather than blanking it. */
+    if (new_bot.empty() && !hat_bot_.empty()) return false;
     hat_bot_ = std::move(new_bot);
     return changed;
 }
@@ -2143,4 +2200,153 @@ void TvDataSource::rpane_event_detail(const std::string &id) {
         rpane_.push_back(mk_kv("name", "name", basename_of(pr.front()[0])));
         rpane_.push_back(mk_kv("exe",  "exe",  pr.front()[0]));
     }
+}
+
+
+/* -- htop snapshot column ------------------------------------------- *
+ *
+ * Render the process tree as it stood at state_.htop_anchor_ns, the
+ * timestamp of whatever event the lpane cursor sits on.  The snapshot
+ * is rebuilt whenever the anchor or focus tgid changes; drawing happens
+ * via the standard panel iterator (panel index 4).
+ *
+ * Inclusion rule:
+ *   start_ns <= T  AND  (end_ns IS NULL OR end_ns >= T - 1s)
+ * - "alive at T" sets the lower bound on end_ns.
+ * - The 1 s grace lets the user *see* a recently-exited process for a
+ *   moment after its death; that is what `htop` does too, and it is
+ *   what the bug report explicitly asks for ("processes that exited
+ *   less than a second before shown time are red").
+ *
+ * Coloring (matching the spec):
+ *   - Green  : just spawned   - T - start_ns < 1 s
+ *   - Error  : just died      - end_ns IS NOT NULL AND T - end_ns < 1 s
+ *   - Search : focus tgid     - the producer of the selected event
+ *   - Dim    : everything else
+ *
+ * The pane is read-only (no cursor, Tab skips it), so the order of
+ * children just needs to be reproducible: sort by start_ns. */
+
+void TvDataSource::rebuild_htop() {
+    htop_.clear();
+    std::string err;
+    if (!db_.ensure_proc_index(&err)) {
+        htop_.push_back(mk_row("__err", "(index: " + err + ")",
+                               RowStyle::Error));
+        return;
+    }
+    int64_t T = state_.htop_anchor_ns;
+    if (T <= 0) {
+        htop_.push_back(mk_row("__hint",
+            "(no anchor — select an event)", RowStyle::Dim));
+        return;
+    }
+    /* Recently-exited grace: 1 second.  Same threshold drives the red
+     * colouring below, so it stays consistent. */
+    const int64_t GRACE_NS = 1000000000LL;
+    std::string sql = sfmt(
+        "SELECT tgid, ppid, CAST(exe AS VARCHAR), start_ns, end_ns "
+        "FROM tv_idx_proc "
+        "WHERE start_ns <= %lld "
+        "  AND (end_ns IS NULL OR end_ns >= %lld) "
+        "ORDER BY start_ns",
+        (long long)T, (long long)(T - GRACE_NS));
+    auto rows = db_.query_strings(sql, &err);
+    if (!err.empty()) {
+        htop_.push_back(mk_row("__err", err, RowStyle::Error));
+        return;
+    }
+    if (rows.empty()) {
+        htop_.push_back(mk_row("__empty",
+            "(no procs alive at this moment)", RowStyle::Dim));
+        return;
+    }
+
+    struct Snap {
+        int         tgid = 0;
+        int         ppid = 0;
+        std::string exe;
+        int64_t     start_ns = 0;
+        int64_t     end_ns   = 0;
+        bool        ended    = false;
+        std::vector<int> children;
+    };
+    std::unordered_map<int, Snap> snap;
+    snap.reserve(rows.size());
+    for (auto &r : rows) {
+        Snap s;
+        s.tgid     = std::atoi(r[0].c_str());
+        s.ppid     = std::atoi(r[1].c_str());
+        s.exe      = r[2];
+        s.start_ns = r[3].empty() ? 0 : std::stoll(r[3]);
+        s.ended    = !r[4].empty();
+        s.end_ns   = s.ended ? std::stoll(r[4]) : 0;
+        snap.emplace(s.tgid, std::move(s));
+    }
+    std::vector<int> roots;
+    for (auto &kv : snap) {
+        Snap &s = kv.second;
+        auto it = snap.find(s.ppid);
+        if (it == snap.end()) roots.push_back(s.tgid);
+        else                  it->second.children.push_back(s.tgid);
+    }
+    auto by_start = [&](int a, int b){ return snap[a].start_ns < snap[b].start_ns; };
+    std::sort(roots.begin(), roots.end(), by_start);
+    for (auto &kv : snap) std::sort(kv.second.children.begin(),
+                                    kv.second.children.end(), by_start);
+
+    int focus_tgid = state_.htop_focus_tgid.empty() ? 0
+                       : std::atoi(state_.htop_focus_tgid.c_str());
+
+    /* Header: anchor as wall-clock-relative seconds plus a little
+     * legend so the colour code is discoverable.  The anchor is shown
+     * relative to the *trace's* first event rather than absolute ns —
+     * matches the time column convention used elsewhere in tv. */
+    int64_t base_ns = T;
+    {
+        auto br = db_.query_strings(
+            "SELECT MIN(ts_ns) FROM ("
+            "  SELECT ts_ns FROM exec UNION ALL "
+            "  SELECT ts_ns FROM exit_)", &err);
+        if (!br.empty() && !br[0][0].empty())
+            try { base_ns = std::stoll(br[0][0]); } catch (...) {}
+    }
+    {
+        double rel = (T - base_ns) / 1e9;
+        RowData hdr;
+        hdr.id    = "__htop_hdr";
+        hdr.style = RowStyle::Heading;
+        hdr.cols  = {sfmt("at t=%.3fs  green=spawned  red=exited  /focus", rel)};
+        htop_.push_back(std::move(hdr));
+    }
+
+    std::function<void(int, const std::string &, bool)> emit =
+        [&](int t, const std::string &prefix, bool is_last) {
+            Snap &s = snap[t];
+            std::string indent = prefix;
+            if (!prefix.empty()) indent += is_last ? "└─ " : "├─ ";
+            std::string name = basename_of(s.exe);
+            if (name.empty()) name = "?";
+            std::string label = indent + name + " [" + std::to_string(s.tgid) + "]";
+
+            RowStyle style = RowStyle::Dim;
+            if (s.tgid == focus_tgid)              style = RowStyle::Search;
+            else if (T - s.start_ns < GRACE_NS)    style = RowStyle::Green;
+            else if (s.ended && T > s.end_ns &&
+                     T - s.end_ns  < GRACE_NS)     style = RowStyle::Error;
+            else                                   style = RowStyle::Normal;
+
+            RowData row;
+            row.id        = "h:" + std::to_string(s.tgid);
+            row.parent_id = "h:" + std::to_string(s.ppid);
+            row.style     = style;
+            row.cols      = {label};
+            htop_.push_back(std::move(row));
+
+            std::string cp = prefix + (is_last ? "   " : "│  ");
+            for (size_t i = 0; i < s.children.size(); i++)
+                emit(s.children[i], cp, i + 1 == s.children.size());
+        };
+    for (size_t i = 0; i < roots.size(); i++)
+        emit(roots[i], "", i + 1 == roots.size());
 }

@@ -48,6 +48,23 @@ struct AppState {
      * window without losing the rest of the filter state. */
     int64_t      ts_after_ns  = 0;
     int64_t      ts_before_ns = 0;
+    /* Optional third column - htop-style snapshot of the process tree
+     * at a chosen instant.  Toggled with `T` (capital).  When on, the
+     * snapshot anchor (htop_anchor_ns) is auto-derived from the
+     * currently-selected event each time the cursor commits.
+     *
+     * Coloring matches htop's "new/dying process" hint:
+     *   - green: process started < 1 s before the anchor
+     *   - red  : process exited  < 1 s before the anchor
+     *   - dim  : process is alive at the anchor but otherwise unremarkable
+     *   - cursor-row colour for the producing tgid of the selected event
+     * The pane is purely informational — it doesn't accept focus.
+     */
+    bool         show_htop_col   = false;
+    int64_t      htop_anchor_ns  = 0;
+    /* tgid of the selected event's producer, highlighted in the htop
+     * column so the eye can find it inside the snapshot tree. */
+    std::string  htop_focus_tgid;
 };
 
 class TvDataSource {
@@ -100,6 +117,16 @@ public:
      * the hat panels dirty). */
     bool recompute_hats_for_window(int first_row, int n_rows);
 
+    /* Per-mode column layout for the htop snapshot column (panel 4
+     * when show_htop_col is true).  Single flex column.  The data
+     * source builds the rows lazily on first row_begin(panel=4). */
+    PanelLayout htop_layout() const;
+    void apply_htop_layout(class Tui &tui, int htop_pane) const;
+    /* Force the next htop_pane build to use this anchor (in ns).
+     * Comparing against the cached anchor lets us avoid rebuilding
+     * when the cursor commits to a row with the same timestamp. */
+    void set_htop_anchor_ns(int64_t ts_ns);
+
 private:
     void row_begin(int panel);
     bool row_has_more(int panel);
@@ -129,6 +156,9 @@ private:
     void rpane_event_detail(const std::string &id);
     void rpane_output_detail(const std::string &id); /* mode 0 cursor */
 
+    /* Build/serve the htop-style snapshot column. */
+    void rebuild_htop();
+
     TvDb     &db_;
     AppState &state_;
 
@@ -136,6 +166,7 @@ private:
     std::vector<RowData> rpane_;
     std::vector<RowData> hat_top_;
     std::vector<RowData> hat_bot_;
+    std::vector<RowData> htop_;
     /* Cached per-rebuild-of-lpane: tgid -> in-trace ancestor chain
      * (child→parent ordered, init filtered out). Lets the proc-tree hat
      * be recomputed for any lpane row window without re-running SQL.
@@ -150,10 +181,14 @@ private:
     size_t rpane_idx_ = 0;
     size_t hat_top_idx_ = 0;
     size_t hat_bot_idx_ = 0;
+    size_t htop_idx_ = 0;
     bool   built_lpane_ = false;
     bool   built_rpane_ = false;
     bool   built_hat_top_ = false;
     bool   built_hat_bot_ = false;
+    bool   built_htop_ = false;
+    int64_t built_htop_for_ns_  = -1;
+    std::string built_htop_focus_tgid_;
     std::string built_for_cursor_;
     std::string built_for_subject_;
     int    built_for_mode_ = -1;
