@@ -6,6 +6,8 @@ tv_sql.h
 gen_sql_h
 build/
 tests/sud_stress
+tests/sud_stress32
+tests/sud_stress64
 deps/duckdb/src/amalgamation/
 # kernel module build artifacts
 *.o
