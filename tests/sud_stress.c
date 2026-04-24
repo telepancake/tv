@@ -45,6 +45,7 @@
 /* signals */
 #define T_SIGALRM 14
 #define T_SIGTRAP  5
+#define T_SIGCHLD 17
 
 /* errno values used in tests */
 #define T_ECHILD   10
@@ -821,6 +822,75 @@ static int t_signal_storm(int threads, int iters)
 }
 
 /* ================================================================
+ * Subtest: sigchld-spawn
+ *
+ * Regression test for the i386 sigreturn-mismatch crash.
+ *
+ * The trigger is a user signal handler installed *without* SA_SIGINFO
+ * — typically a SIGCHLD handler — combined with a child process that
+ * exits and induces signal delivery to the parent.  On i386 the kernel
+ * builds the legacy struct sigframe for non-SA_SIGINFO handlers, which
+ * must be unwound through SYS_sigreturn (#119).  A buggy SUD handler
+ * that always patches the user's restorer to one calling
+ * SYS_rt_sigreturn (#173) makes the kernel parse the frame at the
+ * wrong offsets on return and load garbage into the user registers,
+ * yielding an instant SI_KERNEL SIGSEGV (typically EIP = ESP = 0).
+ *
+ * The repro is bog-standard: install a no-op SIGCHLD handler with no
+ * extra flags, then vfork+execve+wait4 a few hundred times.
+ * ================================================================ */
+static void t_sigchld_noop(int sig)
+{
+    (void)sig;
+}
+
+static int t_sigchld_spawn(int iters_in)
+{
+    int iters = iters_in <= 0 ? 200 : iters_in;
+
+    /* Install a SIGCHLD handler WITHOUT SA_SIGINFO — this is what
+     * a typical libc-style sigaction(SIGCHLD, &{.sa_handler=fn}, NULL)
+     * call ends up sending to the kernel.  We must not force
+     * SA_SIGINFO here or the bug we're guarding against won't trigger.
+     *
+     * Note: the .restorer we pass is irrelevant — SUD's rt_sigaction
+     * interceptor always patches the restorer.  What matters is that
+     * SA_SIGINFO is *unset* so that the SUD interceptor selects the
+     * legacy-frame restorer (which calls SYS_sigreturn).  If SUD
+     * incorrectly selects the rt restorer, the kernel will iret with
+     * garbage registers on the *first* SIGCHLD delivery and crash. */
+    struct t_kern_sigact ksa;
+    t_memset(&ksa, 0, sizeof(ksa));
+    ksa.handler  = t_sigchld_noop;
+    ksa.restorer = t_sigreturn_restorer;
+    ksa.flags    = SA_RESTART | SA_RESTORER;   /* deliberately no SA_SIGINFO */
+    ksa.mask     = 0;
+    raw_syscall6(SYS_rt_sigaction, T_SIGCHLD, (long)&ksa, 0,
+                 sizeof(ksa.mask), 0, 0);
+
+    char *av[] = { (char *)"/bin/true", NULL };
+    for (int i = 0; i < iters; i++) {
+        long pid = t_vfork_exec(av);
+        if (pid < 0) t_die("sigchld-spawn vfork");
+        int st = 0;
+        if (raw_syscall6(SYS_wait4, (long)pid, (long)&st, 0, 0, 0, 0) != pid)
+            t_die("sigchld-spawn wait");
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+            t_die2("sigchld-spawn: bad status", (long)st);
+    }
+
+    /* Restore SIGCHLD to default to leave the process clean. */
+    t_memset(&ksa, 0, sizeof(ksa));
+    ksa.flags = SA_RESTORER;
+    ksa.restorer = t_sigreturn_restorer;
+    raw_syscall6(SYS_rt_sigaction, T_SIGCHLD, (long)&ksa, 0,
+                 sizeof(ksa.mask), 0, 0);
+
+    t_ok("sigchld-spawn");
+    return 0;
+}
+
+/* ================================================================
  * Subtest: ptrace-traceme
  * ================================================================ */
 static int t_ptrace_traceme(void)
@@ -934,6 +1004,7 @@ static void list_tests(void)
         "posix-spawn-storm [threads] [iters]",
         "vfork-exec-loop [iters]",
         "signal-storm [threads] [iters]",
+        "sigchld-spawn [iters]",
         "ptrace-traceme",
         "execve-null",
         "waitid-tight [rounds]",
@@ -971,6 +1042,8 @@ int main(int argc, char **argv)
     if (t_strcmp(t, "signal-storm") == 0)
         return t_signal_storm(argc > 2 ? t_atoi(argv[2]) : 0,
                               argc > 3 ? t_atoi(argv[3]) : 0);
+    if (t_strcmp(t, "sigchld-spawn") == 0)
+        return t_sigchld_spawn(argc > 2 ? t_atoi(argv[2]) : 0);
     if (t_strcmp(t, "ptrace-traceme") == 0)
         return t_ptrace_traceme();
     if (t_strcmp(t, "execve-null") == 0)

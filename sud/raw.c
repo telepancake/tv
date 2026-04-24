@@ -34,6 +34,33 @@ __asm__(
     "    hlt\n"
     "    .size sud_rt_sigreturn_restorer, .-sud_rt_sigreturn_restorer\n"
 );
+
+/*
+ * Legacy (non-SA_SIGINFO) sigreturn restorer for i386.
+ *
+ * On i386 the kernel chooses the signal frame layout based on
+ * SA_SIGINFO: handlers installed *with* SA_SIGINFO get a struct
+ * rt_sigframe and must return through SYS_rt_sigreturn (173); handlers
+ * installed *without* SA_SIGINFO get the legacy struct sigframe and
+ * must return through SYS_sigreturn (119).  Calling the wrong sigreturn
+ * makes the kernel parse the frame at the wrong offsets and load
+ * garbage into the user registers (typically EIP=ESP=0 with random
+ * segment selectors → instant SI_KERNEL SIGSEGV on iret).
+ *
+ * x86_64 has only the rt sigframe / rt_sigreturn flavour, so this
+ * helper is i386-only.
+ */
+__asm__(
+    "    .text\n"
+    "    .globl sud_sigreturn_restorer\n"
+    "    .type sud_sigreturn_restorer, @function\n"
+    "sud_sigreturn_restorer:\n"
+    "    pop  %eax\n"          /* discard signum the kernel pushed   */
+    "    mov  $" STR(SYS_sigreturn) ", %eax\n"
+    "    int  $0x80\n"
+    "    hlt\n"
+    "    .size sud_sigreturn_restorer, .-sud_sigreturn_restorer\n"
+);
 #endif
 
 /* ================================================================

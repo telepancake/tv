@@ -83,6 +83,7 @@ TESTS=(
     "posix-spawn-storm|0|6 30"
     "vfork-exec-loop|0|150"
     "signal-storm|0|4 25"
+    "sigchld-spawn|0|200"
     "ptrace-traceme|0|"
     "execve-null|0|"
     "waitid-tight|0|150"

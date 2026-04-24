@@ -112,6 +112,13 @@
 #define SYS_rt_sigreturn   __NR_rt_sigreturn
 #endif
 
+/* Legacy sigreturn (i386 only — x86_64 has no SYS_sigreturn). */
+#if defined(__i386__)
+#ifndef SYS_sigreturn
+#define SYS_sigreturn      __NR_sigreturn
+#endif
+#endif
+
 /* ================================================================
  * POSIX-like types
  * ================================================================ */
