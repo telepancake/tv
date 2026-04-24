@@ -64,6 +64,12 @@ static inline long raw_syscall6(long nr, long a0, long a1, long a2,
  * ================================================================ */
 void sud_rt_sigreturn_restorer(void);
 
+/* Legacy (non-SA_SIGINFO) sigreturn restorer — i386 only.  See raw.c
+ * for the rationale.  On x86_64 only the rt frame exists. */
+#if defined(__i386__)
+void sud_sigreturn_restorer(void);
+#endif
+
 /* ================================================================
  * Clone trampolines — defined in raw.c
  * ================================================================ */

@@ -813,7 +813,24 @@ static void sigsys_handler_inner(int sig, siginfo_t *info, void *uctx_raw)
         if (act) {
             struct kernel_sigaction patched = *act;
             patched.flags |= SA_RESTORER;
+            /* On i386 the kernel selects the signal frame layout (and
+             * the matching sigreturn syscall) from SA_SIGINFO.  Without
+             * SA_SIGINFO it builds a legacy sigframe which must be
+             * unwound via SYS_sigreturn (#119); with SA_SIGINFO it
+             * builds a struct rt_sigframe which must be unwound via
+             * SYS_rt_sigreturn (#173).  Calling the wrong sigreturn
+             * makes the kernel parse the frame at the wrong offsets and
+             * load garbage into the user registers (typically EIP=ESP=0
+             * with NULL segment selectors → SI_KERNEL SIGSEGV on iret).
+             * x86_64 has only the rt flavour. */
+#if defined(__i386__)
+            if (patched.flags & SA_SIGINFO)
+                patched.restorer = sud_rt_sigreturn_restorer;
+            else
+                patched.restorer = sud_sigreturn_restorer;
+#else
             patched.restorer = sud_rt_sigreturn_restorer;
+#endif
             ret = raw_syscall6(nr, a0, (long)&patched, a2, a3, a4, a5);
         } else {
             ret = raw_syscall6(nr, a0, a1, a2, a3, a4, a5);
