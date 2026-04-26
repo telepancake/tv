@@ -1,7 +1,7 @@
 /* tv_db.cpp - DuckDB-backed storage and query layer. */
 
 #include "tv_db.h"
-#include "wire_in.h"
+#include "wire/wire_in.h"
 
 #include "duckdb.h"
 

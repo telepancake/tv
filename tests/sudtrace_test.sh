@@ -3,7 +3,7 @@
 #
 # Tests that sudtrace correctly traces programs, including multithreaded
 # ones, and produces a valid binary wire stream. Assertions are made
-# against `tv dump`'s textual rendering of the wire file, so they are
+# against `wire/yeetdump`'s textual rendering of the wire file, so they are
 # stable across binary-format revisions as long as the dump output
 # stays human-readable.
 set -eo pipefail
@@ -12,13 +12,14 @@ cd "$(dirname "$0")/.."
 TV=./tv
 SUDTRACE="$TV sud"
 SUD32=./sud32
+YEETDUMP=./wire/yeetdump
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Render a wire file as text via `tv dump`. Returns the dump output on
+# Render a wire file as text via `wire/yeetdump`. Returns the dump output on
 # stdout. Wire files don't grep cleanly (zstd/binary framing), so all
 # event-shape assertions go through this.
-dump() { "$TV" dump "$1" 2>/dev/null; }
+dump() { "$YEETDUMP" "$1" 2>/dev/null; }
 
 PASS=0 FAIL=0 TOTAL=0
 
@@ -48,6 +49,7 @@ int main(void) {
 }
 EOF
 gcc -o "$TMPDIR/hello" "$TMPDIR/hello.c"
+[ -x "$YEETDUMP" ] || make -C wire yeetdump >/dev/null
 
 cat > "$TMPDIR/threads.c" << 'EOF'
 #include <stdio.h>

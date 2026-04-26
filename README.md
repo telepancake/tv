@@ -84,10 +84,15 @@ tv --open trace.tvdb --dump=4 --subject /path/to/output
 
 # Subcommands (single static `tv` binary; sud32/sud64 stay separate).
 tv sud  -- <cmd>          # syscall-user-dispatch tracer (was sudtrace)
-tv dump trace.wire        # hexdump a wire stream (was yeetdump)
 tv ptrace -- <cmd>        # short for `tv uproctrace --ptrace --`
 tv module -- <cmd>        # short for `tv uproctrace --module --`
 tv test                   # built-in self-tests
+
+# Standalone wire-format tools and reference material.
+make -C wire
+./wire/yeetdump trace.wire
+./wire/yeetdump --selftest
+# See ./wire/WIRE-FORMAT.md and ./wire/reference-*.wire
 ```
 
 Pass `--no-env` to omit environment variables from emitted `EXEC` events.

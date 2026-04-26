@@ -31,7 +31,7 @@
  *     writers up to PIPE_BUF (pipes) or unconditionally on regular
  *     files in Linux, so events from different processes interleave
  *     at event boundaries but never inside an event.
- *   - The decoder (wire_in.cpp) keeps one ev_state per observed
+ *   - The decoder (wire/wire_in.cpp) keeps one ev_state per observed
  *     stream_id, so each producer's deltas stay coherent on its own
  *     state.
  *

@@ -1,7 +1,7 @@
-/* wire_in.h - streaming decoder for tv's wire-format trace input.
+/* wire_in.h - streaming decoder for wire-format trace input.
  *
  * Producers (sud, proctrace, uproctrace) emit binary wire events as
- * defined in wire/wire.h. tv consumes them through this adapter.
+ * defined in wire.h. Consumers can use this adapter directly.
  *
  * The decoder is byte-streaming - feed() is safe to call with any
  * fragment size, including a single byte at a time from a non-blocking

@@ -6,7 +6,7 @@
  * database return what we expect.
  */
 
-#include "wire_in.h"
+#include "wire/wire_in.h"
 #include "tv_db.h"
 
 extern "C" {

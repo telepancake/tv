@@ -36,7 +36,7 @@
 #include <zstd.h>
 
 #include "engine.h"
-#include "wire_in.h"
+#include "wire/wire_in.h"
 #include "tv_db.h"
 #include "data_source.h"
 
@@ -44,7 +44,6 @@ extern int uproctrace_main(int argc, char **argv);
 extern int run_tests(); /* tests.cpp */
 extern int fv_main(int argc, char **argv); /* fv.cpp */
 extern "C" int sudtrace_main(int argc, char **argv);  /* sud/sudtrace.c */
-extern "C" int yeetdump_main(int argc, char **argv);  /* tools/yeetdump/yeetdump.c */
 
 namespace {
 
@@ -67,8 +66,6 @@ const char *USAGE =
     "\n"
     "Tools (folded in from former separate binaries):\n"
     "  tv sud [args...]            sudtrace launcher (former sudtrace)\n"
-    "  tv dump <wire-file>...      hexdump a wire stream (former yeetdump)\n"
-    "  tv dump --selftest          wire-format roundtrip test\n"
     "  tv fv [path]                file viewer (former fv)\n"
     "  tv module -- <cmd> ...      shorthand for `tv uproctrace --module --`\n"
     "  tv ptrace -- <cmd> ...      shorthand for `tv uproctrace --ptrace --`\n"
@@ -771,8 +768,6 @@ int main(int argc, char **argv) {
         const char *sub = argv[1];
         if (!std::strcmp(sub, "sud"))
             return sudtrace_main(argc - 1, argv + 1);
-        if (!std::strcmp(sub, "dump"))
-            return yeetdump_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "fv"))
             return fv_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "test"))

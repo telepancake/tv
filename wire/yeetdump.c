@@ -1,4 +1,4 @@
-/* yeetdump.c — round-trip selftest and human dump for tv wire streams.
+/* yeetdump.c — round-trip selftest and human dump for wire streams.
  *
  *   yeetdump --selftest
  *       Round-trip every event class plus boundary cases for the yeet
@@ -22,7 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "wire/wire.h"
+#include "wire.h"
 
 /* ─── pretty-print bytes that aren't claimed to be text ─────────── */
 
@@ -486,14 +486,14 @@ static int selftest(void) {
     return 0;
 }
 
-int yeetdump_main(int argc, char **argv) {
+int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--selftest") == 0) {
         return selftest();
     }
     if (argc < 2) {
         fprintf(stderr,
-                "usage: tv dump --selftest\n"
-                "       tv dump trace.bin [trace.bin ...]\n");
+                "usage: yeetdump --selftest\n"
+                "       yeetdump trace.bin [trace.bin ...]\n");
         return 2;
     }
     int rc = 0;

@@ -107,13 +107,13 @@ $(DUCKDB_OBJ): $(DUCKDB_CPP)
 	$(DUCKDB_CXX) -std=c++17 $(DUCKDB_OPT) -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
 
 # Single statically-linked tv binary with subcommands. Folds in what
-# used to be separate sudtrace/yeetdump/fv binaries — see main.cpp's
-# subcommand dispatch (sud, dump, fv, module, ptrace, uproctrace, test).
-TV_CXX_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp wire_in.cpp \
+# used to be separate sudtrace/fv binaries — see main.cpp's subcommand
+# dispatch (sud, fv, module, ptrace, uproctrace, test).
+TV_CXX_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp wire/wire_in.cpp \
                tv_db.cpp data_source.cpp fv.cpp
-TV_C_SRCS   := sud/sudtrace.c tools/yeetdump/yeetdump.c
+TV_C_SRCS   := sud/sudtrace.c
 TV_C_OBJS   := $(patsubst %.c,build/%.o,$(TV_C_SRCS))
-TV_HDRS := engine.h wire_in.h tv_db.h data_source.h wire/wire.h $(DUCKDB_HPP)
+TV_HDRS := engine.h wire/wire_in.h tv_db.h data_source.h wire/wire.h $(DUCKDB_HPP)
 
 build/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -145,8 +145,11 @@ sud32: $(SUD_SRCS) sudtrace.lds
 	$(CC) -m32 $(SUD_CFLAGS) $(SUD_LDFLAGS) -Wl,-Ttext-segment=0x20000000 -T sudtrace.lds -o sud32 $(SUD_SRCS) -lgcc
 
 .PHONY: wire-test
-wire-test: tv
-	./tv dump --selftest
+wire-test: wire/yeetdump
+	./wire/yeetdump --selftest
+
+wire/yeetdump:
+	$(MAKE) -C wire yeetdump
 
 .PHONY: all keygen sign load unload clean clean-bins install test
 test: tv
@@ -154,4 +157,5 @@ test: tv
 
 clean-bins:
 	rm -f tv sud32 sud64
+	-$(MAKE) -C wire clean
 	-$(MAKE) -C $(ZSTD_DIR) clean

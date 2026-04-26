@@ -7,7 +7,7 @@
 #include <vector>
 
 extern "C" {
-#include "wire/wire.h"
+#include "wire.h"
 }
 
 /* -- per-atom length probe (without consuming) ---------------------- */

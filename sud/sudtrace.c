@@ -56,7 +56,7 @@ static void usage(const char *prog)
         "\n"
         "Syscall User Dispatch (SUD) based process tracer.\n"
         "Produces a binary wire-format trace (see wire/wire.h).\n"
-        "Decode with: yeetdump FILE\n",
+        "Decode with: ./wire/yeetdump FILE\n",
         prog);
     exit(1);
 }
