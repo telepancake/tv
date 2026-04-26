@@ -1773,6 +1773,22 @@ static int wait_for_child(pid_t child)
     return 0;
 }
 
+static int wait_for_child_status(pid_t child)
+{
+    int status;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) {
+            perror("waitpid");
+            return 1;
+        }
+    }
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return 1;
+}
+
 static int run_module_trace(char **cmd, const char *outfile, const char *modtrace_exe)
 {
     if (trace_output_uses_zstd(outfile)) {
@@ -1811,11 +1827,12 @@ static int run_module_trace(char **cmd, const char *outfile, const char *modtrac
         close(pipefd[1]);
         int rc = copy_fd_to_output(pipefd[0]);
         close(pipefd[0]);
-        if (wait_for_child(child) != 0)
-            rc = 1;
+        int child_rc = wait_for_child_status(child);
         if (close_trace_output(outfile) != 0)
             rc = 1;
-        return rc == 0 ? 0 : 1;
+        if (rc != 0)
+            return 1;
+        return child_rc;
     }
 
     pid_t child = fork();
@@ -1834,7 +1851,7 @@ static int run_module_trace(char **cmd, const char *outfile, const char *modtrac
         perror("exec modtrace");
         _exit(127);
     }
-    return wait_for_child(child);
+    return wait_for_child_status(child);
 }
 
 static int build_exec_argv(char ***out_argv, const char *exe,
