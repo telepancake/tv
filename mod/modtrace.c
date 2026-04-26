@@ -12,6 +12,8 @@
 
 #include "wire/wire.h"
 
+enum { OUTPUT_BUFFER_SIZE = 1 << 20 };
+
 static void usage(FILE *f, const char *prog)
 {
     fprintf(f, "Usage: %s [-o FILE] -- command [args...]\n", prog);
@@ -108,7 +110,7 @@ int main(int argc, char **argv)
         }
         trace_out_fd = -1;
     }
-    setvbuf(out, NULL, _IOFBF, 1 << 20);
+    setvbuf(out, NULL, _IOFBF, OUTPUT_BUFFER_SIZE);
     if (write_wire_version(out) != 0) {
         perror("write");
         goto done;
