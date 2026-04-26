@@ -1,19 +1,18 @@
-obj-m += proctrace.o
-
 CC ?= cc
 CXX ?= g++
-KDIR    ?= /lib/modules/$(shell uname -r)/build
+MOD_DIR := mod
 PWD     := $(shell pwd)
-SIGN    := $(KDIR)/scripts/sign-file
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv sud-bins
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+all: tv sud-bins mod-bins
 
-.PHONY: sud-bins
+.PHONY: sud-bins mod-bins
 sud-bins:
 	$(MAKE) $(SUD_NATIVE)
+
+mod-bins:
+	$(MAKE) -C $(MOD_DIR) all
 
 # Generate a MOK keypair (one-time).  After this, run:
 #   sudo mokutil --import MOK.der
@@ -29,23 +28,21 @@ keygen:
 
 # Sign the module (requires MOK.priv + MOK.der from keygen).
 sign: all
-	$(SIGN) sha256 $(MOK_KEY) $(MOK_CER) proctrace.ko
+	$(MAKE) -C $(MOD_DIR) sign
 
 # Build + sign + load in one step.
 load: sign
-	-sudo rmmod proctrace 2>/dev/null
-	sudo insmod proctrace.ko
+	$(MAKE) -C $(MOD_DIR) load
 
 unload:
-	sudo rmmod proctrace
+	$(MAKE) -C $(MOD_DIR) unload
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(MOD_DIR) clean
 	rm -f sudtrace sud32 sud64
 
 install:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
-	depmod -a
+	$(MAKE) -C $(MOD_DIR) install
 
 ZSTD_DIR  := deps/zstd/lib
 ZSTD_LIB  := $(ZSTD_DIR)/libzstd.a
@@ -153,5 +150,5 @@ test: tv
 	./tv test
 
 clean-bins:
-	rm -f tv sud32 sud64
+	rm -f tv sud32 sud64 mod/modtrace
 	-$(MAKE) -C $(ZSTD_DIR) clean

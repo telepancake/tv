@@ -1,7 +1,8 @@
 uproctrace
 tv
 fv
-proctrace.ko
+mod/proctrace.ko
+mod/modtrace
 tv_sql.h
 gen_sql_h
 build/

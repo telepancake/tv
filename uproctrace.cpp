@@ -113,6 +113,8 @@ static pthread_mutex_t g_ev_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Forward declarations */
 static int trace_output_enqueue(const char *buf, size_t len);
+static int build_exec_argv(char ***out_argv, const char *exe,
+                           const char *outfile, int no_env, char **cmd);
 
 static bool path_has_suffix(const char *path, const char *suffix)
 {
@@ -1408,6 +1410,23 @@ static int resolve_sudtrace_exe(char *buf, size_t bufsz)
     return access(buf, X_OK) == 0 ? 0 : -1;
 }
 
+static int resolve_modtrace_exe(char *buf, size_t bufsz)
+{
+    char self_exe[PATH_MAX];
+    if (resolve_self_exe(self_exe, sizeof(self_exe)) == 0) {
+        char *slash = std::strrchr(self_exe, '/');
+        if (slash) {
+            int len = snprintf(buf, bufsz, "%.*s/mod/modtrace",
+                               static_cast<int>(slash - self_exe), self_exe);
+            if (len > 0 && static_cast<size_t>(len) < bufsz && access(buf, X_OK) == 0)
+                return 0;
+        }
+    }
+    if (snprintf(buf, bufsz, "%s", "modtrace") >= static_cast<int>(bufsz))
+        return -1;
+    return access(buf, X_OK) == 0 ? 0 : -1;
+}
+
 static int resolve_exec_path(const char *cmd, char *out, size_t out_sz)
 {
     if (!cmd || !cmd[0] || out_sz == 0)
@@ -1754,36 +1773,68 @@ static int wait_for_child(pid_t child)
     return 0;
 }
 
-static int run_module_trace(char **cmd, const char *outfile)
+static int run_module_trace(char **cmd, const char *outfile, const char *modtrace_exe)
 {
-    int trace_fd = open("/proc/proctrace/new", O_RDONLY);
-    if (trace_fd < 0)
-        return -1;
-    if (open_trace_output(outfile) < 0) {
-        close(trace_fd);
-        return 1;
+    if (trace_output_uses_zstd(outfile)) {
+        int pipefd[2];
+        if (pipe(pipefd) < 0) {
+            perror("pipe");
+            return 1;
+        }
+        if (open_trace_output(outfile) < 0) {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return 1;
+        }
+        pid_t child = fork();
+        if (child < 0) {
+            perror("fork");
+            close(pipefd[0]);
+            close(pipefd[1]);
+            (void)close_trace_output(outfile);
+            return 1;
+        }
+        if (child == 0) {
+            char **sub_argv = nullptr;
+            close(pipefd[0]);
+            if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
+            close(pipefd[1]);
+            if (build_exec_argv(&sub_argv, modtrace_exe, nullptr, 0, cmd) != 0)
+                _exit(127);
+            if (std::strchr(modtrace_exe, '/'))
+                execv(modtrace_exe, sub_argv);
+            else
+                execvp(modtrace_exe, sub_argv);
+            perror("exec modtrace");
+            _exit(127);
+        }
+        close(pipefd[1]);
+        int rc = copy_fd_to_output(pipefd[0]);
+        close(pipefd[0]);
+        if (wait_for_child(child) != 0)
+            rc = 1;
+        if (close_trace_output(outfile) != 0)
+            rc = 1;
+        return rc == 0 ? 0 : 1;
     }
 
     pid_t child = fork();
     if (child < 0) {
         perror("fork");
-        close(trace_fd);
-        (void)close_trace_output(outfile);
         return 1;
     }
     if (child == 0) {
-        execvp(cmd[0], cmd);
-        perror(cmd[0]);
+        char **sub_argv = nullptr;
+        if (build_exec_argv(&sub_argv, modtrace_exe, outfile, 0, cmd) != 0)
+            _exit(127);
+        if (std::strchr(modtrace_exe, '/'))
+            execv(modtrace_exe, sub_argv);
+        else
+            execvp(modtrace_exe, sub_argv);
+        perror("exec modtrace");
         _exit(127);
     }
-
-    int rc = copy_fd_to_output(trace_fd);
-    close(trace_fd);
-    if (wait_for_child(child) != 0)
-        rc = 1;
-    if (close_trace_output(outfile) != 0)
-        rc = 1;
-    return rc == 0 ? 0 : 1;
+    return wait_for_child(child);
 }
 
 static int build_exec_argv(char ***out_argv, const char *exe,
@@ -2144,8 +2195,10 @@ int uproctrace_main(int argc, char **argv)
         usage(argv[0]);
 
     char **cmd = argv + cmd_start;
+    char modtrace_exe[PATH_MAX];
     char sudtrace_exe[PATH_MAX];
-    int have_module = kernel_supports_proctrace_module();
+    int have_module = resolve_modtrace_exe(modtrace_exe, sizeof(modtrace_exe)) == 0 &&
+                      kernel_supports_proctrace_module();
     int have_sud = resolve_sudtrace_exe(sudtrace_exe, sizeof(sudtrace_exe)) == 0 &&
                    kernel_supports_sud();
 
@@ -2163,7 +2216,7 @@ int uproctrace_main(int argc, char **argv)
                     trace_backend_name(selected));
             return 1;
         }
-        return run_module_trace(cmd, outfile);
+        return run_module_trace(cmd, outfile, modtrace_exe);
     case TRACE_BACKEND_SUD:
         if (!have_sud) {
             std::fprintf(stderr, "uproctrace: requested backend '%s' is unavailable\n",
