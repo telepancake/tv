@@ -82,7 +82,7 @@ tv --open trace.tvdb
 tv --open trace.tvdb --dump=1
 tv --open trace.tvdb --dump=4 --subject /path/to/output
 
-# Subcommands (single static `tv` binary; sud32/sud64 stay separate).
+# Subcommands (single static `tv` binary; sud32/sud64 and mod/modtrace stay separate).
 tv sud  -- <cmd>          # syscall-user-dispatch tracer (was sudtrace)
 tv dump trace.wire        # hexdump a wire stream (was yeetdump)
 tv ptrace -- <cmd>        # short for `tv uproctrace --ptrace --`
@@ -121,6 +121,13 @@ make tv DUCKDB_CXX=g++ DUCKDB_OPT=-O2
 ```
 
 The resulting `tv` is statically linked; `-ldl` does not force a dynamic binary, contrary to popular belief — the linker just emits warnings about NSS at runtime, which `tv` does not exercise.
+
+The kernel-module pieces now live under `mod/` and build standalone there:
+
+```bash
+make -C mod
+./mod/modtrace -- make -j8
+```
 
 ---
 

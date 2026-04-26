@@ -1,7 +1,7 @@
 /* wire/wire.h — the only file that knows the tv trace wire format.
  *
  * Self-contained C99. No libc beyond memcpy. Includes correctly from
- *   - the kernel module (proctrace.c),
+ *   - the kernel module (mod/proctrace.c),
  *   - freestanding sud helpers (sud32/sud64; no libc),
  *   - userspace tracers (uproctrace, C++),
  *   - the parquet converter, the dump tool, and tests.
