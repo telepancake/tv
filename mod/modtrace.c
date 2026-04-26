@@ -46,6 +46,15 @@ static int drain_fd(int fd, FILE *out)
     return 1;
 }
 
+static int child_exit_code(int status)
+{
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *outfile = NULL;
@@ -247,6 +256,8 @@ done:
     if (child > 0) {
         int status;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        if (rc == 0)
+            rc = child_exit_code(status);
     }
     if (out) {
         if (fflush(out) != 0)
