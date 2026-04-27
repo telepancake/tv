@@ -53,13 +53,14 @@ enum live_trace_backend {
     LIVE_TRACE_BACKEND_MODULE,
     LIVE_TRACE_BACKEND_SUD,
     LIVE_TRACE_BACKEND_PTRACE,
+    LIVE_TRACE_BACKEND_EXTERNAL,  /* user-supplied tracer via --tracer */
 };
 
 const char *USAGE =
     "tv - process trace viewer (DuckDB-backed)\n"
     "\n"
     "Subcommands:\n"
-    "  tv [--module|--sud|--ptrace] -- <cmd> [args...]\n"
+    "  tv [--module|--sud|--ptrace|--tracer EXE] -- <cmd> [args...]\n"
     "                              record live and view\n"
     "  tv --trace <file.wire[.zst]>      ingest into <file>.tvdb and view\n"
     "  tv --open  <file.tvdb>            open existing tvdb and view\n"
@@ -72,7 +73,7 @@ const char *USAGE =
     "  tv fv [path]                file viewer (former fv)\n"
     "  tv module -- <cmd> ...      shorthand for `tv uproctrace --module --`\n"
     "  tv ptrace -- <cmd> ...      shorthand for `tv uproctrace --ptrace --`\n"
-    "  tv uproctrace [-o FILE] [--module|--sud|--ptrace] -- <cmd> ...\n"
+    "  tv uproctrace [-o FILE] [--module|--sud|--ptrace|--tracer EXE] -- <cmd> ...\n"
     "                              raw recorder (writes wire to fd/file)\n"
     "  tv test                     run built-in self-tests\n"
     "  tv ingest <wire> [-o OUT]   convert wire to .tvdb without UI\n";
@@ -805,6 +806,7 @@ int main(int argc, char **argv) {
         return run_tests();
 
     live_trace_backend live_backend = LIVE_TRACE_BACKEND_AUTO;
+    const char *live_tracer = nullptr;
     int no_env = 0;
     const char *trace_file = nullptr;
     const char *open_file  = nullptr;
@@ -836,6 +838,10 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--module"))  live_backend = LIVE_TRACE_BACKEND_MODULE;
         else if (!std::strcmp(argv[i], "--sud"))     live_backend = LIVE_TRACE_BACKEND_SUD;
         else if (!std::strcmp(argv[i], "--ptrace"))  live_backend = LIVE_TRACE_BACKEND_PTRACE;
+        else if (!std::strcmp(argv[i], "--tracer") && i + 1 < argc) {
+            live_tracer = argv[++i];
+            live_backend = LIVE_TRACE_BACKEND_EXTERNAL;
+        }
         else if (!std::strcmp(argv[i], "--") && i + 1 < argc) { cmd = argv + i + 1; break; }
         else {
             std::fprintf(stderr, "tv: unrecognised arg: %s\n", argv[i]);
@@ -902,12 +908,16 @@ int main(int argc, char **argv) {
             size_t cmdc = 0; while (cmd[cmdc]) cmdc++;
             size_t extra = 2 + cmdc + 1;
             if (no_env) extra++;
-            if (live_backend != LIVE_TRACE_BACKEND_AUTO) extra++;
+            if (live_tracer) extra += 2;
+            else if (live_backend != LIVE_TRACE_BACKEND_AUTO) extra++;
             char **uargv = (char **)std::calloc(extra, sizeof(char*));
             size_t ui = 0;
             uargv[ui++] = (char*)"--uproctrace";
             if (no_env) uargv[ui++] = (char*)"--no-env";
-            if (live_backend == LIVE_TRACE_BACKEND_MODULE) uargv[ui++] = (char*)"--module";
+            if (live_tracer) {
+                uargv[ui++] = (char*)"--tracer";
+                uargv[ui++] = (char*)live_tracer;
+            } else if (live_backend == LIVE_TRACE_BACKEND_MODULE) uargv[ui++] = (char*)"--module";
             else if (live_backend == LIVE_TRACE_BACKEND_SUD) uargv[ui++] = (char*)"--sud";
             else if (live_backend == LIVE_TRACE_BACKEND_PTRACE) uargv[ui++] = (char*)"--ptrace";
             uargv[ui++] = (char*)"--";
