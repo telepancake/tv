@@ -132,7 +132,7 @@ struct LoadProgress {
         if (!done && now - last_draw_ms < min_step) return;
         last_draw_ms = now;
         static const char *verbs[] = {"sift", "stir", "stack", "spark"};
-        int frame = (int)((now - start_ms) / 125) & 3;
+        int frame = (int)(((now - start_ms) / 125) % (sizeof(verbs) / sizeof(verbs[0])));
         double secs = (double)(now - start_ms) / 1000.0;
         std::fprintf(stderr, "%ctv: %s %s  %s ev  %.1fs",
                      tty ? '\r' : '\n',
@@ -986,9 +986,9 @@ int main(int argc, char **argv) {
 
     if (lt.fd >= 0 && incremental) {
         TraceDecoder dec([&](const TraceEvent &ev) {
-            std::string e;
-            if (!db->append(ev, &e))
-                std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
+            std::string err_append;
+            if (!db->append(ev, &err_append))
+                std::fprintf(stderr, "tv: ingest: %s\n", err_append.c_str());
             src.invalidate();
             sync_hats(ui);
         });
