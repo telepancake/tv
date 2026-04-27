@@ -68,28 +68,31 @@ table per trace event class (`exec`, `argv`, `env`, `auxv`, `exit_`, `open_`,
 trace is opening one fd. tv never builds an in-memory copy of the trace.
 
 ```bash
-# Live: pick a tracer, stream events into a fresh .tvdb and view them.
+# Live: pick a tracer, stream events into a fresh .tvdb.
 tv --tracer upttrace  -- make -j8       # ptrace, works anywhere
 tv --tracer sudtrace  -- make -j8       # syscall-user-dispatch, fastest
 tv --tracer modtrace  -- make -j8       # kernel module, lowest overhead
 
-# Convert a trace file into a .tvdb (incremental, bounded memory) and open it.
-tv --trace trace.bin.zst          # creates trace.tvdb if missing/stale
+# Add --interactive when you want the TUI.
+tv --tracer upttrace --interactive -- make -j8
 
-# Open an existing .tvdb directly (no ingest).
-tv --open trace.tvdb
+# Open an existing .tvdb directly.
+tv --open trace.tvdb --interactive
 
 # Non-interactive: dump a panel mode to stdout (1=proc, 2=file, 3=event,
 # 4=deps, 5=rdeps, 6=dcmds, 7=rcmds; modes 4..7 need --subject FILE).
 tv --open trace.tvdb --dump=1
 tv --open trace.tvdb --dump=4 --subject /path/to/output
 
+# Trace stream processor (wire traces, zstd auto-detect, merge/filter/rewrite).
+traceproc --select EXEC,OPEN a.trace.zst b.trace -o filtered.trace.zst
+traceproc --tracer upttrace --zstd -- make -j8 > build.trace.zst
+
 # Subcommands.
 tv dump trace.bin         # hexdump a trace stream
 tv dump --selftest        # roundtrip-test the atom encoding
 tv fv [path]              # file viewer
 tv test                   # built-in self-tests
-tv ingest <trace> -o OUT  # build .tvdb without launching the UI
 ```
 
 Pass `--no-env` to omit environment variables from emitted `EXEC` events.

@@ -4,7 +4,7 @@
 Old traces (``cat /proc/proctrace/new > trace.jsonl``) are one JSON
 object per line. The trace format (``trace/trace.h``) is delta-encoded
 atoms, splits each old EXEC into four trace events (EV_EXEC / EV_ARGV /
-EV_ENV / EV_AUXV), and is what ``tv --trace`` / ``tv --open`` expect.
+EV_ENV / EV_AUXV), and is what ``traceproc`` reads/writes.
 
 Designed for 20+ GB inputs:
 
@@ -23,8 +23,7 @@ Usage:
     cat trace.jsonl | tools/jsonl2wire.py - trace.bin
     tools/jsonl2wire.py trace.jsonl - | zstd > trace.bin.zst
 
-The output can be ingested with ``./tv --trace trace.bin`` or piped
-straight into the ingester.
+The output can be processed with ``./traceproc trace.bin``.
 """
 
 from __future__ import annotations

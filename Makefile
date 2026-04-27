@@ -63,7 +63,7 @@ DUCKDB_OBJ := build/duckdb.o
 
 CXXFLAGS := -std=c++23 -O2 -I. -I$(ZSTD_DIR) -I$(DUCKDB_INC)
 CFLAGS   := -std=c11   -O2 -I. -I$(ZSTD_DIR)
-TV_LIBS := -lm -pthread -ldl $(ZSTD_LIBS)
+TV_LIBS := -lm -pthread -ldl
 # Static link works fine even though duckdb pulls in dlopen/getaddrinfo
 # (those code paths exist for extensions / network reads we don't use).
 TV_LDFLAGS := -static
@@ -136,7 +136,7 @@ build/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_DEP) $(DUCKDB_OBJ)
+tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(DUCKDB_OBJ)
 	$(CXX) $(CXXFLAGS) $(TV_LDFLAGS) -o tv $(TV_CXX_SRCS) $(TV_C_OBJS) \
 	    $(DUCKDB_OBJ) $(TV_LIBS)
 

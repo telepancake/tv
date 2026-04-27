@@ -24,7 +24,6 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/stat.h>
 #include <sys/time.h>
 #include <fcntl.h>
 
@@ -32,8 +31,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-
-#include <zstd.h>
 
 #include "engine.h"
 #include "trace/trace_stream.h"
@@ -69,103 +66,6 @@ const char *USAGE =
     "  tv test                     run built-in self-tests\n"
     "\n"
     "Wire trace file processing lives in traceproc.\n";
-
-/* -- ingest helpers ------------------------------------------------- */
-
-bool has_suffix(const char *s, const char *suf) {
-    size_t n = std::strlen(s), k = std::strlen(suf);
-    return n >= k && std::memcmp(s + n - k, suf, k) == 0;
-}
-
-/* Pipe the bytes of `f` through a wire decoder feeding `db`. Returns
- * false on a hard wire/decode error or db append failure. */
-bool ingest_wire_plain(FILE *f, TvDb &db, std::string *err) {
-    TraceDecoder dec([&](const TraceEvent &ev) {
-        std::string e;
-        if (!db.append(ev, &e)) {
-            std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
-        }
-    });
-    char buf[64 * 1024];
-    while (true) {
-        size_t n = std::fread(buf, 1, sizeof buf, f);
-        if (n == 0) break;
-        if (!dec.feed(buf, n)) {
-            if (err) *err = "wire decode error";
-            return false;
-        }
-    }
-    return true;
-}
-
-bool ingest_wire_zstd(FILE *f, TvDb &db, std::string *err) {
-    ZSTD_DCtx *dctx = ZSTD_createDCtx();
-    if (!dctx) { if (err) *err = "ZSTD_createDCtx failed"; return false; }
-    size_t in_cap = ZSTD_DStreamInSize();
-    size_t out_cap = ZSTD_DStreamOutSize();
-    std::unique_ptr<char[]> in_buf(new char[in_cap]);
-    std::unique_ptr<char[]> out_buf(new char[out_cap]);
-    bool ok = true;
-    TraceDecoder dec([&](const TraceEvent &ev) {
-        std::string e;
-        if (!db.append(ev, &e)) {
-            std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
-        }
-    });
-    while (true) {
-        size_t n = std::fread(in_buf.get(), 1, in_cap, f);
-        if (n == 0) break;
-        ZSTD_inBuffer in{in_buf.get(), n, 0};
-        while (in.pos < in.size) {
-            ZSTD_outBuffer out{out_buf.get(), out_cap, 0};
-            size_t r = ZSTD_decompressStream(dctx, &out, &in);
-            if (ZSTD_isError(r)) {
-                if (err) *err = std::string("zstd: ") + ZSTD_getErrorName(r);
-                ok = false;
-                goto done;
-            }
-            if (out.pos > 0) {
-                if (!dec.feed(out_buf.get(), out.pos)) {
-                    if (err) *err = "wire decode error";
-                    ok = false;
-                    goto done;
-                }
-            }
-        }
-    }
-done:
-    ZSTD_freeDCtx(dctx);
-    return ok;
-}
-
-bool ingest_wire_file(const char *path, TvDb &db, std::string *err) {
-    FILE *f = std::fopen(path, "rb");
-    if (!f) {
-        if (err) *err = std::string("open ") + path + ": " + std::strerror(errno);
-        return false;
-    }
-    bool zst = has_suffix(path, ".zst");
-    bool ok = zst ? ingest_wire_zstd(f, db, err) : ingest_wire_plain(f, db, err);
-    std::fclose(f);
-    return ok;
-}
-
-/* Derive a default `.tvdb` path next to the given wire file. */
-std::string default_tvdb_for_wire(const char *wire_path) {
-    std::string p = wire_path;
-    /* strip .zst */
-    if (p.size() > 4 && p.compare(p.size() - 4, 4, ".zst") == 0)
-        p.resize(p.size() - 4);
-    /* strip .wire */
-    if (p.size() > 5 && p.compare(p.size() - 5, 5, ".wire") == 0)
-        p.resize(p.size() - 5);
-    return p + ".tvdb";
-}
-
-bool file_exists(const char *path) {
-    struct stat st;
-    return ::stat(path, &st) == 0;
-}
 
 /* -- live-trace pipe glue -------------------------------------------- */
 
@@ -699,59 +599,6 @@ int dump_mode(TvDb &db, int mode, const std::string &subject,
             std::printf("\n");
         }
     }
-    return 0;
-}
-
-int ingest_main(int argc, char **argv) {
-    /* tv ingest <wire-file> [-o OUT.tvdb]
-     * Convert a .wire (or .wire.zst) trace to a .tvdb without spawning
-     * the TUI. Output defaults to next-to-input with .tvdb suffix. */
-    const char *in_path = nullptr;
-    const char *out_path = nullptr;
-    for (int i = 1; i < argc; i++) {
-        if (!std::strcmp(argv[i], "-o") && i + 1 < argc) out_path = argv[++i];
-        else if (argv[i][0] == '-') {
-            std::fprintf(stderr,
-                "usage: tv ingest <wire> [-o OUT.tvdb]\n");
-            return 2;
-        }
-        else if (!in_path) in_path = argv[i];
-        else {
-            std::fprintf(stderr,
-                "tv ingest: unexpected positional arg: %s\n", argv[i]);
-            return 2;
-        }
-    }
-    if (!in_path) {
-        std::fprintf(stderr, "tv ingest: missing wire file\n"
-            "usage: tv ingest <wire> [-o OUT.tvdb]\n");
-        return 2;
-    }
-    std::string out_db = out_path ? std::string(out_path)
-                                  : default_tvdb_for_wire(in_path);
-    /* If the output is stale (older than wire), rebuild from scratch.
-     * Otherwise accept that the existing one is up to date. */
-    struct stat st_wire{}, st_db{};
-    bool need_build = ::stat(out_db.c_str(), &st_db) != 0;
-    if (!need_build && ::stat(in_path, &st_wire) == 0 &&
-        st_wire.st_mtime > st_db.st_mtime) need_build = true;
-    if (!need_build) {
-        std::fprintf(stderr,
-            "tv ingest: %s already up to date (use rm + retry to force)\n",
-            out_db.c_str());
-        return 0;
-    }
-    ::unlink(out_db.c_str());
-    std::string err;
-    auto db = TvDb::open_file(out_db, &err);
-    if (!db) { std::fprintf(stderr, "tv ingest: %s\n", err.c_str()); return 1; }
-    if (!ingest_wire_file(in_path, *db, &err)) {
-        std::fprintf(stderr, "tv ingest: %s\n", err.c_str()); return 1;
-    }
-    if (!db->flush(&err)) {
-        std::fprintf(stderr, "tv ingest: flush: %s\n", err.c_str()); return 1;
-    }
-    std::fprintf(stderr, "tv ingest: %s -> %s\n", in_path, out_db.c_str());
     return 0;
 }
 

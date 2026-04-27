@@ -10,7 +10,7 @@
  *
  * If -o is omitted the trace is written to stdout, e.g. for piping:
  *
- *   upttrace -- foo bar | tv --trace -
+ *   upttrace -- foo bar | traceproc - -o trace.bin
  *
  * Events emitted: CWD, EXEC, ARGV, ENV, AUXV, OPEN (real + inherited),
  * EXIT, STDOUT, STDERR.
