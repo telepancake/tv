@@ -68,16 +68,16 @@ table per trace event class (`exec`, `argv`, `env`, `auxv`, `exit_`, `open_`,
 trace is opening one fd. tv never builds an in-memory copy of the trace.
 
 ```bash
-# Live: pick a tracer, stream events into a fresh .tvdb.
+# Live: pick a tracer, stream events into a fresh .tvdb, then open it.
 tv --tracer upttrace  -- make -j8       # ptrace, works anywhere
 tv --tracer sudtrace  -- make -j8       # syscall-user-dispatch, fastest
 tv --tracer modtrace  -- make -j8       # kernel module, lowest overhead
 
-# Add --interactive when you want the TUI.
-tv --tracer upttrace --interactive -- make -j8
+# Add --incremental to watch partial results while ingest is still running.
+tv --tracer upttrace --incremental -- make -j8
 
 # Open an existing .tvdb directly.
-tv --open trace.tvdb --interactive
+tv --open trace.tvdb
 
 # Non-interactive: dump a panel mode to stdout (1=proc, 2=file, 3=event,
 # 4=deps, 5=rdeps, 6=dcmds, 7=rcmds; modes 4..7 need --subject FILE).

@@ -43,13 +43,15 @@ extern "C" int wiredump_main(int argc, char **argv);  /* tools/wiredump/wiredump
 
 namespace {
 
+int64_t now_ms();
+
 const char *USAGE =
     "tv - process trace viewer (DuckDB-backed)\n"
     "\n"
     "Subcommands:\n"
-    "  tv --tracer EXE [-o OUT.tvdb] [--interactive|--dump] -- <cmd> [args...]\n"
-    "                              run trace tool and ingest into a tvdb\n"
-    "  tv --open  <file.tvdb> --interactive\n"
+    "  tv --tracer EXE [-o OUT.tvdb] [--incremental|--dump] -- <cmd> [args...]\n"
+    "                              run trace tool; default waits for full ingest, --incremental shows partial results\n"
+    "  tv --open  <file.tvdb>\n"
     "                              open existing tvdb in the TUI\n"
     "  tv --open  <file.tvdb> --dump[=MODE]\n"
     "                              dump a panel to stdout\n"
@@ -75,6 +77,133 @@ struct LiveTrace {
     TvDb          *db = nullptr;
     TraceDecoder   *dec = nullptr;
 };
+
+struct LoadProgress {
+    bool enabled = false;
+    bool tty = false;
+    int64_t start_ms = 0;
+    int64_t last_draw_ms = 0;
+    uint64_t bytes = 0;
+    uint64_t events = 0;
+
+    explicit LoadProgress(bool on)
+        : enabled(on), tty(on && ::isatty(STDERR_FILENO)),
+          start_ms(now_ms()), last_draw_ms(start_ms) {}
+
+    static std::string human_count(uint64_t n) {
+        char buf[32];
+        const char *u = "";
+        double v = (double)n;
+        if (n >= 1000000000ull) { v /= 1000000000.0; u = "G"; }
+        else if (n >= 1000000ull) { v /= 1000000.0; u = "M"; }
+        else if (n >= 1000ull) { v /= 1000.0; u = "k"; }
+        if (*u) std::snprintf(buf, sizeof buf, "%.1f%s", v, u);
+        else std::snprintf(buf, sizeof buf, "%llu", (unsigned long long)n);
+        return buf;
+    }
+
+    static std::string human_bytes(uint64_t n) {
+        char buf[32];
+        const char *u = "B";
+        double v = (double)n;
+        if (n >= (1ull << 30)) { v /= (double)(1ull << 30); u = "G"; }
+        else if (n >= (1ull << 20)) { v /= (double)(1ull << 20); u = "M"; }
+        else if (n >= (1ull << 10)) { v /= (double)(1ull << 10); u = "K"; }
+        if (std::strcmp(u, "B") == 0)
+            std::snprintf(buf, sizeof buf, "%llu%s", (unsigned long long)n, u);
+        else
+            std::snprintf(buf, sizeof buf, "%.1f%s", v, u);
+        return buf;
+    }
+
+    void bump_bytes(size_t n) {
+        bytes += (uint64_t)n;
+        draw(false);
+    }
+
+    void bump_event() {
+        events++;
+    }
+
+    void draw(bool done) {
+        if (!enabled) return;
+        int64_t now = now_ms();
+        int64_t min_step = tty ? 125 : 1000;
+        if (!done && now - last_draw_ms < min_step) return;
+        last_draw_ms = now;
+        static const char *verbs[] = {"sift", "stir", "stack", "spark"};
+        int frame = (int)((now - start_ms) / 125) & 3;
+        double secs = (double)(now - start_ms) / 1000.0;
+        std::fprintf(stderr, "%ctv: %s %s  %s ev  %.1fs",
+                     tty ? '\r' : '\n',
+                     done ? "ready" : verbs[frame],
+                     human_bytes(bytes).c_str(),
+                     human_count(events).c_str(),
+                     secs);
+        if (done || !tty) std::fputc('\n', stderr);
+        std::fflush(stderr);
+    }
+};
+
+bool drain_live_trace(LiveTrace &lt, bool show_progress, std::string *err) {
+    LoadProgress prog(show_progress);
+    bool append_ok = true;
+    TraceDecoder dec([&](const TraceEvent &ev) {
+        std::string e;
+        if (!lt.db->append(ev, &e)) {
+            if (err && err->empty()) *err = e;
+            append_ok = false;
+        } else {
+            prog.bump_event();
+        }
+    });
+
+    bool ok = true;
+    char buf[64 * 1024];
+    while (ok) {
+        ssize_t n = ::read(lt.fd, buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            if (err) *err = std::string("read trace pipe: ") + std::strerror(errno);
+            ok = false;
+            break;
+        }
+        if (n == 0) break;
+        prog.bump_bytes((size_t)n);
+        if (!dec.feed(buf, (size_t)n)) {
+            if (err && err->empty()) *err = "wire decode error";
+            ok = false;
+        } else if (!append_ok) {
+            ok = false;
+        }
+    }
+    if (lt.fd >= 0) {
+        ::close(lt.fd);
+        lt.fd = -1;
+    }
+    int status = 0;
+    if (lt.child_pid > 0) {
+        if (::waitpid(lt.child_pid, &status, 0) < 0) {
+            if (err && err->empty()) *err = std::string("waitpid: ") + std::strerror(errno);
+            ok = false;
+        }
+        lt.child_pid = 0;
+    }
+    if (ok && !lt.db->flush(err)) ok = false;
+    prog.draw(true);
+    if (ok && status != 0) {
+        if (err) {
+            if (WIFEXITED(status))
+                *err = "tracer exited with status " + std::to_string(WEXITSTATUS(status));
+            else if (WIFSIGNALED(status))
+                *err = "tracer killed by signal " + std::to_string(WTERMSIG(status));
+            else
+                *err = "tracer failed";
+        }
+        return false;
+    }
+    return ok;
+}
 
 void on_trace_fd_cb(Tui &tui, int fd, LiveTrace &lt) {
     char buf[64 * 1024];
@@ -627,7 +756,7 @@ int main(int argc, char **argv) {
     int no_env = 0;
     const char *open_file  = nullptr;
     const char *out_db     = nullptr;
-    bool interactive = false;
+    bool incremental = false;
     bool dump = false;
     int  dump_mode_n = 1;
     std::string dump_subject;
@@ -638,7 +767,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if      (!std::strcmp(argv[i], "--open")  && i + 1 < argc) open_file  = argv[++i];
         else if (!std::strcmp(argv[i], "-o")      && i + 1 < argc) out_db     = argv[++i];
-        else if (!std::strcmp(argv[i], "--interactive")) interactive = true;
+        else if (!std::strcmp(argv[i], "--incremental")) incremental = true;
         else if (!std::strcmp(argv[i], "--dump")) dump = true;
         else if (!std::strncmp(argv[i], "--dump=", 7)) {
             dump = true;
@@ -672,12 +801,6 @@ int main(int argc, char **argv) {
             "tv: live recording requires --tracer EXE (e.g. --tracer upttrace)\n");
         return 1;
     }
-    if (!dump && !interactive && open_file) {
-        std::fprintf(stderr,
-            "tv: opening a tvdb requires --interactive or --dump\n");
-        return 1;
-    }
-
     /* Decide backing .tvdb path. */
     std::string db_path;
     if (open_file) {
@@ -736,48 +859,19 @@ int main(int argc, char **argv) {
     /* If we just wanted a non-interactive dump, do it and exit. */
     if (dump) {
         if (cmd) { /* drain the live pipe first */
-            char buf[64 * 1024];
-            TraceDecoder dec([&](const TraceEvent &ev) {
-                std::string e;
-                if (!db->append(ev, &e))
-                    std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
-            });
-            while (true) {
-                ssize_t n = ::read(lt.fd, buf, sizeof buf);
-                if (n <= 0) break;
-                if (!dec.feed(buf, n)) break;
+            if (!drain_live_trace(lt, false, &err)) {
+                std::fprintf(stderr, "tv: %s\n", err.c_str());
+                return 1;
             }
-            ::close(lt.fd);
-            ::waitpid(lt.child_pid, nullptr, 0);
-            db->flush(&err);
         }
         return dump_mode(*db, dump_mode_n, dump_subject, dump_flags, dump_search);
     }
 
-    if (!interactive) {
-        if (cmd) {
-            char buf[64 * 1024];
-            TraceDecoder dec([&](const TraceEvent &ev) {
-                std::string e;
-                if (!db->append(ev, &e))
-                    std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
-            });
-            while (true) {
-                ssize_t n = ::read(lt.fd, buf, sizeof buf);
-                if (n <= 0) break;
-                if (!dec.feed(buf, n)) {
-                    std::fprintf(stderr, "tv: wire decode error\n");
-                    return 1;
-                }
-            }
-            ::close(lt.fd); lt.fd = -1;
-            ::waitpid(lt.child_pid, nullptr, 0);
-            if (!db->flush(&err)) {
-                std::fprintf(stderr, "tv: flush: %s\n", err.c_str());
-                return 1;
-            }
+    if (cmd && !incremental) {
+        if (!drain_live_trace(lt, true, &err)) {
+            std::fprintf(stderr, "tv: %s\n", err.c_str());
+            return 1;
         }
-        return 0;
     }
 
     /* TUI. */
@@ -890,7 +984,7 @@ int main(int argc, char **argv) {
         sync_hats(ui);
     }
 
-    if (lt.fd >= 0) {
+    if (lt.fd >= 0 && incremental) {
         TraceDecoder dec([&](const TraceEvent &ev) {
             std::string e;
             if (!db->append(ev, &e))
