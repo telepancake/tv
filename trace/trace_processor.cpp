@@ -152,9 +152,9 @@ struct Options {
     bool drop_types[16] = {};
     std::vector<int> pids;
     std::vector<int> tgids;
-    uint64_t after_ns = 0;
-    uint64_t before_ns = 0;
-    int64_t time_offset_ns = 0;
+    std::optional<uint64_t> after_ns;
+    std::optional<uint64_t> before_ns;
+    int64_t time_offset_signed_ns = 0;
     std::optional<uint32_t> set_stream_id;
 };
 
@@ -444,9 +444,9 @@ private:
                 continue;
             if (!contains_int(opt.pids, ev.pid) || !contains_int(opt.tgids, ev.tgid))
                 continue;
-            if (opt.after_ns && ev.ts_ns < opt.after_ns) continue;
-            if (opt.before_ns && ev.ts_ns > opt.before_ns) continue;
-            ev.ts_ns = (uint64_t)((int64_t)ev.ts_ns + opt.time_offset_ns);
+            if (opt.after_ns && ev.ts_ns < *opt.after_ns) continue;
+            if (opt.before_ns && ev.ts_ns > *opt.before_ns) continue;
+            ev.ts_ns = (uint64_t)((int64_t)ev.ts_ns + opt.time_offset_signed_ns);
             queue_.push_back(std::move(ev));
         }
         pending_.clear();
@@ -498,7 +498,7 @@ bool parse_args(int argc, char **argv, Options &opt) {
         } else if (!std::strcmp(a, "--before-ns") && i + 1 < argc) {
             auto v = parse_u64(argv[++i]); if (!v) return false; opt.before_ns = (uint64_t)*v;
         } else if (!std::strcmp(a, "--time-offset-ns") && i + 1 < argc) {
-            auto v = parse_i64(argv[++i]); if (!v) return false; opt.time_offset_ns = (int64_t)*v;
+            auto v = parse_i64(argv[++i]); if (!v) return false; opt.time_offset_signed_ns = (int64_t)*v;
         } else if (!std::strcmp(a, "--set-stream-id") && i + 1 < argc) {
             auto v = parse_u64(argv[++i]); if (!v || *v > UINT32_MAX) return false;
             opt.set_stream_id = (uint32_t)*v;
