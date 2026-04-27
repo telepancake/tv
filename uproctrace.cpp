@@ -1416,7 +1416,7 @@ static int resolve_modtrace_exe(char *buf, size_t bufsz)
     if (resolve_self_exe(self_exe, sizeof(self_exe)) == 0) {
         char *slash = std::strrchr(self_exe, '/');
         if (slash) {
-            int len = snprintf(buf, bufsz, "%.*s/mod/modtrace",
+            int len = snprintf(buf, bufsz, "%.*s/modtrace",
                                static_cast<int>(slash - self_exe), self_exe);
             if (len > 0 && static_cast<size_t>(len) < bufsz && access(buf, X_OK) == 0)
                 return 0;
