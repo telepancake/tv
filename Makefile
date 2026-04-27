@@ -5,7 +5,7 @@ PWD     := $(shell pwd)
 MOK_KEY ?= $(PWD)/MOK.priv
 MOK_CER ?= $(PWD)/MOK.der
 
-all: tv sudtrace upttrace sud-bins mod-bins
+all: tv traceproc sudtrace upttrace sud-bins mod-bins
 
 .PHONY: sud-bins mod-bins
 sud-bins:
@@ -46,7 +46,13 @@ install:
 	$(MAKE) -C $(MOD_DIR) install
 
 ZSTD_DIR  := deps/zstd/lib
-ZSTD_LIB  := $(ZSTD_DIR)/libzstd.a
+ifneq ($(wildcard $(ZSTD_DIR)/Makefile),)
+ZSTD_DEP  := $(ZSTD_DIR)/libzstd.a
+ZSTD_LIBS := $(ZSTD_DEP)
+else
+ZSTD_DEP  :=
+ZSTD_LIBS := -lzstd
+endif
 
 DUCKDB_DIR := deps/duckdb
 DUCKDB_AMAL_DIR := $(DUCKDB_DIR)/src/amalgamation
@@ -57,7 +63,7 @@ DUCKDB_OBJ := build/duckdb.o
 
 CXXFLAGS := -std=c++23 -O2 -I. -I$(ZSTD_DIR) -I$(DUCKDB_INC)
 CFLAGS   := -std=c11   -O2 -I. -I$(ZSTD_DIR)
-TV_LIBS := -lm -pthread -ldl $(ZSTD_LIB)
+TV_LIBS := -lm -pthread -ldl $(ZSTD_LIBS)
 # Static link works fine even though duckdb pulls in dlopen/getaddrinfo
 # (those code paths exist for extensions / network reads we don't use).
 TV_LDFLAGS := -static
@@ -85,7 +91,7 @@ SUD_SRCS    += sud/path_remap/addin.c
 endif
 SUD_NATIVE  := $(if $(filter x86_64,$(shell uname -m)),sud64,sud32)
 
-$(ZSTD_LIB):
+$(ZSTD_DEP):
 	$(MAKE) -C $(ZSTD_DIR) libzstd.a
 
 # DuckDB amalgamation is huge. Default to clang -O0 because it's
@@ -130,9 +136,12 @@ build/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_LIB) $(DUCKDB_OBJ)
+tv: $(TV_CXX_SRCS) $(TV_C_OBJS) $(TV_HDRS) $(ZSTD_DEP) $(DUCKDB_OBJ)
 	$(CXX) $(CXXFLAGS) $(TV_LDFLAGS) -o tv $(TV_CXX_SRCS) $(TV_C_OBJS) \
 	    $(DUCKDB_OBJ) $(TV_LIBS)
+
+traceproc: trace/trace_processor.cpp trace/trace_stream.cpp trace/trace_stream.h trace/trace.h wire/wire.h $(ZSTD_DEP)
+	$(CXX) $(CXXFLAGS) -o $@ trace/trace_processor.cpp trace/trace_stream.cpp $(ZSTD_LIBS)
 
 # Standalone sudtrace launcher (the tracer binary itself; calls into
 # sud32/sud64 wrappers to drive the traced process). See sud/sudtrace.c
@@ -142,8 +151,8 @@ sudtrace: sud/sudtrace.c wire/wire.h trace/trace.h
 
 # Standalone upttrace (ptrace-based userspace tracer, works anywhere).
 UPTTRACE_HDRS := wire/wire.h trace/trace.h
-upttrace: upt/upttrace.cpp $(UPTTRACE_HDRS) $(ZSTD_LIB)
-	$(CXX) $(CXXFLAGS) -o $@ upt/upttrace.cpp -pthread $(ZSTD_LIB)
+upttrace: upt/upttrace.cpp $(UPTTRACE_HDRS) $(ZSTD_DEP)
+	$(CXX) $(CXXFLAGS) -o $@ upt/upttrace.cpp -pthread $(ZSTD_LIBS)
 
 # Release build: production-grade flags, asserts off, debug info stripped.
 # Use:  make release        (drop the dev-friendly default `tv` binary first)

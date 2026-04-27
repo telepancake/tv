@@ -5,7 +5,7 @@
  *   wire bytes  --->  TraceDecoder  --->  TvDb (DuckDB Appender)  --->  .tvdb file
  *      ^                                                                  |
  *      |                                                                  v
- *   uproctrace child / `--trace foo.wire`                  TvDataSource (SQL queries)
+ *   trace tool child                                       TvDataSource (SQL queries)
  *                                                                          |
  *                                                                          v
  *                                                                    Tui (engine.h)
@@ -50,11 +50,12 @@ const char *USAGE =
     "tv - process trace viewer (DuckDB-backed)\n"
     "\n"
     "Subcommands:\n"
-    "  tv --tracer EXE -- <cmd> [args...]\n"
-    "                              record live (via tracer) and view\n"
-    "  tv --trace <file.bin[.zst]>       ingest into <file>.tvdb and view\n"
-    "  tv --open  <file.tvdb>            open existing tvdb and view\n"
-    "  tv --dump                         dump mode 1 (process tree) to stdout (with --trace/--open)\n"
+    "  tv --tracer EXE [-o OUT.tvdb] [--interactive|--dump] -- <cmd> [args...]\n"
+    "                              run trace tool and ingest into a tvdb\n"
+    "  tv --open  <file.tvdb> --interactive\n"
+    "                              open existing tvdb in the TUI\n"
+    "  tv --open  <file.tvdb> --dump[=MODE]\n"
+    "                              dump a panel to stdout\n"
     "\n"
     "Tracer binaries are now separate executables — pick one with --tracer:\n"
     "  upttrace    ptrace-based, works anywhere\n"
@@ -66,7 +67,8 @@ const char *USAGE =
     "  tv dump --selftest          atom-format roundtrip test\n"
     "  tv fv [path]                file viewer\n"
     "  tv test                     run built-in self-tests\n"
-    "  tv ingest <trace> [-o OUT]  convert trace to .tvdb without UI\n";
+    "\n"
+    "Wire trace file processing lives in traceproc.\n";
 
 /* -- ingest helpers ------------------------------------------------- */
 
@@ -766,8 +768,6 @@ int main(int argc, char **argv) {
             return fv_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "test"))
             return run_tests();
-        if (!std::strcmp(sub, "ingest"))
-            return ingest_main(argc - 1, argv + 1);
         std::fprintf(stderr, "tv: unknown subcommand: %s\n\n", sub);
         std::fputs(USAGE, stderr);
         return 1;
@@ -778,9 +778,9 @@ int main(int argc, char **argv) {
 
     const char *live_tracer = nullptr;
     int no_env = 0;
-    const char *trace_file = nullptr;
     const char *open_file  = nullptr;
     const char *out_db     = nullptr;
+    bool interactive = false;
     bool dump = false;
     int  dump_mode_n = 1;
     std::string dump_subject;
@@ -789,9 +789,9 @@ int main(int argc, char **argv) {
     char **cmd = nullptr;
 
     for (int i = 1; i < argc; i++) {
-        if      (!std::strcmp(argv[i], "--trace") && i + 1 < argc) trace_file = argv[++i];
-        else if (!std::strcmp(argv[i], "--open")  && i + 1 < argc) open_file  = argv[++i];
+        if      (!std::strcmp(argv[i], "--open")  && i + 1 < argc) open_file  = argv[++i];
         else if (!std::strcmp(argv[i], "-o")      && i + 1 < argc) out_db     = argv[++i];
+        else if (!std::strcmp(argv[i], "--interactive")) interactive = true;
         else if (!std::strcmp(argv[i], "--dump")) dump = true;
         else if (!std::strncmp(argv[i], "--dump=", 7)) {
             dump = true;
@@ -816,7 +816,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!trace_file && !open_file && !cmd) {
+    if (!open_file && !cmd) {
         std::fputs(USAGE, stderr);
         return 1;
     }
@@ -825,30 +825,16 @@ int main(int argc, char **argv) {
             "tv: live recording requires --tracer EXE (e.g. --tracer upttrace)\n");
         return 1;
     }
+    if (!dump && !interactive && open_file) {
+        std::fprintf(stderr,
+            "tv: opening a tvdb requires --interactive or --dump\n");
+        return 1;
+    }
 
     /* Decide backing .tvdb path. */
     std::string db_path;
     if (open_file) {
         db_path = open_file;
-    } else if (trace_file) {
-        db_path = out_db ? out_db : default_tvdb_for_wire(trace_file);
-        /* If the .tvdb is older than the wire file or absent, rebuild. */
-        struct stat st_wire{}, st_db{};
-        bool need_build = ::stat(db_path.c_str(), &st_db) != 0;
-        if (!need_build && ::stat(trace_file, &st_wire) == 0 &&
-            st_wire.st_mtime > st_db.st_mtime) need_build = true;
-        if (need_build) {
-            ::unlink(db_path.c_str());
-            std::string err;
-            auto db = TvDb::open_file(db_path, &err);
-            if (!db) { std::fprintf(stderr, "tv: %s\n", err.c_str()); return 1; }
-            if (!ingest_wire_file(trace_file, *db, &err)) {
-                std::fprintf(stderr, "tv: %s\n", err.c_str()); return 1;
-            }
-            if (!db->flush(&err)) {
-                std::fprintf(stderr, "tv: flush: %s\n", err.c_str()); return 1;
-            }
-        }
     } else {
         /* Live: write to a tempfile next to cwd. */
         if (out_db) db_path = out_db;
@@ -917,6 +903,30 @@ int main(int argc, char **argv) {
             db->flush(&err);
         }
         return dump_mode(*db, dump_mode_n, dump_subject, dump_flags, dump_search);
+    }
+
+    if (!interactive) {
+        if (cmd) {
+            char buf[64 * 1024];
+            TraceDecoder dec([&](const TraceEvent &ev) {
+                std::string e; (void)db->append(ev, &e);
+            });
+            while (true) {
+                ssize_t n = ::read(lt.fd, buf, sizeof buf);
+                if (n <= 0) break;
+                if (!dec.feed(buf, n)) {
+                    std::fprintf(stderr, "tv: wire decode error\n");
+                    return 1;
+                }
+            }
+            ::close(lt.fd); lt.fd = -1;
+            ::waitpid(lt.child_pid, nullptr, 0);
+            if (!db->flush(&err)) {
+                std::fprintf(stderr, "tv: flush: %s\n", err.c_str());
+                return 1;
+            }
+        }
+        return 0;
     }
 
     /* TUI. */
