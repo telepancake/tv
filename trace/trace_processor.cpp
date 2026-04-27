@@ -1,4 +1,4 @@
-/* trace/trace_processor.cpp — streaming TRACE processor.
+/* trace/trace_processor.cpp — streaming TRACE processor for tv.
  *
  * Reads zero or more TRACE streams (plain or zstd), optionally adds a live
  * tracer/processor launched as `EXE [--no-env] -- command...`, filters and
