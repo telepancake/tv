@@ -1,5 +1,6 @@
 upttrace
 tv
+traceproc
 fv
 mod/proctrace.ko
 mod/modtrace
