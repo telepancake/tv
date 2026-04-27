@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Convert legacy ``proctrace`` JSONL traces into the new tv wire format.
+"""Convert legacy ``proctrace`` JSONL traces into the tv trace format.
 
-Old traces (``cat /proc/proctrace/new > trace.jsonl``) are one JSON object
-per line.  The new wire format (``wire/wire.h``) is delta-encoded yeet
-atoms, splits each old EXEC into four wire events (EV_EXEC / EV_ARGV /
+Old traces (``cat /proc/proctrace/new > trace.jsonl``) are one JSON
+object per line. The trace format (``trace/trace.h``) is delta-encoded
+atoms, splits each old EXEC into four trace events (EV_EXEC / EV_ARGV /
 EV_ENV / EV_AUXV), and is what ``tv --trace`` / ``tv --open`` expect.
 
 Designed for 20+ GB inputs:
@@ -11,19 +11,19 @@ Designed for 20+ GB inputs:
 * lines are read in fixed-byte chunks and dispatched to a worker pool that
   parses JSON and produces flat event tuples
 * the main process performs the (inherently sequential) delta-encoding +
-  yeet emission and streams to disk
+  atom emission and streams to disk
 * malformed lines are tolerated — they produce a single ``WARN`` line on
   stderr and are skipped, never aborting the run
 * a periodic ``progress`` line on stderr lets you eyeball throughput
 
 Usage:
 
-    tools/jsonl2wire.py trace.jsonl trace.wire        # plain
-    tools/jsonl2wire.py -j 8 trace.jsonl trace.wire   # 8 worker procs
-    cat trace.jsonl | tools/jsonl2wire.py - trace.wire
-    tools/jsonl2wire.py trace.jsonl - | zstd > trace.wire.zst
+    tools/jsonl2wire.py trace.jsonl trace.bin        # plain
+    tools/jsonl2wire.py -j 8 trace.jsonl trace.bin   # 8 worker procs
+    cat trace.jsonl | tools/jsonl2wire.py - trace.bin
+    tools/jsonl2wire.py trace.jsonl - | zstd > trace.bin.zst
 
-The output can be ingested with ``./tv --trace trace.wire`` or piped
+The output can be ingested with ``./tv --trace trace.bin`` or piped
 straight into the ingester.
 """
 
@@ -40,9 +40,9 @@ import time
 from typing import Iterable, List, Optional, Tuple
 
 
-# ─────────────────────────── wire constants ─────────────────────────── #
+# ─────────────────────────── trace constants ────────────────────────── #
 
-WIRE_VERSION = 1
+TRACE_VERSION = 3
 
 EV_EXEC, EV_ARGV, EV_ENV, EV_AUXV = 0, 1, 2, 3
 EV_EXIT, EV_OPEN, EV_CWD = 4, 5, 6
@@ -77,9 +77,9 @@ OPEN_FLAGS = {
 }
 
 
-# ─────────────────────────── yeet encoder ───────────────────────────── #
+# ─────────────────────────── atom encoder ──────────────────────────── #
 
-def yeet_blob(buf: bytearray, src: bytes) -> None:
+def wire_put_blob(buf: bytearray, src: bytes) -> None:
     n = len(src)
     if n == 1 and src[0] < 0xC0:
         buf.append(src[0])
@@ -101,12 +101,10 @@ def yeet_blob(buf: bytearray, src: bytes) -> None:
     buf.extend(src)
 
 
-def yeet_u64(buf: bytearray, v: int) -> None:
-    # minimal LE bytes
+def wire_put_u64(buf: bytearray, v: int) -> None:
     if v < 0 or v >= (1 << 64):
         raise OverflowError(v)
     if v == 0:
-        # n == 0 → inline atom of length 0
         buf.append(0xC0)
         return
     raw = bytearray()
@@ -121,30 +119,17 @@ def yeet_u64(buf: bytearray, v: int) -> None:
     buf.extend(raw)
 
 
-def yeet_i64(buf: bytearray, v: int) -> None:
-    # zigzag
+def wire_put_i64(buf: bytearray, v: int) -> None:
     u = ((v << 1) ^ (v >> 63)) & ((1 << 64) - 1)
-    yeet_u64(buf, u)
+    wire_put_u64(buf, u)
 
 
-def yeet_pair(out: bytearray, a: bytes, b: bytes) -> None:
-    total = len(a) + len(b)
-    if total <= 0x37:
-        out.append(0xC0 + total)
-        out.extend(a)
-        out.extend(b)
-        return
-    lenbuf = bytearray()
-    tmp = total
-    while tmp:
-        lenbuf.append(tmp & 0xFF)
-        tmp >>= 8
-    if len(lenbuf) > 7:
-        raise OverflowError(f"pair too large: {total} bytes")
-    out.append(0xF8 + len(lenbuf))
-    out.extend(lenbuf)
-    out.extend(a)
-    out.extend(b)
+def wire_put_pair(out: bytearray, a: bytes, b: bytes) -> None:
+    """Outer atom whose payload is wire_put_blob(a) || wire_put_blob(b)."""
+    inner = bytearray()
+    wire_put_blob(inner, a)
+    wire_put_blob(inner, b)
+    wire_put_blob(out, bytes(inner))
 
 
 # ─────────────────────────── translation ────────────────────────────── #
@@ -353,30 +338,29 @@ def _worker(chunk: List[bytes]) -> Tuple[List[EventTuple], int]:
 # ─────────────────────────── main driver ────────────────────────────── #
 
 def _emit_event(buf: bytearray, state: List[int], ev: EventTuple) -> None:
-    """Build the event header (delta-encoded base + raw extras) and
-    yeet_pair it with the blob."""
+    """Build the event header (stream_id || delta-encoded base ||
+    extras) and wrap with wire_put_pair against the blob."""
     typ, ts, pid, tgid, ppid, nspid, nstgid, extras, blob = ev
     hdr = bytearray()
+    # stream_id (this importer is a single producer → 1)
+    wire_put_u64(hdr, 1)
     new = (typ, ts, pid, tgid, ppid, nspid, nstgid)
     for i in range(7):
-        # signed delta in 64-bit two's complement
         d = new[i] - state[i]
-        # normalise to signed 64-bit range
         if d >= (1 << 63):
             d -= (1 << 64)
         elif d < -(1 << 63):
             d += (1 << 64)
-        yeet_i64(hdr, d)
+        wire_put_i64(hdr, d)
         state[i] = new[i]
     for x in extras:
-        # extras are raw signed i64
         v = int(x)
         if v >= (1 << 63):
             v -= (1 << 64)
         elif v < -(1 << 63):
             v += (1 << 64)
-        yeet_i64(hdr, v)
-    yeet_pair(buf, bytes(hdr), blob)
+        wire_put_i64(hdr, v)
+    wire_put_pair(buf, bytes(hdr), blob)
 
 
 def _open_input(path: str) -> io.BufferedReader:
@@ -428,7 +412,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     fin = _open_input(args.input)
     fout = _open_output(args.output)
     out_buf = bytearray()
-    yeet_u64(out_buf, WIRE_VERSION)
+    wire_put_u64(out_buf, TRACE_VERSION)
     fout.write(bytes(out_buf))
     out_buf.clear()
 

@@ -31,6 +31,7 @@
 
 #include <sched.h>
 #include "wire/wire.h"
+#include "trace/trace.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -55,8 +56,8 @@ static void usage(const char *prog)
         "Usage: %s [-o FILE] [--no-env] -- command [args...]\n"
         "\n"
         "Syscall User Dispatch (SUD) based process tracer.\n"
-        "Produces a binary wire-format trace (see wire/wire.h).\n"
-        "Decode with: yeetdump FILE\n",
+        "Produces a binary trace (see trace/trace.h).\n"
+        "Decode with: tv dump FILE\n",
         prog);
     exit(1);
 }
@@ -266,17 +267,19 @@ static void emit_exit(pid_t pid, int status)
         extras[3] = status;
     }
 
-    uint8_t hdr[EV_HEADER_V2_MAX];
-    int hlen = ev_build_header_v2(g_launcher_stream_id, &g_launcher_state,
-                                  hdr,
-                                  EV_EXIT, ts_ns,
-                                  pid, tgid, ppid, pid, tgid,
-                                  extras, 4);
-    if (hlen > 0) {
-        uint8_t buf[EV_HEADER_V2_MAX + 16];
-        uint8_t *w = buf;
-        if (yeet_pair(&w, buf + sizeof buf, hdr, hlen, NULL, 0) == 0) {
-            write_all(g_out_fd, buf, (size_t)(w - buf));
+    uint8_t hdr[EV_HEADER_MAX];
+    Dst hd = wire_dst(hdr, sizeof hdr);
+    ev_build_header(&g_launcher_state, &hd, g_launcher_stream_id,
+                    EV_EXIT, ts_ns,
+                    pid, tgid, ppid, pid, tgid,
+                    extras, 4);
+    if (hd.p) {
+        size_t hlen = (size_t)(hd.p - hdr);
+        uint8_t buf[EV_HEADER_MAX + 16];
+        Dst od = wire_dst(buf, sizeof buf);
+        wire_put_pair(&od, wire_src(hdr, hlen), wire_src(NULL, 0));
+        if (od.p) {
+            write_all(g_out_fd, buf, (size_t)((uint8_t *)od.p - buf));
         }
     }
 }
@@ -529,13 +532,13 @@ int sudtrace_main(int argc, char **argv)
             __sync_fetch_and_add(&g_shared->next_stream_id, 1u) + 1u;
     }
 
-    /* Write the wire version atom once at the head of the output.
-     * v2 because we use per-stream delta state with leading stream_id. */
+    /* Write the trace version atom once at the head of the output. */
     {
-        uint8_t buf[EV_HEADER_V2_MAX];
-        uint8_t *w = buf;
-        if (yeet_u64(&w, buf + sizeof buf, WIRE_VERSION_V2) == 0) {
-            write_all(g_out_fd, buf, (size_t)(w - buf));
+        uint8_t buf[16];
+        Dst d = wire_dst(buf, sizeof buf);
+        wire_put_u64(&d, TRACE_VERSION);
+        if (d.p) {
+            write_all(g_out_fd, buf, (size_t)((uint8_t *)d.p - buf));
         }
     }
 

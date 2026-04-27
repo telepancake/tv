@@ -1,12 +1,12 @@
 /* tv_db.cpp - DuckDB-backed storage and query layer. */
 
 #include "tv_db.h"
-#include "wire_in.h"
+#include "trace/trace_stream.h"
 
 #include "duckdb.h"
 
 extern "C" {
-#include "wire/wire.h"
+#include "trace/trace.h"
 }
 
 #include <cstring>
@@ -88,7 +88,7 @@ const char *table_for(int32_t type) {
     }
 }
 
-void append_header(duckdb_appender ap, const WireEvent &ev) {
+void append_header(duckdb_appender ap, const TraceEvent &ev) {
     duckdb_append_uint64(ap, ev.ts_ns);
     duckdb_append_int32(ap, ev.pid);
     duckdb_append_int32(ap, ev.tgid);
@@ -262,7 +262,7 @@ std::unique_ptr<TvDb> TvDb::open_memory(std::string *err) {
     return TvDb::open_with_path(nullptr, ":memory:", err);
 }
 
-bool TvDb::append(const WireEvent &ev, std::string *err) {
+bool TvDb::append(const TraceEvent &ev, std::string *err) {
     const char *t = table_for(ev.type);
     if (!t) {
         if (err) *err = "unknown event type " + std::to_string(ev.type);

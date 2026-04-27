@@ -2,7 +2,7 @@
  *
  * The whole pipeline:
  *
- *   wire bytes  --->  WireDecoder  --->  TvDb (DuckDB Appender)  --->  .tvdb file
+ *   wire bytes  --->  TraceDecoder  --->  TvDb (DuckDB Appender)  --->  .tvdb file
  *      ^                                                                  |
  *      |                                                                  v
  *   uproctrace child / `--trace foo.wire`                  TvDataSource (SQL queries)
@@ -36,7 +36,7 @@
 #include <zstd.h>
 
 #include "engine.h"
-#include "wire_in.h"
+#include "trace/trace_stream.h"
 #include "tv_db.h"
 #include "data_source.h"
 
@@ -44,7 +44,7 @@ extern int uproctrace_main(int argc, char **argv);
 extern int run_tests(); /* tests.cpp */
 extern int fv_main(int argc, char **argv); /* fv.cpp */
 extern "C" int sudtrace_main(int argc, char **argv);  /* sud/sudtrace.c */
-extern "C" int yeetdump_main(int argc, char **argv);  /* tools/yeetdump/yeetdump.c */
+extern "C" int wiredump_main(int argc, char **argv);  /* tools/wiredump/wiredump.c */
 
 namespace {
 
@@ -68,7 +68,7 @@ const char *USAGE =
     "\n"
     "Tools (folded in from former separate binaries):\n"
     "  tv sud [args...]            sudtrace launcher (former sudtrace)\n"
-    "  tv dump <wire-file>...      hexdump a wire stream (former yeetdump)\n"
+    "  tv dump <trace-file>...     hexdump a trace stream (former yeetdump/wiredump)\n"
     "  tv dump --selftest          wire-format roundtrip test\n"
     "  tv fv [path]                file viewer (former fv)\n"
     "  tv module -- <cmd> ...      shorthand for `tv uproctrace --module --`\n"
@@ -88,7 +88,7 @@ bool has_suffix(const char *s, const char *suf) {
 /* Pipe the bytes of `f` through a wire decoder feeding `db`. Returns
  * false on a hard wire/decode error or db append failure. */
 bool ingest_wire_plain(FILE *f, TvDb &db, std::string *err) {
-    WireDecoder dec([&](const WireEvent &ev) {
+    TraceDecoder dec([&](const TraceEvent &ev) {
         std::string e;
         if (!db.append(ev, &e)) {
             std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
@@ -114,7 +114,7 @@ bool ingest_wire_zstd(FILE *f, TvDb &db, std::string *err) {
     std::unique_ptr<char[]> in_buf(new char[in_cap]);
     std::unique_ptr<char[]> out_buf(new char[out_cap]);
     bool ok = true;
-    WireDecoder dec([&](const WireEvent &ev) {
+    TraceDecoder dec([&](const TraceEvent &ev) {
         std::string e;
         if (!db.append(ev, &e)) {
             std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
@@ -181,7 +181,7 @@ struct LiveTrace {
     pid_t          child_pid = 0;
     int            fd = -1;
     TvDb          *db = nullptr;
-    WireDecoder   *dec = nullptr;
+    TraceDecoder   *dec = nullptr;
 };
 
 void on_trace_fd_cb(Tui &tui, int fd, LiveTrace &lt) {
@@ -773,7 +773,7 @@ int main(int argc, char **argv) {
         if (!std::strcmp(sub, "sud"))
             return sudtrace_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "dump"))
-            return yeetdump_main(argc - 1, argv + 1);
+            return wiredump_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "fv"))
             return fv_main(argc - 1, argv + 1);
         if (!std::strcmp(sub, "test"))
@@ -933,7 +933,7 @@ int main(int argc, char **argv) {
     if (dump) {
         if (cmd) { /* drain the live pipe first */
             char buf[64 * 1024];
-            WireDecoder dec([&](const WireEvent &ev) {
+            TraceDecoder dec([&](const TraceEvent &ev) {
                 std::string e; (void)db->append(ev, &e);
             });
             while (true) {
@@ -1059,7 +1059,7 @@ int main(int argc, char **argv) {
     }
 
     if (lt.fd >= 0) {
-        WireDecoder dec([&](const WireEvent &ev) {
+        TraceDecoder dec([&](const TraceEvent &ev) {
             std::string e; (void)db->append(ev, &e);
             src.invalidate();
             sync_hats(ui);

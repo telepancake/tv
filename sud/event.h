@@ -1,7 +1,7 @@
 /*
  * sud/event.h — Wire-format event emission for sudtrace.
  *
- * Emits events in the binary wire format defined by wire/wire.h.
+ * Emits events in the trace format defined by trace/trace.h.
  * All emit_* functions are async-signal-safe: raw syscalls only,
  * static buffers, no cross-process locking. Each process owns its
  * own ev_state and stream_id (handed out from a shared atomic

@@ -1,16 +1,16 @@
 /* tests.cpp - tv self-tests.
  *
- * Run with `tv --test`. Strictly black-box: build a wire byte stream
- * in-memory, feed it through the same WireDecoder + TvDb path the
+ * Run with `tv --test`. Strictly black-box: build a trace byte stream
+ * in-memory, feed it through the same TraceDecoder + TvDb path the
  * real ingest uses, then assert that SQL queries against the resulting
  * database return what we expect.
  */
 
-#include "wire_in.h"
+#include "trace/trace_stream.h"
 #include "tv_db.h"
 
 extern "C" {
-#include "wire/wire.h"
+#include "trace/trace.h"
 }
 
 #include <cstdio>
@@ -43,37 +43,20 @@ int g_pass = 0;
         __FILE__, __LINE__, #a, #b, _a.c_str(), _b.c_str()); } \
 } while (0)
 
-/* -- tiny wire-stream builder --------------------------------------- */
+/* -- tiny trace-stream builder -------------------------------------- */
 
-struct WireBuilder {
+struct TraceBuilder {
     std::vector<uint8_t> buf;
     ev_state st{};
+    uint32_t stream_id = 1;
     bool wrote_version = false;
-
-    void reserve_more(size_t n) {
-        if (buf.size() + n > buf.capacity()) buf.reserve(buf.size() + n + 64);
-    }
-
-    void write_atom(const void *data, size_t len) {
-        /* Use the public yeet_pair (header empty), allocating a generous
-         * scratch then truncating. For tests, just compute the prefix
-         * worst-case and resize. */
-        size_t cap = buf.size() + 16 + len;
-        buf.resize(cap);
-        uint8_t *p = buf.data() + buf.size() - 16 - len;
-        const uint8_t *end = buf.data() + cap;
-        if (yeet_blob(&p, end, data, (uint64_t)len) < 0) {
-            std::fprintf(stderr, "wirebuilder yeet_blob failed\n");
-            std::abort();
-        }
-        buf.resize((size_t)(p - buf.data()));
-    }
 
     void version() {
         if (wrote_version) return;
-        uint8_t pre[8]; uint8_t *p = pre;
-        if (yeet_u64(&p, pre + sizeof pre, WIRE_VERSION) < 0) std::abort();
-        buf.insert(buf.end(), pre, p);
+        uint8_t pre[16]; Dst d = wire_dst(pre, sizeof pre);
+        wire_put_u64(&d, TRACE_VERSION);
+        if (!d.p) std::abort();
+        buf.insert(buf.end(), pre, d.p);
         wrote_version = true;
     }
 
@@ -81,40 +64,39 @@ struct WireBuilder {
                int32_t ppid, const int64_t *extras, unsigned n_extras,
                const void *blob, size_t blen) {
         version();
-        uint8_t hdr[EV_HEADER_MAX];
-        int hlen = ev_build_header(&st, hdr, type, ts_ns, pid, tgid, ppid,
-                                   pid /*nspid*/, tgid /*nstgid*/,
-                                   extras, n_extras);
-        if (hlen < 0) { std::fprintf(stderr, "ev_build_header failed\n"); std::abort(); }
-        /* Outer atom = header || blob. Use yeet_pair. */
-        size_t cap_extra = 16 + (size_t)hlen + blen;
+        uint8_t hdrbuf[EV_HEADER_MAX];
+        Dst hd = wire_dst(hdrbuf, sizeof hdrbuf);
+        ev_build_header(&st, &hd, stream_id, type, ts_ns,
+                        pid, tgid, ppid,
+                        pid /*nspid*/, tgid /*nstgid*/,
+                        extras, n_extras);
+        if (!hd.p) { std::fprintf(stderr, "ev_build_header failed\n"); std::abort(); }
+        size_t hlen = (size_t)(hd.p - hdrbuf);
+
+        size_t cap_extra = 2 * WIRE_PREFIX_MAX + hlen + blen + 16;
         size_t cur = buf.size();
         buf.resize(cur + cap_extra);
-        uint8_t *p = buf.data() + cur;
-        const uint8_t *end = buf.data() + cur + cap_extra;
-        if (yeet_pair(&p, end, hdr, (uint64_t)hlen, blob, (uint64_t)blen) < 0) {
-            std::fprintf(stderr, "yeet_pair failed\n"); std::abort();
-        }
-        buf.resize((size_t)(p - buf.data()));
+        Dst od = wire_dst(buf.data() + cur, cap_extra);
+        wire_put_pair(&od,
+                      wire_src(hdrbuf, hlen),
+                      wire_src(blob, blen));
+        if (!od.p) { std::fprintf(stderr, "wire_put_pair failed\n"); std::abort(); }
+        buf.resize((size_t)(od.p - buf.data()));
     }
 };
 
 /* -- fixture: a tiny synthetic trace -------------------------------- */
 
-void build_fixture(WireBuilder &w) {
+void build_fixture(TraceBuilder &w) {
     /* Process 100: make all */
     w.event(EV_EXEC, 1000, /*pid*/100, /*tgid*/100, /*ppid*/1, nullptr, 0,
             "/usr/bin/make", 13);
-    /* argv: make\0all\0 (trailing NUL kernel-style) */
     w.event(EV_ARGV, 1000, 100, 100, 1, nullptr, 0, "make\0all\0", 9);
     w.event(EV_CWD,  1000, 100, 100, 1, nullptr, 0, "/home/user", 10);
-    /* OPEN /etc/passwd O_RDONLY fd=3 */
     int64_t open_ex[7] = {0 /*flags*/, 3, 0, 0, 0, 0, 0};
     w.event(EV_OPEN, 1100, 100, 100, 1, open_ex, 7, "/etc/passwd", 11);
-    /* OPEN /tmp/out O_WRONLY|O_CREAT fd=4 with err=0 */
     int64_t open_ex2[7] = {0101 /*O_WRONLY|O_CREAT*/, 4, 0, 0, 0, 0, 0};
     w.event(EV_OPEN, 1200, 100, 100, 1, open_ex2, 7, "/tmp/out", 8);
-    /* exit code 0 */
     int64_t ex[4] = {EV_EXIT_EXITED, 0, 0, 0};
     w.event(EV_EXIT, 2000, 100, 100, 1, ex, 4, nullptr, 0);
 
@@ -127,12 +109,12 @@ void build_fixture(WireBuilder &w) {
 
 /* -- tests ----------------------------------------------------------- */
 
-void test_wire_decoder_parses_all_events() {
-    WireBuilder w;
+void test_trace_decoder_parses_all_events() {
+    TraceBuilder w;
     build_fixture(w);
 
     int counts[16] = {0};
-    WireDecoder dec([&](const WireEvent &ev) {
+    TraceDecoder dec([&](const TraceEvent &ev) {
         if (ev.type >= 0 && ev.type < 16) counts[ev.type]++;
     });
     EXPECT(dec.feed(w.buf.data(), w.buf.size()));
@@ -143,11 +125,11 @@ void test_wire_decoder_parses_all_events() {
     EXPECT_EQ(counts[EV_EXIT], 2);
 }
 
-void test_wire_decoder_byte_at_a_time() {
-    WireBuilder w;
+void test_trace_decoder_byte_at_a_time() {
+    TraceBuilder w;
     build_fixture(w);
     int total = 0;
-    WireDecoder dec([&](const WireEvent &) { total++; });
+    TraceDecoder dec([&](const TraceEvent &) { total++; });
     for (size_t i = 0; i < w.buf.size(); i++) {
         EXPECT(dec.feed(&w.buf[i], 1));
     }
@@ -155,49 +137,49 @@ void test_wire_decoder_byte_at_a_time() {
     EXPECT_EQ(total, 9);
 }
 
-void test_wire_decoder_rejects_wrong_version() {
+void test_trace_decoder_rejects_wrong_version() {
     /* Hand-craft a stream with a bad version. */
     uint8_t bad[2];
-    uint8_t *p = bad;
-    yeet_u64(&p, bad + sizeof bad, 99); /* version 99 - unsupported */
+    Dst d = wire_dst(bad, sizeof bad);
+    wire_put_u64(&d, 99); /* bad version */
     int evs = 0;
-    WireDecoder dec([&](const WireEvent &){ evs++; });
-    EXPECT(!dec.feed(bad, (size_t)(p - bad)));
+    TraceDecoder dec([&](const TraceEvent &){ evs++; });
+    EXPECT(!dec.feed(bad, (size_t)(d.p - bad)));
     EXPECT_EQ(evs, 0);
 }
 
-/* v2 wire format: two producers (stream_id 1 and stream_id 2) emit
- * interleaved events into the same output. The decoder must keep one
- * ev_state per stream_id; if it accidentally shares state, the deltas
- * desync and the second stream's pid/tgid/ts come out wrong. */
-void test_wire_decoder_v2_multi_stream() {
+/* Two producers (stream_id 1 and stream_id 2) emit interleaved events
+ * into the same output. The decoder must keep one ev_state per
+ * stream_id; if it accidentally shares state, the deltas desync and
+ * the second stream's pid/tgid/ts come out wrong. */
+void test_trace_decoder_multi_stream() {
     std::vector<uint8_t> buf;
-    /* version atom = v2 */
     {
-        uint8_t v[2]; uint8_t *p = v;
-        if (yeet_u64(&p, v + sizeof v, WIRE_VERSION_V2) < 0) std::abort();
-        buf.insert(buf.end(), v, p);
+        uint8_t v[2]; Dst d = wire_dst(v, sizeof v);
+        wire_put_u64(&d, TRACE_VERSION);
+        if (!d.p) std::abort();
+        buf.insert(buf.end(), v, d.p);
     }
     auto emit = [&](uint32_t sid, ev_state *st, int32_t type, uint64_t ts,
                     int32_t pid, int32_t tgid, int32_t ppid,
                     const int64_t *extras, unsigned n_extras,
                     const void *blob, size_t blen) {
-        uint8_t hdr[EV_HEADER_V2_MAX];
-        int hlen = ev_build_header_v2(sid, st, hdr, type, ts,
-                                      pid, tgid, ppid, pid, tgid,
-                                      extras, n_extras);
-        if (hlen < 0) std::abort();
-        std::vector<uint8_t> ev(EV_HEADER_V2_MAX + 16 + blen);
-        uint8_t *p = ev.data();
-        if (yeet_pair(&p, ev.data() + ev.size(),
-                      hdr, (uint64_t)hlen, blob, (uint64_t)blen) < 0) std::abort();
-        buf.insert(buf.end(), ev.data(), p);
+        uint8_t hdr[EV_HEADER_MAX];
+        Dst hd = wire_dst(hdr, sizeof hdr);
+        ev_build_header(st, &hd, sid, type, ts,
+                        pid, tgid, ppid, pid, tgid,
+                        extras, n_extras);
+        if (!hd.p) std::abort();
+        size_t hlen = (size_t)(hd.p - hdr);
+
+        std::vector<uint8_t> ev(hlen + blen + 2 * WIRE_PREFIX_MAX + 16);
+        Dst d = wire_dst(ev.data(), ev.size());
+        wire_put_pair(&d, wire_src(hdr, hlen), wire_src(blob, blen));
+        if (!d.p) std::abort();
+        buf.insert(buf.end(), ev.data(), d.p);
     };
 
     ev_state st1{}, st2{};
-    /* Interleave events from two producers. Different pid families on
-     * purpose so that a state mix-up shows up immediately as a wrong
-     * decoded pid. */
     emit(1, &st1, EV_EXEC, 1000, 100, 100, 1, nullptr, 0, "/bin/sh", 7);
     emit(2, &st2, EV_EXEC, 2000, 500, 500, 1, nullptr, 0, "/bin/cat", 8);
     emit(1, &st1, EV_EXEC, 1100, 101, 101, 100, nullptr, 0, "/bin/ls", 7);
@@ -208,15 +190,12 @@ void test_wire_decoder_v2_multi_stream() {
 
     struct Got { uint32_t sid; int32_t pid; int32_t type; uint64_t ts; };
     std::vector<Got> got;
-    WireDecoder dec([&](const WireEvent &ev) {
+    TraceDecoder dec([&](const TraceEvent &ev) {
         got.push_back({ev.stream_id, ev.pid, ev.type, ev.ts_ns});
     });
     EXPECT(dec.feed(buf.data(), buf.size()));
     EXPECT_EQ((size_t)6, got.size());
     if (got.size() == 6) {
-        /* Stream 1 events keep stream_id=1 and the original pids/ts;
-         * stream 2 events keep stream_id=2. A shared-state bug would
-         * scramble at least one of these. */
         EXPECT_EQ((int)got[0].sid, 1); EXPECT_EQ((int)got[0].pid, 100);
         EXPECT_EQ((int)got[1].sid, 2); EXPECT_EQ((int)got[1].pid, 500);
         EXPECT_EQ((int)got[2].sid, 1); EXPECT_EQ((int)got[2].pid, 101);
@@ -235,15 +214,14 @@ void test_tvdb_ingest_and_query() {
     EXPECT(db != nullptr);
     if (!db) { std::fprintf(stderr, "open_memory: %s\n", err.c_str()); return; }
 
-    WireBuilder w;
+    TraceBuilder w;
     build_fixture(w);
-    WireDecoder dec([&](const WireEvent &ev) {
+    TraceDecoder dec([&](const TraceEvent &ev) {
         std::string e; (void)db->append(ev, &e);
     });
     EXPECT(dec.feed(w.buf.data(), w.buf.size()));
     EXPECT(db->flush(&err));
 
-    /* row counts per table */
     auto exec_n = db->query_int64("SELECT COUNT(*) FROM exec", &err);
     EXPECT_EQ((int64_t)2, exec_n.empty() ? -1 : exec_n[0]);
     auto open_n = db->query_int64("SELECT COUNT(*) FROM open_", &err);
@@ -251,31 +229,22 @@ void test_tvdb_ingest_and_query() {
     auto exit_n = db->query_int64("SELECT COUNT(*) FROM exit_", &err);
     EXPECT_EQ((int64_t)2, exit_n.empty() ? -1 : exit_n[0]);
     auto argv_n = db->query_int64("SELECT COUNT(*) FROM argv", &err);
-    /* Process 100: make, all (2 args). Process 200: false (1 arg). */
     EXPECT_EQ((int64_t)3, argv_n.empty() ? -1 : argv_n[0]);
 
-    /* Process 100 ran make */
     auto exes = db->query_strings(
         "SELECT exe FROM exec WHERE tgid = 100", &err);
     EXPECT_EQ((size_t)1, exes.size());
     if (!exes.empty()) EXPECT_STR(exes[0][0], "/usr/bin/make");
 
-    /* Process 200 exited with code 1 (failing) */
     auto codes = db->query_int64(
         "SELECT code_or_sig FROM exit_ WHERE tgid = 200", &err);
     EXPECT_EQ((int64_t)1, codes.empty() ? -1 : codes[0]);
 
-    /* The OPEN of /tmp/out was a write (O_WRONLY|O_CREAT). Test uses
-     * `% 4` instead of `& 3` because the bitwise & operator lives in
-     * DuckDB's core_functions extension which is not linked into the
-     * vendored amalgamation. */
     auto wopens = db->query_strings(
         "SELECT path FROM open_ WHERE tgid = 100 AND (flags % 4) != 0", &err);
     EXPECT_EQ((size_t)1, wopens.size());
     if (!wopens.empty()) EXPECT_STR(wopens[0][0], "/tmp/out");
 
-    /* Total row count = 2 EXEC + 3 ARGV-rows (make,all,false)
-     *                 + 1 CWD + 2 OPEN + 2 EXIT = 10 rows. */
     EXPECT_EQ((int64_t)10, db->total_event_count());
 }
 
@@ -288,8 +257,8 @@ void test_tvdb_persists_across_open() {
         auto db = TvDb::open_file(path, &err);
         EXPECT(db != nullptr);
         if (!db) return;
-        WireBuilder w; build_fixture(w);
-        WireDecoder dec([&](const WireEvent &ev){
+        TraceBuilder w; build_fixture(w);
+        TraceDecoder dec([&](const TraceEvent &ev){
             std::string e; (void)db->append(ev, &e);
         });
         dec.feed(w.buf.data(), w.buf.size());
@@ -305,13 +274,11 @@ void test_tvdb_persists_across_open() {
 }
 
 void test_data_source_mode1_query() {
-    /* The lpane mode 1 query must produce one row per process,
-     * ordered by start_ns ascending. */
     std::string err;
     auto db = TvDb::open_memory(&err);
     if (!db) { std::fprintf(stderr, "open_memory: %s\n", err.c_str()); g_fail++; return; }
-    WireBuilder w; build_fixture(w);
-    WireDecoder dec([&](const WireEvent &ev){ std::string e; (void)db->append(ev, &e); });
+    TraceBuilder w; build_fixture(w);
+    TraceDecoder dec([&](const TraceEvent &ev){ std::string e; (void)db->append(ev, &e); });
     dec.feed(w.buf.data(), w.buf.size());
     db->flush(&err);
 
@@ -324,8 +291,6 @@ void test_data_source_mode1_query() {
     }
 }
 
-/* -- lazy index materialisation -------------------------------------- */
-
 void test_proc_index_built_and_persisted() {
     std::string err;
     char path[64]; std::snprintf(path, sizeof path, "/tmp/tv_idx_%d.tvdb",
@@ -334,8 +299,8 @@ void test_proc_index_built_and_persisted() {
     {
         auto db = TvDb::open_file(path, &err);
         if (!db) { ::unlink(path); g_fail++; return; }
-        WireBuilder w; build_fixture(w);
-        WireDecoder dec([&](const WireEvent &ev){ std::string e; (void)db->append(ev, &e); });
+        TraceBuilder w; build_fixture(w);
+        TraceDecoder dec([&](const TraceEvent &ev){ std::string e; (void)db->append(ev, &e); });
         dec.feed(w.buf.data(), w.buf.size());
         db->flush(&err);
         EXPECT(db->ensure_proc_index(&err));
@@ -355,13 +320,11 @@ void test_proc_index_built_and_persisted() {
             EXPECT_STR(rows[1][3], "1");
         }
 
-        /* Calling ensure_*() again must be a no-op (already in tv_meta). */
         EXPECT(db->ensure_proc_index(&err));
         auto meta = db->query_strings(
             "SELECT value FROM tv_meta WHERE key='idx_proc'", &err);
         EXPECT_EQ((size_t)1, meta.size());
     }
-    /* Reopen - index must still be there. */
     {
         auto db = TvDb::open_file(path, &err);
         if (!db) { ::unlink(path); g_fail++; return; }
@@ -375,8 +338,8 @@ void test_path_index_summary() {
     std::string err;
     auto db = TvDb::open_memory(&err);
     if (!db) { g_fail++; return; }
-    WireBuilder w; build_fixture(w);
-    WireDecoder dec([&](const WireEvent &ev){ std::string e; (void)db->append(ev, &e); });
+    TraceBuilder w; build_fixture(w);
+    TraceDecoder dec([&](const TraceEvent &ev){ std::string e; (void)db->append(ev, &e); });
     dec.feed(w.buf.data(), w.buf.size());
     db->flush(&err);
     EXPECT(db->ensure_path_index(&err));
@@ -397,19 +360,15 @@ void test_path_index_summary() {
 }
 
 void test_edge_index_dep_closure() {
-    /* Build a synthetic graph:  proc 100 reads /etc/passwd, writes /tmp/out.
-     * deps(/tmp/out) must therefore include /etc/passwd. */
     std::string err;
     auto db = TvDb::open_memory(&err);
     if (!db) { g_fail++; return; }
-    WireBuilder w; build_fixture(w);
-    WireDecoder dec([&](const WireEvent &ev){ std::string e; (void)db->append(ev, &e); });
+    TraceBuilder w; build_fixture(w);
+    TraceDecoder dec([&](const TraceEvent &ev){ std::string e; (void)db->append(ev, &e); });
     dec.feed(w.buf.data(), w.buf.size());
     db->flush(&err);
     EXPECT(db->ensure_edge_index(&err));
 
-    /* dep closure: start at /tmp/out (write), find files read by procs
-     * that wrote it. */
     auto rows = db->query_strings(
         "WITH RECURSIVE closure(path, depth) AS ("
         "  SELECT '/tmp/out', 0"
@@ -430,10 +389,10 @@ void test_edge_index_dep_closure() {
 } /* namespace */
 
 int run_tests() {
-    test_wire_decoder_parses_all_events();
-    test_wire_decoder_byte_at_a_time();
-    test_wire_decoder_rejects_wrong_version();
-    test_wire_decoder_v2_multi_stream();
+    test_trace_decoder_parses_all_events();
+    test_trace_decoder_byte_at_a_time();
+    test_trace_decoder_rejects_wrong_version();
+    test_trace_decoder_multi_stream();
     test_tvdb_ingest_and_query();
     test_tvdb_persists_across_open();
     test_data_source_mode1_query();

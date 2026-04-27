@@ -104,13 +104,15 @@ $(DUCKDB_OBJ): $(DUCKDB_CPP)
 	$(DUCKDB_CXX) -std=c++17 $(DUCKDB_OPT) -I$(DUCKDB_INC) -c $(DUCKDB_CPP) -o $@
 
 # Single statically-linked tv binary with subcommands. Folds in what
-# used to be separate sudtrace/yeetdump/fv binaries — see main.cpp's
+# used to be separate sudtrace/wiredump/fv binaries — see main.cpp's
 # subcommand dispatch (sud, dump, fv, module, ptrace, uproctrace, test).
-TV_CXX_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp wire_in.cpp \
+TV_CXX_SRCS := main.cpp engine.cpp uproctrace.cpp tests.cpp \
+               trace/trace_stream.cpp \
                tv_db.cpp data_source.cpp fv.cpp
-TV_C_SRCS   := sud/sudtrace.c tools/yeetdump/yeetdump.c
+TV_C_SRCS   := sud/sudtrace.c tools/wiredump/wiredump.c
 TV_C_OBJS   := $(patsubst %.c,build/%.o,$(TV_C_SRCS))
-TV_HDRS := engine.h wire_in.h tv_db.h data_source.h wire/wire.h $(DUCKDB_HPP)
+TV_HDRS := engine.h trace/trace_stream.h tv_db.h data_source.h \
+           wire/wire.h trace/trace.h $(DUCKDB_HPP)
 
 build/%.o: %.c
 	@mkdir -p $(dir $@)

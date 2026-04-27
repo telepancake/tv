@@ -14,7 +14,7 @@
  *   events, no OOM, no disk I/O.
  *
  * • TGID-based tagging (threads bundled).
- * • Binary wire format (see wire/wire.h).
+ * • Binary trace format (see trace/trace.h).
  * • OPEN logs inode + device of the result.
  * • CWD event emitted on exec and chdir (replaces cwd field in EXEC).
  * • Compat 4.15–6.x.
@@ -56,6 +56,7 @@
 #include <linux/circ_buf.h>
 
 #include "wire/wire.h"
+#include "trace/trace.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("proctrace");
@@ -401,25 +402,30 @@ static void emit_one(struct trace_session *s,
     struct log_work *lw;
     unsigned long flags;
     uint8_t hdr[EV_HEADER_MAX];
-    uint8_t *p;
-    const uint8_t *end;
-    int hlen;
+    Dst hd, od;
+    size_t hlen;
 
-    lw = log_work_alloc(s, EV_HEADER_MAX + YEET_PREFIX_MAX + blen);
+    lw = log_work_alloc(s, EV_HEADER_MAX + 2u * WIRE_PREFIX_MAX + blen);
     if (!lw) return;
 
-    p = (uint8_t *)lw->data;
-    end = p + EV_HEADER_MAX + YEET_PREFIX_MAX + blen;
-
     spin_lock_irqsave(&s->ring.emit_lock, flags);
-    hlen = ev_build_header(&s->ring.st, hdr, type, ts_ns,
-                           pid, tgid, ppid, nspid, nstgid,
-                           extras, n_extras);
-    if (hlen > 0 &&
-        yeet_pair(&p, end, hdr, hlen, blob, blen) == 0) {
-        lw->len = (size_t)(p - (uint8_t *)lw->data);
-        session_log_submit(s, lw);
-        lw = NULL;
+    hd = wire_dst(hdr, sizeof hdr);
+    /* proctrace is single-producer per session — stream_id 1. */
+    ev_build_header(&s->ring.st, &hd, 1u, type, ts_ns,
+                    pid, tgid, ppid, nspid, nstgid,
+                    extras, n_extras);
+    if (hd.p) {
+        hlen = (size_t)((uint8_t *)hd.p - hdr);
+        od = wire_dst(lw->data,
+                      EV_HEADER_MAX + 2u * WIRE_PREFIX_MAX + blen);
+        wire_put_pair(&od,
+                      wire_src(hdr, hlen),
+                      wire_src(blob, blen));
+        if (od.p) {
+            lw->len = (size_t)((uint8_t *)od.p - (uint8_t *)lw->data);
+            session_log_submit(s, lw);
+            lw = NULL;
+        }
     }
     spin_unlock_irqrestore(&s->ring.emit_lock, flags);
     if (lw) kfree(lw);
@@ -510,8 +516,7 @@ static struct trace_session *session_create(pid_t root_tgid)
 {
     struct trace_session *s; int ret;
     uint8_t version_atom[16];
-    uint8_t *p;
-    const uint8_t *end;
+    Dst d;
     
     s = kzalloc(sizeof(*s), GFP_KERNEL);
     if (!s) return ERR_PTR(-ENOMEM);
@@ -531,11 +536,12 @@ static struct trace_session *session_create(pid_t root_tgid)
         return ERR_PTR(-ENOMEM);
     }
 
-    /* Write WIRE_VERSION as first atom in the stream. */
-    p = version_atom;
-    end = version_atom + sizeof(version_atom);
-    if (yeet_u64(&p, end, WIRE_VERSION) == 0)
-        ring_write(&s->ring, (char*)version_atom, p - version_atom);
+    /* Write TRACE_VERSION as first atom in the stream. */
+    d = wire_dst(version_atom, sizeof(version_atom));
+    wire_put_u64(&d, TRACE_VERSION);
+    if (d.p)
+        ring_write(&s->ring, (char *)version_atom,
+                   (uint8_t *)d.p - version_atom);
 
     s->id = atomic_fetch_inc(&next_session_id);
     s->root_tgid = root_tgid; s->dead = false;

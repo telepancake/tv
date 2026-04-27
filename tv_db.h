@@ -1,11 +1,11 @@
 /* tv_db.h - tv's storage and query layer, on DuckDB.
  *
  * A trace lives on disk as a single DuckDB native database file
- * (`foo.tvdb`). One table per wire event class:
+ * (`foo.tvdb`). One table per trace event class:
  *
  *   exec, argv, env, auxv, exit, open, cwd, stdout, stderr
  *
- * Schema mirrors wire/wire.h:
+ * Schema mirrors trace/trace.h:
  *   - all tables share six common header columns
  *     (ts_ns UBIGINT, pid INT, tgid INT, ppid INT, nspid INT, nstgid INT)
  *   - argv/env/auxv are split into one row per element (idx column)
@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-struct WireEvent;
+struct TraceEvent;
 
 class TvDb {
 public:
@@ -39,10 +39,10 @@ public:
     TvDb(const TvDb &) = delete;
     TvDb &operator=(const TvDb &) = delete;
 
-    /* Append one decoded wire event into the matching table. Internally
+    /* Append one decoded trace event into the matching table. Internally
      * uses cached duckdb_appender objects per table; call flush() to
      * commit pending appends to the on-disk file. */
-    bool append(const WireEvent &ev, std::string *err);
+    bool append(const TraceEvent &ev, std::string *err);
 
     /* Flush all open appenders and CHECKPOINT the database. Required
      * before queries that should see appended data, and at shutdown. */

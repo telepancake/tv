@@ -28,6 +28,7 @@
 
 extern "C" {
 #include "wire/wire.h"
+#include "trace/trace.h"
 }
 
 #include <string>
@@ -137,25 +138,29 @@ static void emit_one(int32_t type, uint64_t ts_ns,
                      const int64_t *extras, unsigned n_extras,
                      const void *blob, size_t blen)
 {
-    size_t buf_size = EV_HEADER_MAX + YEET_PREFIX_MAX + blen;
+    size_t buf_size = EV_HEADER_MAX + 2 * WIRE_PREFIX_MAX + blen + 16;
     std::vector<uint8_t> buf(buf_size);
-    
-    uint8_t *p = buf.data();
-    const uint8_t *end = buf.data() + buf_size;
 
     pthread_mutex_lock(&g_ev_lock);
-    
+
     uint8_t hdr[EV_HEADER_MAX];
-    int hlen = ev_build_header(&g_ev_state, hdr, type, ts_ns,
-                               pid, tgid, ppid, nspid, nstgid,
-                               extras, n_extras);
-    if (hlen > 0 && yeet_pair(&p, end, hdr, hlen, blob, blen) == 0) {
-        size_t total = static_cast<size_t>(p - buf.data());
-        pthread_mutex_unlock(&g_ev_lock);
-        trace_output_enqueue(reinterpret_cast<const char*>(buf.data()), total);
-    } else {
-        pthread_mutex_unlock(&g_ev_lock);
+    Dst hd = wire_dst(hdr, sizeof hdr);
+    /* upttrace is single-producer — stream_id 1. */
+    ev_build_header(&g_ev_state, &hd, 1u, type, ts_ns,
+                    pid, tgid, ppid, nspid, nstgid,
+                    extras, n_extras);
+    if (hd.p) {
+        size_t hlen = (size_t)(hd.p - hdr);
+        Dst od = wire_dst(buf.data(), buf_size);
+        wire_put_pair(&od, wire_src(hdr, hlen), wire_src(blob, blen));
+        if (od.p) {
+            size_t total = (size_t)((uint8_t *)od.p - buf.data());
+            pthread_mutex_unlock(&g_ev_lock);
+            trace_output_enqueue(reinterpret_cast<const char*>(buf.data()), total);
+            return;
+        }
     }
+    pthread_mutex_unlock(&g_ev_lock);
 }
 
 static int trace_output_write_plain(struct trace_output *out, const char *buf, size_t len)
@@ -1669,13 +1674,13 @@ static int open_trace_output(const char *outfile)
         return -1;
     }
 
-    /* Emit WIRE_VERSION as the first thing in the stream */
+    /* Emit TRACE_VERSION as the first thing in the stream */
     uint8_t version_buf[16];
-    uint8_t *vp = version_buf;
-    const uint8_t *vend = version_buf + sizeof(version_buf);
-    if (yeet_u64(&vp, vend, WIRE_VERSION) == 0) {
-        trace_output_enqueue(reinterpret_cast<const char*>(version_buf), 
-                           static_cast<size_t>(vp - version_buf));
+    Dst vd = wire_dst(version_buf, sizeof(version_buf));
+    wire_put_u64(&vd, TRACE_VERSION);
+    if (vd.p) {
+        trace_output_enqueue(reinterpret_cast<const char*>(version_buf),
+                           static_cast<size_t>((uint8_t *)vd.p - version_buf));
     }
 
     return 0;
