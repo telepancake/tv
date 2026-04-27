@@ -738,7 +738,9 @@ int main(int argc, char **argv) {
         if (cmd) { /* drain the live pipe first */
             char buf[64 * 1024];
             TraceDecoder dec([&](const TraceEvent &ev) {
-                std::string e; (void)db->append(ev, &e);
+                std::string e;
+                if (!db->append(ev, &e))
+                    std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
             });
             while (true) {
                 ssize_t n = ::read(lt.fd, buf, sizeof buf);
@@ -756,7 +758,9 @@ int main(int argc, char **argv) {
         if (cmd) {
             char buf[64 * 1024];
             TraceDecoder dec([&](const TraceEvent &ev) {
-                std::string e; (void)db->append(ev, &e);
+                std::string e;
+                if (!db->append(ev, &e))
+                    std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
             });
             while (true) {
                 ssize_t n = ::read(lt.fd, buf, sizeof buf);
@@ -888,7 +892,9 @@ int main(int argc, char **argv) {
 
     if (lt.fd >= 0) {
         TraceDecoder dec([&](const TraceEvent &ev) {
-            std::string e; (void)db->append(ev, &e);
+            std::string e;
+            if (!db->append(ev, &e))
+                std::fprintf(stderr, "tv: ingest: %s\n", e.c_str());
             src.invalidate();
             sync_hats(ui);
         });

@@ -265,15 +265,13 @@ public:
     }
 
 private:
-    struct PairHash {
-        size_t operator()(const uint64_t &v) const { return (size_t)(v ^ (v >> 32)); }
-    };
-
     uint32_t out_stream_id(const OwnedEvent &ev) {
         uint64_t key = ((uint64_t)(uint32_t)ev.source << 32) | ev.stream_id;
         auto it = stream_map_.find(key);
         if (it != stream_map_.end()) return it->second;
         uint32_t sid = next_stream_id_++;
+        /* stream id 0 is avoided because older C dump code used it as
+         * an empty-slot sentinel in its stream table. */
         if (sid == 0) sid = next_stream_id_++;
         stream_map_[key] = sid;
         return sid;
@@ -309,7 +307,7 @@ private:
     ZSTD_CStream *cctx_ = nullptr;
     std::vector<char> outbuf_;
     std::unordered_map<uint32_t, ev_state> states_;
-    std::unordered_map<uint64_t, uint32_t, PairHash> stream_map_;
+    std::unordered_map<uint64_t, uint32_t> stream_map_;
     uint32_t next_stream_id_ = 1;
 };
 
@@ -336,7 +334,10 @@ public:
     const std::string &name() const { return name_; }
 
     void close() {
-        if (dctx_) { ZSTD_freeDStream(dctx_); dctx_ = nullptr; }
+        if (dctx_) {
+            ZSTD_freeDStream(dctx_);
+            dctx_ = nullptr;
+        }
         if (f_) {
             if (owns_) std::fclose(f_);
             f_ = nullptr;
@@ -549,7 +550,8 @@ std::unique_ptr<Source> open_tracer_source(int idx, const Options &opt,
         ::close(pipefd[0]);
         if (::dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
         ::close(pipefd[1]);
-        size_t cmdc = 0; while (opt.cmd[cmdc]) cmdc++;
+        size_t cmdc = 0;
+        while (opt.cmd[cmdc]) cmdc++;
         size_t argc = 1 + (opt.no_env ? 1 : 0) + 1 + cmdc + 1;
         char **av = (char **)std::calloc(argc, sizeof(char *));
         size_t ai = 0;
