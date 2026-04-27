@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "wire/wire.h"
+#include "trace/trace.h"
 
 enum { OUTPUT_BUFFER_SIZE = 1 << 20 };
 
@@ -19,15 +20,16 @@ static void usage(FILE *f, const char *prog)
     fprintf(f, "Usage: %s [-o FILE] -- command [args...]\n", prog);
 }
 
-static int write_wire_version(FILE *out)
+static int write_trace_version(FILE *out)
 {
     uint8_t buf[16];
-    uint8_t *p = buf;
-    const uint8_t *end = buf + sizeof(buf);
+    Dst d = wire_dst(buf, sizeof(buf));
 
-    if (yeet_u64(&p, end, WIRE_VERSION) != 0)
+    wire_put_u64(&d, TRACE_VERSION);
+    if (!d.p)
         return -1;
-    return fwrite(buf, 1, (size_t)(p - buf), out) == (size_t)(p - buf) ? 0 : -1;
+    size_t n = (size_t)((uint8_t *)d.p - buf);
+    return fwrite(buf, 1, n, out) == n ? 0 : -1;
 }
 
 static int drain_fd(int fd, FILE *out)
@@ -111,7 +113,7 @@ int main(int argc, char **argv)
         trace_out_fd = -1;
     }
     setvbuf(out, NULL, _IOFBF, OUTPUT_BUFFER_SIZE);
-    if (write_wire_version(out) != 0) {
+    if (write_trace_version(out) != 0) {
         perror("write");
         goto done;
     }

@@ -1,16 +1,16 @@
 /*
- * sud/event.c — Wire-format event emission for sudtrace.
+ * sud/event.c — TRACE-format event emission for sudtrace.
  *
- * Emits events using the binary format from wire/wire.h:
+ * Emits events using the format from trace/trace.h:
  *   [version atom is written once by the launcher]
- *   <outer atom per event> = yeet_pair(stream_id || hdr, blob)
+ *   <outer atom per event> = wire_put_pair(stream_id+hdr, blob)
  *
  * Every emit path is async-signal-safe: raw syscalls, static buffers,
  * no malloc, no stdio, no TLS. The SIGSYS handler calls these from
  * arbitrary traced program contexts.
  *
- * Cross-process coherence — per-process stream design (wire v2)
- * -------------------------------------------------------------
+ * Cross-process coherence — per-process stream design
+ * ---------------------------------------------------
  * The previous design held a cross-process spinlock over a shared
  * ev_state and serialised every emitter. That kills throughput,
  * leaves async-signal-safety on a knife edge (a process killed mid-
@@ -26,18 +26,15 @@
  *     next stream_id with __sync_fetch_and_add and keeps a
  *     *process-local* ev_state.
  *   - Each event is built into a single static scratch buffer and
- *     emitted with one raw_write() (or one raw_writev() if the blob
- *     doesn't fit in scratch). Both syscalls are atomic against other
- *     writers up to PIPE_BUF (pipes) or unconditionally on regular
- *     files in Linux, so events from different processes interleave
- *     at event boundaries but never inside an event.
- *   - The decoder (wire_in.cpp) keeps one ev_state per observed
- *     stream_id, so each producer's deltas stay coherent on its own
- *     state.
+ *     emitted with one raw_write(). The syscall is atomic against
+ *     other writers up to PIPE_BUF (pipes) or unconditionally on
+ *     regular files in Linux, so events from different processes
+ *     interleave at event boundaries but never inside an event.
+ *   - The decoder (trace/trace_stream.cpp) keeps one ev_state per
+ *     observed stream_id, so each producer's deltas stay coherent
+ *     on its own state.
  *
- * Stream id 0 is reserved for "default / legacy" — it's what a v1
- * producer would land on. The launcher takes id 1; children get 2, 3,
- * 4, …
+ * Stream id 1 is the launcher's; children get 2, 3, 4, …
  */
 
 #include "sud/libc.h"
@@ -45,6 +42,7 @@
 #include "sud/fmt.h"
 #include "sud/event.h"
 #include "wire/wire.h"
+#include "trace/trace.h"
 
 /* ================================================================
  * Global variable definitions
@@ -237,19 +235,16 @@ static uint64_t get_ts_ns(void)
 /* ================================================================
  * Core event emitter.
  *
- * Builds the v2 header (stream_id || delta-encoded base scalars +
- * extras) against this process's *local* ev_state and emits the
- * outer atom in a single syscall:
- *
- *   - small payloads (header + blob ≤ WIRE_EVENT_STACK_MAX) are
- *     packed into the static scratch buffer and shipped with one
- *     raw_write().
- *   - oversized blobs (only EV_ENV ever hits this) are emitted via
- *     raw_writev() with three iovs (outer-atom prefix, header, blob).
- *     writev is atomic per-call against other writers.
+ * Builds the header (stream_id || delta-encoded base scalars +
+ * extras) against this process's *local* ev_state, then writes the
+ * outer atom — a wire_put_pair of (header, blob) — into the static
+ * scratch buffer and ships it in one raw_write().
  *
  * No lock — the only cross-process state is the stream-id counter
- * touched once at sud_wire_init() time.
+ * touched once at sud_wire_init() time. raw_write is atomic per-call
+ * against other writers on regular files (and up to PIPE_BUF on
+ * pipes), so events from different processes interleave at event
+ * boundaries only — never inside one.
  * ================================================================ */
 
 #define WIRE_EVENT_STACK_MAX  (ENV_MAX_READ + PATH_MAX * 8 + 256)
@@ -269,55 +264,24 @@ static void emit_event(int32_t type, pid_t pid, pid_t tgid, pid_t ppid,
     /* Lazy init in case a stand-alone use forgot to call sud_wire_init. */
     if (!g_stream_id_set) sud_wire_init();
 
-    uint8_t hdr[EV_HEADER_V2_MAX];
-    int hlen = ev_build_header_v2(g_stream_id, &g_ev_state, hdr,
-                                  type, ts_ns,
-                                  pid, tgid, ppid,
-                                  /* nspid, nstgid: same as pid/tgid when not
-                                   * explicitly different — sud can't tell */
-                                  pid, tgid,
-                                  extras, n_extras);
-    if (hlen < 0) return;
+    uint8_t hdr[EV_HEADER_MAX];
+    Dst hd = wire_dst(hdr, sizeof hdr);
+    ev_build_header(&g_ev_state, &hd, g_stream_id,
+                    type, ts_ns,
+                    pid, tgid, ppid,
+                    /* nspid, nstgid: same as pid/tgid when not
+                     * explicitly different — sud can't tell */
+                    pid, tgid,
+                    extras, n_extras);
+    if (!hd.p) return;
+    size_t hlen = (size_t)(hd.p - hdr);
 
-    /* Common case: header + blob fits in the scratch buffer. Build
-     * the outer atom in-place, ship in one syscall. */
-    uint8_t *w = (uint8_t *)g_event_buf;
-    const uint8_t *end = w + WIRE_EVENT_STACK_MAX;
-    if (yeet_pair(&w, end, hdr, hlen, blob, blen) == 0) {
-        emit_raw(g_event_buf, (size_t)(w - (uint8_t *)g_event_buf));
-        return;
-    }
-
-    /* Oversized: build the outer-atom long-form prefix on the stack
-     * and writev (prefix, hdr, blob) in one atomic syscall. */
-    uint8_t prefix[16];
-    uint8_t *pp = prefix;
-    uint64_t total = (uint64_t)hlen + blen;
-    uint8_t lenbuf[8]; uint8_t lensz = 0; uint64_t tmp = total;
-    while (tmp) { lenbuf[lensz++] = (uint8_t)(tmp & 0xFFu); tmp >>= 8; }
-    if (lensz > 7u) return;
-    *pp++ = (uint8_t)(0xF8u + lensz);
-    for (uint8_t i = 0; i < lensz; i++) *pp++ = lenbuf[i];
-
-    struct sud_iovec iov[3];
-    int iovcnt = 0;
-    iov[iovcnt].iov_base = prefix;
-    iov[iovcnt].iov_len  = (size_t)(pp - prefix);
-    iovcnt++;
-    iov[iovcnt].iov_base = hdr;
-    iov[iovcnt].iov_len  = (size_t)hlen;
-    iovcnt++;
-    if (blen) {
-        iov[iovcnt].iov_base = blob;
-        iov[iovcnt].iov_len  = blen;
-        iovcnt++;
-    }
-    /* writev is atomic against other writers on regular files; on
-     * pipes it's atomic up to PIPE_BUF. We accept a partial write on
-     * a clogged pipe by short-emitting (the trace will look truncated
-     * but won't corrupt — the next event's stream_id resyncs the
-     * delta state at the decoder). */
-    (void)raw_writev(g_out_fd, iov, iovcnt);
+    Dst od = wire_dst(g_event_buf, WIRE_EVENT_STACK_MAX);
+    wire_put_pair(&od,
+                  wire_src(hdr, hlen),
+                  wire_src(blob, blen));
+    if (!od.p) return;  /* event larger than scratch — drop */
+    emit_raw(g_event_buf, (size_t)((uint8_t *)od.p - (uint8_t *)g_event_buf));
 }
 
 /* ================================================================
